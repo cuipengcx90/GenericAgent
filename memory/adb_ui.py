@@ -4,6 +4,14 @@
 # u2 (uiautomator2) 不受idle限制，适合动画密集app（美团等）
 # 弹窗检测: ui(clickable_only=True, raw=True) 找全屏FrameLayout+底部小ImageView(关闭X)
 # 已知包名: 美团外卖=com.sankuai.meituan.takeoutnew 淘宝=com.taobao.taobao
+# ── 连接方式 ──────────────────────────────────────────────────
+# [USB]       手机开「USB调试」→ 接线 → adb devices → 手机弹框点允许 → 再次 adb devices 确认
+# [WiFi传统]  先USB连: adb tcpip 5555 → adb connect <IP>:5555 → 拔线可用
+# [Android11+ 无线配对码] 设置→开发者→无线调试→使用配对码配对
+#   adb pair <IP>:<配对端口>   (输入6位配对码)
+#   adb connect <IP>:<调试端口>  ⚠️ 两端口不同！调试端口在「无线调试」主界面看
+#   每次重启手机后调试端口变，需重新 adb connect；配对只需做一次
+# ─────────────────────────────────────────────────────────────
 import subprocess, xml.etree.ElementTree as ET, os, re, shutil
 
 ADB = shutil.which("adb") or "adb"

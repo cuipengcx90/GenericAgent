@@ -40,8 +40,39 @@ def __getattr__(name):  # once guard in PEP 562
     if name == 'mykeys': return reload_mykeys()[0]
     raise AttributeError(f"module 'llmcore' has no attribute {name}")
 
+# --- LLMLingua lazy warmup (background thread, non-blocking) ---
+_llmlingua_compressor = None
+_llmlingua_ready = False
+
+def _llmlingua_warmup():
+    """Load LLMLingua model in background thread; sets _llmlingua_compressor when ready."""
+    global _llmlingua_compressor, _llmlingua_ready
+    try:
+        from llmlingua import PromptCompressor
+        _llmlingua_compressor = PromptCompressor(
+            model_name="microsoft/llmlingua-2-xlm-roberta-large-meetingbank",
+            use_llmlingua2=True, device_map="cpu"
+        )
+        _llmlingua_ready = True
+        print("[LLMLingua] model ready")
+    except Exception as e:
+        print(f"[LLMLingua] warmup failed: {e}")
+
+def _try_llmlingua(text, rate=0.4):
+    """Try LLMLingua compression; returns compressed text or None on failure."""
+    if not _llmlingua_ready or _llmlingua_compressor is None: return None
+    try:
+        result = _llmlingua_compressor.compress_prompt(text, rate=rate, force_tokens=['\n'])
+        return result.get('compressed_prompt', None)
+    except Exception as e:
+        print(f"[LLMLingua] compress error: {e}"); return None
+
+# Kick off background warmup once at import time (non-blocking)
+threading.Thread(target=_llmlingua_warmup, daemon=True).start()
+
 def compress_history_tags(messages, keep_recent=10, max_len=800, force=False, interval=5):
-    """Compress <thinking>/<tool_use>/<tool_result> tags in older messages to save tokens."""
+    """Compress <thinking>/<tool_use>/<tool_result> tags in older messages to save tokens.
+    Uses LLMLingua when model is ready (background-loaded), falls back to regex truncation."""
     compress_history_tags._cd = getattr(compress_history_tags, '_cd', 0) + 1
     if force: compress_history_tags._cd = 0
     if compress_history_tags._cd % interval != 0: return messages
@@ -53,6 +84,13 @@ def compress_history_tags(messages, keep_recent=10, max_len=800, force=False, in
         text = _hist_pat.sub(lambda m: f'<{m.group(1)}>[...]</{m.group(1)}>', text)
         for pat in _pats.values(): text = pat.sub(lambda m: m.group(1) + _trunc_str(m.group(2)) + m.group(3), text)
         return text
+    def _compress_str(s):
+        """Try LLMLingua first; fallback to regex truncation."""
+        if not isinstance(s, str): return s
+        if _llmlingua_ready and len(s) > max_len:
+            compressed = _try_llmlingua(s)
+            if compressed: return compressed
+        return _trunc_str(s)
     for i, msg in enumerate(messages):
         if i >= len(messages) - keep_recent: break
         c = msg['content']
@@ -65,13 +103,15 @@ def compress_history_tags(messages, keep_recent=10, max_len=800, force=False, in
                 elif t == 'thinking' and isinstance(b.get('thinking'), str): b['thinking'] = _trunc_str(b['thinking'])
                 elif t == 'tool_result':
                     tc = b.get('content')
-                    if isinstance(tc, str): b['content'] = _trunc_str(tc)
+                    if isinstance(tc, str): b['content'] = _compress_str(tc)
                     elif isinstance(tc, list):
                         for sub in tc:
-                            if isinstance(sub, dict) and sub.get('type') == 'text': sub['text'] = _trunc_str(sub.get('text'))
+                            if isinstance(sub, dict) and sub.get('type') == 'text': sub['text'] = _compress_str(sub.get('text'))
                 elif t == 'tool_use' and isinstance(b.get('input'), dict):
-                    for k, v in b['input'].items(): b['input'][k] = _trunc_str(v)
-    print(f"[Cut] {_before} -> {sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)}")
+                    for k, v in b['input'].items(): b['input'][k] = _compress_str(v)
+    _after = sum(len(json.dumps(m, ensure_ascii=False)) for m in messages)
+    _mode = 'LLMLingua' if _llmlingua_ready else 'regex'
+    print(f"[Cut/{_mode}] {_before} -> {_after}")
     return messages
 
 def _sanitize_leading_user_msg(msg):

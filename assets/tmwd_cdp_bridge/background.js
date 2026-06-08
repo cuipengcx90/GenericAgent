@@ -227,10 +227,12 @@ async function isServerAlive() {
   try {
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 2000);
-    await fetch('http://127.0.0.1:18765', { signal: ctrl.signal });
+    await fetch('http://127.0.0.1:18766', { signal: ctrl.signal });
     return true; // Got HTTP response → port is listening
   } catch (e) {
-    return false; // Network error (connection refused) or timeout → server not alive
+    // If fetch throws but it's not a connection refused (e.g. non-HTTP WS upgrade response), still consider alive
+    if (e.name !== 'AbortError' && !e.message?.includes('Failed to fetch')) return true;
+    return false; // Connection refused or timeout → server not alive
   }
 }
 

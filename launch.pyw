@@ -63,7 +63,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     port = str(find_free_port()) if args.port == '0' else args.port
     print(f'[Launch] Using port {port}')
-    threading.Thread(target=start_streamlit, args=(port,), daemon=True).start()
+    # threading.Thread(target=start_streamlit, args=(port,), daemon=True).start()  # disabled: using Kiro instead
 
     if args.tg:
         tgproc = subprocess.Popen([sys.executable, os.path.join(frontends_dir, "tgapp.py")], creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)

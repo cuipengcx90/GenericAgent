@@ -13,6 +13,8 @@ autonomous_task.py - 自主行动任务管理API
 import os
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from datetime import datetime
 
@@ -24,6 +26,8 @@ _TEMP_DIR = _AGENT_DIR / "temp"                        # GenericAgent/temp/
 _REPORTS_DIR = _TEMP_DIR / "autonomous_reports"
 _HISTORY_FILE = _REPORTS_DIR / "history.txt"
 _TODO_FILE = _TEMP_DIR / "TODO.txt"
+_COMPRESS_SCRIPT = _TEMP_DIR / "compress_log.py"
+_LOG_DIR = _AGENT_DIR / "logs"
 
 def _next_report_number() -> int:
     """扫 history.txt 第一行提取最大 RXX 编号，返回下一个"""
@@ -55,6 +59,33 @@ def get_history(n: int = 20) -> str:
 def set_todo(*args, **kwargs) -> str:
     """返回 TODO.txt 的真实绝对路径，供 agent/子agent 自行读写。"""
     return f'路径: {str(_TODO_FILE)}'
+
+
+def compress_and_archive() -> str:
+    """
+    调用 compress_log.py 压缩 autonomous_reflect.log，减少日志体积。
+    
+    Returns:
+        成功消息或错误消息
+    """
+    if not _COMPRESS_SCRIPT.exists():
+        return f"[WARN] compress_log.py 不存在: {_COMPRESS_SCRIPT}"
+    
+    log_file = _LOG_DIR / "autonomous_reflect.log"
+    if not log_file.exists():
+        return f"[WARN] autonomous_reflect.log 不存在: {log_file}"
+    
+    try:
+        result = subprocess.run(
+            [sys.executable, str(_COMPRESS_SCRIPT)],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return f"✅ 日志已压缩: {result.stdout.strip()}"
+        else:
+            return f"[ERROR] 压缩失败 (rc={result.returncode}): {result.stderr[:200]}"
+    except Exception as e:
+        return f"[ERROR] 压缩异常: {e}"
 
 
 def complete_task(taskname: str, historyline: str, report_path: str) -> str:
@@ -118,10 +149,34 @@ def complete_task(taskname: str, historyline: str, report_path: str) -> str:
             pass
         return f"[ERROR] 写入 history 失败: {e}（报告已回滚）"
 
-    # ── 3. 返回改 TODO 指令 ──
+    # ── 3. 自动压缩日志 ──
+    compress_msg = compress_and_archive()
+
+    # ── 3.5 飞书群推送 ──
+    try:
+        sys.path.insert(0, str(_AGENT_DIR / "reflect_scripts"))
+        from notify_feishu_group import notify_group
+        notify_group(f"✅ [Agent完成] {taskname}\n{line}")
+        feishu_msg = "📨 飞书推送成功"
+    except Exception as _fe:
+        feishu_msg = f"📨 飞书推送跳过: {_fe}"
+
+    # ── 3.6 钉钉群推送 ──
+    try:
+        sys.path.insert(0, str(_AGENT_DIR / "reflect_scripts"))
+        from notify_dingtalk_group import notify_group as ding_notify
+        ding_notify(f"✅ [Agent完成] {taskname}\n{line}")
+        dingtalk_msg = "📨 钉钉推送成功"
+    except Exception as _de:
+        dingtalk_msg = f"📨 钉钉推送跳过: {_de}"
+
+    # ── 4. 返回改 TODO 指令 ──
     return (
         f"✅ 完成！报告已保存: {dest_name}\n"
         f"历史已记录: {line}\n"
+        f"{compress_msg}\n"
+        f"{feishu_msg}\n"
+        f"{dingtalk_msg}\n"
         f"👉 请在 {_TODO_FILE} 中将对应任务标记为 [x] R{rnum}，然后结束，**其他TODO下次再干**"
     )
 

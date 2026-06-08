@@ -152,7 +152,11 @@ def check():
         # 检查冷却
         last = _last_run(tid, done_files)
         cooldown = _parse_cooldown(repeat)
-        if last and (now - last) < cooldown: continue
+        # 日历日修正：daily/weekday 任务只要跨天了就不受小时冷却限制
+        if last and repeat in ('daily', 'weekday') and last.date() < now.date():
+            pass  # 已跨天，允许触发
+        elif last and (now - last) < cooldown:
+            continue
         
         # --- 触发防抖：防止卡死任务阻塞后续任务 ---
         if tid in _pending:
