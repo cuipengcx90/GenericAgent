@@ -1,0 +1,7 @@
+{
+  "schedule": "00:00",
+  "repeat": "every_1h",
+  "enabled": true,
+  "max_delay_hours": 48,
+  "prompt": "【文件夹监控任务】检查 ~/Downloads 目录中近1小时内新增的文件：\n```python\nimport os, time\nfrom pathlib import Path\nwatch_dir = Path.home() / 'Downloads'\nignore_exts = {'.crdownload', '.part', '.tmp', '.DS_Store'}\nnow = time.time()\nnew_files = []\nfor f in watch_dir.iterdir():\n    if f.is_file() and f.suffix.lower() not in ignore_exts and not f.name.startswith('.'):\n        if now - f.stat().st_mtime < 3600:  # 1小时内修改\n            new_files.append(f)\nprint(f'发现 {len(new_files)} 个新文件: {[f.name for f in new_files]}')\n```\n如果有新文件：\n1. 判断每个文件的类型和用途\n2. 给出规范文件名建议（格式：日期_描述.扩展名）\n3. 建议归档到 ~/Documents/归档/ 下合适的子目录\n4. 用以下方式推送飞书通知：\n```python\nimport sys; sys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nfrom reflect_scripts.reflect_common import notify_feishu\nnotify_feishu(f'📁 Downloads新文件\\n\\n{处理结果}')\n```\n如果没有新文件，直接结束，不推送。"
+}

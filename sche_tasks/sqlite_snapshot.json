@@ -1,0 +1,7 @@
+{
+  "schedule": "08:00",
+  "repeat": "daily",
+  "enabled": true,
+  "prompt": "执行SQLite快照+diff任务：\n1. 运行 python /Users/cuip/projects/GenericAgent/temp/sqlite_probe.py --snapshot 记录当前快照\n2. 运行 python /Users/cuip/projects/GenericAgent/temp/sqlite_probe.py --diff 对比最近两次快照\n3. 若diff输出中有任何行数变化（delta != 0），则调用飞书通知：import sys; sys.path.insert(0,'/Users/cuip/projects/GenericAgent'); from reflect_scripts.reflect_common import notify_feishu; notify_feishu('SQLite变化告警\\n' + diff_output)\n4. 无变化则静默完成，不发通知",
+  "max_delay_hours": 48
+}

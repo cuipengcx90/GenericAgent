@@ -1,0 +1,7 @@
+{
+  "schedule": "08:30",
+  "repeat": "weekly",
+  "enabled": true,
+  "prompt": "执行EIA能源价格摘要任务：运行 python /Users/cuip/projects/GenericAgent/temp/eia_supply_chain_digest.py，获取最新EIA能源价格数据并生成供应链摘要。完成后将结果摘要写入报告路径。",
+  "max_delay_hours": 24
+}

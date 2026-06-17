@@ -1,0 +1,7 @@
+{
+  "schedule": "10:00",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 24,
+  "prompt": "【TrendRadar 晨报推送任务】\n1. 调用 TrendRadar MCP（地址：http://127.0.0.1:3333）工具 search_articles，参数 query='AI 画图 Stable Diffusion ComfyUI FLUX 大模型 GitHub 开源 编程'，limit=20\n2. 再查询 query='LLM GPT DeepSeek Claude 开源工具 安全漏洞 GPU 芯片'，limit=15\n3. 合并去重，按重要性排序，挑选今日最值得关注的 8-12 条\n4. 用中文写一份晨报，格式：\n   🌅 **IT情报晨报 · {今日日期}**\n   分类（AI画图 / 大模型 / 开源&工具 / 安全 / 芯片GPU）分组列出\n   每条格式：▸ 标题（来源）\n   简要1句话说明为什么重要\n   末尾加：📡 数据来源：TrendRadar\n5. 推送到【飞书私信】：调用 sys.path.insert(0,'/Users/cuip/projects/GenericAgent') 后 from reflect_scripts.reflect_common import notify_feishu，将报告发送到飞书私信\n6. 推送到【家庭群】：from reflect_scripts.notify_feishu_group import notify_group，将同一份报告发送到群\n7. 推送到【钉钉群】：from reflect_scripts.notify_dingtalk_group import notify_group as ding_notify，调用 ding_notify(报告内容) 发送到钉钉群\n⚠️ 重要：步骤5/6/7每一步必须独立 try/except，任何一方推送失败时打印警告并继续执行其余推送，绝不能因一方失败导致其他渠道收不到消息\n8. 将报告全文写入文件 /Users/cuip/projects/GenericAgent/output/trendradar_morning_{今日日期}.txt"
+}

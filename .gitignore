@@ -28,16 +28,38 @@ model_responses.txt
 
 # Sensitive files (API keys, credentials)
 mykey.py
+*.pem
+*.key
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
 
 tasks/
 
 *.zip
 *.exe
 
+# === memory 分层版本管理（方案A）===
+# 默认排除 memory 下所有内容（覆盖 L1/L2 运行时记忆、历史日志、归档等高频变动/敏感文件）
 memory/*
-!memory/memory_management_sop.md
+# 放行所有子目录结构，以便递归追踪其中的知识资产
+!memory/*/
+!memory/**/
+# 再次排除目录内所有普通文件，只让下面的 .md/.py 白名单生效
+memory/**
+!memory/**/
+# 放行知识资产：SOP 文档(.md) + 工具脚本(.py)
+# 新增 SOP/脚本自动纳入版本控制，无需再手工维护白名单
+!memory/**/*.md
+!memory/**/*.py
+# 显式排除：缓存
+memory/**/__pycache__/
+# 注：L1/L2(global_mem*.txt)、history.txt、file_access_stats.json、L4归档等
+#     因非 .md/.py 类型，自动保持被忽略状态，无需额外规则
 
-# Allow tracking of specific SOPs
+# Explicit upstream memory whitelist retained for readability/auditability.
+!memory/memory_management_sop.md
 !memory/web_setup_sop.md
 !memory/autonomous_operation_sop.md
 !memory/autonomous_operation_sop/
@@ -92,7 +114,6 @@ memory/L4_raw_sessions/*
 # Morphling SOP
 !memory/morphling_sop.md
 
-
 # ADB UI tool
 !memory/adb_ui.py
 
@@ -117,12 +138,22 @@ memory/L4_raw_sessions/*
 
 # Review Mode SOP
 !memory/review_sop.md
-
 # Visual Studio
 .vs/
 restore_commit.txt
 
-sche_tasks/
+# === sche_tasks 分层版本管理（方案A）===
+# 默认排除 sche_tasks 下所有内容
+sche_tasks/*
+# 放行任务定义(.json)与任务脚本(.py)，它们是可复用的知识资产
+!sche_tasks/*.json
+!sche_tasks/*.py
+# 排除运行时产物：执行报告归档、日志、缓存
+sche_tasks/done/
+sche_tasks/scheduler.log
+sche_tasks/__pycache__/
+# CDP Bridge 密钥配置（首次运行自动生成）
+assets/tmwd_cdp_bridge/config.js
 assets/copilot_proxy.pyw
 # 模型 instruction（本地定制，不入库）
 assets/glm52_instruction.txt
@@ -145,12 +176,26 @@ frontends/conductor_im_plugins/*
 **/__pycache__/
 
 .claude/
+mcp_servers.json
 
 # Project Mode SOP
 !memory/project_mode_sop.md
 
+# 本地敏感配置(webhook/secret,禁提交)
+config/
+
+# 本地运行产物
+/output/
+sqlite_snapshots.jsonl
+roi_history.json
+
 # 本地 bug / 局限报告草稿（交给维护者参考，不进仓库）
 /BUG_*.md
+archive/
+.venv
+
+# 本地敏感cookie(含真实会话凭证,禁提交)
+birdie_monitor/birdie_cookies_raw.json
 
 # Beta 渠道：订阅门户插件（仅 beta 分发携带，不入库）
 plugins/subscription_portal.py

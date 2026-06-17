@@ -1,0 +1,7 @@
+{
+  "schedule": "16:00",
+  "repeat": "weekly_last_workday",
+  "enabled": true,
+  "max_delay_hours": 6,
+  "prompt": "执行 bar_smyze_opserver 当周 SLS 日志巡检。步骤：\n1. 读 ../memory/weekly_inspection_sop.md，严格按 SOP 全部 Phase 执行（Phase1扫描→Phase2A/2B/2C下钻→Phase3 DB验证→Phase4报告），不可跳步、不可跑通即止。\n2. 巡检周期为最近7天（今天往前推7天到今天）。通过 ga_mcp_client 调用 SLS MCP 拉取 ERROR/WARN，按 SOP 下钻取样（每类≥10条）并做 DB/代码交叉验证。\n3. 报告严格按 SOP Phase4 完整模板（10章结构+每问题四段式+锚点目录）输出，写入 /Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/bar_smyze_opserver/docs/analysis/ops-weekly-inspection/weekly-inspection-postmortem-{今天日期YYYY-MM-DD}.md\n4. 报告写完后，用飞书私信推送通知：\n```python\nimport sys\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nfrom reflect_scripts.reflect_common import notify_feishu\nnotify_feishu('【周巡检完成】bar_smyze_opserver SLS日志巡检\\n周期: {开始日期}~{结束日期}\\n问题: P1 x{数}/P2 x{数}/P3 x{数}\\nTOP问题: {最高优先级问题一句话}\\n报告: docs/analysis/ops-weekly-inspection/weekly-inspection-postmortem-{日期}.md')\n```\n推送内容用实际巡检结果填充，只推送一次。\n5. 最后把本次巡检概要写入调度报告路径。"
+}

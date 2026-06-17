@@ -1,0 +1,7 @@
+{
+  "schedule": "10:30",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 24,
+  "prompt": "执行以下代码，完成后只推送一次，不要中途推送：\n```python\nimport sys\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent/sche_tasks')\nfrom run_tech_trends import run\nrun()\n```\n注意：run()内部已包含推送逻辑，执行完毕即可，不要额外推送任何消息。"
+}

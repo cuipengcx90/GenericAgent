@@ -1,0 +1,7 @@
+{
+  "schedule": "00:00",
+  "repeat": "every_1h",
+  "enabled": false,
+  "prompt": "【TrendRadar 热点深挖任务 - 仅推新话题到群】\n1. 读取已处理话题记录文件：/Users/cuip/projects/GenericAgent/output/trendradar_seen_topics.json\n   如果文件不存在，初始化为空列表 []\n2. 调用 TrendRadar MCP（地址：http://127.0.0.1:3333）工具 get_hot_list，获取当前热榜\n   同时查询 search_articles，query='AI OR GitHub OR 大模型 OR 芯片 OR 开源'，limit=30\n3. 对比已处理记录，找出【本次新出现】的热门话题（标题未出现过的）\n4. 如果没有新话题，直接结束，不推送任何消息\n5. 对每个新话题（最多取前3个最热的）：\n   a. 判断是否属于 IT/AI/科技/财经 领域，不相关则跳过\n   b. 用 Google 搜索该话题最新动态，获取2-3个关键信息点\n   c. 生成简报（100字内）：话题标题 + 核心内容 + 为什么重要\n6. 将所有新话题简报合并，格式：\n   🔥 **热点速报 · {当前时间}**\n   （逐条列出，每条以 ▸ 开头）\n   📡 TrendRadar实时监测\n7. 推送到【家庭群】：\n   sys.path.insert(0,'/Users/cuip/projects/GenericAgent')\n   from reflect_scripts.notify_feishu_group import notify_group\n   notify_group(报告文字)\n8. 将本次所有话题标题追加到已处理记录文件（保留最近500条防止文件过大）",
+  "_note": "已停用：简化架构后由TR直推群替代，GA只负责晨晚报私信"
+}

@@ -1,0 +1,7 @@
+{
+  "schedule": "11:00",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 6,
+  "prompt": "执行ROI监控日报任务：\n\n1. 运行roi_monitor.py生成ROI指标分析\n2. 分析趋势变化（对比昨日/7日/30日数据）\n3. 检测异常告警（平均产出<100行/任务数<3个/天）\n4. 将完整报告写入指定路径（scheduler会自动注入报告路径）\n\n报告要求：\n- 包含ROI指标dashboard\n- 包含趋势分析（7日/30日对比）\n- 包含异常告警（如有）\n- 包含优化建议\n\n注意：第一件事用update_working_checkpoint记录报告路径，防止长任务遗忘。"
+}

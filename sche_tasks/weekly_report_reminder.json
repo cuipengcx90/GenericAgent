@@ -1,0 +1,6 @@
+{
+  "schedule": "17:00",
+  "repeat": "weekly_last_workday",
+  "enabled": true,
+  "prompt": "今天是本周最后一个工作日，请按 weekly_report_sop 生成本周周报草稿。\n\n步骤：\n1. 读取 ../memory/weekly_report_sop.md 获取完整流程\n2. 遍历 5 个仓库（bar_smyze_mp/bar_smyze_op/bar_smyze_opserver/bar_smyze_scm/bar-deploy-server）分析本周崔朋的 git 提交\n3. 按业务域分类 commit，统计 bug 占比，生成 HTML 正文\n4. 用 lark-cli mail +reply 创建草稿（仅存草稿不发送）\n5. 用 +draft-edit 修正主题日期\n6. 飞书私信通知用户：「📋 周报草稿已生成并存入飞书邮箱草稿箱，请检查确认后回复我发送。」\n7. 等待用户确认后再执行 lark-cli mail user_mailbox.drafts send 发送"
+}
