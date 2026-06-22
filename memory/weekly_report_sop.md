@@ -5,16 +5,13 @@
 - 主题格式: `Re: 【周报】-崔朋（YYYY.MM.DD - YYYY.MM.DD）`（本周第一个工作日 ~ 最后一个工作日，用 chinese_calendar 动态计算）
 - 回复 message-id: 每周从上一封周报邮件获取（`lark-cli mail +search` 搜最新一封）
 
-## 分析的仓库（bar-smyze + bar-deploy 子工程）
-- bar_smyze_mp（小程序用户端）
-- bar_smyze_op（运营后台前端）
-- bar_smyze_opserver（后端服务）
-- bar_smyze_scm（供应链/基建）
-- bar-deploy-server（部署服务）
-- 路径:
-  - `/Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/` 下上述 4 个仓库
-  - `/Users/cuip/develop/WorkSpaces/idea/smyze/bar-deploy/bar-deploy-server`
+## 分析的仓库（动态扫描，自动适配新增子工程）
+- **扫描根目录**: `/Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/`
+- **动态发现规则**: 遍历根目录下所有含 `.git` 的子目录（`os.path.isdir(子目录/.git)`），即视为待分析仓库。**禁止硬编码仓库清单**——后续团队会持续新增子工程，必须自动纳入。
+- **本周活跃过滤**: 对每个发现的仓库执行 git log，仅保留本周区间内有 `崔朋` commit（数量>0）的仓库进入周报，无 commit 的自动跳过（不报错）。
 - author 过滤: `崔朋`，`--no-merges`，本周第一个工作日~今天（用 chinese_calendar 计算）
+- ⚠️ **bar-deploy-server 已迁入 bar-smyze 根目录**：旧路径 `/Users/cuip/develop/WorkSpaces/idea/smyze/bar-deploy/bar-deploy-server` 与新路径同一远端（`bar-deploy/bar-deploy-server.git`），属冗余副本，**只扫 bar-smyze 根下的，不再单独遍历 bar-deploy 目录**，避免重复统计。
+- 截至本次扫描，根目录下 git 子工程共 11 个（mp/op/opserver/scm/screen/e2e/maintenance_app/market-server/deploy-server/deploy-webadmin/smyze-spec），其中本周通常仅少数有崔朋 commit——具体以动态扫描结果为准，不要预设。
 
 ## 正文结构与格式
 ```
@@ -29,7 +26,8 @@
 
 ## 标准操作流程
 1. **获取上周已发送周报**: `lark-cli mail +search --query "【周报】-崔朋" --limit 1`，必须选最新一封**已发送成功**的周报邮件，不能基于旧草稿/错误 reply
-2. **Git 分析**: 遍历 5 个仓库（mp/op/opserver/scm/bar-deploy-server），`git log --all --no-merges --author=崔朋 --since=周一T00:00:00+08:00 --until=明天T00:00:00+08:00`
+2. **Git 分析（动态扫描）**: 遍历 bar-smyze 根目录下所有含 `.git` 的子工程，对每个执行 `git log --all --no-merges --author=崔朋 --since=周一T00:00:00+08:00 --until=明天T00:00:00+08:00`，仅保留有 commit 的仓库
+   - ⚠️ **禁止硬编码仓库清单**：用 `os.listdir` + 判断 `.git` 自动发现，后续新增子工程零改动自动纳入
    - ⚠️ **--since/--until 必须带显式时区 `T00:00:00+08:00`**：不带时间时 git 会用当前时刻补全，导致当天早于该时刻的 commits 被截断丢失
 3. **分类统计**: 按 commit message prefix 分 feat/fix/chore，计算 bug 占比
 4. **按业务域归类 + 归纳合并**: 跨仓库同一业务合并（如发票=mp+op+opserver 的相关 commit）

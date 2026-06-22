@@ -33,3 +33,5 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 ### 5. 通知发送
 - 飞书群：`from notify_feishu_group import notify_group; notify_group(text)`（需sys.path加reflect_scripts）
 - 飞书私信：`from reflect_common import notify_feishu; notify_feishu(text)`
+- 钉钉群：`from notify_dingtalk_group import notify_group; notify_group(text)`（模块名是 notify_dingtalk_group，非 ding_notify；sender 同为 notify_group）
+- 三通道各自独立 try/except，互不阻塞
