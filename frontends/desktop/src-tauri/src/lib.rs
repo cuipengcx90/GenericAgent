@@ -125,7 +125,45 @@ fn find_python() -> String {
 
 /// Find the project directory (folder containing agentmain.py).
 /// Bundle layout: <exe dir>/runtime/app/agentmain.py. Dev layout: walk up from the exe.
+/// Explicit developer override from ~/.ga_desktop_settings.json "force_project_dir".
+/// When set to a directory that contains agentmain.py, it wins over bundled runtime
+/// and auto-discovery, so a packaged .app can be pointed at a local source checkout.
+fn forced_project_dir() -> Option<String> {
+    let p = read_settings()
+        .get("force_project_dir")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if p.is_empty() {
+        return None;
+    }
+    if std::path::Path::new(&p).join("agentmain.py").exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Explicit developer override for the python interpreter ("force_python_path").
+fn forced_python() -> Option<String> {
+    let p = read_settings()
+        .get("force_python_path")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if p.is_empty() {
+        None
+    } else {
+        Some(p)
+    }
+}
+
 fn find_project_dir() -> Option<String> {
+    // Explicit developer override always wins.
+    if let Some(p) = forced_project_dir() {
+        return Some(p);
+    }
+
     // Bundle layout: source tucked under <anchor>/runtime/app/
     if let Some(anchor) = bundle_anchor_dir() {
         let app = anchor.join("runtime").join("app");
@@ -381,6 +419,20 @@ pub fn get_or_discover_config() -> (String, String) {
     // NOTE: the external GA source override does NOT change which project_dir/bridge we run.
     // 方案三: we always run the bundle's own bridge + frontend, and inject the external核 via
     // the GA_ROOT env (see sanitize_bundle_env). So project_dir stays the bundle here.
+    //
+    // Explicit developer override (force_project_dir / force_python_path) still wins over
+    // everything, including a packaged .app's bundled runtime. This is the supported
+    // way to point an installed app at a local source checkout.
+    if let Some(project) = forced_project_dir() {
+        let python = forced_python().unwrap_or_else(find_python);
+        if !python.is_empty() {
+            merge_settings(serde_json::json!({
+                "python_path": python,
+                "project_dir": project
+            }));
+            return (python, project);
+        }
+    }
 
     if bundle_root().is_some() {
         let python = find_python();

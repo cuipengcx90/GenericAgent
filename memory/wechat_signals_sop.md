@@ -39,6 +39,7 @@
 4. **⚠️编排脚本必须把参数透传给collector**: `run_wechat_ocr_daily.py` 调collector时务必带 `--group/--date/--win-start-hour/--win-days`(2026-06修复前漏传, 导致群校验+时间锚点全空转, 这是"误采个人聊天/错群"的代码级根因)。collector里 `switch_to_group` 旧Cmd+F版已删, 只保留四参会话搜索框版。
 4. **耗时长**: 单群 collector滚动采集+三阶段LLM+Chrome截图约5-8min, 后台nohup跑勿用前台timeout。
 5. 校验产物: PNG须>100KB、md非空, 否则视失败查 `run_daily.log` 干净行。
+6. **⚠️锁屏前置检查(2026-06-29实测铁证)**: 方案B靠GUI(微信置前台→screencapture截聊天区→Vision OCR), **屏幕锁定时整链路第一步即废**——微信主窗口无法激活(`System Events` windowCount=0, `activate`/`open -a`/AX全无效), 截图截不到聊天内容。表象易误判为"切群失败/标题OCR空"。**定时任务启动前必先探 `Quartz.CGSSessionCopyCurrentDictionary().get('CGSSessionScreenIsLocked')`, ==True 则直接快速跳过+飞书通知说明原因, 不做任何激活重试**(本次未前置检查白耗14轮)。同理无人值守长跑场景, 屏保/锁屏会随时打断方案B, 优先用方案A(解密DB, 不依赖GUI)。
 
 ### 多群采集现状
 - **方案B(OCR)仅支持单群**, 逐群靠 `--group` 搜索框切群循环, 20-30群×5-8min=2-3小时GUI自动化, 慢且脆(微信UI状态易扰), 不推荐规模化。
