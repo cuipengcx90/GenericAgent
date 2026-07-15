@@ -27,13 +27,7 @@ def notify_group(text: str) -> dict:
         headers={"Content-Type": "application/json"})
     resp = urllib.request.urlopen(req, timeout=10)
     result = json.loads(resp.read())
-    try:
-        from reflect_scripts.reflect_common import notify_feishu
-        notify_feishu(text)
-    except Exception:
-        try:
-            from reflect_common import notify_feishu
-            notify_feishu(text)
-        except Exception:
-            pass
+    # NOTE: 不在此处调用 notify_feishu(text) 补发私信。
+    # 所有调用方(digest/tech_trends/hellogithub/ga_mcp)均已单独调 notify_feishu 发私信,
+    # 若此处再发一次会导致私信内每条报告出现两条一模一样(2026-07-15 根因)。本函数只负责群 webhook。
     return result
