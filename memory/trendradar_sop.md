@@ -83,3 +83,12 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - 校验：`grep -rn "notify_feishu" reflect_scripts/notify_feishu_group.py` 应无匹配；下一次晨/晚报私信只应出现一条。
 - ★排查铁律（血泪）：**"稳定每天两条"几乎一定是代码结构性双发（一次运行内调两次），不是概率性的崩溃/重试**。崩溃窗口、竞态只会偶发，不会天天精准两条。遇到重复推送先分类：偶发→查时序/幂等；每天必现→查一次调用链里同一副作用被触发几次（grep 通知函数的所有调用方 + 每个通知函数内部是否又转调了别的通知函数）。
 - ★教训：通知通道函数应**单一职责**——发群的只发群，发私信的只发私信，绝不在一个通道函数里"顺手"再发另一个通道，否则调用方叠加就双发。
+
+
+## 9. 新增数据源：Linux.do 社区热帖接入晨/晚报（2026-07-17）
+- 需求：把 Linux.do 每日热帖并入 IT情报晨报/晚报。入口 `sche_tasks/run_trendradar_digest.py`（非 tech_trends）。
+- 取数方式（★关键坑）：linux.do 全站套 Cloudflare，普通 `requests`（哪怕带 Chrome UA）被按 **JA3/TLS 指纹**拦成 `Just a moment` 挑战页——非 UA 问题，是 TLS 指纹。**必须用 `curl_cffi` 的 `requests.get(url, impersonate="chrome")` 伪造浏览器指纹**才能过。RSS 端点 `https://linux.do/top.rss?period=daily`（热帖）/ `latest.rss`（最新）返回标准 Discourse RSS XML，解析 `channel/item` 的 title/link 即可。
+- 限速坑：linux.do 对 RSS 有 **429 限速**，连续快速请求（如调试时单测+正式run 挨着跑）必触发。故 `fetch_linuxdo()` 内置 **3 次退避重试（sleep 2s）+ top.rss 失败回落 latest.rss**；仍失败则返回带 `error` 的 dict，**不抛异常**，保证日报主流程不受影响。
+- 接入三处：①顶部配置 `LINUXDO_RSS` / `LINUXDO_LIMIT`；②`fetch_linuxdo()` 独立函数；③`fetch_material()` 末尾 `material['linuxdo']=fetch_linuxdo()`；④prompt 加固定分类「💬 Linux.do 社区热议」（从 material.linuxdo.items 挑 3-5 条技术/AI/开源/羊毛相关、跳过纯闲聊，附原帖链接；空或 error 则省略不虚构）+ 数据来源署名改「TrendRadar + Linux.do」。
+- 验证方法：`python3 run_trendradar_digest.py --period morning --dry-run --force`（--force 绕当天幂等）→ 读 `output/trendradar_{period}_{date}.material.json` 确认 `linuxdo.items` 非空、`error` 为 None → grep 报告 txt 里「Linux.do」段有真实 topic 链接。已实测 PASS（15 条）。
+- 提交：`3f3822f`。
