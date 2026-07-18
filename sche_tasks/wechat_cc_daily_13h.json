@@ -1,7 +1,7 @@
 {
-  "schedule": "13:00",
+  "schedule": "22:00",
   "repeat": "daily",
-  "enabled": true,
+  "enabled": false,
   "max_delay_hours": 3,
   "prompt": "执行多群微信日报（方案B：截图+OCR，全程不碰微信进程/不读数据库/不解密）。\n\n目标群（按顺序逐个处理，群名必须与微信显示完全一致）：\n1. ccb Agent 技术讨论群（纯净版）\n2. ccb_闲聊\n3. GenericAgent体验交流群6\n4. Ruiqin出海【day104#-4442】\n\n对每个群依次执行：\n1. 用 ljqCtrl 激活微信窗口到前台。\n2. 直接运行下面的命令即可，切群由 collector 的 --group 自动完成：collector 会先 OCR 当前窗口标题校验是否已在目标群；若已在该群则跳过切群（省一步）；若不在，则点击左上会话搜索框、粘贴群名、OCR 左列结果、定位“群聊”分类区段、点中匹配项进群；切群后仍非目标群则报错退出，绝不盲采个人聊天/错群。\n3. 运行：/opt/anaconda3/bin/python3 run_wechat_ocr_daily.py --group \"<当前群名>\" --date $(date +%Y-%m-%d) --frames 40 --scroll-clicks 20 --win-start-hour 13 --win-days 1\n   产物：报告默认按天落到 <obsidian vault>/微信日报/<date>/report_<群名>.png（海报）+ report_<群名>.md（同名md）。\n\n全部群处理完后：\n- 汇总每个群的成功/跳过状态。\n- 把成功产出的海报PNG推送到飞书私信（见 notify_channels_sop）。\n- 任一群因群名未匹配或OCR无内容而跳过，在飞书消息里明确说明原因，绝不静默。\n\n窗口约定：日报覆盖昨13:00→今13:00（--win-start-hour 13 --win-days 1）。微信须前台运行供键鼠自动化。"
 }

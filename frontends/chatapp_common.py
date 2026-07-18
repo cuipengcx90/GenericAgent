@@ -345,8 +345,28 @@ class AgentChatMixin:
             self.user_tasks.pop(chat_id, None)
 
 
-from agentmain import GeneraticAgent as _GA
-from continue_cmd import handle_frontend_command as _handle_continue_frontend, install as _install_continue, reset_conversation as _reset_conversation
-_install_continue(_GA)
-from btw_cmd import handle_frontend_command as _handle_btw_frontend, install as _install_btw; _install_btw(_GA)
-from review_cmd import install as _install_review; _install_review(_GA)
+def install_agent_extensions(agent_cls=None):
+    """Install optional command extensions without importing agentmain at module import time."""
+    if agent_cls is None:
+        from agentmain import GeneraticAgent as agent_cls
+    from frontends.continue_cmd import install as _install_continue
+    from frontends.btw_cmd import install as _install_btw
+    from frontends.review_cmd import install as _install_review
+    _install_continue(agent_cls)
+    _install_btw(agent_cls)
+    _install_review(agent_cls)
+
+
+def _handle_continue_frontend(agent, cmd):
+    from frontends.continue_cmd import handle_frontend_command
+    return handle_frontend_command(agent, cmd)
+
+
+def _handle_btw_frontend(agent, cmd):
+    from frontends.btw_cmd import handle_frontend_command
+    return handle_frontend_command(agent, cmd)
+
+
+def _reset_conversation(agent):
+    from frontends.continue_cmd import reset_conversation
+    return reset_conversation(agent)

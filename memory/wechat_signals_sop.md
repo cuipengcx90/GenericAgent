@@ -155,6 +155,11 @@ signal_strength:
 6. **WAL flush延迟** — WeChat SQLite WAL模式，消息可能滞后。翻群后等几秒再解密
 7. **link/appmsg内容是XML** — 用regex提取: `re.search(r'<title>(.*?)</title>', content)`
 8. **chatlog API已废弃** — 不再使用chatlog HTTP API方案
+9. **screencapture 必须绝对路径(方案B关键坑)** — 定时任务用 anaconda 环境，PATH 缺 `/usr/sbin`，`screencapture` 找不到 → collector 的 `capture()` 静默不生成截图 → OCR items=0 → 切群候选空/采集全失败。`collector.py` 的 `capture()` 已改用绝对路径 `/usr/sbin/screencapture`。排查信号: 截图文件 exists=False 而非内容空。
+10. **微信窗口最小化导致"未找到窗口"(方案B关键坑)** — `AXMinimized=true`(最小化到Dock)时 `activate` 不解最小化，CGWindowList 看不到窗口 → collector 报"未找到微信窗口"。每群处理前用 osascript 设 `AXMinimized=false` 解最小化前置(System Events 能看到窗口数≠CGWindowList 可见)。
+11. **飞书发海报PNG(方案B推送)** — reflect_common 无现成发图，notify_feishu 只发文本。发图流程: `im/v1/images`(multipart, image_type=message) 上传得 image_key → `im/v1/messages` 发 msg_type=image。token 复用 reflect_common._get_token()。reflect_common 已新增 upload_feishu_image()/send_feishu_image() helper。send_feishu_image 返回 dict code==0 即成功。
+12. **NumPy 1.x/2.4.4 warmup 噪音(2026-07-02实测,非致命)** — `llmcore._llmlingua_warmup` 后台线程 import llmlingua→nltk/sklearn/pyarrow 链报 `ImportError: numpy.core.multiarray failed to import`,巨量 traceback 污染 stderr。**仅 LLMLingua 压缩预热失败,主链(OCR→normalize→LLM extract→html→png)完全不受影响**,报告正常产出。日志里看到该 traceback 别当故障追;判定单群成败只认 `[完成]` 标记或 poster 阶段真实报错。
+13. **空群=时间窗过滤"保留0"是正常业务态,应跳过非失败(2026-07-02实测)** — collector 切群成功且采到消息,但 `[Stage0] 时间窗过滤 保留0 丢弃N`(该群最近活动早于窗口起点)时,chat_clean 为 0 字符,poster `[Stage1] 输入0字符` 后 exit 1。这不是 bug——按"空群跳过并在推送文案说明原因,绝不静默"处理,不重试。误当失败会白耗轮次。
 
 ## 海报风长图渲染 (实测踩坑, wechat_render_html.py)
 

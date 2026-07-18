@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """每日技术开源趋势报告 - GitHub + HN + HuggingFace Papers"""
-import sys, json, requests
+import sys, os, json, requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
@@ -105,7 +105,38 @@ def fetch_trendshift(limit=15):
         print(f"⚠️ Trendshift 获取失败: {e}")
         return []
 
-def run():
+STATE_PATH = "/Users/cuip/projects/GenericAgent/output/.tech_trends_push_state.json"
+
+def _load_state():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _mark_sent(date_str):
+    st = _load_state()
+    st[date_str] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+
+def run(force=False):
+    # === 幂等闸门: 当日只推一次, 防重复推送 (2026-07-14 根治) ===
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    lock_path = f"/tmp/tech_trends_{date_str}.lock"
+    if not force:
+        st = _load_state()
+        if st.get(date_str):
+            print(f"⏭️ 跳过: {date_str} 今日已推送 (at {st[date_str]}) — 防重复。如需强推用 run(force=True)")
+            return {"status": "skipped", "reason": "already_sent_today", "date": date_str}
+        # 并发锁: 同日同秒双启只放行一个
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+        except FileExistsError:
+            print(f"⏭️ 跳过: 已有同日进程持锁 {lock_path} — 防并发重复。如需强推用 run(force=True)")
+            return {"status": "skipped", "reason": "locked", "date": date_str}
+
     print("📡 拉取数据...")
     gh_daily = fetch_github("daily", 15)
     gh_weekly = fetch_github("weekly", 10)
@@ -192,7 +223,13 @@ def run():
     sess = NativeClaudeSession(cfg=cfg)
     msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
     report = ''.join(sess.ask(msg))
+    # 正文末尾统一追加归档站链接（历史推送全览，方便追溯/分享）
+    report = report.rstrip() + "\n\n📚 历史归档全览：http://192.168.1.40:8899/\n（同一 WiFi 且本机开机时可访问）"
     print(f"✅ 报告生成，{len(report)} 字符")
+
+    # 推送前即落状态: 内容已就绪, 从此刻起当日任何重复调用都会被幂等闸门拦下
+    if not force:
+        _mark_sent(date_str)
 
     # 推送隔离：任何一方失败不影响另一方
     print("📤 推送飞书私信...")

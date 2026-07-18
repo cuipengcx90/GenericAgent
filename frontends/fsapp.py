@@ -1,12 +1,25 @@
-import glob, json, os, queue as Q, re, sys, threading, time
+import fcntl, glob, json, os, queue as Q, re, sys, threading, time
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
-from agentmain import GeneraticAgent
 from frontends.chatapp_common import format_restore
 from frontends.continue_cmd import handle_frontend_command as handle_continue_frontend, reset_conversation
-from llmcore import mykeys
+
+
+def _load_feishu_keys():
+    try:
+        import mykey
+        return {k: v for k, v in vars(mykey).items() if not k.startswith('_')}
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'mykey':
+            raise
+    key_path = os.path.join(PROJECT_ROOT, 'mykey.json')
+    with open(key_path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+mykeys = _load_feishu_keys()
 
 import traceback
 import lark_oapi as lark
@@ -32,6 +45,20 @@ _MSG_TYPE_MAP = {"image": "[image]", "audio": "[audio]", "file": "[file]", "medi
 TEMP_DIR = os.path.join(PROJECT_ROOT, "temp")
 MEDIA_DIR = os.path.join(TEMP_DIR, "feishu_media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+LOCK_PATH = os.path.join(TEMP_DIR, "feishu_agent.lock")
+_lock_file = None
+
+
+def _acquire_process_lock():
+    global _lock_file
+    _lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"[ERROR] another fsapp instance is already running; lock={LOCK_PATH}")
+        sys.exit(2)
+    _lock_file.write(f"{os.getpid()}\n")
+    _lock_file.flush()
 
 
 _TRUNC_TAIL = 300  # 截断兜底时保留原文尾部字符数
@@ -234,14 +261,47 @@ APP_SECRET = str(mykeys.get("fs_app_secret", "") or "").strip()
 ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
 AGENT_TIMEOUT_SEC = 900
+FEISHU_CLIENT_TIMEOUT_SEC = 8
+CARD_PATCH_WARN_SEC = 2.0
 
-agent = GeneraticAgent()
-threading.Thread(target=agent.run, daemon=True).start()
+agent = None
+_agent_lock = threading.Lock()
+
+
+def get_agent():
+    """Lazy-load the heavy GA runtime after the Feishu websocket is alive."""
+    global agent
+    if agent is not None:
+        return agent
+    with _agent_lock:
+        if agent is None:
+            from agentmain import GeneraticAgent
+            from frontends.chatapp_common import install_agent_extensions
+            install_agent_extensions(GeneraticAgent)
+            agent = GeneraticAgent()
+            threading.Thread(target=agent.run, daemon=True, name="ga-agent-runner").start()
+        return agent
+
+
+def _warm_agent_async():
+    try:
+        get_agent()
+    except Exception as e:
+        print(f"[ERROR] agent warmup failed: {e}")
+
+
 client, user_tasks = None, {}
 
 
 def create_client():
-    return lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).log_level(lark.LogLevel.INFO).build()
+    return (
+        lark.Client.builder()
+        .app_id(APP_ID)
+        .app_secret(APP_SECRET)
+        .log_level(lark.LogLevel.INFO)
+        .timeout(FEISHU_CLIENT_TIMEOUT_SEC)
+        .build()
+    )
 
 
 def _card_raw(elements):
@@ -257,16 +317,20 @@ def _card(text):
 
 
 def _send_raw(receive_id, payload, msg_type, rtype):
+    t0 = time.time()
     try:
         body = CreateMessageRequest.builder().receive_id_type(rtype).request_body(
             CreateMessageRequestBody.builder().receive_id(receive_id).msg_type(msg_type).content(payload).build()
         ).build()
         r = client.im.v1.message.create(body)
+        dt = time.time() - t0
+        if dt > CARD_PATCH_WARN_SEC:
+            print(f"[WARN] send_message slow {dt:.2f}s type={msg_type} rtype={rtype}")
         if r.success():
             return r.data.message_id if r.data else None
         print(f"发送失败: {r.code}, {r.msg}")
     except Exception as e:
-        print(f"[ERROR] _send_raw 网络异常: {e}")
+        print(f"[ERROR] _send_raw 网络异常 after {time.time() - t0:.2f}s: {e}")
     return None
 
 
@@ -275,17 +339,21 @@ def _patch_card(message_id, card_json):
 
 
 def _patch_card_result(message_id, card_json):
+    t0 = time.time()
     try:
         body = PatchMessageRequest.builder().message_id(message_id).request_body(
             PatchMessageRequestBody.builder().content(card_json).build()
         ).build()
         r = client.im.v1.message.patch(body)
+        dt = time.time() - t0
+        if dt > CARD_PATCH_WARN_SEC:
+            print(f"[WARN] patch_card slow {dt:.2f}s message_id={message_id}")
         if not r.success():
             print(f"[ERROR] patch_card 失败: {r.code}, {r.msg}")
         msg = f"{getattr(r, 'code', '')} {getattr(r, 'msg', '')}".lower()
         return r.success(), ("230099" in msg or "11310" in msg or "element exceeds the limit" in msg)
     except Exception as e:
-        print(f"[ERROR] _patch_card 网络异常: {e}")
+        print(f"[ERROR] _patch_card 网络异常 after {time.time() - t0:.2f}s: {e}")
         return False, False
 
 
@@ -477,9 +545,11 @@ def _build_step_detail(resp, tool_calls):
 
 
 class _TaskCard:
-    """飞书任务卡片：单卡片持续 patch；每步一个独立折叠面板（header 显示 summary，展开看详情）。"""
-    _DETAIL_LIMIT = 8000
-    _FINAL_LIMIT = 6000
+    """飞书任务卡片：后台线程 create/patch，避免飞书 API 慢时阻塞 agent 主循环。"""
+    _DETAIL_LIMIT = 4000
+    _FINAL_LIMIT = 4000
+    _QUEUE_LIMIT = 8
+    _STEP_FLUSH_INTERVAL = 3.0
 
     def __init__(self, receive_id, rid_type):
         self.rid, self.rtype = receive_id, rid_type
@@ -491,6 +561,11 @@ class _TaskCard:
         self.turn_no = 0
         self.turn_base = 1
         self.note = None
+        self._lock = threading.RLock()
+        self._q = Q.Queue(maxsize=self._QUEUE_LIMIT)
+        self._last_step_flush = 0.0
+        self._worker = threading.Thread(target=self._worker_loop, name="fs-card-patch", daemon=True)
+        self._worker.start()
 
     def _step_panel(self, idx, summary, detail):
         detail = detail or "_(无输出)_"
@@ -502,7 +577,7 @@ class _TaskCard:
             "elements": [{"tag": "markdown", "content": detail}],
         }
 
-    def _build(self):
+    def _build_locked(self):
         header = f"**{self.status}**"
         if self.page_no > 1:
             header += f"\n\n📄 工作卡片 {self.page_no}"
@@ -515,15 +590,55 @@ class _TaskCard:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
         return _card_raw(els)
 
-    def _push(self):
-        card = self._build()
-        if self.msg_id:
-            return _patch_card_result(self.msg_id, card)
-        else:
-            self.msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
-            return bool(self.msg_id), False
+    def _enqueue(self, reason, force=False):
+        if not force and reason == "step" and time.time() - self._last_step_flush < self._STEP_FLUSH_INTERVAL:
+            return
+        if reason == "step":
+            self._last_step_flush = time.time()
+        try:
+            self._q.put_nowait(reason)
+        except Q.Full:
+            try:
+                self._q.get_nowait()
+            except Q.Empty:
+                pass
+            try:
+                self._q.put_nowait(reason)
+            except Q.Full:
+                print(f"[WARN] fs card queue still full, drop {reason}")
 
-    def _rollover(self):
+    def _push_sync(self):
+        with self._lock:
+            card = self._build_locked()
+            msg_id = self.msg_id
+        if msg_id:
+            return _patch_card_result(msg_id, card)
+        msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
+        with self._lock:
+            if msg_id:
+                self.msg_id = msg_id
+        return bool(msg_id), False
+
+    def _worker_loop(self):
+        while True:
+            reason = self._q.get()
+            # Coalesce bursts so one slow Feishu patch does not build a backlog.
+            while True:
+                try:
+                    reason = self._q.get_nowait()
+                except Q.Empty:
+                    break
+            t0 = time.time()
+            ok, limit = self._push_sync()
+            dt = time.time() - t0
+            if dt > CARD_PATCH_WARN_SEC:
+                print(f"[WARN] fs card push slow {dt:.2f}s reason={reason} ok={ok} limit={limit}")
+            if limit:
+                with self._lock:
+                    self._rollover_locked()
+                self._push_sync()
+
+    def _rollover_locked(self):
         self.page_no += 1
         self.msg_id = None
         self.final = None
@@ -532,35 +647,25 @@ class _TaskCard:
     # ── 公开接口 ──
 
     def start(self):
-        self._push()
+        self._enqueue("start", force=True)
 
     def step(self, summary, detail=""):
-        self.turn_no += 1
-        step = (summary, detail)
-        self.steps.append(step)
-        self.status = f"⏳ 工作中 · Turn {self.turn_no}"
-        ok, limit = self._push()
-        if limit:
-            self.steps.pop()
-            self._rollover()
-            self.turn_base = self.turn_no
-            self.steps = [step]
-            self._push()
+        with self._lock:
+            self.turn_no += 1
+            self.steps.append((summary, detail))
+            self.status = f"⏳ 工作中 · Turn {self.turn_no}"
+        self._enqueue("step")
 
     def done(self, text):
-        self.status = "✅ 已完成"
-        self.final = (text or "_(无文本输出)_")[:self._FINAL_LIMIT]
-        ok, limit = self._push()
-        if limit:
-            self._rollover()
-            self.steps = []
-            self.turn_base = self.turn_no + 1
+        with self._lock:
+            self.status = "✅ 已完成"
             self.final = (text or "_(无文本输出)_")[:self._FINAL_LIMIT]
-            self._push()
+        self._enqueue("done", force=True)
 
     def fail(self, msg):
-        self.status = f"❌ {msg}"
-        self._push()
+        with self._lock:
+            self.status = f"❌ {msg}"
+        self._enqueue("fail", force=True)
 
 
 def _make_task_hook(card, done_event, on_final):
@@ -608,25 +713,27 @@ def handle_message(data):
         card = _TaskCard(receive_id, rid_type)
         card.start()
         on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
-        if not hasattr(agent, '_turn_end_hooks'): agent._turn_end_hooks = {}
-        agent._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
+        ag = get_agent()
+        if not hasattr(ag, '_turn_end_hooks'): ag._turn_end_hooks = {}
+        ag._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
         try:
-            agent.put_task(user_input, source="feishu", images=image_paths)
+            ag.put_task(user_input, source="feishu", images=image_paths)
             start = time.time()
             while not done_event.wait(timeout=3):
                 if not user_tasks.get(open_id, {}).get("running", True):
-                    agent.abort()
+                    ag.abort()
                     card.fail("已停止")
                     break
                 if time.time() - start > AGENT_TIMEOUT_SEC:
-                    agent.abort()
+                    ag.abort()
                     card.fail("任务超时")
                     break
         except Exception as e:
             traceback.print_exc()
             card.fail(f"错误: {e}")
         finally:
-            agent._turn_end_hooks.pop(hook_key, None)
+            if hasattr(ag, '_turn_end_hooks'):
+                ag._turn_end_hooks.pop(hook_key, None)
             user_tasks.pop(open_id, None)
 
     threading.Thread(target=run_agent, daemon=True).start()
@@ -634,34 +741,45 @@ def handle_message(data):
 
 def handle_command(open_id, cmd, chat_id=None):
     def _send_cmd_response(content):
-        if chat_id:
-            send_message(chat_id, content, receive_id_type="chat_id")
-        else:
-            send_message(open_id, content)
+        receive_id = chat_id or open_id
+        rtype = "chat_id" if chat_id else "open_id"
+
+        def _worker():
+            try:
+                send_message(receive_id, content, receive_id_type=rtype)
+            except Exception as e:
+                print(f"[ERROR] async command response failed: {e}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     parts = (cmd or "").split()
     op = (parts[0] if parts else "").lower()
+    ag = get_agent() if op != "/help" else None
     if op == "/stop":
+        print(f"[fs cmd] /stop requested by {open_id}")
         if open_id in user_tasks:
             user_tasks[open_id]["running"] = False
-        agent.abort()
+            print(f"[fs cmd] marked task stopped for {open_id}")
+        ag.abort()
         _send_cmd_response("正在停止...")
+        print(f"[fs cmd] /stop dispatched for {open_id}")
     elif op == "/new":
-        _send_cmd_response(reset_conversation(agent))
+        _send_cmd_response(reset_conversation(ag))
     elif op == "/help":
         _send_cmd_response("命令列表:\n/stop - 停止当前任务\n/status - 查看状态\n/llm - 查看当前模型列表\n/llm [n] - 切换到第 n 个模型\n/restore - 恢复上次对话历史\n/continue - 列出可恢复会话\n/continue [n] - 恢复第 n 个会话\n/new - 开启新对话并清空当前上下文\n/help - 显示帮助")
     elif op == "/status":
-        llm = agent.get_llm_name() if agent.llmclient else "未配置"
-        _send_cmd_response(f"状态: {'🔴 运行中' if agent.is_running else '🟢 空闲'}\nLLM: [{agent.llm_no}] {llm}")
+        llm = ag.get_llm_name() if ag.llmclient else "未配置"
+        _send_cmd_response(f"状态: {'🔴 运行中' if ag.is_running else '🟢 空闲'}\nLLM: [{ag.llm_no}] {llm}")
     elif op == "/llm":
-        if not agent.llmclient:
+        if not ag.llmclient:
             return _send_cmd_response("❌ 当前没有可用的 LLM 配置")
         if len(parts) > 1:
             try:
-                agent.next_llm(int(parts[1]))
-                return _send_cmd_response(f"✅ 已切换到 [{agent.llm_no}] {agent.get_llm_name()}")
+                ag.next_llm(int(parts[1]))
+                return _send_cmd_response(f"✅ 已切换到 [{ag.llm_no}] {ag.get_llm_name()}")
             except Exception:
-                return _send_cmd_response(f"用法: /llm <0-{len(agent.list_llms()) - 1}>")
-        lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in agent.list_llms()]
+                return _send_cmd_response(f"用法: /llm <0-{len(ag.list_llms()) - 1}>")
+        lines = [f"{'→' if cur else '  '} [{i}] {name}" for i, name, cur in ag.list_llms()]
         _send_cmd_response("LLMs:\n" + "\n".join(lines))
     elif op == "/restore":
         try:
@@ -669,19 +787,20 @@ def handle_command(open_id, cmd, chat_id=None):
             if err:
                 return _send_cmd_response(err.replace("❌ ", ""))
             restored, fname, count = restored_info
-            agent.history.extend(restored)
-            agent.abort()
+            ag.history.extend(restored)
+            ag.abort()
             _send_cmd_response(f"已恢复 {count} 轮对话\n来源: {fname}\n(仅恢复上下文，请输入新问题继续)")
         except Exception as e:
             _send_cmd_response(f"恢复失败: {e}")
     elif op == "/continue" or cmd.startswith("/continue"):
-        _send_cmd_response(handle_continue_frontend(agent, cmd))
+        _send_cmd_response(handle_continue_frontend(ag, cmd))
     else:
         _send_cmd_response(f"未知命令: {cmd}")
 
 
 def main():
     global client
+    _acquire_process_lock()
     if not APP_ID or not APP_SECRET:
         print("错误: 请在 mykey.py 或 mykey.json 中配置 fs_app_id 和 fs_app_secret")
         sys.exit(1)

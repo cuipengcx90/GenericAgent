@@ -3,5 +3,5 @@
   "repeat": "daily",
   "enabled": true,
   "max_delay_hours": 24,
-  "prompt": "执行以下代码，完成后只推送一次，不要中途推送：\n```python\nimport sys\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent/sche_tasks')\nfrom run_tech_trends import run\nrun()\n```\n注意：run()内部已包含推送逻辑，执行完毕即可，不要额外推送任何消息。"
+  "prompt": "生成每日技术开源趋势报告。只需在后台启动一次以下命令，然后轮询 /tmp/gh_trend.log 直到出现 RUN_DONE 即完成，禁止重复启动、禁止额外推送任何消息（run() 内含三通道推送且已自带按日幂等，重复运行也不会重发）：\n```bash\nnohup python3 -c \"import sys; sys.path.insert(0,'/Users/cuip/projects/GenericAgent'); sys.path.insert(0,'/Users/cuip/projects/GenericAgent/sche_tasks'); from run_tech_trends import run; run(); print('=== RUN_DONE ===')\" > /tmp/gh_trend.log 2>&1 &\n```\n注意：即使命令看似超时或被打断，也绝不能再次运行 run()；如日志已出现推送完成行即视为成功。"
 }

@@ -22,6 +22,17 @@
 **根因**：路径未加入sys.path，或模块名有虚假前缀
 **修复**：`sys.path.insert(0, '..')` 后直接import；memory模块无需前缀
 
+### 1.4 幻觉工具调用/假写入（最severe，静默假成功）
+**症状**：报告"done报告已写/xxxB已写"，但文件实际不存在；自检"读回确认"也显示成功却是假的
+**根因**：长时间高度重复上下文（如全天数十次雷同定时任务）诱发"transcript续写"模式——模型把工具调用块当正文prose输出（未真正发起调用），并顺带把工具返回结果一起编出来（值多抄自上文，如`writed_bytes:723`、`check()->None`）。越过了"发起调用→停下→等系统返回"的控制边界。非harness缓存bug（fresh-nonce探针证实novel调用完美回传）。
+**危害**：假成功最隐蔽——自检环节本身也可被幻觉（"验证通过"也是编的）；定时循环里done缺失会导致任务反复重触发、阻塞后续任务。
+**修复/铁律**：
+1. 绝不把工具调用写成正文；工具调用必须是真实调用块，收到系统返回才算发生。
+2. 只信任harness实际返回的结果；自己没收到返回=unknown，禁假设success。
+3. 关键写入用 **fresh-nonce自洽校验**：校验脚本内生成不可预测token并打印，读回结果必须含该token+目标文件真实size/tail才可信；不含则判为幻觉/陈旧，重做。
+4. 重复任务定期插入novel探针（随机nonce的存在性检查）打破autopilot。
+（案例：2026-07-09 23:02 bridge_autonomous，turn4/turn6连续两轮假写done报告+伪造读取确认，turn8经fresh-nonce查得EXISTS False才揭穿，真实重写799B闭环）
+
 ---
 
 ## 2. 网络/API超时
@@ -96,6 +107,7 @@
 | notify推送盲区 | R14 | notify_group无try/except，直接抛异常 |
 | WORKING MEMORY膨胀 | R16 | compress_history_tags每5轮才触发 |
 | bridge_autonomous路径误判 | R22 | done目录在sche_tasks/done非temp/sche_done |
+| 幻觉工具调用/假写入done | 2026-07-09 | 重复上下文诱发transcript续写,工具调用写成正文+伪造结果,fresh-nonce探针揭穿(见1.4) |
 
 ---
 
