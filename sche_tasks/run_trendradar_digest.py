@@ -42,10 +42,9 @@ KEYWORDS = [
     'LLM DeepSeek GPT Claude 开源工具 安全漏洞 GPU 芯片',
 ]
 
-# Linux.do 社区热帖来源。RSS 端点能出内容，但 Cloudflare 按 TLS 指纹(JA3)拦截
-# 普通 requests(返回 403)；curl_cffi 伪造 chrome 指纹可稳定通过。取每日热榜。
-LINUXDO_RSS = 'https://linux.do/top.rss?period=daily'
-LINUXDO_LIMIT = 15
+# Linux.do 社区热帖已原生内置到 TrendRadar(config.yaml 的 rss.feeds 里 id=linux-do，
+# impersonate:chrome 走 curl_cffi 过 Cloudflare JA3 拦截)。此处不再自行抓取，
+# 数据统一从 get_latest_rss 返回的 material['rss'] 里取(feed_name「Linux.do 社区热帖」)。
 
 
 def _json_text(obj: Any) -> str:
@@ -165,55 +164,6 @@ def _mcp_call(s: 'requests.Session', hdr: dict, name: str, args: dict, timeout: 
     return result.get('content', result)
 
 
-def fetch_linuxdo(limit: int = LINUXDO_LIMIT) -> dict[str, Any]:
-    """抓 Linux.do 每日热帖(RSS)。CF 按 JA3 拦截普通 requests，故用 curl_cffi
-    伪造 chrome 指纹。429 限速时退避重试并回落 latest.rss。失败不抛，返回带 error
-    的 dict，保证日报主流程不受影响。"""
-    import time as _time
-    out: dict[str, Any] = {'source': 'linux.do', 'url': LINUXDO_RSS, 'items': []}
-    try:
-        from curl_cffi import requests as cffi_requests
-        import xml.etree.ElementTree as ET
-    except Exception as e:
-        out['error'] = f'import: {type(e).__name__}: {e}'
-        return out
-
-    endpoints = [LINUXDO_RSS, 'https://linux.do/latest.rss']
-    last_err = ''
-    for url in endpoints:
-        for attempt in range(3):
-            try:
-                r = cffi_requests.get(url, impersonate='chrome', timeout=20)
-                if r.status_code == 429:
-                    last_err = f'status=429 @{url}'
-                    _time.sleep(3 * (attempt + 1))
-                    continue
-                if r.status_code != 200 or not r.text.lstrip().startswith('<?xml'):
-                    last_err = f'status={r.status_code}, not xml @{url}'
-                    break
-                root = ET.fromstring(r.text)
-                for it in root.findall('.//item')[:limit]:
-                    title = (it.findtext('title') or '').strip()
-                    link = (it.findtext('link') or '').strip()
-                    if not title:
-                        continue
-                    out['items'].append({
-                        'title': title,
-                        'link': link,
-                        'category': (it.findtext('category') or '').strip(),
-                        'pubDate': (it.findtext('pubDate') or '').strip(),
-                    })
-                if out['items']:
-                    out['url'] = url
-                    return out
-            except Exception as e:
-                last_err = f'{type(e).__name__}: {e} @{url}'
-                _time.sleep(2)
-    if not out['items']:
-        out['error'] = last_err or 'no items'
-    return out
-
-
 def fetch_material(period: str) -> dict[str, Any]:
 
     """Fetch TrendRadar data over a single raw MCP session. No notification tool here."""
@@ -249,7 +199,6 @@ def fetch_material(period: str) -> dict[str, Any]:
     except Exception as e:
         material['rss_error'] = f'{type(e).__name__}: {e}'
 
-    material['linuxdo'] = fetch_linuxdo()
     return material
 
 
@@ -266,12 +215,12 @@ def build_report(period: str, material: dict[str, Any]) -> str:
 1. 标题必须是：{icon} **IT情报{title_word} · {date_str}**
 2. 挑选 8-12 条，按分类组织：AI画图 / 大模型 / 开源&工具 / 安全 / 芯片GPU。没有内容的分类可省略。
 3. 每条格式：▸ 标题（来源）\n  简要1句话说明为什么重要。
-4. 另起一个固定分类「💬 Linux.do 社区热议」：从 material.linuxdo.items 里挑 3-5 条技术/AI/开源/羊毛资讯相关的热帖（跳过纯闲聊/情绪贴），格式：▸ 帖子标题（linux.do）\n  附原帖链接。若 material.linuxdo 为空或含 error，则省略该分类，不要虚构。
+4. 另起一个固定分类「💬 Linux.do 社区热议」：从 RSS 数据里 feed_name 为「Linux.do 社区热帖」的条目中挑 3-5 条技术/AI/开源/羊毛资讯相关的热帖（跳过纯闲聊/情绪贴），格式：▸ 帖子标题（linux.do）\n  附原帖链接(url 字段)。若没有该来源的条目，则省略该分类，不要虚构。
 5. {period_hint}；合并重复话题，不要虚构来源、版本号、公司公告。
 6. 末尾必须包含：\n📡 数据来源：TrendRadar + Linux.do | {tail}\n📚 历史归档全览：{ARCHIVE_URL}\n（同 WiFi 且本机开机时可访问）
 7. 只输出报告正文，不要输出过程说明。
 
-数据 JSON（含 TrendRadar 与 linuxdo 两部分）：
+数据 JSON（TrendRadar 关键词命中 + RSS 全量，其中 RSS 已含 Linux.do 社区热帖来源）：
 {json.dumps(material, ensure_ascii=False, default=str)[:60000]}
 """
     cfg = next((v for k, v in mykeys.items() if 'native' in k and 'claude' in k), None)
