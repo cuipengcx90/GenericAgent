@@ -35,7 +35,10 @@ from reflect_scripts.notify_dingtalk_group import notify_group as notify_dingtal
 OUT_DIR = ROOT / 'output'
 STATE_PATH = OUT_DIR / '.trendradar_digest_state.json'
 LOCK_DIR = OUT_DIR / '.trendradar_locks'
-ARCHIVE_URL = 'http://192.168.1.40:8899/'
+
+from tools.lan_ip import archive_url  # noqa: E402
+
+ARCHIVE_URL = archive_url()
 
 KEYWORDS = [
     'AI 画图 Stable Diffusion ComfyUI FLUX 大模型 GitHub 开源 编程',
@@ -209,15 +212,15 @@ def build_report(period: str, material: dict[str, Any]) -> str:
     tail = '早安 ☀️' if period == 'morning' else '晚安 🌙'
     period_hint = '今日最值得关注' if period == 'morning' else '今天下午以后/最近更新优先'
 
-    prompt = f"""你是技术情报编辑。请基于下面 TrendRadar MCP 数据 + Linux.do 社区热帖，生成中文 IT 情报{title_word}。
+    prompt = f"""你是技术情报编辑。请基于下面 TrendRadar MCP 数据（RSS 已含 Linux.do 社区热帖），生成中文 IT 情报{title_word}。
 
 要求：
 1. 标题必须是：{icon} **IT情报{title_word} · {date_str}**
 2. 挑选 8-12 条，按分类组织：AI画图 / 大模型 / 开源&工具 / 安全 / 芯片GPU。没有内容的分类可省略。
 3. 每条格式：▸ 标题（来源）\n  简要1句话说明为什么重要。
-4. 另起一个固定分类「💬 Linux.do 社区热议」：从 RSS 数据里 feed_name 为「Linux.do 社区热帖」的条目中挑 3-5 条技术/AI/开源/羊毛资讯相关的热帖（跳过纯闲聊/情绪贴），格式：▸ 帖子标题（linux.do）\n  附原帖链接(url 字段)。若没有该来源的条目，则省略该分类，不要虚构。
+4. 另起一个固定分类「💬 Linux.do 社区热议」：从 RSS 数据里 feed_name 为「Linux.do 社区热帖」的条目中挑 5-8 条技术/AI/开源/工具/羊毛资讯相关的热帖；若有效技术向条目不足 5 条，可少于 5 条但不要用纯闲聊/情绪贴凑数。格式：▸ 帖子标题（linux.do）\n  附原帖链接(url 字段)。若没有该来源的条目，则省略该分类，不要虚构。
 5. {period_hint}；合并重复话题，不要虚构来源、版本号、公司公告。
-6. 末尾必须包含：\n📡 数据来源：TrendRadar + Linux.do | {tail}\n📚 历史归档全览：{ARCHIVE_URL}\n（同 WiFi 且本机开机时可访问）
+6. 末尾必须包含：\n📡 数据来源：TrendRadar | {tail}\n📚 历史归档全览：{ARCHIVE_URL}\n（同 WiFi 且本机开机时可访问）
 7. 只输出报告正文，不要输出过程说明。
 
 数据 JSON（TrendRadar 关键词命中 + RSS 全量，其中 RSS 已含 Linux.do 社区热帖来源）：

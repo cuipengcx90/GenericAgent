@@ -13,7 +13,10 @@ import os, re, json, html, datetime, glob
 ROOT = "/Users/cuip/projects/GenericAgent"
 OUT_DIR = os.path.join(ROOT, "output")
 ARCHIVE_DIR = os.path.join(ROOT, "archive")
-ARCHIVE_URL = "http://192.168.1.40:8899/"   # 家庭局域网访问地址（同 WiFi 且本机开机时可达）
+import sys as _sys
+_sys.path.insert(0, os.path.join(ROOT, "tools"))
+from lan_ip import archive_url as _archive_url  # 家庭 WiFi DHCP，IP 每天漂，动态探测当天真实 LAN IP
+ARCHIVE_URL = _archive_url()
 STATE_FILE = os.path.join(ARCHIVE_DIR, ".push_state.json")  # 去重状态：仅内容变化时才私信
 
 # 类型定义：前缀 -> (图标, 中文标签, 主题色)
@@ -28,7 +31,13 @@ TYPES = {
 
 URL_RE = re.compile(r'(https?://[^\s<>"\)）]+)')
 MDLINK_RE = re.compile(r'\[([^\]]+)\]\((https?://[^\s)]+)\)')
+ARCHIVE_URL_RE = re.compile(r'http://192\.168\.\d+\.\d+:8899/')
 WEEKDAY = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def normalize_archive_links(raw: str) -> str:
+    """归档页渲染时把历史推送正文里的旧局域网归档链接替换成当天动态 URL。"""
+    return ARCHIVE_URL_RE.sub(ARCHIVE_URL, raw)
 
 
 def parse_name(fn):
@@ -138,7 +147,7 @@ def build():
         tkey, sortkey, disp, wday = parsed
         try:
             with open(path, encoding="utf-8") as f:
-                raw = f.read()
+                raw = normalize_archive_links(f.read())
         except Exception:
             continue
         icon, label, color = TYPES[tkey]

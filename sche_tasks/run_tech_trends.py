@@ -8,6 +8,7 @@ sys.path.insert(0, '/Users/cuip/projects/GenericAgent')
 from llmcore import NativeClaudeSession, mykeys
 from reflect_scripts.reflect_common import notify_feishu
 from reflect_scripts.notify_feishu_group import notify_group
+from tools.lan_ip import archive_url
 
 headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
@@ -224,7 +225,7 @@ def run(force=False):
     msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
     report = ''.join(sess.ask(msg))
     # 正文末尾统一追加归档站链接（历史推送全览，方便追溯/分享）
-    report = report.rstrip() + "\n\n📚 历史归档全览：http://192.168.1.40:8899/\n（同一 WiFi 且本机开机时可访问）"
+    report = report.rstrip() + f"\n\n📚 历史归档全览：{archive_url()}\n（同一 WiFi 且本机开机时可访问）"
     print(f"✅ 报告生成，{len(report)} 字符")
 
     # 推送前即落状态: 内容已就绪, 从此刻起当日任何重复调用都会被幂等闸门拦下
