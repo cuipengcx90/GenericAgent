@@ -45,9 +45,40 @@ KEYWORDS = [
     'LLM DeepSeek GPT Claude 开源工具 安全漏洞 GPU 芯片',
 ]
 
-# Linux.do 社区热帖已原生内置到 TrendRadar(config.yaml 的 rss.feeds 里 id=linux-do，
-# impersonate:chrome 走 curl_cffi 过 Cloudflare JA3 拦截)。此处不再自行抓取，
-# 数据统一从 get_latest_rss 返回的 material['rss'] 里取(feed_name「Linux.do 社区热帖」)。
+# Linux.do 社区热帖：TrendRadar 的 get_latest_rss 是所有源混合按时间取 limit 条，
+# V2EX 发帖极频繁会霸榜(实测 80 条里 V2EX 占 59、Linux.do 仅 6)，导致专栏干瘪。
+# 因此这里对 Linux.do 单独直连 top.rss?period=daily 专源抓取(curl_cffi 伪造 chrome
+# 指纹过 Cloudflare JA3 拦截，与 TrendRadar config.yaml 里 id=linux-do 同源同手法)，
+# 结果放进 material['linuxdo'] 独立喂给「Linux.do 社区热议」专栏，不与其它源抢配额。
+
+LINUXDO_RSS_URL = 'https://linux.do/top.rss?period=daily'
+
+
+def _fetch_linuxdo(limit: int = 30) -> dict[str, Any]:
+    """直连 Linux.do 每日热帖 RSS，独立取材，避免被混合 RSS 池里高频源挤占。"""
+    out: dict[str, Any] = {'source': 'Linux.do 社区热帖', 'url': LINUXDO_RSS_URL, 'items': []}
+    try:
+        from curl_cffi import requests as creq  # noqa: PLC0415
+        r = creq.get(LINUXDO_RSS_URL, impersonate='chrome', timeout=20)
+        r.raise_for_status()
+        xml = r.text
+    except Exception as e:  # noqa: BLE001
+        out['error'] = f'{type(e).__name__}: {e}'
+        return out
+    try:
+        import xml.etree.ElementTree as ET  # noqa: PLC0415
+        root = ET.fromstring(xml)
+        for it in root.iter('item'):
+            title = (it.findtext('title') or '').strip()
+            link = (it.findtext('link') or '').strip()
+            if not title or not link:
+                continue
+            out['items'].append({'title': title, 'url': link})
+            if len(out['items']) >= limit:
+                break
+    except Exception as e:  # noqa: BLE001
+        out['error'] = f'parse: {type(e).__name__}: {e}'
+    return out
 
 
 def _json_text(obj: Any) -> str:
@@ -202,6 +233,9 @@ def fetch_material(period: str) -> dict[str, Any]:
     except Exception as e:
         material['rss_error'] = f'{type(e).__name__}: {e}'
 
+    # Linux.do 专源单独抓取，避免被混合 RSS 池里高频源(V2EX)挤占配额。
+    material['linuxdo'] = _fetch_linuxdo(limit=30)
+
     return material
 
 
@@ -218,7 +252,7 @@ def build_report(period: str, material: dict[str, Any]) -> str:
 1. 标题必须是：{icon} **IT情报{title_word} · {date_str}**
 2. 挑选 8-12 条，按分类组织：AI画图 / 大模型 / 开源&工具 / 安全 / 芯片GPU。没有内容的分类可省略。
 3. 每条格式：▸ 标题（来源）\n  简要1句话说明为什么重要。
-4. 另起一个固定分类「💬 Linux.do 社区热议」：从 RSS 数据里 feed_name 为「Linux.do 社区热帖」的条目中挑 5-8 条技术/AI/开源/工具/羊毛资讯相关的热帖；若有效技术向条目不足 5 条，可少于 5 条但不要用纯闲聊/情绪贴凑数。格式：▸ 帖子标题（linux.do）\n  附原帖链接(url 字段)。若没有该来源的条目，则省略该分类，不要虚构。
+4. 另起一个固定分类「💬 Linux.do 社区热议」：数据只从下面 JSON 的 material['linuxdo'].items 里取（这是 Linux.do 今日热帖专源，与其它 RSS 分开抓，字段为 title/url）。从中挑 6-8 条技术/AI/开源/工具/羊毛资讯相关的热帖；若有效技术向条目不足 6 条，可少于 6 条但不要用纯闲聊/情绪贴（如情感、吐槽、生活流水）凑数。格式：▸ 帖子标题（linux.do）\n  附原帖链接(url 字段)。若 linuxdo.items 为空，则省略该分类，不要虚构。
 5. {period_hint}；合并重复话题，不要虚构来源、版本号、公司公告。
 6. 末尾必须包含：\n📡 数据来源：TrendRadar | {tail}\n📚 历史归档全览：{ARCHIVE_URL}\n（同 WiFi 且本机开机时可访问）
 7. 只输出报告正文，不要输出过程说明。
