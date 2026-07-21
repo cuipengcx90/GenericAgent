@@ -1,0 +1,47 @@
+# [Global Memory Insight]
+浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF blob/跨域iframe/CDP)
+键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py
+密钥/配置: keychain.py | keychain_sop
+MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)
+进程内存/扫描: procmem_scanner.py | procmem_scanner_sop
+定时/自主/反射: scheduled_task_sop | autonomous_operation_sop | agentmain --reflect
+通知推送通道: notify_channels_sop(飞书私信/飞书群/钉钉群)
+微信信号日报+周报: wechat_signals_sop(日报18点窗口昨18→今18/周报周一09:00/海报PNG/--window解密需sudo提key/wechat_pipeline.py一键管道/AppleScript翻群同步/方案B OCR截图链路run_wechat_ocr_daily.py单群无sudo,collector只采前台群+时间窗自停(绝对/相对日期锚点),定时每天13点窗口昨13→今13)
+手机: adb_ui.py
+
+需要时 read L2 或 ls ../memory/ 查 L3
+L0: memory_management_sop
+L2: TrendRadar_MCP | GA MCP统一调用 | 用户背景 | smyze/bar代码库架构 | Git Hook生效性 | Quarkus版本风险 | Codeg+GA整合部署 | 周报工具链
+L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_sop
+| scan_and_analyze_sop | test_and_document_sop | root_cause_analysis_sop | trendradar_sop | github_contribution_sop
+| trendradar_sop(晨/晚报重复推送根治:确定性单入口+幂等;稳定双发查通知函数互相转调;Linux.do接入查Docker镜像/CF指纹/RSS混合池limit配额) | recommendation_pitfalls_sop | ctf_skills_integration_sop
+| hellogithub_monthly_sop
+| tmwebdriver_sop | jshook_runtime_sop | js_runtime_hooking_playbook_sop | vision_sop | ljqCtrl_sop
+| sophub_sop | sophub_security_sops | codex_jailbreak_risk_sop | ctf_core_contract_risk_sop | llm_prompt_bypass_risk_sop
+| keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md
+| cc_disguise_knowledge(CC伪装机制/工具映射/排错,无部署)
+| deepresearch_sop(多来源深度研究DAG) | hcaptcha_sop | github_project_learning_sop(陌生代码库学习)
+| baidu_pan_transfer_sop(网盘转存/资源入库保留URL+提取码+边界)
+| trellis_integration_sop(GA×Trellis通用集成: 检测.trellis/自动走工作流)
+| codex_web_auditor_prompt_sop(Web逆向/API签名破限prompt,5态状态机+CDP注入)
+| weekly_inspection_sop(opserver SLS周巡检: 扫描→下钻→DB验证→报告; 三层防线根治格式漂移: ①生成层gen_report_skeleton.py按问题清单JSON生成锁死结构骨架(LLM只填{填:}槽不碰结构) ②校验层weekly_inspection_verify.py机械校验 ③推送层verify_then_notify.py通知必达(PASS正常/FAIL降级告警/缺失异常都推送,绝不静默))
+| weekly_report_sop(周报reply保留引用+git+飞书群聊证据;版式已根治为可执行护栏:weekly_report_gen.py结构锁死生成(LLM只产content.json禁徒手写HTML)+weekly_report_verify.py机械校验闸门(通过才通知),定时任务prompt已接通)
+| performance_self_review_sop(季度绩效考评表: 季初目标制定+季末自评. git取数→KPI域→高大上叙事)
+| ga_desktop_env_override_sop(GA桌面.app接管本地源码环境: 改lib.rs加force_*+替换二进制ad-hoc重签;升级会覆盖二进制;消息通道开关灰=IM进程态非配置,IM自启归launchd)
+| dingtalk_message_digest_sop(钉钉消化入Wiki需读正文+保留URL/提取码/边界)
+| fofa_cli_proxy_hunter_sop(FOFA发现+验证OpenAI兼容代理/newapi:三段决策/models非可用/实调才usable/skill在~/.codex/skills;--profile cli_proxy|newapi切片包;扩范围--slice-family/切片A-J+6子代理并行各写独立文件;长任务后台nohup避60s超时)
+| navicat_trial_reset_sop(Navicat试用期重置:删plist+.32hex隐藏文件,必bash执行)
+| output_archive_sop(推送产物归档站:build_output_archive.py生成自包含HTML+launchd(server8899/rebuild监听output)+哈希去重私信;坑:归档目录须出output外防自触发/Clash TUN假IP198.18.0.1须解ifconfig取真实LAN)
+L4: L4_raw_sessions/
+
+[RULES]
+1. 搜索先行: 优先cwd；搜文件名先es；网页搜索只用google；本机rg未装(搜索静默返回空!)→用grep
+2. 交叉验证: 禁信摘要，数值进详情核实
+3. 编码安全: 改前必读；file_read代替cat/type；memory模块直接import
+4. 闭环: 物理模拟后确认；3次失败求助；Git完整闭环
+5. 进程: 禁无条件杀python；精确PID；禁os.kill判活
+6. 窗口: GUI状态优先win32gui枚举标题
+7. web JS: 原生setter+事件链；点击前检disabled；scan空先稍等再扫
+8. SOP: 读SOP禁凭印象；有utils必用；复杂规划先读plan_sop
+9. git日期: --since/--until必须带T00:00:00+08:00；裸日期会丢当天commits
+10. 自主交付: "完成"=质量达标的完整闭环，非满足字面要求。发现差距/标杆/缺陷应一气呵成自己做完(对比→修正→固化SOP)，禁拆成等用户"继续"才推一步
