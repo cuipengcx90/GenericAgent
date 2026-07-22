@@ -104,3 +104,13 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - 验证(端到端,容器内)：`docker exec trendradar python -c "from curl_cffi import requests as c; print(c.get('https://linux.do/top.rss?period=daily',impersonate='chrome').status_code)"`→200；`docker exec trendradar python -m trendradar` 日志见 `[RSS] Linux.do 社区热帖: 获取 30 条`。PASS(2026-07-20)。
 - ★2026-07-21 专栏内容偏少/偏闲聊根因★：linux-do 已进库、`get_latest_rss` 也返回，但用户反馈专栏条目少且混情感/生活贴。实测 `get_latest_rss(limit=80)` 返回满 80 条却是**全源混合按时间排序**，V2EX 发帖极频繁独占 59 条、Linux.do 仅挤到 6 条候选→喂给 LLM 的技术向素材太薄。★正确解★：**不要**再在 digest 自写 top.rss 抓取(重蹈 §9 被否的老路，我一度提交 `8459eea` 又回退)；只需把 `get_latest_rss` 的 `limit` 从 80 调大到 **400**，Linux.do 候选即从 6 → **56 条**(仍全出自 TrendRadar 引擎)，再按 feed_name 过滤 + prompt 里要求「挑技术/AI/开源/工具/羊毛向 6-8 条，不足不用闲聊贴凑数」。提交 `bae47a1`(GA)。教训：混合池「某源条目少」先查是不是**高频源霸占 limit 配额**，优先调 limit 而非另起抓取。
 - 坑：mac 宿主无 `timeout` 命令(仅容器内 linux 有)，别在宿主 bash 包 timeout；docker build 数分钟→后台 nohup 跑避 60s 工具超时。
+
+## 10. 空数据自愈：取材全 0 时退避重试 + 仍空跳过（2026-07-22）
+- 现象：用户收到晨报正文「关键词命中 0 条、RSS 全量 0 条，暂无可用情报」。这**不是报错/崩溃**，是 digest 遇空数据时的诚实降级文案（不瞎编来源）。截图排查用 `vision_utils.ask_vision(img, prompt, backend='openai')`（claude 后端代理挂时报 400，换 openai 后端）。
+- 根因：脚本运行那一刻(约 10:00 晨报窗口)MCP `get_latest_rss`/`search_news` 返回 `success:True` 但 `data:[]`/`total:0`——上游 TrendRadar 容器正处**重启中或当日首轮爬虫未抓完**的空窗期。稍后实测即恢复(RSS 314 条含 Linux.do 30)。属**偶发时序**，非配置/代码故障。
+- ★判空铁律★：`success:True` **不等于**有数据。健康的 TrendRadar RSS 应是几百条；`total:0` 且 queries 也全 0 = 空窗。判空要数 `rss.summary.total` + 每个 query 的 `result.total`，二者皆 0 才算全空(见 `_material_counts`)。
+- 根治(已实现,`run_trendradar_digest.py`)：
+  1. `fetch_material` 拆成外层重试 + `_fetch_material_once`：抓完调 `_material_counts` 判空，全 0 则退避重试(sleep 阶梯,默认 3 次),任一轮拿到数据立即返回。material 里记 `_all_empty_after_retries` 标记。
+  2. `run()`：重试后仍全空 → **不 build/send 降级文案到正式渠道**(飞书群/钉钉群),返回 `{skipped:True, reason:'empty_after_retries'}` 且**不认领当日 state** → 后续定时轮次/手动 `--force` 仍能补发真正有内容的报。避免把「暂无情报」推给全员。
+- 补发命令：`python3 sche_tasks/run_trendradar_digest.py --period morning --force`(先 `--dry-run --force` 验证有内容再正式发)。ga_mcp_client 正确接口是 `call_sync(server,tool,args)`(非 call_tool)。
+- 教训：外部数据源「偶发返空」要在**取材层做退避重试**(时序抖动多半自愈),并在**推送层设空数据闸门**(仍空则跳过而非发降级文案)。二者配合:重试兜住偶发空窗,闸门兜住真·无数据。

@@ -170,8 +170,64 @@ def _mcp_call(s: 'requests.Session', hdr: dict, name: str, args: dict, timeout: 
     return result.get('content', result)
 
 
-def fetch_material(period: str) -> dict[str, Any]:
+def _material_counts(material: dict[str, Any]) -> tuple[int, int]:
+    """Return (keyword_hits, rss_count) so callers can tell whether the fetch is empty.
 
+    A healthy TrendRadar returns hundreds of RSS items; an all-zero result means the
+    upstream container was mid-restart / first-crawl window and returned success:True
+    with empty data. See trendradar_sop §9.
+    """
+    kw_hits = 0
+    for q in material.get('queries') or []:
+        res = q.get('result') if isinstance(q, dict) else None
+        if isinstance(res, dict):
+            kw_hits += int(res.get('total') or len(res.get('results') or []) or 0)
+    rss = material.get('rss')
+    rss_count = 0
+    if isinstance(rss, dict):
+        summ = rss.get('summary') or {}
+        rss_count = int(summ.get('total') or summ.get('returned') or len(rss.get('data') or []) or 0)
+    return kw_hits, rss_count
+
+
+def _material_is_empty(material: dict[str, Any]) -> bool:
+    kw, rss = _material_counts(material)
+    return kw == 0 and rss == 0
+
+
+# 上游临时空窗时的退避重试节奏(秒)。TrendRadar 容器重启/首轮爬虫窗口会短暂返回
+# success:True + 空 data,单次抓取会误判"无情报"。见 trendradar_sop §9。
+_EMPTY_RETRY_BACKOFF = (8, 20, 40)
+
+
+def fetch_material(period: str) -> dict[str, Any]:
+    """Fetch TrendRadar material, retrying on all-zero results (upstream empty window).
+
+    A single all-zero fetch is almost never real (TrendRadar normally serves hundreds
+    of items). Instead of shipping a degraded "no intel" report, retry with backoff and
+    keep the best (non-empty) attempt. Records retry metadata on the material.
+    """
+    attempts = len(_EMPTY_RETRY_BACKOFF) + 1
+    material: dict[str, Any] = {}
+    for i in range(attempts):
+        material = _fetch_material_once(period)
+        kw, rss = _material_counts(material)
+        material['_counts'] = {'keyword_hits': kw, 'rss': rss}
+        material['_attempt'] = i + 1
+        if not _material_is_empty(material):
+            return material
+        if i < len(_EMPTY_RETRY_BACKOFF):
+            wait = _EMPTY_RETRY_BACKOFF[i]
+            print(f'[fetch_material] empty result (kw=0,rss=0), attempt {i + 1}/{attempts}, '
+                  f'retrying in {wait}s (upstream likely mid-restart)', file=sys.stderr)
+            time.sleep(wait)
+    material['_all_empty_after_retries'] = attempts
+    print(f'[fetch_material] still empty after {attempts} attempts; upstream TrendRadar '
+          f'has no data right now', file=sys.stderr)
+    return material
+
+
+def _fetch_material_once(period: str) -> dict[str, Any]:
     """Fetch TrendRadar data over a single raw MCP session. No notification tool here."""
     s, hdr = _mcp_open_session()
     tools = _mcp_list_tools(s, hdr)
@@ -352,8 +408,23 @@ def run(period: str, dry_run: bool = False, force: bool = False, self_test: bool
         date_str = datetime.now().strftime('%Y-%m-%d')
         material = fetch_material(period)
         material_path = OUT_DIR / f'trendradar_{period}_{date_str}.material.json'
-        report_path = OUT_DIR / f'trendradar_{period}_{date_str}.txt'
         material_path.write_text(json.dumps(material, ensure_ascii=False, indent=2, default=str), encoding='utf-8')
+
+        # 重试后仍全空 = 上游 TrendRadar 确实没数据。不推"暂无情报"降级文案到正式渠道,
+        # 也不认领当日 state,让后续定时轮次/手动补发仍能发出真正有内容的报告。见 §9。
+        if _material_is_empty(material):
+            kw, rss = _material_counts(material)
+            print(f'[run] material still empty after retries (kw={kw},rss={rss}); '
+                  f'skip sending degraded report', file=sys.stderr)
+            return {
+                'period': period,
+                'material_path': str(material_path),
+                'skipped_empty': True,
+                'attempts': material.get('_attempt'),
+                'send': {'skipped': True, 'reason': 'upstream empty after retries'},
+            }
+
+        report_path = OUT_DIR / f'trendradar_{period}_{date_str}.txt'
         report = build_report(period, material)
         report_path.write_text(report, encoding='utf-8')
         send_result = send_once(period, report, dry_run=dry_run, force=force)
