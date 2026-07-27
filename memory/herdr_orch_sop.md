@@ -22,10 +22,22 @@
 - 护栏：send 前查 `agent_status`，非 idle 拒绝驱动（避免打断 working 中的业务 agent）。
 - 完整产品设计（Backend 抽象/P0-P4 里程碑/CCB 差距表/AGPL 合规）见 `temp/herdr_orch/DESIGN.md`。
 
+## P2 编排层（已完成，契约测试全绿）
+- `dag.py`(temp/herdr_orch/dag.py) 声明式 DAG，三语义：
+  - **多前置 join**：节点 `deps` 全部 ok 才触发（B 等 A1+A2 都完成）；下游 prompt 用 `{节点名}` 占位注入前置回复。
+  - **失败重试**：每节点 `max_retries` 次 + 指数退避(backoff)；BackendError/超时都算失败。
+  - **超时降级 on_fail**：`abort`(整 DAG 抛 DagError 快速失败) / `skip`(标记 failed，join 阻断下游自动 skip，独立分支继续) / `degrade`(fallback 占位，下游照跑)。
+  - 拓扑排序用 Kahn 算法，带环检测 + 缺失依赖检测（都抛 DagError）。
+  - 传输经可注入 `runner`（默认走 backend.get_backend().ask）；契约测试注入 mock runner，不碰真机。
+- 契约测试 `test_dag.py`：16 项断言(join3/重试3/abort1/skip3/degrade3/环1/缺失依赖1+拓扑序2隐含)全 PASS。
+- **修复 bug**：orchestrator.py 原调 `be.run_blocking`(后端无此方法，实际跑不通)，已改为 `be.ask`，与 backend 接口对齐。
+
 ## 当前代码入口
 - `temp/herdr_orch/protocol.py`：`make_req_id / wrap_prompt / is_done / strip_markers`
 - `temp/herdr_orch/driver.py`：`list_agents / read / send / ask`
-- `temp/herdr_orch/orchestrator.py`：`Orchestrator.on_done(src,dst,template)` + `run(agent,message)`；`agent` 参数直接传 pane_id/target。
+- `temp/herdr_orch/orchestrator.py`：`Orchestrator.on_done(src,dst,template)` + `run(agent,message)`；`agent` 参数直接传 pane_id/target。（简单线性/callback 边编排）
+- `temp/herdr_orch/dag.py`：`DAG(runner=None,backoff=2.0)` + `Node(name,target,prompt,deps,max_retries,timeout,on_fail,fallback)` + `add()/run()`。（P2 声明式多前置 join + 重试 + 降级；复杂拓扑用它）
+- `temp/herdr_orch/test_dag.py`：P2 契约测试(16 断言)。
 - `temp/herdr_orch/demo_a_to_b.py`：A→B 示例。
 
 ## P1 数据源层（已完成，契约测试全绿）
