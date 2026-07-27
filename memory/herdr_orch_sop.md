@@ -42,8 +42,11 @@
 
 ## P1 数据源层（已完成，契约测试全绿）
 - `HerdrJsonlBackend`(temp/herdr_orch/jsonl_backend.py) 打通：send(护栏+baseline记录)→is_done(双重确认:idle+回复变化,防发送瞬间status未转working的竞态)→read_reply(直读JSONL干净正文)→ask(阻塞轮询,但受60s杀进程限制,长任务改send+多次短read)。
-- `backend.py` 分级路由：有 agent_session(claude)→jsonl 后端；无→screen 后端(抓屏+哨兵降级)。
-- 契约测试 `test_backend.py`：10 项断言(状态语义4/分级路由2/发送护栏1/双重确认3)全 PASS。
+- `backend.py` 分级路由：**判据是 `info.has_jsonl`（=`session_id` 非空 且 `source=="herdr:claude"`），不是 session_id 单独非空**。codex 也报 session_id 但 source=`herdr:codex`→has_jsonl=False→走 screen 后端。（入口函数是 `get_backend(target)`，不是 select_backend）
+- `HerdrScreenBackend`(temp/herdr_orch/screen_backend.py) 完成判定**根因修复**：`is_done` = 观测过 working 后回落到可用态(idle/done)；用 `_saw_working` 标志堵 poll0 竞态（send 前可能残留 idle，须先见 working 再回落才算完成）。**已彻底弃用两条旧方案**：①纯哨兵 DONE 计数≥2（codex TUI 折叠在飞 prompt，内嵌 DONE 行常不上屏→计数不可靠→永久超时）②屏文相对 baseline 变化作附加闸（send 会立刻回显 prompt 污染屏文 baseline，一回显即成立，无法区分"仅回显"与"真出正文"）。哨兵/屏文降级为仅供 read_reply 抽正文。
+- 真机验证(w9:p45/codex,2026-07-27)：修前 22 轮全 False、50s 超时；修后 ask() 8.4s 返回，超时根因确实解决。
+- **codex 正文不可留存的已知局限**：codex TUI 完成后折叠/重绘响应区只留一个 `•` bullet，正文从不留存于可抓取屏文（隔 1 分钟复读仍只有 `•`）。故 screen 后端**完成判定可靠、正文尽力而为**；适合"发指令+确认完成"编排，需可靠回收正文就路由到有 JSONL 的 claude。
+- 契约测试 `test_backend.py`：状态语义4/分级路由2/发送护栏1/双重确认3 + **screen 完成判定4**（poll0 闸/working 中/回落 idle/回落 done）全 PASS。
 - **测试隔离铁律**：契约测试 mock 了 snapshot(find_agent/read_last_reply) 后，还**必须 stub 掉 `driver.send`**（`driver.send = lambda t,x: None`）。否则 send() 第31行会真打 herdr CLI，报 `agent_not_found` 让测试崩溃。凡后端 send 路径的纯逻辑测试都要断掉传输层真机调用。
 
 ## 验证口径
