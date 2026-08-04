@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
 """每日技术开源趋势报告 - GitHub + HN + HuggingFace Papers"""
-import sys, os, json, requests
+import sys, os, json, re, requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
 sys.path.insert(0, '/Users/cuip/projects/GenericAgent')
-from llmcore import NativeClaudeSession, mykeys
+from llmcore import build_mixin_session
 from reflect_scripts.reflect_common import notify_feishu
 from reflect_scripts.notify_feishu_group import notify_group
 from tools.lan_ip import archive_url
 
 headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
+_LLM_TAG_PATS = [
+    r"<" + t + r">.*?</" + t + r">"
+    for t in ("thinking", "summary", "tool_use", "file_content")
+]
+
+
+def _strip_llm_tags(text: str) -> str:
+    """Strip internal agent tags (e.g. <summary>) leaked from the system prompt.
+
+    Mirrors frontends/fsapp.py::_clean so autonomous report pipelines never
+    push raw <summary>/<thinking> blocks to Feishu/DingTalk.
+    """
+    for pat in _LLM_TAG_PATS:
+        text = re.sub(pat, "", text or "", flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def fetch_github(since="daily", limit=15):
+  try:
     r = requests.get(f"https://github.com/trending?since={since}", headers=headers, timeout=15)
     soup = BeautifulSoup(r.text, "html.parser")
     repos = []
@@ -33,9 +51,16 @@ def fetch_github(since="daily", limit=15):
             "today": today_elem[-1].get_text(strip=True).split()[0].replace(",","") if today_elem else "0"
         })
     return repos
+  except Exception as e:
+    print(f"⚠️ fetch_github 失败(降级跳过): {e}")
+    return []
 
 def fetch_hn(limit=20):
-    ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10).json()
+    try:
+        ids = requests.get("https://hacker-news.firebaseio.com/v0/topstories.json", timeout=10).json()
+    except Exception as e:
+        print(f"⚠️ fetch_hn 失败(降级跳过): {e}")
+        return []
     items = []
     for hid in ids[:limit]:
         try:
@@ -51,16 +76,20 @@ def fetch_hn(limit=20):
     return items
 
 def fetch_hf(limit=15):
-    r = requests.get("https://huggingface.co/api/daily_papers", timeout=10)
-    result = []
-    for p in r.json()[:limit]:
-        paper = p.get("paper", {})
-        result.append({
-            "title": paper.get("title",""),
-            "url": f"https://huggingface.co/papers/{paper.get('id','')}",
-            "upvotes": p.get("upvotes", 0)
-        })
-    return result
+    try:
+        r = requests.get("https://huggingface.co/api/daily_papers", timeout=10)
+        result = []
+        for p in r.json()[:limit]:
+            paper = p.get("paper", {})
+            result.append({
+                "title": paper.get("title",""),
+                "url": f"https://huggingface.co/papers/{paper.get('id','')}",
+                "upvotes": p.get("upvotes", 0)
+            })
+        return result
+    except Exception as e:
+        print(f"⚠️ fetch_hf 失败(降级跳过): {e}")
+        return []
 
 def fetch_trendshift(limit=15):
     """从 trendshift.io 获取每日 engagement 排名的开源项目"""
@@ -120,6 +149,36 @@ def _mark_sent(date_str):
     st[date_str] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(STATE_PATH, "w", encoding="utf-8") as f:
         json.dump(st, f, ensure_ascii=False, indent=2)
+
+class ReportQualityError(RuntimeError):
+    """LLM返回错误页、截断文本或不完整日报时阻止其被当作正式推送。"""
+
+
+def _validate_report(report, date_str):
+    text = (report or "").strip()
+    markers = ("!!!Error:", "HTTP 403", "HTTP 4", "HTTP 5", "流异常中断", "未收到完整响应", "[!!!")
+    if not text or any(marker in text for marker in markers):
+        raise ReportQualityError("LLM returned an error/interrupted response")
+    required = (f"每日技术开源趋势报告 · {date_str}", "GitHub 日榜", "Hacker News", "HuggingFace", "数据来源：")
+    missing = [item for item in required if item not in text]
+    if missing:
+        raise ReportQualityError(f"report missing required sections: {', '.join(missing)}")
+    if len(text) < 1800:
+        raise ReportQualityError(f"report too short: {len(text)} chars")
+    return text
+
+
+def _build_report_with_fallback(prompt, date_str):
+    """Use the centrally configured Mixin routing policy from mykey.py."""
+    sess = build_mixin_session()
+    msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
+    try:
+        print(f"🤖 AI 分析（统一 Mixin：{sess.name}）...")
+        report = _strip_llm_tags(''.join(sess.ask(msg)))
+        return _validate_report(report, date_str), sess.current_name
+    except Exception as exc:
+        raise ReportQualityError(f"mixin model chain failed: {type(exc).__name__}: {exc}") from exc
+
 
 def run(force=False):
     # === 幂等闸门: 当日只推一次, 防重复推送 (2026-07-14 根治) ===
@@ -219,18 +278,13 @@ def run(force=False):
 📡 数据来源：GitHub Trending / Trendshift / Hacker News / HuggingFace Daily Papers
 ⏰ 生成时间：{now_str}"""
 
-    print("🤖 AI 分析...")
-    cfg = next((v for k, v in mykeys.items() if 'native' in k and 'claude' in k), None)
-    sess = NativeClaudeSession(cfg=cfg)
-    msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
-    report = ''.join(sess.ask(msg))
+    report, model_used = _build_report_with_fallback(prompt, date_str)
     # 正文末尾统一追加归档站链接（历史推送全览，方便追溯/分享）
     report = report.rstrip() + f"\n\n📚 历史归档全览：{archive_url()}\n（同一 WiFi 且本机开机时可访问）"
-    print(f"✅ 报告生成，{len(report)} 字符")
+    print(f"✅ 报告生成，{len(report)} 字符（模型：{model_used}）")
 
-    # 推送前即落状态: 内容已就绪, 从此刻起当日任何重复调用都会被幂等闸门拦下
-    if not force:
-        _mark_sent(date_str)
+    # 仅合格正文才认领状态；force 补发也必须覆盖此前错误的 sent 标记。
+    _mark_sent(date_str)
 
     # 推送隔离：任何一方失败不影响另一方
     print("📤 推送飞书私信...")

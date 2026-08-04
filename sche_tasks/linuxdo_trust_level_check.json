@@ -1,0 +1,7 @@
+{
+  "schedule": "09:30",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 6,
+  "prompt": "检查用户linux.do信任等级(TL3)是否仍达标，不达标才提醒，达标静默结束：\n1. 用web_scan(tabs_only)找是否已有打开到 https://connect.linux.do/ 的tab；没有则用web_execute_js在任一linux.do域下的tab执行 location.href='https://connect.linux.do/' 导航过去（同一段JS里导航后不能继续操作，需拆两次调用，等待约1秒后再读取）\n2. 读取 document.body.innerText，定位『信任级别 3 的要求』区块，判断是『已符合』还是『不符合』\n3. 若已符合：什么都不做，直接结束，不发送任何通知（不要打扰用户）\n4. 若不符合：解析文本里的各项数字（活跃程度/访问天数/浏览话题/浏览帖子/回复话题/点赞/获赞/获赞天数/获赞用户 等，格式均为『当前值/门槛值』），找出哪几项未达标(当前值<门槛值)，用 reflect_scripts/reflect_common.py 的 notify_feishu() 私信提醒用户，内容需具体列出：不达标的项目名+当前值/门槛值+差距，并简短建议（例如访问天数不足需要本人持续登录，无法脚本代刷；获赞不足可考虑发一条有实际内容的技术贴）。不要自动发帖或点赞，只提醒不代操作。\n5. 执行完毕后把结论(达标/不达标+具体数据)写入报告路径即可。"
+}

@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {"id":"paseo","name":"Paseo","repo":"getpaseo/paseo","importance":"high","local_commands":["paseo --version"],"local_paths":[],"upgrade_policy":"assess"},
+    {"id":"ruflo","name":"Ruflo","repo":"ruvnet/ruflo","importance":"high","local_commands":["ruflo --version"],"local_paths":[],"upgrade_policy":"assess"},
+    {"id":"multica","name":"Multica","repo":"multica-ai/multica","changelog_url":"https://multica.ai/changelog","importance":"high","local_commands":["multica --version"],"local_paths":[],"upgrade_policy":"assess"},
+    {"id":"tutti","name":"Tutti","repo":"tutti-os/tutti","importance":"high","local_commands":["tutti --version"],"local_paths":[],"upgrade_policy":"assess"},
+    {"id":"orca","name":"Orca","repo":"stablyai/orca","importance":"high","local_commands":["orca --version"],"local_paths":["/usr/local/bin/orca"],"upgrade_policy":"cautious"},
+    {"id":"genericagent","name":"GenericAgent","repo":"lsdefine/GenericAgent","importance":"critical","local_commands":[],"local_paths":["/Users/cuip/projects/GenericAgent","/Users/cuip/projects/GenericAgent/.trellis"],"upgrade_policy":"manual_review"},
+    {"id":"claude_codex_bridge","name":"Claude Codex Bridge","repo":"SeemSeam/claude_codex_bridge","importance":"high","local_commands":["ccb --version"],"local_paths":[],"upgrade_policy":"cautious"},
+    {"id":"trellis","name":"Trellis","repo":"mindfold-ai/Trellis","changelog_url":"https://docs.trytrellis.app/zh/changelog","importance":"critical","local_commands":["trellis --version"],"local_paths":["/Users/cuip/projects/GenericAgent/.trellis","/Users/cuip/projects/GenericAgent/.trellis/.version"],"upgrade_policy":"manual_review"}
+  ]
+}

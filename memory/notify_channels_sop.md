@@ -15,3 +15,5 @@
 ## 坑点
 - 钉钉Webhook无签名校验，直接POST即可；飞书群Webhook需hmac签名
 - 钉钉消息体用 `msgtype`+`text.content`；飞书用 `msg_type`+`content.text`
+- sche_tasks下LLM直出报告(sess.ask())未经清洗会把系统提示强制要求的`<summary>`/`<thinking>`等内部标签原样带入推送内容(2026-07-31修复)。前端fsapp.py/wechatapp.py/plan_state.py各自有`_clean()`剥离`<thinking><summary><tool_use><file_content>`标签，但sche_tasks三个直连LLM的脚本(run_trendradar_digest.py/run_tech_trends.py/run_hellogithub_monthly.py)绕过了前端未经清洗。已在三者report赋值处补同款`_strip_llm_tags()`(复制_TAG_PATS逻辑，未抽公共util)。新增sche_tasks脚本用sess.ask()生成报告时必须同样清洗，检查方式：`grep -RIln "sess.ask(" sche_tasks/*.py`。
+

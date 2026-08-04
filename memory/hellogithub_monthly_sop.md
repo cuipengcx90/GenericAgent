@@ -13,6 +13,7 @@
 
 ## 关键坑点
 1. **飞书 webhook 是纯文本**：msg_type=text 不渲染 Markdown，prompt 必须要求 AI 输出纯文本+emoji排版
-2. **NativeClaudeSession 用法**：需 cfg 参数 `cfg=next((v for k,v in mykeys.items() if 'native' in k and 'claude' in k), None)`，`sess.ask(msg)` 返回 generator 需 join
+2. **模型调用改统一入口(2026-07-28)**：不再用 `NativeClaudeSession` 单模型直连,改调 `llmcore.build_mixin_session()`(读 `mykey.py:mixin_config`,跨模型自动兜底,详见 trendradar_sop 第13章),`sess.ask(msg)` 返回 generator 需 join
 3. **当月数据不全**：默认取上月(datetime.now().replace(day=1) - timedelta(days=1))
 4. **numpy warning 无害**：LLMLingua warmup 失败不影响主流程，忽略即可
+5. **推送前质量闸门(2026-07-28新增)**：`_validate_report(text)` 校验必备段(HelloGitHub/月度精选/月刊/数据来源)缺失、含中断标记(`!!!Error:`)、正文过短(<约800字)则抛 `ReportQualityError` 阻断推送,绝不发残缺报告。

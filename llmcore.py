@@ -1224,6 +1224,47 @@ def resolve_client(cfg_name):
     s = resolve_session(cfg_name)
     return (NativeToolClient(s) if isinstance(s, (NativeClaudeSession, NativeOAISession)) else ToolClient(s)) if s else None
 
+
+def build_mixin_session(cfg=None):
+    """Build the configured cross-model failover session for non-tool callers.
+
+    ``mixin_config.llm_nos`` holds backend *display names* (e.g. ``claude-relay``),
+    not config keys. Match agentmain: materialize every eligible client, then let
+    MixinSession select by ``backend.name``. Routing order / retry policy stay only
+    in ``mykey.py:mixin_config``.
+    """
+    mykey_cfg = reload_mykeys()[0]
+    mixin_cfg = cfg or mykey_cfg.get('mixin_config')
+    if not mixin_cfg:
+        raise ValueError("Config 'mixin_config' not in mykey")
+    names = mixin_cfg.get('llm_nos', [])
+    if not names:
+        raise ValueError("mixin_config.llm_nos is empty")
+    # Same pool construction as agentmain.load_llm_sessions (without nesting mixin).
+    clients = []
+    for key, entry in mykey_cfg.items():
+        if not any(x in key for x in ('api', 'config', 'cookie')):
+            continue
+        if 'mixin' in key:
+            continue
+        try:
+            client = resolve_client(key)
+        except Exception:
+            client = None
+        if client is not None:
+            clients.append(client)
+    if not clients:
+        raise ValueError('No eligible LLM clients found to back mixin_config')
+    available = {getattr(c.backend, 'name', None) for c in clients}
+    missing = [n for n in names if n not in available]
+    if missing:
+        raise ValueError(
+            f"mixin_config.llm_nos names not found among clients: {missing}; "
+            f"available={sorted(x for x in available if x)}"
+        )
+    return MixinSession(clients, mixin_cfg)
+
+
 def fast_ask(prompt, cfg_name):
     sess = resolve_session(cfg_name)
     if not sess: raise ValueError(f"fast_ask: '{cfg_name}' unsupported")

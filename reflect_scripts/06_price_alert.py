@@ -3,20 +3,36 @@
 监控 BTC/ETH 等价格波动，触发 Agent 分析并推飞书
 启动：python agentmain.py --reflect reflect_scripts/06_price_alert.py
 """
-import sys, json, urllib.request, time
+import sys, os, json, urllib.request, time
 sys.path.insert(0, '/Users/cuip/projects/GenericAgent/reflect_scripts')
 from reflect_common import notify_feishu, Debounce
 
-INTERVAL = 120   # 每2分钟检查一次
+INTERVAL = 120   # 每2分钟检查一次（常驻模式下生效；定时任务每次独立进程调用则靠持久化文件累积历史）
 
 # ===== 配置区 =====
 WATCH_COINS   = ["bitcoin", "ethereum"]   # CoinGecko ID，免费无需 API key
-ALERT_CHANGE  = 0.05    # 触发阈值：5% 波动
-WINDOW_SECS   = 600     # 统计窗口：10分钟内的涨跌幅
+ALERT_CHANGE  = 0.05    # 触发阈值：5% 波动（相对上一次持久化的采样点）
+HISTORY_FILE  = os.path.join(os.path.dirname(__file__), '.price_history.json')
 # ==================
 
-_price_history: dict[str, list] = {}   # {coin: [(timestamp, price), ...]}
 _db = Debounce(cooldown=1800)          # 同一币种 30 分钟内不重复告警
+
+def _load_history() -> dict:
+    """跨进程持久化历史：定时任务每次独立起进程，内存dict无法累积，改用文件"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_history(history: dict):
+    try:
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f)
+    except Exception as e:
+        print(f"[价格历史保存失败] {e}")
 
 def _fetch_prices() -> dict[str, float]:
     ids = ",".join(WATCH_COINS)
@@ -30,24 +46,26 @@ def check():
         now = time.time()
         prices = _fetch_prices()
         alerts = []
+        history = _load_history()   # {coin: [ts, price]}，跨进程持久化的"上一次"采样点
 
         for coin, price in prices.items():
-            hist = _price_history.setdefault(coin, [])
-            hist.append((now, price))
-            # 清理窗口外的历史
-            _price_history[coin] = [(t, p) for t, p in hist if now - t <= WINDOW_SECS]
+            prev = history.get(coin)
+            history[coin] = [now, price]   # 无论是否触发都更新为最新点，供下次比较
 
-            if len(_price_history[coin]) < 2:
-                continue
-            oldest_price = _price_history[coin][0][1]
-            change = (price - oldest_price) / oldest_price
+            if prev is None:
+                continue   # 首次记录，无上一次可比
+            prev_ts, prev_price = prev
+            change = (price - prev_price) / prev_price
 
             if abs(change) >= ALERT_CHANGE and _db.should_fire(coin):
                 direction = "📈 暴涨" if change > 0 else "📉 暴跌"
+                elapsed_min = (now - prev_ts) / 60
                 alerts.append(
                     f"{coin.upper()} {direction} {change*100:+.1f}%，"
-                    f"当前价格 ${price:,.2f}（{WINDOW_SECS//60}分钟前 ${oldest_price:,.2f}）"
+                    f"当前价格 ${price:,.2f}（{elapsed_min:.0f}分钟前 ${prev_price:,.2f}）"
                 )
+
+        _save_history(history)   # 写回文件，供下次独立进程调用时读取
 
         if not alerts:
             return None

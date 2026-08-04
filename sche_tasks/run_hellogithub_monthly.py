@@ -4,16 +4,53 @@
   1. 月度精选榜: hellogithub.com/?sort_by=featured&rank_by=monthly
   2. 月刊 Volume: hellogithub.com/periodical/volume/{num}
 """
-import sys, requests
+import re, sys, requests
 from datetime import datetime, timedelta
 
 sys.path.insert(0, '/Users/cuip/projects/GenericAgent')
-from llmcore import NativeClaudeSession, mykeys
+from llmcore import build_mixin_session
 from reflect_scripts.reflect_common import notify_feishu
 from reflect_scripts.notify_feishu_group import notify_group
 
 API = 'https://api.hellogithub.com/v1'
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+
+
+class ReportQualityError(RuntimeError):
+    """Raised when a generated report is unsafe to push."""
+
+
+_LLM_TAG_PATS = [
+    r"<" + t + r">.*?</" + t + r">"
+    for t in ("thinking", "summary", "tool_use", "file_content")
+]
+
+
+def _strip_llm_tags(text: str) -> str:
+    """Strip internal agent tags (e.g. <summary>) leaked from the system prompt.
+
+    Mirrors frontends/fsapp.py::_clean so autonomous report pipelines never
+    push raw <summary>/<thinking> blocks to Feishu/DingTalk.
+    """
+    for pat in _LLM_TAG_PATS:
+        text = re.sub(pat, "", text or "", flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _validate_report(report):
+    """Block partial/error responses before either notification channel is called."""
+    text = (report or '').strip()
+    bad_markers = ('!!!Error:', 'HTTP 403', 'HTTP 4', 'HTTP 5', '流异常中断', '未收到完整响应', '[!!!')
+    required = ('HelloGitHub', '月度精选', '月刊', '数据来源')
+    markers = [marker for marker in bad_markers if marker in text]
+    missing = [part for part in required if part not in text]
+    if markers:
+        raise ReportQualityError(f'report contains stream interruption marker: {markers}')
+    if missing:
+        raise ReportQualityError(f'report missing required parts: {missing}')
+    if len(text) < 800:
+        raise ReportQualityError(f'report too short: {len(text)} chars')
+    return text
 
 
 def fetch_monthly_featured(year=None, month=None, pages=3):
@@ -149,11 +186,11 @@ def run():
 """
 
     print("\n🤖 AI 生成报告中...")
-    cfg = next((v for k, v in mykeys.items() if 'native' in k and 'claude' in k), None)
-    sess = NativeClaudeSession(cfg=cfg)
+    sess = build_mixin_session()
+    print(f"   统一 Mixin：{sess.name}")
     msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
-    report = ''.join(sess.ask(msg))
-    print(f"✅ 报告生成完成 ({len(report)}字)")
+    report = _validate_report(_strip_llm_tags(''.join(sess.ask(msg))))
+    print(f"✅ 报告生成完成并通过质量校验 ({len(report)}字)")
 
     # 推送
     print("📤 推送飞书...")

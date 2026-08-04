@@ -1,0 +1,7 @@
+{
+  "schedule": "11:00",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 6,
+  "prompt": "执行以下代码，完成后只推送一次，不要中途推送：\n```python\nimport subprocess, sys\nr = subprocess.run([sys.executable, '/Users/cuip/projects/GenericAgent/birdie_monitor/birdie_daily.py'], text=True, capture_output=True, timeout=280)\nprint('exit:', r.returncode)\nprint(r.stdout)\nif r.returncode != 0:\n    print(r.stderr, file=sys.stderr)\n```\n注意：脚本内部已包含签到、按关键词(AI Agent/AI coding/AI应用开发/出海SaaS/Vibe Coding/Claude Code/AI创业/独立开发出海/SaaS出海/MCP教程/AI产品出海/懂王/鸡翅大模型/赋范)搜索BirdieSearch.com、解析真实网盘链接(百度网盘/夸克网盘)、本地去重、并已自行完成飞书私信+钉钉群通知，脚本内部只在有新增命中或搜索额度用尽时才推送一次。不要额外调用其他通知函数，也不要重复推送脚本已经发送过的内容。脚本stdout中的“今日无新增命中”且没有推送动作时属于正常静默，无需额外通知。"
+}

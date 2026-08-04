@@ -114,3 +114,25 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
   2. `run()`：重试后仍全空 → **不 build/send 降级文案到正式渠道**(飞书群/钉钉群),返回 `{skipped:True, reason:'empty_after_retries'}` 且**不认领当日 state** → 后续定时轮次/手动 `--force` 仍能补发真正有内容的报。避免把「暂无情报」推给全员。
 - 补发命令：`python3 sche_tasks/run_trendradar_digest.py --period morning --force`(先 `--dry-run --force` 验证有内容再正式发)。ga_mcp_client 正确接口是 `call_sync(server,tool,args)`(非 call_tool)。
 - 教训：外部数据源「偶发返空」要在**取材层做退避重试**(时序抖动多半自愈),并在**推送层设空数据闸门**(仍空则跳过而非发降级文案)。二者配合:重试兜住偶发空窗,闸门兜住真·无数据。
+
+## 11. tech_trends 单源无保护炸穿 run() + 死锁阻断补跑（2026-07-25）
+- 现象：早上 tech_trends 情报整份没推(三通道全无)。查 `reflect_logs/scheduler_*.log` 见进程在 `fetch_hf` 阶段崩溃、无 RUN_DONE。
+- 根因1(炸穿)：`run_tech_trends.py` 的 `fetch_hf`(HuggingFace)顶层 `requests.get` **无 try/except**,huggingface.co 超时(境外站点分流不通,同日 CoinGecko 也连超时)直接抛异常炸穿整个 `run()`,后面 GitHub/HN/Trendshift 的数据和推送全部没执行。对照 `fetch_trendshift` 本就有 try/except 返回 `[]` 优雅降级。
+- 根因2(死锁阻断补跑)：崩溃进程留下 0 字节死锁 `/tmp/tech_trends_DATE.lock`(O_EXCL 按日锁),补跑时被「已有同日进程持锁」误拦。**注意锁正常完成后也不主动删,靠次日换文件名+状态文件双保险**;同日崩溃后手动补跑需先确认无进程(`ps aux|grep run_tech_trends`)再 `rm` 死锁。
+- 根治(已改)：`fetch_github`/`fetch_hn`/`fetch_hf` 三个顶层请求全部包 try/except 失败 print 告警 + 返回 `[]`,任一源挂掉都能用其余源照常出报告推送。`py_compile` 通过。
+- 补跑安全性判据：`_mark_sent` 在**报告生成后、推送前**才写状态文件(`output/.tech_trends_push_state.json`)。崩在 fetch(更早)→状态文件必无今日记录→清死锁后直接 `run()` 正常补跑即可(不需 force,幂等闸门反而是保护)。补跑命令:清死锁后 `python3 -c "import sys;sys.path.insert(0,'sche_tasks');from run_tech_trends import run;run()"`。
+- 通用教训：凡对外部源逐个取材的脚本,**每个源的顶层网络请求都必须独立 try/except 降级返回空**,严禁任一源异常炸穿主流程导致整份产出丢失。这是比「加重试」更稳的根治——境外网络可能持续不通,降级能保证有几分数据出几分报告。
+
+## 12. TrendRadar 晨报 LLM 流式中断 → 半截报告仍被推送（2026-07-25）
+- 现象：用户截图 07-25 10:00 IT情报晨报,正文在「💻 芯片GPU」段后直接出现 `[!!! 流异常中断，未收到完整响应 !!!]`,后半截(开源工具/Linux.do 等)全缺,但仍照常推给三通道。**这不是"格式没按 SOP",是半成品报告被当正式报推送**。
+- 根因：`run_trendradar_digest.py` 的 `build_report()` 把 `sess.ask()` 的流式返回直接拼成字符串返回,LLM 流中途断开时,llmcore 会在文本里插入 `[!!! 流异常中断，未收到完整响应 !!!]` 占位符——但 `build_report` **不校验**,`run()` 拿到就 `report_path.write_text()` 再 `send_once()`,半截内容照发。与第 10 章"空数据"不同:那是取材层空,这是**生成层残缺**,原代码两道闸门都没覆盖生成层。
+- 根治(已实现)：新增 `class ReportQualityError` + `_validate_report_quality(period, report)`,检测三类问题→抛错:①流中断标记(`流异常中断`/`未收到完整响应`/`[!!!`);②缺必备结构(`IT情报{晨/晚}报`/当日 date/`📡 数据来源：TrendRadar`/`ARCHIVE_URL`);③正文 `<1800` 字(正常晨报约 1900+)。`build_report` 返回前调用校验;`run()` 里 `build_report` 最多试 **2 次**,仍失败则写 `trendradar_{period}_{date}.failed.txt` 并返回 `{skipped_bad_report:True, reason:'bad_report_quality'}`——**不写正式 .txt、不 send、不认领 state**,后续 `--force` 可补发。`py_compile` 通过。
+- 补发验证：`--dry-run --force` 先看正文(注意 dry-run 也会覆盖写 .txt),grep 确认无中断标记 + 有尾部,再 `--force` 正式发。本次补发成功:`2026-07-25:morning` state `sent_at=11:55:37`,三通道 OK,终版 1843 字无残缺。
+- 通用教训：**凡"LLM 流式生成→直接推送"的链路,推送前必须有质量闸门检出流中断占位符/结构残缺/异常过短并阻断推送+可重试**。生成层残缺和取材层空数据是两类独立故障,闸门要分别覆盖:取材空→跳过(第10章),生成残→重试后跳过(本章)。
+
+## 13. 三定时任务改用 mykey 统一跨模型兜底 build_mixin_session（2026-07-28）
+- 背景：tech_trends/trendradar_digest/hellogithub_monthly 原来各自手写单一模型绑定(如直连 claude-opus-4-8),该模型无权限时无兜底,整份推送失败。
+- 根治：`llmcore.py` 新增 `build_mixin_session(cfg=None)`，读 `mykey.py:mixin_config`(含 `llm_nos`/`max_retries`/`base_delay`)构造 `MixinSession`，三脚本统一改调它 `.ask(msg)`，任一节点 4xx/5xx 失败自动滚动到下一节点。以后只需维护 `mykey.py:mixin_config.llm_nos` 顺序，不用逐脚本改代码。
+- **坑点(踩过)**：`mixin_config.llm_nos` 存的是各 native 配置内部的**显示名**(如 `claude-relay`/`gpt-native`/`claude-router`/`micu-grok`)，**不是** `mykey.mykeys` 的顶层配置键名(如 `native_claude_config0`)。若直接拿 `llm_nos` 里的字符串去 `resolve_client(name)`/字典查找会 100% 报 `Config not in mykey`。正确做法(仿 `agentmain.py` 的 `load_llm_sessions`)：先把 `mykeys` 里所有 native_*/oai_* 配置都跑一遍 `resolve_client` 拿到全量 client 列表，再按每个 client 的 `backend.name` 去匹配 `llm_nos` 里的名字筛选/排序。
+- 验证手法：`py_compile` 全过 → 构造 `MixinSession` 实例断言节点数/名字 → 用 FakeBackend 模拟 504 验证 failover 滚动到下一节点 → 真实网络调用一次 `build_mixin_session().ask()` 确认端到端有效回复(非 mock)。
+

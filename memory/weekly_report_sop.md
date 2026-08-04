@@ -63,7 +63,7 @@ Sam，您好：
 6. **生成 HTML body**: 写入临时文件 `temp/weekly_body.html`
 7. **创建 reply 草稿**: `lark-cli mail +reply --message-id <上周已发送message_id> --to sam.zhang@smyze-ch.com --body <HTML>`
 8. **如需调整正文**: 对 reply 草稿使用 `+draft-edit` 的 patch `set_reply_body`，只替换本次新增内容，**保留 quoted content**，实现“上方本周新内容 + 下方上周已发送引用”的追加回复效果
-9. **修正主题/收件人**: 必要时用 `+draft-edit` 修正 subject / recipients，但不要用 `set_body` 覆盖整个 reply，除非明确要移除引用
+9. **修正主题/收件人**: 用 `+draft-edit --set-to 'sam.zhang@smyze-ch.com'`（整体替换 To，剔除被追加进来的自己）与 `--set-subject 'Re: 【周报】-崔朋（YYYY.MM.DD - YYYY.MM.DD）'`；不要用 `set_body` 覆盖整个 reply，除非明确要移除引用
 10. **飞书通知用户**: `notify_feishu("📋 周报草稿已生成，请检查草稿箱后确认发送")`
 11. **等用户确认后发送**: `lark-cli mail user_mailbox.drafts send --params '{"user_mailbox_id":"me","draft_id":"<ID>"}'`
 
@@ -79,7 +79,7 @@ Sam，您好：
 - **【血泪事故·2026-07-03】周报漏读群聊而报告谎称已读**：当次会话 checkpoint 已完整存下群聊步骤，但因 SOP 旧措辞"群聊补充/仅新增数据源"把强制步骤弱化为可选，执行时跑完 git→正文→邮件草稿→通知就自认闭环跳过了群聊；更严重的是 done 报告照搬记忆里的计划文本"脑补"写成"两群内外均读"，实际一条 `chat-messages-list` 都没发。根治：群聊已升级为【强制步骤】，并新增上方"完成判定门槛"硬校验——报告必须附每群实际返回条数，杜绝自述蒙混。
 - **git --since/--until 必须带 `T00:00:00+08:00`**：裸日期 `--since=2026-06-08` 会被 git 用当前时刻补全时间部分，导致当天早于该时刻的 commits 静默丢失（致命级，曾导致 hotfix 3 条严重 bug 修复全部漏报）
 - `lark-cli mail +reply` 默认只存草稿不发送 ✅
-- `+reply` 的 `--to` 会覆盖原始收件人列表，必须显式指定仅 sam.zhang
+- **【实锤·2026-07-24】`+reply --to` 是"追加到原发件人"而非覆盖**：reply 自己发的周报时原发件人=自己，`--to sam` 只会追加 → 收件人变成 `[自己, sam]`（07-17 现象）；本周甚至新建邮件只发自己。因此 step 7 建 reply 后**必须**再用 `+draft-edit --set-to 'sam.zhang@smyze-ch.com'`（`--set-to` 是整体替换 To），把自己剔除，仅剩 sam；随后跑 verify 投递闸门确认 To 精确等于 sam
 - `+draft-edit --set-subject` 可修正自动回复主题中的日期
 - bash 中执行 Python 代码需用 `type: python`，不能混用
 - HTML body 含中文/特殊字符时，通过文件读取传参比命令行直接传更稳定
@@ -87,9 +87,11 @@ Sam，您好：
 - 若用户要“追加回复”效果，必须使用 `set_reply_body` 保留 `has_quoted_content=true` 的引用块；误用 `set_body` 会把 reply 变成仅剩新正文
 - **【版式根治·2026-07-10】格式反复出错的真因＝我每次徒手写 HTML，靠"记住 SOP 文字"必漂移。文字规范不是控制力，代码才是。已把版式变成可执行工具链，以后禁止徒手写正文 HTML：**
   - 生成：`weekly_report_gen.py content.json -o weekly_body.html` —— LLM 只产 content.json（纯内容数据，schema 见脚本顶部），HTML 每层包裹标签由脚本固定，无法漂移
-  - 校验：`weekly_report_verify.py --draft-id <ID>` —— 发用户前的强制闸门，机械检查：加粗数字标题/真`<ul>`列表/无`（一）`中文括号编号/无手打`•`/引用块保留/主题全角括号+Re空格；ALL PASS(退出码0)才可通知，任何 FAIL 先修正
+  - 校验：`weekly_report_verify.py --draft-id <ID>` —— 发用户前的强制闸门，机械检查：加粗数字标题/真`<ul>`列表/无`（一）`中文括号编号/无手打`•`/引用块保留/主题全角括号+Re空格/**引言干净一行(『工作汇报。』与『一、』之间禁任何导语)**/**投递安全(To 精确等于 sam.zhang@smyze-ch.com、禁止 peng.cui@smyze.cn、必须有 reply 线程证据)**；ALL PASS(退出码0)才可通知，任何 FAIL 先修正
   - 定时任务 prompt 已改为强制走「git→content.json→gen→draft-edit→verify→通过才通知」
   - 校验只针对引用块之前的正文（历史引用邮件改不了，不参与内容校验）
+- **【P0发送事故·2026-07-24】周报发错人且不是 reply＝投递安全没有机械闸门**：用户指出“为啥发给我自己，发错人了”。工具核验真实邮件元数据：本周已发送邮件 `message_id=NzUyMzMyYmItY2FiYi00ODgyLWFmZjgtY2MzN2NlYzVhNjI1` 的 `To=['peng.cui@smyze.cn']`、`in_reply_to=None`、`thread_id==message_id`，实锤是**新建邮件且只发给自己，没有发给 sam**；进一步对比 2026-07-17 周报也发现 `To=['peng.cui@smyze.cn','sam.zhang@smyze-ch.com']` 且 `in_reply_to=None`，说明发送链路长期未强制 reply、未强制“收件人仅 Sam”。根治：`weekly_report_verify.py --draft-id <ID>` 新增投递安全硬闸，发送/通知前必须回读线上草稿或邮件元数据并机械校验：① To 精确等于 `['sam.zhang@smyze-ch.com']`；② To 禁止包含 `peng.cui@smyze.cn`；③ 必须有 reply 线程证据（`in_reply_to` 存在或 `thread_id != message_id`）。用 07-24 错误邮件实测已 FAIL：缺 Sam/发自己/非 reply 均被拦截。教训：**收件人与线程属于 P0，不得用“预览发自己”替代；凡未通过线上草稿投递安全校验，一律禁止通知用户发送，更禁止直接发送。**
+- **【版式再漂移·2026-07-24】intro 塞概述导语＝工具链有了但内容闸门有洞**：本周 content.json 的 `intro` 写成"以下是本周…的工作汇报。**本周共提交53次…缺陷修复占比约58%…主要精力集中在统一权限体系…**"——把 SOP line 28 明令禁止的概述导语和 bug 占比一并塞进引言。gen 脚本忠实渲染（结构没漂），但 verify 旧的 7 项只查 HTML 结构，**没人管引言正文写了什么**，于是违规版顺利过闸并发到自己邮箱预览被用户逮到。根治：verify 新增第 8 项机械闸门「引言干净一行」——纯文本里『工作汇报。』与『一、』之间必须为空，任何字符即 FAIL；bug 占比/提交数按 line 39 只能放「一、」末尾 bullet。教训：**光锁结构不锁内容仍会漏；凡 SOP 用文字规定的"禁止写 X"，都要有对应机械 check，否则等于没规定。**
 - **【版式事故·2026-07-10 原始记录】**：用户投诉"格式又不对"。根因＝用了 `（一）（二）` 中文括号编号 + `&nbsp;&nbsp;•` 手打符号 + 纯黑字，而上周已发送周报是飞书富文本。修正基准＝上周已发送那封的 body_html。此坑现已被上方工具链根治。
   - 段落/标题：`<div style="margin-top:4px;margin-bottom:4px;line-height:1.8"><div dir="auto" class="" style="font-size:16px"><span style="font-size:14px"><span style="font-family:-apple-system, &quot;PingFang SC&quot;, sans-serif"><span style="color:rgb(51, 51, 51)">…</span></span></span></div></div>`
   - 一级章节 `一、二、三、` 与二级小标题 `1. 2. 3.`（阿拉伯数字，**非**中文括号）都用 `<b>…</b>` 加粗

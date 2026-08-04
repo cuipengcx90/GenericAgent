@@ -27,10 +27,27 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from ga_mcp_client import call_sync, list_tools_sync  # noqa: E402
-from llmcore import NativeClaudeSession, mykeys  # noqa: E402
+from llmcore import build_mixin_session  # noqa: E402
 from reflect_scripts.reflect_common import notify_feishu  # noqa: E402
 from reflect_scripts.notify_feishu_group import notify_group as notify_feishu_group  # noqa: E402
 from reflect_scripts.notify_dingtalk_group import notify_group as notify_dingtalk_group  # noqa: E402
+
+_LLM_TAG_PATS = [
+    r"<" + t + r">.*?</" + t + r">"
+    for t in ("thinking", "summary", "tool_use", "file_content")
+]
+
+
+def _strip_llm_tags(text: str) -> str:
+    """Strip internal agent tags (e.g. <summary>) leaked from the system prompt.
+
+    Mirrors frontends/fsapp.py::_clean so autonomous report pipelines never
+    push raw <summary>/<thinking> blocks to Feishu/DingTalk.
+    """
+    for pat in _LLM_TAG_PATS:
+        text = re.sub(pat, "", text or "", flags=re.DOTALL)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
 
 OUT_DIR = ROOT / 'output'
 STATE_PATH = OUT_DIR / '.trendradar_digest_state.json'
@@ -264,6 +281,36 @@ def _fetch_material_once(period: str) -> dict[str, Any]:
     return material
 
 
+class ReportQualityError(RuntimeError):
+    def __init__(self, msg: str, report: str = ''):
+        super().__init__(msg)
+        self.report = report  # 保留失败时的真实生成文本，便于人工核查/降级兜底
+
+
+def _validate_report_quality(period: str, report: str) -> None:
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    title_word = '晨报' if period == 'morning' else '晚报'
+    required = [
+        f'IT情报{title_word}',
+        date_str,
+        '📡 数据来源：TrendRadar',
+        ARCHIVE_URL,
+    ]
+    bad_markers = [
+        '流异常中断',
+        '未收到完整响应',
+        '[!!!',
+    ]
+    missing = [s for s in required if s not in report]
+    markers = [s for s in bad_markers if s in report]
+    if markers:
+        raise ReportQualityError(f'report contains stream interruption marker: {markers}', report=report)
+    if missing:
+        raise ReportQualityError(f'report missing required parts: {missing}', report=report)
+    if len(report.strip()) < 1800:
+        raise ReportQualityError(f'report too short: {len(report.strip())} chars', report=report)
+
+
 def build_report(period: str, material: dict[str, Any]) -> str:
     date_str = datetime.now().strftime('%Y-%m-%d')
     title_word = '晨报' if period == 'morning' else '晚报'
@@ -285,16 +332,15 @@ def build_report(period: str, material: dict[str, Any]) -> str:
 数据 JSON（TrendRadar 关键词命中 + RSS 全量，其中 RSS 已含 Linux.do 社区热帖来源）：
 {json.dumps(material, ensure_ascii=False, default=str)[:60000]}
 """
-    cfg = next((v for k, v in mykeys.items() if 'native' in k and 'claude' in k), None)
-    if not cfg:
-        raise RuntimeError('No native claude config found in mykeys')
-    sess = NativeClaudeSession(cfg=cfg)
+    sess = build_mixin_session()
+    print(f'🤖 报告生成（统一 Mixin：{sess.name}）')
     msg = {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}
-    report = ''.join(sess.ask(msg)).strip()
+    report = _strip_llm_tags(''.join(sess.ask(msg))).strip()
     if f'IT情报{title_word}' not in report:
         report = f'{icon} **IT情报{title_word} · {date_str}**\n\n' + report
     if ARCHIVE_URL not in report:
         report = report.rstrip() + f'\n\n📚 历史归档全览：{ARCHIVE_URL}\n（同 WiFi 且本机开机时可访问）'
+    _validate_report_quality(period, report)
     return report
 
 
@@ -425,7 +471,63 @@ def run(period: str, dry_run: bool = False, force: bool = False, self_test: bool
             }
 
         report_path = OUT_DIR / f'trendradar_{period}_{date_str}.txt'
-        report = build_report(period, material)
+        last_error = None
+        report = ''
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            try:
+                report = build_report(period, material)
+                break
+            except ReportQualityError as e:
+                last_error = f'{type(e).__name__}: {e}'
+                last_report = e.report
+                print(f'[run] report quality failed, attempt {attempt}/{max_attempts}: {last_error}', file=sys.stderr)
+                if attempt >= max_attempts:
+                    fail_path = OUT_DIR / f'trendradar_{period}_{date_str}.failed.txt'
+                    fail_path.write_text(last_report or last_error or '', encoding='utf-8')
+                    title_word = '晨报' if period == 'morning' else '晚报'
+                    # 只有"内容太短"这一种失败原因、且确实拿到了非空正文时才降级发送；
+                    # 缺失必需片段/流中断标记仍视为真正的生成故障，继续跳过不发。
+                    only_too_short = (
+                        'too short' in str(e)
+                        and 'missing required parts' not in str(e)
+                        and 'stream interruption' not in str(e)
+                    )
+                    if only_too_short and last_report.strip():
+                        report = (
+                            f'⚠️（今日素材较少，篇幅低于常规标准，仍完整发送）\n\n'
+                            + last_report
+                        )
+                        report_path.write_text(report, encoding='utf-8')
+                        send_result = send_once(period, report, dry_run=dry_run, force=force)
+                        return {
+                            'period': period,
+                            'report_path': str(report_path),
+                            'material_path': str(material_path),
+                            'chars': len(report),
+                            'degraded_send': True,
+                            'degrade_reason': last_error,
+                            'send': send_result,
+                        }
+                    alert = (
+                        f'⚠️ TrendRadar {title_word}生成失败（{date_str}），已跳过推送\n'
+                        f'重试 {max_attempts} 次后仍未通过质量校验，最后一次错误：\n{last_error}\n'
+                        f'详情见: {fail_path}'
+                    )
+
+                    try:
+                        notify_feishu(alert)
+                    except Exception as notify_err:
+                        print(f'[run] failure alert also failed to send: {notify_err}', file=sys.stderr)
+                    return {
+                        'period': period,
+                        'material_path': str(material_path),
+                        'report_failed_path': str(fail_path),
+                        'skipped_bad_report': True,
+                        'send': {'skipped': True, 'reason': 'bad_report_quality', 'error': last_error},
+                    }
+                # 504/网关抖动通常几十秒到几分钟内会恢复，重试前退避等待
+                time.sleep(20 * attempt)
         report_path.write_text(report, encoding='utf-8')
         send_result = send_once(period, report, dry_run=dry_run, force=force)
         return {

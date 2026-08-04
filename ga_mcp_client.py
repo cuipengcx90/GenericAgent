@@ -42,17 +42,25 @@ def _load_config() -> dict[str, Any]:
 
 
 def _resolve_env(env_dict: dict[str, str] | None) -> dict[str, str] | None:
-    """解析环境变量中的 ${VAR} 引用"""
+    """解析环境变量中的 ${VAR} 引用，并与当前os.environ合并（用于子进程env）"""
     if not env_dict:
         return None
+    resolved = _resolve_refs(env_dict)
+    return {**os.environ, **resolved}
+
+
+def _resolve_refs(d: dict[str, str] | None) -> dict[str, str] | None:
+    """仅解析 ${VAR} 引用，不与os.environ合并（用于HTTP headers等场景）"""
+    if not d:
+        return None
     resolved = {}
-    for k, v in env_dict.items():
+    for k, v in d.items():
         if v.startswith("${") and v.endswith("}"):
             env_name = v[2:-1]
             resolved[k] = os.environ.get(env_name, "")
         else:
             resolved[k] = v
-    return {**os.environ, **resolved}
+    return resolved
 
 
 def _detect_transport(config: dict[str, Any]) -> str:
@@ -123,7 +131,10 @@ class MCPClient:
 
     async def _connect_http(self) -> None:
         url = self.config["url"]
-        transport = await self._stack.enter_async_context(streamablehttp_client(url))
+        headers = _resolve_refs(self.config.get("headers"))
+        transport = await self._stack.enter_async_context(
+            streamablehttp_client(url, headers=headers)
+        )
         read, write, _get_session_id = transport
         session = await self._stack.enter_async_context(ClientSession(read, write))
         await session.initialize()

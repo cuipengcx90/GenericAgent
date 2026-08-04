@@ -260,7 +260,7 @@ APP_ID = str(mykeys.get("fs_app_id", "") or "").strip()
 APP_SECRET = str(mykeys.get("fs_app_secret", "") or "").strip()
 ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
-AGENT_TIMEOUT_SEC = 900
+AGENT_TIMEOUT_SEC = 3600  # was 900; other frontends (tg/streamlit/qt/discord) have no hard cutoff at all
 FEISHU_CLIENT_TIMEOUT_SEC = 8
 CARD_PATCH_WARN_SEC = 2.0
 
