@@ -107,6 +107,17 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 
 ## 10. 空数据自愈：取材全 0 时退避重试 + 仍空跳过（2026-07-22）
 - 现象：用户收到晨报正文「关键词命中 0 条、RSS 全量 0 条，暂无可用情报」。这**不是报错/崩溃**，是 digest 遇空数据时的诚实降级文案（不瞎编来源）。截图排查用 `vision_utils.ask_vision(img, prompt, backend='openai')`（claude 后端代理挂时报 400，换 openai 后端）。
+
+## 11. LLM思考过程污染报告推送（2026-08-12）
+- 现象：飞书私信收到的晨报/晚报**开头70+行是LLM的思考过程**（"用户要求我基于提供的TrendRadar MCP数据..."、"关键要求："、"先分析数据："、"让我浏览数据找出重要条目"），真正报告正文从`## 🤖 大模型`等分类标题才开始。
+- 根因：`build_report` 的prompt虽明确要求"只输出报告正文，不要过程说明"（L330），但**LLM模型不遵守指令**，把prompt要求全部回显并在标题行后继续输出完整分析过程，再输出正文。旧代码只调用`_strip_llm_tags`剥内部标签（`<summary>`等），未过滤CoT(Chain of Thought)文本。
+- 根治（`run_trendradar_digest.py` L338-353，2026-08-12）：`build_report`获取LLM输出后，**双重定位过滤**：
+  ① 找到标题行位置：`{icon} **IT情报{晨报|晚报}`
+  ② 从标题后找第一个分类标题：`## 🤖`/`🎨`/`🛠`/`🔒`/`💎`等（正则`^##\s+[🤖🎨🛠🔒💎📱]`）
+  ③ 重构报告：`标题行 + \n\n + 分类标题开始的内容`，丢弃标题后、分类前的所有思考过程行
+- 实测：2026-08-12晨报原始3318字符，标题后71行是思考过程→过滤后1630字符干净正文，无"用户要求我"/"先分析数据"等残留。
+- 教训：**LLM生成面向用户的报告时，prompt约束不可靠，必须后处理过滤**。寻找报告真正内容的结构化标记（分类标题、固定格式等）做锚点切割，而非依赖"请不要输出XX"。
+- 校验：`grep -E "用户要求我|关键要求：|先分析数据|让我浏览数据" output/trendradar_{morning,evening}_$(date +%Y-%m-%d).txt`应无匹配；飞书私信报告直接以`🌅 **IT情报晨报`或`🌙 **IT情报晚报`开头，紧跟分类标题。
 - 根因：脚本运行那一刻(约 10:00 晨报窗口)MCP `get_latest_rss`/`search_news` 返回 `success:True` 但 `data:[]`/`total:0`——上游 TrendRadar 容器正处**重启中或当日首轮爬虫未抓完**的空窗期。稍后实测即恢复(RSS 314 条含 Linux.do 30)。属**偶发时序**，非配置/代码故障。
 - ★判空铁律★：`success:True` **不等于**有数据。健康的 TrendRadar RSS 应是几百条；`total:0` 且 queries 也全 0 = 空窗。判空要数 `rss.summary.total` + 每个 query 的 `result.total`，二者皆 0 才算全空(见 `_material_counts`)。
 - 根治(已实现,`run_trendradar_digest.py`)：
@@ -135,4 +146,10 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - 根治：`llmcore.py` 新增 `build_mixin_session(cfg=None)`，读 `mykey.py:mixin_config`(含 `llm_nos`/`max_retries`/`base_delay`)构造 `MixinSession`，三脚本统一改调它 `.ask(msg)`，任一节点 4xx/5xx 失败自动滚动到下一节点。以后只需维护 `mykey.py:mixin_config.llm_nos` 顺序，不用逐脚本改代码。
 - **坑点(踩过)**：`mixin_config.llm_nos` 存的是各 native 配置内部的**显示名**(如 `claude-relay`/`gpt-native`/`claude-router`/`micu-grok`)，**不是** `mykey.mykeys` 的顶层配置键名(如 `native_claude_config0`)。若直接拿 `llm_nos` 里的字符串去 `resolve_client(name)`/字典查找会 100% 报 `Config not in mykey`。正确做法(仿 `agentmain.py` 的 `load_llm_sessions`)：先把 `mykeys` 里所有 native_*/oai_* 配置都跑一遍 `resolve_client` 拿到全量 client 列表，再按每个 client 的 `backend.name` 去匹配 `llm_nos` 里的名字筛选/排序。
 - 验证手法：`py_compile` 全过 → 构造 `MixinSession` 实例断言节点数/名字 → 用 FakeBackend 模拟 504 验证 failover 滚动到下一节点 → 真实网络调用一次 `build_mixin_session().ask()` 确认端到端有效回复(非 mock)。
+
+## 14. run_trendradar_digest.py 单次执行长达10+分钟 → 工具层超时误判 + 僵尸锁排查（2026-08-06 实战）
+- 现象：定时任务直接同步跑 `python3 sche_tasks/run_trendradar_digest.py --period morning`，被上层工具 60s/300s 超时打断两次；但底层 python 子进程**不受工具超时影响**，独立跑到 ~13 分钟后（LLM 生成+质量重试链路）才结束，此时锁已被 `finally: _release_lock(lock)` 正常释放，但因中途工具层已"认为"失败，未等到真实产物就返回，未留下 `.txt`/`.failed.txt`。
+- 排障法：锁文件 `output/.trendradar_locks/{period}_{date}.lock` 内容含 `pid=<PID> at=<ISO时间>`；若再次运行时因 `O_EXCL` 拿不到锁，先 `cat` 锁文件取 pid，`ps -p <pid>` 判活——进程已不存在即僵尸锁（前次被工具层打断但子进程已跑完/锁已释放），可安全 `rm` 后重跑；进程仍存在则说明前次仍在跑，不要并发起第二个实例，转为轮询等待。
+- 正确做法：改用 `nohup python3 sche_tasks/run_trendradar_digest.py --period morning > /tmp/xxx.log 2>&1 &` 后台启动拿到 pid，用 `ps -p <pid>` 轮询（每 20-25s 一次）等待进程结束，再读日志判断真实 `sent`/`skipped`/`degraded_send` 结果，避免被工具 60/300s 超时误判为失败而重复触发。
+- 代码实测更新（与本文件 §12 旧描述有出入，以此为准）：`run()` 里 `build_report` 实际 `max_attempts = 4`（非旧文档写的 2 次）。第 4 次仍失败时，若失败原因**仅是"内容过短"**（`'too short' in str(e)` 且不含 `missing required parts`/`stream interruption`）且拿到的 `last_report` 非空，会走**降级发送**分支：给正文加 `⚠️（今日素材较少，篇幅低于常规标准，仍完整发送）` 前缀后照常写 `.txt` + `send_once()`，返回 `degraded_send: True`（**非 skipped**，三通道仍会收到）；只有缺失必需结构片段或含流中断标记时才真正 `skipped_bad_report`（写 `.failed.txt`，不发送）。
 

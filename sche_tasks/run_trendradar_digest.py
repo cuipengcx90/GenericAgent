@@ -336,6 +336,31 @@ def build_report(period: str, material: dict[str, Any]) -> str:
     print(f'🤖 报告生成（统一 Mixin：{sess.name}）')
     msg = {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}
     report = _strip_llm_tags(''.join(sess.ask(msg))).strip()
+    
+    # 🔧 过滤LLM思考过程：定位真正报告开头（标题+第一个分类标题）
+    title_pattern = f'{icon} **IT情报{title_word}'
+    if title_pattern in report:
+        title_idx = report.find(title_pattern)
+        # 从标题后查找第一个分类标题（## + emoji）
+        import re
+        lines = report[title_idx:].split('\n')
+        category_start = 0
+        for i, line in enumerate(lines):
+            if re.match(r'^##\s+[🤖🎨🛠🔒💎📱]', line.strip()):
+                category_start = i
+                break
+        
+        if category_start > 1:  # 标题和分类标题之间有思考过程
+            # 重构报告：标题行 + 分类标题开始的内容
+            title_line = lines[0]
+            content_from_category = '\n'.join(lines[category_start:])
+            report = f'{title_line}\n\n{content_from_category}'
+            print(f'⚠️  已过滤标题后的 {category_start-1} 行思考过程')
+        elif title_idx > 0:  # 只有标题前有思考过程
+            removed = report[:title_idx].strip()
+            report = report[title_idx:].strip()
+            print(f'⚠️  已过滤 {len(removed)} 字符的前置思考过程')
+    
     if f'IT情报{title_word}' not in report:
         report = f'{icon} **IT情报{title_word} · {date_str}**\n\n' + report
     if ARCHIVE_URL not in report:
