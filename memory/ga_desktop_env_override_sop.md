@@ -30,8 +30,10 @@ bridge 子进程跑 `agentmain.py` + `/opt/anaconda3/bin/python3` 即接管成�
 
 ## [更新 2026-07-18] 上游已原生化桌面接管
 origin/main 合并后, 桌面 App 接管机制升级为"方案三": 不再改 project_dir, 改用 `GA_ROOT` env 注入外部源码 (`sanitize_bundle_env` 实现)。
-本地 lib.rs 原 `forced_project_dir`/`forced_python` 显式覆盖分支已在 merge 时移除(采上游侧); `forced_*` 函数定义仍保留但覆盖入口已废。
 含义: 让安装版 .app 跑本地源码, 现应"设置 external GA source → 注入 GA_ROOT"再重签二进制, 而非旧的 force 覆盖 settings。
+
+## [更新 2026-08-05 已实测] forced_project_dir 覆盖分支实际未废, 与方案三并存
+之前(07-18)记录"forced_project_dir/forced_python 覆盖分支已在 merge 时移除"**不准确**——2026-08-05 rebase 本地 main 到最新 origin/main 后, 实测 `find_project_dir()`(163行) 和 `get_or_discover_config()`(426行) 均仍保留 `forced_project_dir()` 优先判断("Explicit developer override always wins"), 与方案三 `GA_ROOT` 注入(531行 `valid_ga_source_override`)**并存不冲突**: forced_* 是开发者显式指定本地源码路径的旧覆盖法(仍生效, 优先级最高), 方案三是面向普通用户"设置 external GA source"的新推荐法。两套机制互不排斥, 遇到 lib.rs 冲突按"两边都保留"合并即可, 不要按旧记录误删 forced_* 分支。
 环境坑记录: 本次会话 code_run/file_read 的 stdout 展示层被缓存污染(返回旧输出/空), 全程靠进程 exit_code 编码判定结果, stdout 不可信。
 
 ## [更新 2026-07-18 已实测] 方案三接管步骤(★取代上面旧 force 补丁法★)

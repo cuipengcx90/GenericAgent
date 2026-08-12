@@ -341,12 +341,12 @@ def build_report(period: str, material: dict[str, Any]) -> str:
     title_pattern = f'{icon} **IT情报{title_word}'
     if title_pattern in report:
         title_idx = report.find(title_pattern)
-        # 从标题后查找第一个分类标题（## + emoji）
+        # 从标题后查找第一个分类标题（## 开头）
         import re
         lines = report[title_idx:].split('\n')
         category_start = 0
         for i, line in enumerate(lines):
-            if re.match(r'^##\s+[🤖🎨🛠🔒💎📱]', line.strip()):
+            if re.match(r'^##\s+', line.strip()):
                 category_start = i
                 break
         

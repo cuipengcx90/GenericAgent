@@ -81,6 +81,7 @@ Sam，您好：
 - `lark-cli mail +reply` 默认只存草稿不发送 ✅
 - **【实锤·2026-07-24】`+reply --to` 是"追加到原发件人"而非覆盖**：reply 自己发的周报时原发件人=自己，`--to sam` 只会追加 → 收件人变成 `[自己, sam]`（07-17 现象）；本周甚至新建邮件只发自己。因此 step 7 建 reply 后**必须**再用 `+draft-edit --set-to 'sam.zhang@smyze-ch.com'`（`--set-to` 是整体替换 To），把自己剔除，仅剩 sam；随后跑 verify 投递闸门确认 To 精确等于 sam
 - `+draft-edit --set-subject` 可修正自动回复主题中的日期
+- **【2026-08-07实测】**`mail +reply` 创建的草稿可能默认填自己为 To、主题为`回复：…`；创建后先 `+draft-edit --inspect` 核对引用块与投递头，再用 patch 的 `set_recipients`、`set_subject`、`set_reply_body` 配合 `allow_protected_header_edits=true` 整体改为仅 Sam/标准 `Re:`，最后必须跑线上 `weekly_report_verify.py --draft-id`。
 - bash 中执行 Python 代码需用 `type: python`，不能混用
 - HTML body 含中文/特殊字符时，通过文件读取传参比命令行直接传更稳定
 - 周报必须基于**上周已发送成功**的周报邮件继续 reply，不能基于历史错误草稿或废弃 reply
