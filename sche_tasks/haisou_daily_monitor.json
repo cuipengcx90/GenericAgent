@@ -1,0 +1,7 @@
+{
+  "schedule": "11:15",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 6,
+  "prompt": "执行以下代码，完成后不要额外重复推送；脚本负责首次基线、增量和异常通知：\n```python\nimport subprocess, sys\nr = subprocess.run([sys.executable, '/Users/cuip/projects/GenericAgent/birdie_monitor/haisou_daily.py'], text=True, capture_output=True, timeout=300)\nprint('exit:', r.returncode)\nprint(r.stdout)\nprint(r.stderr)\n```"
+}
