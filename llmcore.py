@@ -1081,6 +1081,7 @@ class MixinSession:
         'stream', 'connect_timeout', 'read_timeout', 'temperature', 'max_tokens',
         'reasoning_effort', 'service_tier', 'thinking_type',
         'thinking_budget_tokens', 'omit_thinking', 'proxies', 'verify',
+        'max_retries', 'base_delay', 'max_retry_after',
     })
     _FACADE_STATE = frozenset({'name', 'history', 'system', 'tools', 'lock'})
 

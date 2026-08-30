@@ -19,6 +19,10 @@
 - `web_scan` 仅读当前页不导航，切换网站用 `web_execute_js` + `location.href='url'`
 - ⚠导航与后续操作**必须拆成两次调用**：同一段JS内 `location.href` 后继续操作→报错`Inspected target navigated or closed`（页面已换执行上下文销毁）。先导航→等加载→再单独执行操作
 
+## X 时间线采集（2026-08-17 实测）
+- `TMWebDriver.execute_js()` 的返回可能是 `{'data': value}`；采集前需解包，勿直接按顶层列表判断。
+- X 个人主页导航后固定 sleep 会在异步时间线渲染前得到 0 条；轮询 `[data-testid="tweet"]` 数量至大于 0（设总超时）后，再执行提取 JS。已实测采得 3 帖，SQLite 按 status URL 去重后二次运行新增为 0。
+
 ## Google图搜
 - class名混淆禁硬编码，点击结果用 `[role=button]` div
 - web_scan过滤边栏，弹出后用JS：文本`document.body.innerText`，大图遍历img按`naturalWidth`最大取src

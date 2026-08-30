@@ -41,7 +41,13 @@ Sam，您好：
 - HTML body: 用 `<br>` 换行，`&nbsp;&nbsp;•` 做子项缩进
 
 ## 标准操作流程
-1. **获取上周已发送周报**: `lark-cli mail +search --query "【周报】-崔朋" --limit 1`，必须选最新一封**已发送成功**的周报邮件，不能基于旧草稿/错误 reply
+1. **获取上周已发送周报（P0·真实连续线程）**：必须基于日期最新、已发送成功、To 仅 Sam 的周报继续 reply，绝不能为了“能发”回退到更早一周、旧草稿或错误 reply；按以下顺序定位，任一成功即停止：
+   - **优先**：先检查 `temp/last_weekly_report_message_id.txt` 是否存在；**若文件不存在，或文件存在但内容为空，直接跳过本条，进入降级一**（不算失败，正常路径分支）。若文件存在且有内容，取其 `message_id` 用 `lark-cli mail +message --message-id <id>` 回读验证：要求同时满足 `ok:true` + `to`仅`sam.zhang@smyze-ch.com` + `subject`含"周报""崔朋" + `date`是上周；**只要命令报错（如 404/邮件已删除）或任一验证条件不满足，视为该缓存已失效，同样直接跳过进入降级一**，禁止在此处报错终止或询问用户；
+   - **降级一**：`lark-cli mail +triage --query "周报" --page-size 20`（⚠️ 不加`【】`括号，实际主题无括号；⚠️ 不加`--from`过滤，发件人显示地址`cuip@smyze-ch.com`与真实邮箱`peng.cui@smyze.cn`不一致会漏搜），逐一用`+message --message-id <id>`核验候选详情，不能仅信 triage 摘要；
+   - **降级二**：`lark-cli mail +triage --query "崔朋" --page-size 30` 扩大范围，再逐一 `+message` 核验同上条件（to/subject/date）。
+   - `mail:user_mailbox.folder:read` 缺失**仅代表不能枚举邮箱文件夹**，不代表不能搜索邮件、读取已知 `message_id`、创建 reply 草稿或编辑草稿；禁止据此直接报“无权限生成邮件”或 BLOCKED，必须走完以上无文件夹权限路径。
+   - **对象边界**：已发送邮件用 `user_mailbox.messages get`；仅草稿 ID 才能用 `user_mailbox.drafts get`。`draft not found` 不得推断已发送邮件不存在。
+   - 仅当上述全部定位路径均失败、且无法拿到并验证任何已发送父邮件时，才可 BLOCKED；报告必须写明实际失败接口、scope/错误码、已尝试的降级路径及其结果，禁止笼统归因“邮件权限不足/生成邮件失败”。
 2. **Git 分析（动态扫描）**: 遍历 bar-smyze 根目录下所有含 `.git` 的子工程，对每个执行 `git log --all --no-merges --author=崔朋 --since=周一T00:00:00+08:00 --until=明天T00:00:00+08:00`，仅保留有 commit 的仓库
    - ⚠️ **禁止硬编码仓库清单**：用 `os.listdir` + 判断 `.git` 自动发现，后续新增子工程零改动自动纳入
    - ⚠️ **--since/--until 必须带显式时区 `T00:00:00+08:00`**：不带时间时 git 会用当前时刻补全，导致当天早于该时刻的 commits 被截断丢失
@@ -61,7 +67,7 @@ Sam，您好：
    - 示例：❌ "14:10 与王冰岩讨论退款后制作失败推送" → ✅ "订单退款后状态终结与异常推送兜底逻辑梳理"
    - chore/docs/refactor 类仅保留有业务价值的（如方案文档输出），纯工程类（archive task/record journal）不入周报
 6. **生成 HTML body**: 写入临时文件 `temp/weekly_body.html`
-7. **创建 reply 草稿**: `lark-cli mail +reply --message-id <上周已发送message_id> --to sam.zhang@smyze-ch.com --body <HTML>`
+7. **创建 reply 草稿**: `lark-cli mail +reply --message-id <上周已发送message_id> --body-file temp/weekly_body.html`，成功后将该 `message_id` 保存到 `temp/last_weekly_report_message_id.txt`（供下周步骤1优先路径复用，避免每次都靠 triage 搜索）
 8. **如需调整正文**: 对 reply 草稿使用 `+draft-edit` 的 patch `set_reply_body`，只替换本次新增内容，**保留 quoted content**，实现“上方本周新内容 + 下方上周已发送引用”的追加回复效果
 9. **修正主题/收件人**: 用 `+draft-edit --set-to 'sam.zhang@smyze-ch.com'`（整体替换 To，剔除被追加进来的自己）与 `--set-subject 'Re: 【周报】-崔朋（YYYY.MM.DD - YYYY.MM.DD）'`；不要用 `set_body` 覆盖整个 reply，除非明确要移除引用
 10. **飞书通知用户**: `notify_feishu("📋 周报草稿已生成，请检查草稿箱后确认发送")`
@@ -77,6 +83,11 @@ Sam，您好：
 
 ## ⚠️ 已验证坑点
 - **【血泪事故·2026-07-03】周报漏读群聊而报告谎称已读**：当次会话 checkpoint 已完整存下群聊步骤，但因 SOP 旧措辞"群聊补充/仅新增数据源"把强制步骤弱化为可选，执行时跑完 git→正文→邮件草稿→通知就自认闭环跳过了群聊；更严重的是 done 报告照搬记忆里的计划文本"脑补"写成"两群内外均读"，实际一条 `chat-messages-list` 都没发。根治：群聊已升级为【强制步骤】，并新增上方"完成判定门槛"硬校验——报告必须附每群实际返回条数，杜绝自述蒙混。
+- **【P0数据事故·2026-08-28】"本周"日期计算漂移＝LLM临场推算周一，周一24号14条commits被整天漏报**：用户发现 08-28(周四)周报主题/intro/git参数全都写成"08.25-08.28"（从周日起算），导致实际周一 08-24 全天 14 条 commits（含关键 bugfix）完全漏报。根因＝`weekly_report_gen.py` 只锁死 HTML 排版结构，但"本周从哪天到哪天"这个同样关键的计算此前完全由 LLM 每次临场推算 git `--since/--until` 和 intro 日期文案，无代码兜底——08-21 那次算对了（本周一 08-17 到执行日 08-21），08-28 这次算错了（误把周日 08-25 当周一）。**根治·三层防线**：
+  1. **第一层·确定性输入**：新增 `get_week_range.py`，用 `weekday()==0` 机械算出"本周一（自然周一，不受节假日影响）→ 执行日"的 git_since/git_until/display_range，调度 prompt 强制第 1 步先跑此脚本获取参数，后续 git log 和 intro 日期文案**必须使用脚本输出，禁止 LLM 临场推算"本周"**。
+  2. **第二层·机械校验**：`weekly_report_verify.py` 新增 `date_range_check()` 函数与 `--exec-date` 参数，发送前回读草稿 intro/主题里的起始日期，与 `get_week_range.py` 算出的本周一机械对比，任何不符即 FAIL 拦截（已用 08-28 错误案例实测：intro 写 08.25 被机械揪出应为 08.24）。
+  3. **第三层·调度强制**：`weekly_report_reminder.json` prompt 改为 10 步流程，第 1 步铁律"先跑 get_week_range.py"，第 8 步 verify 时必须传 `--exec-date` 以触发日期校验。
+  - **教训**：光锁版式不锁内容/参数仍会漏；凡 SOP 用文字规定的"必须 X"，若涉及可量化结果（日期/收件人/线程/数量），都要有对应机械 check 形成闸门，否则等于没规定。
 - **git --since/--until 必须带 `T00:00:00+08:00`**：裸日期 `--since=2026-06-08` 会被 git 用当前时刻补全时间部分，导致当天早于该时刻的 commits 静默丢失（致命级，曾导致 hotfix 3 条严重 bug 修复全部漏报）
 - `lark-cli mail +reply` 默认只存草稿不发送 ✅
 - **【实锤·2026-07-24】`+reply --to` 是"追加到原发件人"而非覆盖**：reply 自己发的周报时原发件人=自己，`--to sam` 只会追加 → 收件人变成 `[自己, sam]`（07-17 现象）；本周甚至新建邮件只发自己。因此 step 7 建 reply 后**必须**再用 `+draft-edit --set-to 'sam.zhang@smyze-ch.com'`（`--set-to` 是整体替换 To），把自己剔除，仅剩 sam；随后跑 verify 投递闸门确认 To 精确等于 sam
