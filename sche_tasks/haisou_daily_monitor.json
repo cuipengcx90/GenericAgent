@@ -3,5 +3,5 @@
   "repeat": "daily",
   "enabled": true,
   "max_delay_hours": 6,
-  "prompt": "执行以下代码，完成后不要额外重复推送；脚本负责首次基线、增量和异常通知：\n```python\nimport subprocess, sys\nr = subprocess.run([sys.executable, '/Users/cuip/projects/GenericAgent/birdie_monitor/haisou_daily.py'], text=True, capture_output=True, timeout=300)\nprint('exit:', r.returncode)\nprint(r.stdout)\nprint(r.stderr)\n```"
+  "prompt": "执行以下代码，完成后不要额外重复推送；脚本负责首次基线、增量和异常通知：\n```python\nimport subprocess, sys\n\n# 第1步：同步全能IT最近3天课程到动态关键词\nprint('=== 步骤1：同步全能IT课程 ===')\nr1 = subprocess.run([sys.executable, '/Users/cuip/projects/GenericAgent/birdie_monitor/sync_quangneng.py'], \n                    text=True, capture_output=True, timeout=120)\nprint(r1.stdout)\nif r1.stderr:\n    print('stderr:', r1.stderr)\n\n# 第2步：执行海搜监控（会自动使用动态关键词）\nprint('\\n=== 步骤2：执行海搜监控 ===')\nr2 = subprocess.run([sys.executable, '/Users/cuip/projects/GenericAgent/birdie_monitor/haisou_daily.py'], \n                    text=True, capture_output=True, timeout=300)\nprint('exit:', r2.returncode)\nprint(r2.stdout)\nif r2.stderr:\n    print('stderr:', r2.stderr)\n```"
 }

@@ -1,9 +1,10 @@
-"""海搜会员每日网盘资源监控：搜索→按 hsid 去重→仅新增通知。"""
+"""海搜会员每日网盘资源监控：搜索→按 hsid+标题去重→仅新增通知。"""
 import html
 import json
 import re
 import sys
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import requests
@@ -13,18 +14,25 @@ from keychain import keys
 
 BASE = "https://haisou.cc"
 KEYCHAIN_NAME = "haisou_hs_web_session"
-KEYWORDS = [
+# 静态关键词（手动维护）
+STATIC_KEYWORDS = [
+    # AI开发
     "AI Agent", "AI coding", "AI应用开发", "出海SaaS", "Vibe Coding",
     "Claude Code", "AI创业", "独立开发出海", "SaaS出海", "MCP教程",
     "AI产品出海", "懂王", "鸡翅大模型", "赋范",
+    # AI测试
+    "AI测试", "软件测试", "自动化测试", "柠檬班", "华测", "华测教育",
+    "接口测试", "性能测试", "测试开发", "测试工程师",
 ]
 PLATFORMS = ("quark", "baidu", "ali")
 LINK_TEMPLATES = {
     "quark": "https://pan.quark.cn/s/{code}",
-    "baidu": "https://pan.baidu.com/s/1{code}",
+    "baidu": "https://pan.baidu.com/s/{code}",
     "ali": "https://www.alipan.com/s/{code}",
 }
 STATE_PATH = Path(__file__).with_name("haisou_seen_items.json")
+# 动态关键词文件（全能IT课程标题）
+DYNAMIC_KEYWORDS_PATH = Path(__file__).with_name("quangneng_keywords.json")
 
 
 def clean(value):
@@ -35,6 +43,26 @@ def load_state():
     if not STATE_PATH.exists():
         return None
     return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+
+
+def load_dynamic_keywords():
+    """加载动态关键词（全能IT课程标题），仅返回未找到的课程"""
+    if not DYNAMIC_KEYWORDS_PATH.exists():
+        return []
+    data = json.loads(DYNAMIC_KEYWORDS_PATH.read_text(encoding="utf-8"))
+    # 仅返回未找到的课程标题
+    return [title for title, info in data.items() if not info.get("found", False)]
+
+
+def mark_keyword_found(keyword):
+    """标记动态关键词已找到"""
+    if not DYNAMIC_KEYWORDS_PATH.exists():
+        return
+    data = json.loads(DYNAMIC_KEYWORDS_PATH.read_text(encoding="utf-8"))
+    if keyword in data:
+        data[keyword]["found"] = True
+        data[keyword]["found_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        DYNAMIC_KEYWORDS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_state(state):
@@ -70,6 +98,36 @@ def make_item(keyword, item):
     }
 
 
+def normalize_title(title):
+    """标题归一化：去噪后用于相似度比对"""
+    if not title:
+        return ""
+    # 转小写，去除常见噪声词
+    s = title.lower()
+    noise = ["完结", "更新", "全集", "高清", "1080p", "720p", "百度网盘", "阿里云盘", "夸克网盘",
+             "(", ")", "（", "）", "[", "]", "【", "】", "|", "-", "_", "·"]
+    for n in noise:
+        s = s.replace(n, "")
+    # 去除多余空格
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def is_title_duplicate(new_title, existing_titles, threshold=0.85):
+    """判断标题是否与已有标题重复（相似度>threshold）"""
+    norm_new = normalize_title(new_title)
+    if not norm_new:
+        return False
+    for existing in existing_titles:
+        norm_exist = normalize_title(existing)
+        if not norm_exist:
+            continue
+        ratio = SequenceMatcher(None, norm_new, norm_exist).ratio()
+        if ratio >= threshold:
+            return True
+    return False
+
+
 def run():
     state = load_state()
     first_run = state is None
@@ -82,19 +140,36 @@ def run():
     session.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     session.cookies.set("hs_web_session", cookie, domain="haisou.cc", path="/")
     additions = []
+    # 提取已有标题用于去重
+    existing_titles = [r.get("title", "") for r in state.values() if isinstance(r, dict)]
+
+    # 合并静态关键词 + 动态关键词（全能IT课程标题）
+    all_keywords = list(STATIC_KEYWORDS) + load_dynamic_keywords()
+
     try:
-        for keyword in KEYWORDS:
+        for keyword in all_keywords:
             for platform in PLATFORMS:
                 for item in search(session, keyword, platform):
                     hsid = item.get("hsid")
                     if not hsid or hsid in state:
                         continue
+                    # 标题去重检查
+                    title = clean(item.get("share_name"))
+                    if is_title_duplicate(title, existing_titles):
+                        continue
                     record = make_item(keyword, item)
                     state[hsid] = record
+                    existing_titles.append(title)  # 添加到已有标题列表
+
+                    # 如果是动态关键词（全能IT课程），标记为已找到
+                    if keyword not in STATIC_KEYWORDS:
+                        mark_keyword_found(keyword)
+
                     if not first_run:
                         additions.append(record)
     except Exception as exc:
-        # 不保存部分结果，以便下次完整补扫；错误必须触发告警。
+        # 已完成的搜索结果必须落库并随异常通知发送；未扫描部分留待下次执行。
+        save_state(state)
         return additions, first_run, str(exc)
     save_state(state)
     return additions, first_run, None
@@ -102,14 +177,15 @@ def run():
 
 def build_report(additions, first_run, error):
     date = time.strftime("%Y-%m-%d")
+    if first_run and not additions:
+        lines = [f"✅ 海搜监控已建立基线（{date}），后续仅推送新增资源。"]
+    else:
+        lines = [f"🔎 海搜每日监控（{date}）", f"新增 {len(additions)} 条："]
+        for item in additions:
+            password = item["share_pwd"] or "无"
+            lines.append(f"\n【{item['keyword']}｜{item['platform']}】{item['title']}\n  链接: {item['link'] or '未知'}  提取码: {password}")
     if error:
-        return f"⚠️ 海搜监控异常（{date}）\n{error}\n请检查会员会话或海搜服务状态。"
-    if first_run:
-        return f"✅ 海搜监控已建立基线（{date}），后续仅推送新增资源。"
-    lines = [f"🔎 海搜每日监控（{date}）", f"新增 {len(additions)} 条："]
-    for item in additions:
-        password = item["share_pwd"] or "无"
-        lines.append(f"\n【{item['keyword']}｜{item['platform']}】{item['title']}\n  链接: {item['link'] or '未知'}  提取码: {password}")
+        lines.append(f"\n⚠️ 后续扫描中断：{error}\n已搜到的新增已照常发送；未扫描部分将在下次继续。")
     return "\n".join(lines)
 
 
