@@ -97,6 +97,7 @@ Sam，您好：
 - HTML body 含中文/特殊字符时，通过文件读取传参比命令行直接传更稳定
 - 周报必须基于**上周已发送成功**的周报邮件继续 reply，不能基于历史错误草稿或废弃 reply
 - 若用户要“追加回复”效果，必须使用 `set_reply_body` 保留 `has_quoted_content=true` 的引用块；误用 `set_body` 会把 reply 变成仅剩新正文
+- **【实锤·2026-09-11】patch 的 `set_reply_body` 只认内联 `value`（HTML 字符串），写 `value_file` 字段会被 lark-cli 静默忽略**：当次用 `{"op":"set_reply_body","value_file":"weekly_body.html"}` 打补丁，回执 `ok:true` 无报错，但正文根本没写进去——线上 `verify --draft-id` 检出 `my_content_len=12`（仅剩包装标签）、5 项内容 FAIL 被拦截。根治：patch 里必须把 HTML 读进来内联到 `value` 字段（`json.dump` 序列化），禁用任何 `*_file` 变体；打完补丁**必须**再跑线上 `verify --draft-id`，凭 `my_content_len` 与 ALL PASS 确认正文真的落库，不能只看补丁回执 `ok:true`
 - **【版式根治·2026-07-10】格式反复出错的真因＝我每次徒手写 HTML，靠"记住 SOP 文字"必漂移。文字规范不是控制力，代码才是。已把版式变成可执行工具链，以后禁止徒手写正文 HTML：**
   - 生成：`weekly_report_gen.py content.json -o weekly_body.html` —— LLM 只产 content.json（纯内容数据，schema 见脚本顶部），HTML 每层包裹标签由脚本固定，无法漂移
   - 校验：`weekly_report_verify.py --draft-id <ID>` —— 发用户前的强制闸门，机械检查：加粗数字标题/真`<ul>`列表/无`（一）`中文括号编号/无手打`•`/引用块保留/主题全角括号+Re空格/**引言干净一行(『工作汇报。』与『一、』之间禁任何导语)**/**投递安全(To 精确等于 sam.zhang@smyze-ch.com、禁止 peng.cui@smyze.cn、必须有 reply 线程证据)**；ALL PASS(退出码0)才可通知，任何 FAIL 先修正
