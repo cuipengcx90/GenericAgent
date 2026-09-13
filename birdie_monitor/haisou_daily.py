@@ -128,6 +128,27 @@ def is_title_duplicate(new_title, existing_titles, threshold=0.85):
     return False
 
 
+def tokenize_keyword(keyword):
+    """把关键词按分隔符及中英文边界切成核心词，过滤过短噪声片段。"""
+    # 如“和橘子学AI创作”切成“和橘子学”“ai”“创作”，避免整串无法命中。
+    keyword = re.sub(r"([\u4e00-\u9fff])([a-zA-Z0-9])", r"\1 \2", keyword)
+    keyword = re.sub(r"([a-zA-Z0-9])([\u4e00-\u9fff])", r"\1 \2", keyword)
+    parts = re.split(r"[|｜/,，、\s()（）\[\]【】\-]+", keyword)
+    tokens = [p for p in parts if len(p) >= 2]
+    return tokens or [keyword]
+
+
+def is_relevant(keyword, title):
+    """判断搜索结果标题是否与关键词真正相关，防止 haisou OR 式分词匹配带来的垃圾。
+    要求关键词中最长（最具辨识度）的核心词出现在标题中。例如 ``AI Agent``
+    必须命中 ``Agent``，不能仅因命中高频词 ``AI`` 而放行。
+    """
+    title_l = (title or "").lower()
+    tokens = tokenize_keyword(keyword.lower())
+    core_token = max(tokens, key=len)
+    return core_token in title_l
+
+
 def run():
     state = load_state()
     first_run = state is None
@@ -155,6 +176,9 @@ def run():
                         continue
                     # 标题去重检查
                     title = clean(item.get("share_name"))
+                    # 相关性校验：过滤 haisou 分词模糊匹配带来的无关垃圾结果
+                    if not is_relevant(keyword, title):
+                        continue
                     if is_title_duplicate(title, existing_titles):
                         continue
                     record = make_item(keyword, item)

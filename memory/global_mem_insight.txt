@@ -7,7 +7,8 @@ MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)
 定时/自主/反射: scheduled_task_sop | autonomous_operation_sop | agentmain --reflect
 通知推送通道: notify_channels_sop(飞书私信/飞书群/钉钉群;sess.ask()直出报告需_strip_llm_tags剥<summary>等内部标签防泄漏)
 微信信号日报+周报: wechat_signals_sop(日报18点窗口昨18→今18/周报周一09:00/海报PNG/--window解密需sudo提key/wechat_pipeline.py一键管道/AppleScript翻群同步/方案B OCR截图链路run_wechat_ocr_daily.py单群无sudo,collector只采前台群+时间窗自停(绝对/相对日期锚点),定时每天13点窗口昨13→今13)
-手机: adb_ui.py
+微信朋友圈发布: wechat_moments_publish_sop(隐私尚饮/赞评已通)
+手机: adb_ui.py | android_uu_cellular_troubleshooting_sop
 
 需要时 read L2 或 ls ../memory/ 查 L3
 L0: memory_management_sop
@@ -17,6 +18,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | trendradar_sop(晨/晚报重复推送根治:确定性单入口+幂等;稳定双发查通知函数互相转调;Linux.do接入查Docker镜像/CF指纹/RSS混合池limit配额;单次执行可长达10+分钟会被工具60/300s超时误判,应nohup后台起+ps -p轮询,锁文件内含pid可判僵尸锁;build_report实测max_attempts=4,仅"内容过短"原因会降级发送degraded_send=True仍三通道照发非skipped;LLM思考过程污染报告2026-08-12已修复:Claude API 8/9-10服务端adaptive行为变更开始输出CoT,双重定位过滤标题后+分类标题前,正则须^##\s+匹配所有二级标题非限定emoji,两轮修复验证成功过滤74行污染) | recommendation_pitfalls_sop | ctf_skills_integration_sop
 | hellogithub_monthly_sop | project_update_monitor_sop(重点GitHub/Changelog监控: sources.json扩展源、首次建基线不推送、远端差异+本地版本建议、绝不自动升级；通知仅以release_tag/tag/changelog_hash变化触发含RC/Beta,commit_sha单独前进不触发；无--notify预览不推进有变化基线；卡片项目数=sources.json实时长度非硬编码；已加emoji图标规范🚀🔔✅📦🏷️🗂️💡🔗及变更分类图标；核心变更列表已加1.2.3.序号；卡片每个项目标题行(📦徽标｜项目名)前也已加1.2.3.序号(project_card_element新增index参数,build_notification_card用enumerate传入)，与变更详情内部序号是两处不同层级；无Release的Mintlify文档站(如Trellis)额外fetch changelog_url+.md取纯Markdown存changelog_body做内容源兜底,changelog_hash仍用原始正文算不受影响；chinese_change_summary逐行提取改严格匹配列表标记才收纳,避免blockquote/代码块/标题误入；翻译固定走本机codex exec(脚本内确定性调用非本会话手动翻译,因脚本被定时无人值守子进程唤起);翻译前需清洗两类噪音:中英文同行无分隔拼接(截取最后中文句末标点后非中文残留)+纯下载链接行/裸露by@user in url落款)
 | tmwebdriver_sop | jshook_runtime_sop | js_runtime_hooking_playbook_sop | vision_sop | ljqCtrl_sop
+|| launchpad_folder_sop(分类基线/验收/持续调整)
 | sophub_sop | sophub_security_sops | sophub_6a69733c(UUYC网易UU远程CLI操作SOP: uuyc-cli设备/云电脑/终端/远程协助命令参考,raw端点匿名可访问) | codex_jailbreak_risk_sop | ctf_core_contract_risk_sop | llm_prompt_bypass_risk_sop
 | keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md
 | cc_disguise_knowledge(CC伪装机制/工具映射/排错,无部署)
@@ -36,7 +38,8 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | linuxdo_deep_read_sop(linux.do合集贴深阅读:主帖+子帖逐个不合并/fetch分批补拉≤50校验posts_count/cookedToText复用JS/热门楼按like排序摘原文/输出禁宽表格用列表/伪造请求头类只讨论不协助实现)
 | birdiesearch_monitor_sop(网盘资源监控:签名算法+/redirect解析真实链接+限额实测触发式停止;关键词验证会耗当日额度;站外热度调研用MCP tavily-hikari非Google网页搜)
 | haisou_monitor_sop(haisou.cc网盘监控)
-| linuxdo_trust_level_sop(linux.do TL3等级维护:官方要求访问≥50天/获赞20/送赞30/回复10话题/浏览25%等,只能人工自动结算无接口强刷;检查读connect.linux.do的"信任级别3要求"区块;访问天数无法脚本代刷/禁模拟登录;发帖需POST /posts.json带tags字段[类版块组标签如AI]否则422;编辑帖子用PUT /posts/{id}.json;语气去AI味=去"1.2.3.分点+客套结尾"模板腔改口语化;已建每天09:30定时检查linuxdo_trust_level_check.json,已符合完全静默不通知,不符合才私信列差距不代操作)
+| linuxdo_trust_level_sop(linux.do TL3等级维护:官方要求访问≥50天/获赞20/送赞30/回复10话题/浏览25%等,只能人工自动结算无接口强刷;检查读connect.linux.do的"信任级别3要求"区块;访问天数无法脚本代刷/禁模拟登录;发帖需POST /posts.json带tags字段[类版块组标签如AI]否则422;编辑帖子用PUT /posts/{id}.json;语气去AI味=去"1.2.3.分点+客套结尾"模板腔改口语化;已建每天09:30定时检查linuxdo_trust_level_check.json,已符合完全静默不通知,不符合才私信列差距不代操作) | launchpad_folder_sop
+| wechat_moments_publish_sop(隐私尚饮/赞评已通)
 L4: L4_raw_sessions/
 
 [RULES]
@@ -52,3 +55,4 @@ L4: L4_raw_sessions/
 10. 自主交付: "完成"=质量达标的完整闭环，非满足字面要求。发现差距/标杆/缺陷应一气呵成自己做完(对比→修正→固化SOP)，禁拆成等用户"继续"才推一步
 11. 批量合并: 多楼层/多锚点/多校验等同类重复操作先grep/正则一次性定位或批量抽取，禁逐条摸索式单独调用(定位锚点用grep -n非分段file_read试)
 12. 拼接URL/ID禁凭直觉套模板，须用真实返回值实测打开；出错要批量回刷历史数据非只改模板
+13. 禁空报完成: GUI/发布类任务须OCR或等价证据核验后才可报成功；未打通步骤须明示，禁把中间态当完成；口头「已沉淀SOP」须grep memory确认文件真实存在
