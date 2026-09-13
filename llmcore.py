@@ -513,6 +513,13 @@ def _stream_with_retry(sess, url, headers, payload, parse_fn):
                     except: body = ""
                     err = f"!!!Error: HTTP {r.status_code}" + (f" (retry-after > {cap:.0f}s)" if d is None and r.status_code in _RETRYABLE and attempt < sess.max_retries else "") + (f": {body}" if body else "")
                     yield err; return [{"type": "text", "text": err}]
+                if sess.stream:  # TTFT = first SSE event (prefill done), not first visible chunk; hidden thinking must count in decode window
+                    _il = r.iter_lines
+                    def _probe(*a, **k):
+                        for line in _il(*a, **k):
+                            if line and STATS.get('t_ttft') is None: STATS['t_ttft'] = time.time()
+                            yield line
+                    r.iter_lines = _probe
                 gen = parse_fn(r)
                 try:
                     while True:
@@ -668,7 +675,7 @@ class BaseSession:
         self.api_key = cfg['apikey']
         self.api_base = cfg['apibase'].rstrip('/')
         self.model = cfg.get('model', '')
-        default_context_win = 35000; default_cut_msg_interval = 7
+        default_context_win = 38000; default_cut_msg_interval = 8
         if 'deepseek' in self.model.lower():
             default_context_win = 80000; default_cut_msg_interval = 25; self.trim_keep_rate = 0.3
         self.context_win = cfg.get('context_win', default_context_win)
@@ -701,7 +708,7 @@ class BaseSession:
         self.api_mode = 'responses' if mode in ('responses', 'response') else 'chat_completions'
         self.temperature = cfg.get('temperature', 1)
         self.max_tokens = cfg.get('max_tokens')
-        self.default_ua = "claude-cli/2.1.152 (external, cli)"
+        self.default_ua = "claude-cli/2.1.251 (external, cli)"
         self.user_agent = cfg.get("user_agent", self.default_ua)
     def _apply_claude_thinking(self, payload):
         if self.thinking_type:
@@ -813,7 +820,7 @@ def _fix_messages(messages):
     return merged
 
 class NativeClaudeSession(BaseSession):
-    native_ua = "claude-cli/2.1.152 (native, cli)"
+    native_ua = "claude-cli/2.1.251 (native, cli)"
     def __init__(self, cfg):
         super().__init__(cfg)
         self.fake_cc_system_prompt = cfg.get("fake_cc_system_prompt", False)
