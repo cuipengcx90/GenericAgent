@@ -154,7 +154,7 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 ## 13. 三定时任务改用 mykey 统一跨模型兜底 build_mixin_session（2026-07-28）
 - 背景：tech_trends/trendradar_digest/hellogithub_monthly 原来各自手写单一模型绑定(如直连 claude-opus-4-8),该模型无权限时无兜底,整份推送失败。
 - 根治：`llmcore.py` 新增 `build_mixin_session(cfg=None)`，读 `mykey.py:mixin_config`(含 `llm_nos`/`max_retries`/`base_delay`)构造 `MixinSession`，三脚本统一改调它 `.ask(msg)`，任一节点 4xx/5xx 失败自动滚动到下一节点。以后只需维护 `mykey.py:mixin_config.llm_nos` 顺序，不用逐脚本改代码。
-- **坑点(踩过)**：`mixin_config.llm_nos` 存的是各 native 配置内部的**显示名**(如 `claude-relay`/`gpt-native`/`claude-router`/`micu-grok`)，**不是** `mykey.mykeys` 的顶层配置键名(如 `native_claude_config0`)。若直接拿 `llm_nos` 里的字符串去 `resolve_client(name)`/字典查找会 100% 报 `Config not in mykey`。正确做法(仿 `agentmain.py` 的 `load_llm_sessions`)：先把 `mykeys` 里所有 native_*/oai_* 配置都跑一遍 `resolve_client` 拿到全量 client 列表，再按每个 client 的 `backend.name` 去匹配 `llm_nos` 里的名字筛选/排序。
+- **坑点(踩过)**：`mixin_config.llm_nos` 存的是各 native 配置内部的**显示名**(如 `claude-relay`/`gpt-native`/`claude-router`/`gpt-6-astra`)，**不是** `mykey.mykeys` 的顶层配置键名(如 `native_claude_config0`)。若直接拿 `llm_nos` 里的字符串去 `resolve_client(name)`/字典查找会 100% 报 `Config not in mykey`。正确做法(仿 `agentmain.py` 的 `load_llm_sessions`)：先把 `mykeys` 里所有 native_*/oai_* 配置都跑一遍 `resolve_client` 拿到全量 client 列表，再按每个 client 的 `backend.name` 去匹配 `llm_nos` 里的名字筛选/排序。
 - 验证手法：`py_compile` 全过 → 构造 `MixinSession` 实例断言节点数/名字 → 用 FakeBackend 模拟 504 验证 failover 滚动到下一节点 → 真实网络调用一次 `build_mixin_session().ask()` 确认端到端有效回复(非 mock)。
 
 ## 14. run_trendradar_digest.py 单次执行长达10+分钟 → 工具层超时误判 + 僵尸锁排查（2026-08-06 实战）
