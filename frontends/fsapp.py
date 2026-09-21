@@ -1,4 +1,4 @@
-import fcntl, glob, json, os, queue as Q, re, sys, threading, time
+import fcntl, glob, json, os, queue as Q, re, sys, threading, time, uuid
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -549,10 +549,19 @@ class _TaskCard:
     _DETAIL_LIMIT = 4000
     _FINAL_LIMIT = 4000
     _QUEUE_LIMIT = 8
+    _PAGE_STEPS = 50           # 每页最多步数（实测约 58 步即触达飞书卡片体积上限）
+    _PAGE_CHARS = 8000         # 每页正文字符预算；实测超限点 58 步×均值272字符，收此值留安全边际
     _STEP_FLUSH_INTERVAL = 3.0
+    _REGISTRY_MAX = 200        # 翻页注册表上限，超出丢弃最早的，防长跑内存累积
+    _registry = {}             # uid -> _TaskCard，翻页回调据此找回卡片实例
 
     def __init__(self, receive_id, rid_type):
         self.rid, self.rtype = receive_id, rid_type
+        self.uid = uuid.uuid4().hex[:12]
+        self.page_idx = 0
+        _TaskCard._registry[self.uid] = self
+        while len(_TaskCard._registry) > _TaskCard._REGISTRY_MAX:
+            _TaskCard._registry.pop(next(iter(_TaskCard._registry)))
         self.steps = []          # [(summary, detail), ...]
         self.status = "🤔 思考中..."
         self.final = None
@@ -579,16 +588,54 @@ class _TaskCard:
 
     def _build_locked(self):
         header = f"**{self.status}**"
-        if self.page_no > 1:
-            header += f"\n\n📄 工作卡片 {self.page_no}"
+        pages = self._paginate()
+        self.page_idx = max(0, min(self.page_idx, len(pages) - 1))
+        total = len(pages)
+        header = f"**{self.status}**"
+        if total > 1:
+            header += f"\n\n📄 第 {self.page_idx + 1}/{total} 页"
         els = [{"tag": "markdown", "content": header}]
         if self.note:
             els.append({"tag": "markdown", "content": self.note})
-        for i, (s, d) in enumerate(self.steps, self.turn_base):
+        base = self.turn_base + sum(len(p) for p in pages[:self.page_idx])
+        for i, (s, d) in enumerate(pages[self.page_idx], base):
             els.append(self._step_panel(i, s, d))
         if self.final:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
+        if total > 1:
+            els.append(self._page_buttons(total))
         return _card_raw(els)
+
+    def _paginate(self):
+        """按「步数 + 字符预算」双判据切页：常态装满 _PAGE_STEPS 步，遇大步骤则提前翻页。"""
+        pages, cur, n = [], [], 0
+        for s, d in self.steps:
+            size = len(s) + len(d)
+            if cur and (len(cur) >= self._PAGE_STEPS or n + size > self._PAGE_CHARS):
+                pages.append(cur); cur, n = [], 0
+            cur.append((s, d)); n += size
+        if cur or not pages: pages.append(cur)
+        return pages
+
+    def _page_buttons(self, total):
+        """翻页按钮：value 回传 card uid + 目标页，由 handle_card_action 处理。"""
+        acts = []
+        if self.page_idx > 0:
+            acts.append({"tag": "button", "type": "default", "size": "small",
+                         "text": {"tag": "plain_text", "content": "◀ 上一页"},
+                         "value": {"ga_card": self.uid, "page": self.page_idx - 1}})
+        acts.append({"tag": "button", "type": "text", "size": "small",
+                     "text": {"tag": "plain_text", "content": f"{self.page_idx + 1}/{total}"}})
+        if self.page_idx + 1 < total:
+            acts.append({"tag": "button", "type": "primary", "size": "small",
+                         "text": {"tag": "plain_text", "content": "下一页 ▶"},
+                         "value": {"ga_card": self.uid, "page": self.page_idx + 1}})
+        return {"tag": "action", "actions": acts}
+
+    def goto_page(self, idx):
+        with self._lock:
+            self.page_idx = max(0, int(idx))
+        self._enqueue("page", force=True)
 
     def _enqueue(self, reason, force=False):
         if not force and reason == "step" and time.time() - self._last_step_flush < self._STEP_FLUSH_INTERVAL:
@@ -617,7 +664,10 @@ class _TaskCard:
         with self._lock:
             if msg_id:
                 self.msg_id = msg_id
-        return bool(msg_id), False
+                return True, False
+            # 新建失败：多半是卡片体积累积超限(飞书 200800)。返回 limit 让上层 rollover 清空已展示
+            # 步骤后重试；否则 msg_id 恒为 None，卡片将永久发不出去（飞书端表现为"卡死"）。
+            return False, bool(self.steps)
 
     def _worker_loop(self):
         while True:
@@ -642,7 +692,9 @@ class _TaskCard:
         self.page_no += 1
         self.msg_id = None
         self.final = None
-        self.note = "⚠️ 上一张工作卡片达到飞书限制，本页继续展示后续进展。"
+        self.turn_base = self.turn_no + 1   # 新页从当前轮继续编号
+        self.steps = []                      # 必须清空：否则新卡片与旧卡片同样超限，rollover 失效
+        self.note = "📄 上一条工作卡片已满，本页继续；往上翻可查看完整历史。"
 
     # ── 公开接口 ──
 
@@ -684,6 +736,17 @@ def _make_task_hook(card, done_event, on_final):
         except Exception as e:
             print(f"[fs hook] error: {e}")
     return hook
+def handle_card_action(data):
+    """卡片翻页按钮回调：按 value 里的 uid 找回实例并切页。"""
+    try:
+        v = data.event.action.value or {}
+        if isinstance(v, str):
+            v = json.loads(v or '{}')
+        card = _TaskCard._registry.get(v.get('ga_card'))
+        if card and isinstance(v.get('page'), int):
+            card.goto_page(v['page'])
+    except Exception as e:
+        print(f"[fs card action] error: {e}")
 
 
 def handle_message(data):
@@ -808,6 +871,7 @@ def main():
     handler = (lark.EventDispatcherHandler.builder("", "")
                .register_p2_im_message_receive_v1(handle_message)
                .register_p2_im_message_message_read_v1(lambda _: None)
+               .register_p2_card_action_trigger(handle_card_action)
                .build())
     cli = lark.ws.Client(APP_ID, APP_SECRET, event_handler=handler, log_level=lark.LogLevel.INFO)
     print("=" * 50 + "\n飞书 Agent 已启动（长连接模式）\n" + f"App ID: {APP_ID}\n等待消息...\n" + "=" * 50)
