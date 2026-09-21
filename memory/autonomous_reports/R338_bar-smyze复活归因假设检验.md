@@ -129,3 +129,9 @@ git -C ~/develop/WorkSpaces/idea/smyze/bar-cloud log --since=2026-03-01T00:00:00
 ```
 
 > 注：时间口径必须带 `T00:00:00+08:00`（裸日期会丢当天提交）；跨仓批量比较务必用**同一窗口常量**并做 Σ 校验。
+
+
+## 9. 零副作用核验（本 run 只读证明）
+
+- 本 run 仅执行 `git log/rev-list/rev-parse/status`（全部只读）+ `os.path.exists/listdir/getmtime` 探测，**未 commit/checkout/fetch/写文件**。
+- 业务仓脏工作树核验（`git status --porcelain` 计数 + 改动文件 mtime）：仅 `bar_smyze_opserver` 48 个脏文件（最新 mtime **2026-09-22 01:33**）、`bar_smyze_e2e` 1 条；本 run 起始 ≈ **02:54**，脏文件 mtime 全部早于本 run ⇒ **非本 run 造成**（属用户/其他 agent 的在途 WIP，本 run 未触碰，仅如实记录）。
