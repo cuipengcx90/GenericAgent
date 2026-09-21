@@ -44,6 +44,7 @@
   2. Clash 逐节点测目标站（只读）：`curl -s --unix-socket /tmp/verge/verge-mihomo.sock "http://localhost/proxies/<urlencoded节点名>/delay?timeout=8000&url=https%3A%2F%2Fwww.birdiesearch.com%2F"`。可用节点名用 `/proxies` 查；`DIRECT` 亦返回 Timeout 可排除"单节点被封"。
   3. 第三方独立出口旁证：`curl -x http://127.0.0.1:7897 'https://r.jina.ai/https://www.birdiesearch.com/'`（超时/422 = 站点对境外机房也不可达）。
 - ⚠️ 坑：Clash TUN 开启时本机"直连"同样被接管，`--noproxy '*'` 或裸 socket 的结果**不能**作为真实直连证据；域名解析走 fake-ip(198.18.x)，真实 IP 需用 DoH(`https://1.1.1.1/dns-query?name=...&type=A`)查。
+- 复发确认(2026-09-21 11:01 与 11:12 连续两次调度)：仍止于 `/api/user/sign` 的 `SSLEOFError`。当日复测：Clash 组『宝可梦』8/8 节点对目标站 `delay` 测试全失败(`Timeout` / `An error occurred in the delay test`)，**同一批节点 google/generate_204 正常**(308/90/42/188/43/258ms，仅 2 个节点自身超时)；`r.jina.ai` 旁证返回 `422 AssertionFailureError: page.goto: Timeout 15000ms exceeded`。→ 再次独立确认**站点侧不可达**，非节点/配置问题；两次调度均未推送、未耗额度、未写 `birdie_seen_items.json`。
 - 历史：自 2026-09-13 起连续多日同一阶段失败且**全程静默**（脚本签到即崩 → 从不推送，用户无感知），判定为站点级持续故障，非本机/节点问题；此类长期静默需人工介入（建议增加连续失败告警）。
 
 ## 已知噪音(勿误判为故障)

@@ -133,4 +133,39 @@ function getLikeCount(post) {
 }
 ```
 
+---
+
+## 「人工智能技术日报+播客」每日归档专用链路（2026-09-21 实测沉淀）
+
+适用：定时任务 `linuxdo_ai_daily_summary`（每天处理**至多一篇**新日报 → 归档 Obsidian → 仅新增且验收通过才飞书私信）。
+
+### 发现（比 Google 更可靠）
+- 日报作者固定 `xtc0809`（分类 前沿快讯 cat 78），标题形如 `linux.do人工智能技术日报+播客-YY-MM-DD`（**标题日期 = 发布日**；PDF 里的数据日期 = 标题日期 - 1）。
+- **首选**站内搜索：同源 tab `fetch('/search.json?q=' + encodeURIComponent('人工智能技术日报 order:latest'))` → `topics[]` 即完整时间倒序列表（含 topic_id / title / created_at），一次拿全，还能交叉确认无其他作者同类贴。
+- 备选：`/user_actions.json?username=xtc0809&filter=5&offset=0&limit=40`（filter=5 = 该用户创建的主题）。
+- ⚠️ `https://linux.do/u/<name>/activity/topics.json` **不是**有效 API（返回 HTML，解析后 `user_actions` 为空），别用。
+- ⚠️ Google `site:linux.do/t/topic "人工智能技术日报"` 结果严重滞后，只能兜底。
+
+### 限流与 429（重要）
+- linux.do 在密集请求后会进入 **Cloudflare IP 级 429**：页面顶部返回 `Just a moment...`。特征：**浏览器 fetch 与 curl_cffi（各 impersonate 版本、各 UA）同时 429** → 是 IP 限流而非指纹问题，换指纹/加代理都无用。
+- 对策：**等待约 10 分钟**后自动恢复（实测 200）。不要试图绕 CF、不要切代理硬打。
+- 附带结论：`connect.linux.do` 的 CF 卡死（见 `linuxdo_trust_level_sop`）与本次 429 是两类不同故障，不要混淆。
+
+### 正文=纯附件时的取 PDF
+- 这类日报 `posts_count == 1`（无回帖），主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
+- 主帖里给的是 `/uploads/short-url/xxxx.pdf`（**该路径用 curl/curl_cffi 直连会 404**——short-url 需经浏览器会话重定向）。
+- 正确取法二选一：
+  1. 浏览器 fetch 后读 `r.url` 拿真实 CDN 实链，如 `https://cdn3.ldstatic.com/original/4X/0/0/f/<hash>.pdf`，再用 curl_cffi 直连下载（实测 200 / application/pdf）；
+  2. 直接对 `/uploads/short-url/xxx.pdf` 做浏览器 fetch → `blob()`（SOP 里 PDF blob 链路）。
+- 抽文本：`pdftotext -layout in.pdf out.txt`（本机已装，实测 1.9MB PDF → 29k 字符 / 815 行），比 Python 库更省事。
+
+### 归档结构（与既有 09-14~09-18 期保持一致）
+- Raw `50 Raw/linux-do/YYYY-MM-DD linux.do人工智能技术日报+播客.md`：frontmatter（`source_url` 主帖 / `author: xtc0809` / `report_date` 数据日期）+ 来源 blockquote（PDF/播客/小宇宙真链）+ `## PDF 全文（原文提取）` + `## 主帖正文（原文提取 · 含播客与往期链接）`。
+- Wiki `60 Wiki/topics/linuxdo-ai-daily-YYYY-MM-DD.md`：今日亮点 → 模型/工具 → 教程/实战 → 社区与治理 → 总体趋势（照抄 PDF 末尾「今日技术趋势」）→ 数据概览表（抓取总量/标签新增/历史命中/今日全新话题/昨日话题后续/最终纳入日报/话题组）→ 参考链接。
+- INDEX：`60 Wiki/INDEX.md` 的「### AI 工具 / Claude Code」组按**最新在前**插入一行 `[[topics/linuxdo-ai-daily-...]]`。
+- 播客链接两个都要保留：catbox mp3 + 小宇宙 `https://www.xiaoyuzhoufm.com/podcast/<id>`（后者从主帖文本里直接抄，别套模板）。
+
+### 验收脚本要点
+Raw/Wiki/INDEX 三文件存在且非空 → frontmatter `sources` 逐条解析到真实文件 → 正文 wikilink ≥2 且均存在 → 正文中每个 linux.do topic URL **只出现一次**（主帖 URL 只放「参考链接」一处）→ 任一 FAIL 则不推送。
+
 
