@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-22
-- 正文已恢复: 77 / 索引可见 335 个编号
+- 正文已恢复: 83 / 索引可见 341 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -343,3 +343,9 @@
 | R333 | ⚠️仅索引 | LaunchAgents自动化拓扑与健康状态(20plist) | ...md | 11运行/5未加载/1错误/1缺失；6个AI Agent核心+2开发工具构成四层拓扑；识别4项优化建议(清理失效/修复错误/补日志/加KeepAlive) |
 | R334 | ⚠️仅索引 | smyze代码库架构演变趋势(10仓库/27模块) | 见 history/日志 | 近3月仅bar-cloud活跃(13commits集中bar-qmai-service)，其余9仓库冻结；R225基线依赖图谱未变；识别3大模块趋势(qmai热点/基建冻结/Dev |
 | R335 | ✅正文 | 下批TODO生成(规划模式) | 8163B R335_规划模式_下批TODO生成与独立评审.md | 发现temp/autonomous_reports报告库(R1-R334)整体丢失→history已从logs/autonomous_reflect.log重建303条(缺号31) |
+| R336 | ✅正文 | 自主报告归档抢救(R1-R335) | 6090B R336_自主报告归档抢救.md | 从L4会话归档恢复76份报告正文+335行索引并入库(memory/autonomous_reports),commit 668fdc7;钩子方案待审 |
+| R337 | ✅正文 | roi_monitor 产出量告警修复 | 9265B R337_patch_roi_monitor_v2.md | 实测根因=v1快照无avg_lines字段致<100行告警自06-26起为死代码+心跳稀释(占比77.6%);口径v2=done/报告行数分层现算,阈值按121天回溯校准(下滑25 |
+| R338 | ✅正文 | bar-smyze「复活」归因检验 | 14054B R338_bar-smyze复活归因假设检验.md | 结论=前提错位：R334的"10仓/27模块"是smyze根级云服务组(bar-cloud等,复现13次提交=精确命中),该组今日仍冻结;而看似复活的smyze/bar-smyze |
+| R339 | ✅正文 | 本地语音转写(ASR)实测 | 9291B R339_ASR本地语音转写能力缺口实测.md | 结论=前提错位:memory早就有 whisper_utils.py(176行,faster-whisper 1.2.1)且全API实测通过,TODO称'完全没有音频节点'过期;真 |
+| R340 | ✅正文 | 记忆更新欠账清单 | 16577B R340_记忆更新欠账清单.md | 135区块判定(已落地54/部分40/待评估26/丢弃5/空转10,落地率69.6%);★口径纠偏=TODO称'332处'无法复现,实测zip(L4月度归档)行首header仅10 |
+| R341 | ✅正文 | 生成下一批TODO(规划模式第2批) | 6792B R341_下一批TODO规划.md | 批判读history(309行,R1-R340;类型字段非受控词表达30+种写法,月份分布04月200/05月58/09月6)识别低价值模式(自我报告元分析/浅层可用性验证/泛采集 |

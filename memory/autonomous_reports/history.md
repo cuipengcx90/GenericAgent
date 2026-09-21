@@ -1,9 +1,15 @@
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
-- 采集: 2026-09-22；行数 304
+- 采集: 2026-09-22；行数 310
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R341 | 2026-09-22 | 产出 | 生成下一批TODO(规划模式第2批) | 批判读history(309行,R1-R340;类型字段非受控词表达30+种写法,月份分布04月200/05月58/09月6)识别低价值模式(自我报告元分析/浅层可用性验证/泛采集)与近3轮连续命中的'前提错位'根因(立项时未做最小可行性探测);出6条候选(temp/review_todos2.txt)交独立subagent评审(自读记忆+SOP,评1-10):待审清单收口9分最高/数据源地图7/信源审计7/silk5;评审判定'4条重叠(1↔6①、2↔6②)+2条低复利工具化'→删欠账巡检器(并入钩子)、替换本地语义检索(先证价值)、解散冲浪条目,最终保留4任务+种子项写入temp/TODO.txt;新探测=TrendRadar生产链可离线审计(~/projects/TrendRadar config ro挂载+/output 415期报告带来源标注)/微信msg下仅attach,file,migrate,video无voice(复核R339)/本机无sentence-transformers·faiss·duckdb·jieba;4条记忆提案(探测前置/评审价值在查重叠/TrendRadar链路位置/无向量检索栈/类型字段需归一)
+R340 | 2026-09-22 | 产出 | 记忆更新欠账清单 | 135区块判定(已落地54/部分40/待评估26/丢弃5/空转10,落地率69.6%);★口径纠偏=TODO称'332处'无法复现,实测zip(L4月度归档)行首header仅106次→唯一区块103,∪md语料26=127,1119次字符串多为会话转述;真欠账=P1 procmem macOS无root限制(5区块重复提出,R296+R303两次实测,procmem_scanner_sop.md零命中)/P2用户画像三连(钉钉HRM+Copilot·Lark主导92%节律·飞书KV27%,4月待审从未落盘)/P3 gh CLI v2.79边界/P5 R336自己的sync提案也未入SOP(全memory零命中'autonomous_reports_archive');新发现=global_mem.txt 14个段落整段重复(行146-201 vs 244-306等);产物=temp/mem_debt/memory_debt_ledger.csv(135行)+FINDINGS.md+5条待审提案
+R339 | 2026-09-22 | 能力 | 本地语音转写(ASR)实测 | 结论=前提错位:memory早就有 whisper_utils.py(176行,faster-whisper 1.2.1)且全API实测通过,TODO称'完全没有音频节点'过期;真缺口=入口/SOP/选型依据+解释器绑定陷阱(★faster-whisper只在/opt/anaconda3/bin/python3;homebrew python3.13报ModuleNotFoundError,负控已复现)。真音频端到端(say合成真语音+已知真值):中文长句 tiny=繁体+3错字 / base=繁体+2错字 / small=0错(2.4-3.8s/15s),英文tiny即0错;whisper.cpp(homebrew,ggml-tiny,Metal)722ms可跑但繁体无标点⇒保底备选。m4a/aac 可直吃,SRT与detect_language(zh 0.9972)实测正常。★微信语音夹具不可得=环境阻塞点(attach子目录直方图 Img638/Ann45/Rec10 无Voice、全容器silk/aud/amr=0),且该容器 find -type f 恒为0(TCC)须用ls。交付=memory/asr_cli.py(37行,核心13行,格式无关封装,回归4例全过)+L3 SOP提案7条(待审未落盘)+记忆更新提案4条(待审)。局限:TTS干净语音,真实噪声/口音精度待复测;.silk需silk-v3-decoder。
+R338 | 2026-09-22 | 产出 | bar-smyze「复活」归因检验 | 结论=前提错位：R334的"10仓/27模块"是smyze根级云服务组(bar-cloud等,复现13次提交=精确命中),该组今日仍冻结;而看似复活的smyze/bar-smyze/11仓从未冻结(全年4522/1166/464…,9月736提交/6-8月更高,9月反低于8月),驱动=3名真人开发(崔朋/yongqing.zhou/yiqun);唯一0→有跃迁是根仓bar-smyze(首提交2026-06-15「初始化CCB多Agent协作框架」,无remote,内容=skills/.dsh/.trellis六平台镜像)=H1的CCB编排链部分成立但落在工具链仓而非产品仓;09-14~16 DSH注入层批量(6类同题提交×4~7仓同分钟)+物理落点.dsh/AGENTS.md,但只占9月提交14~44%;AI署名率仅0.27%(2/736);含4条L2记忆更新提案待审
+R337 | 2026-09-22 | 工程 | roi_monitor 产出量告警修复 | 实测根因=v1快照无avg_lines字段致<100行告警自06-26起为死代码+心跳稀释(占比77.6%);口径v2=done/报告行数分层现算,阈值按121天回溯校准(下滑25%/稀疏4.0);补丁10处替换183行diff,真实数据触发3类告警(06-01停摆/07-10降27.5%/06-04稀疏);未改仓库,落地待批
+R336 | 2026-09-22 | 灾备 | 自主报告归档抢救(R1-R335) | 从L4会话归档恢复76份报告正文+335行索引并入库(memory/autonomous_reports),commit 668fdc7;钩子方案待审
 R335 | 2026-09-22 | 规划 | 下批TODO生成(规划模式) | 发现temp/autonomous_reports报告库(R1-R334)整体丢失→history已从logs/autonomous_reflect.log重建303条(缺号31);真灾备源=memory/L4_raw_sessions/*.zip(2026-05.zip含375处R文件名+332处报告签名,可恢复率≈97%);6候选经subagent真机23轮评审8/7/4/4/6/6→保留4条+新增记忆欠账项,删2条(launchd整改前提过期且越权/反射器审计属重复验证)
 R334 | 2026-05-11 | 产出 | smyze代码库架构演变趋势(10仓库/27模块) | 近3月仅bar-cloud活跃(13commits集中bar-qmai-service)，其余9仓库冻结；R225基线依赖图谱未变；识别3大模块趋势(qmai热点/基建冻结/DevOps停滞)+4项优化建议
 R333 | 2026-05-11 | 产出 | LaunchAgents自动化拓扑与健康状态(20plist) | 11运行/5未加载/1错误/1缺失；6个AI Agent核心+2开发工具构成四层拓扑；识别4项优化建议(清理失效/修复错误/补日志/加KeepAlive)
