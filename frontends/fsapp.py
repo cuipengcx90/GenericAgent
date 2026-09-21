@@ -795,8 +795,15 @@ def handle_message(data):
         ag._turn_end_hooks[hook_key] = _make_task_hook(card, done_event, on_final)
         try:
             ag.put_task(user_input, source="feishu", images=image_paths)
-            start = time.time()
+            start = time.time(); _started = False
             while not done_event.wait(timeout=3):
+                # 曾被启动过、现在 is_running 已为 False 且 done_event 未设置：说明任务是被
+                # 外部中止的（abort 不经过 hook），此时必须自己收尾，否则卡片永远停在"工作中"。
+                if getattr(ag, "is_running", False):
+                    _started = True
+                elif _started:
+                    card.fail("任务已中止")
+                    break
                 if not user_tasks.get(open_id, {}).get("running", True):
                     ag.abort()
                     card.fail("已停止")
