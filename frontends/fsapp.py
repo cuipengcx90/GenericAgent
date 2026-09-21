@@ -549,8 +549,11 @@ class _TaskCard:
     _DETAIL_LIMIT = 4000
     _FINAL_LIMIT = 4000
     _QUEUE_LIMIT = 8
-    _PAGE_STEPS = 50           # 每页最多步数（实测约 58 步即触达飞书卡片体积上限）
-    _PAGE_CHARS = 8000         # 每页正文字符预算；实测超限点 58 步×均值272字符，收此值留安全边际
+    # 实测（2026-09-21）：飞书的硬限制是 **element 数量**（约 65 个），不是体积。
+    # elements=64 通过、67 被拒（报 11310 element exceeds the limit）；
+    # 而 50 步 × 800 字（4 万字符 / 126KB）照样通过，故体积预算可大幅放宽。
+    _PAGE_STEPS = 50           # 50 步 + 页眉 + 按钮区 ≈ 52 个 element，留足余量
+    _PAGE_CHARS = 30000        # 体积兜底：防止极长 thinking 把单页推到 MB 级
     _STEP_FLUSH_INTERVAL = 3.0
     _REGISTRY_MAX = 200        # 翻页注册表上限，超出丢弃最早的，防长跑内存累积
     _registry = {}             # uid -> _TaskCard，翻页回调据此找回卡片实例
@@ -559,6 +562,7 @@ class _TaskCard:
         self.rid, self.rtype = receive_id, rid_type
         self.uid = uuid.uuid4().hex[:12]
         self.page_idx = 0
+        self._follow_tail = True   # 默认跟随最新页，用户手动翻页后置 False
         _TaskCard._registry[self.uid] = self
         while len(_TaskCard._registry) > _TaskCard._REGISTRY_MAX:
             _TaskCard._registry.pop(next(iter(_TaskCard._registry)))
@@ -587,9 +591,10 @@ class _TaskCard:
         }
 
     def _build_locked(self):
-        header = f"**{self.status}**"
         pages = self._paginate()
-        self.page_idx = max(0, min(self.page_idx, len(pages) - 1))
+        # 默认停在最新页（用户关心当下进展）；手动翻页后不再自动跟随
+        self.page_idx = (len(pages) - 1) if self._follow_tail \
+            else max(0, min(self.page_idx, len(pages) - 1))
         total = len(pages)
         header = f"**{self.status}**"
         if total > 1:
@@ -618,25 +623,29 @@ class _TaskCard:
         return pages
 
     def _page_buttons(self, total):
-        """翻页按钮：value 回传 card uid + 目标页，由 handle_card_action 处理。
-        注意：卡片 JSON 2.0 已移除 `action` 容器标签（1.0 才有），按钮必须直接
-        作为 element 放进 body.elements，否则报 200861 unsupported tag action。"""
-        acts = []
-        if self.page_idx > 0:
-            acts.append({"tag": "button", "type": "default",
-                         "text": {"tag": "plain_text", "content": "◀ 上一页"},
-                         "value": {"ga_card": self.uid, "page": self.page_idx - 1}})
-        acts.append({"tag": "button", "type": "text",
-                     "text": {"tag": "plain_text", "content": f"{self.page_idx + 1}/{total}"}})
-        if self.page_idx + 1 < total:
-            acts.append({"tag": "button", "type": "primary",
-                         "text": {"tag": "plain_text", "content": "下一页 ▶"},
-                         "value": {"ga_card": self.uid, "page": self.page_idx + 1}})
-        return acts
+        """翻页按钮：column_set 三列等宽横排，value 回传 card uid + 目标页。
+        注意：卡片 JSON 2.0 已移除 `action` 容器；按钮直放 elements 或 column 内。
+        首尾页用 disabled 置灰而非隐藏，避免按钮位置跳动。"""
+        def _col(btn):
+            return {"tag": "column", "width": "weighted", "weight": 1, "elements": [btn]}
+
+        prev = {"tag": "button", "type": "default", "width": "fill",
+                "disabled": self.page_idx <= 0,
+                "text": {"tag": "plain_text", "content": "◀ 上一页"},
+                "value": {"ga_card": self.uid, "page": self.page_idx - 1}}
+        cur = {"tag": "button", "type": "text", "width": "fill",
+               "text": {"tag": "plain_text", "content": f"{self.page_idx + 1} / {total}"}}
+        nxt = {"tag": "button", "type": "primary", "width": "fill",
+               "disabled": self.page_idx >= total - 1,
+               "text": {"tag": "plain_text", "content": "下一页 ▶"},
+               "value": {"ga_card": self.uid, "page": self.page_idx + 1}}
+        return [{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
+                 "columns": [_col(prev), _col(cur), _col(nxt)]}]
 
     def goto_page(self, idx):
         with self._lock:
             self.page_idx = max(0, int(idx))
+            self._follow_tail = False     # 用户手动翻页后停止自动跟随最新页
         self._enqueue("page", force=True)
 
     def _enqueue(self, reason, force=False):
