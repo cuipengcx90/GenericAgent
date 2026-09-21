@@ -31,3 +31,14 @@
 
 ## 已建定时监测
 `../sche_tasks/linuxdo_trust_level_check.json`：每天09:30检查一次，**已符合则完全静默不通知**；不符合才私信列出具体哪几项+当前值/门槛值+差距，且仅提醒不代操作(不自动发帖/点赞)。检查用新开独立tab(不覆盖用户已有tab)，用完关闭不留痕。
+
+## ⚠️ connect.linux.do 被 Cloudflare 卡死时的备用检查入口(2026-09-21 实测)
+现象：`connect.linux.do` 顶层导航必定停在 CF managed challenge(title「请稍候…」，hidden `cf-turnstile-response` 恒为空)。
+根因：Chrome cookies 里 `cf_clearance` 的 `partitionKey.topLevelSite = https://linux.do`(CHIPS 分区 cookie)，**仅当顶层站点是 linux.do 时才携带**；顶层导航到 connect.linux.do 不携带 → 必然重新挑战。同浏览器访问 `https://linux.do/` 正常放行。
+已验证无效：等待6~15s / 连续重载 / `Page.reload(ignoreCache)` / `Page.bringToFront` 前台化 / curl 带 `cf_clearance`+`auth.session-token` 直连(403，JA3 指纹不符) / 从 linux.do 页跨域 fetch(被 CORS 挡)。
+**备用入口(推荐)**：直接读 **linux.do 首页的「要求」等级卡**，一步拿到全部 TL3 明细，格式与 connect 页一致：
+`✓ 访问天数 81/50 / ✓ 浏览话题 582/500 / ○ 已读帖子 13407/20000 / ○ 回复 8/10 / ✓ 送出赞 84/30 / ✓ 获赞 39/20 / ✓ 获赞天数 9/7 / ✓ 点赞用户 39/5 / ✓ 被举报帖子 0/5 / ✓ 发起举报 0/5 / ✓ 被禁言 0/0 / ✓ 被封禁 0/0`，卡片头部汇总「✓N 已达标 / X% 完成度 / LvX → LvX+1 / ○M 待完成」。
+解析注意：driver 会往 body 注入 `ljq_driver: 已连接` 首行，解析前先剔除；`document.title` 会一直是「请稍候…」，不可用来判断加载态。
+
+## 故障排查留档建议
+CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如 `sche_tasks/done/*_linuxdo_trust_level_check.md`)，避免下次重复试错。
