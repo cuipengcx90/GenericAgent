@@ -6,10 +6,18 @@
 
 ## 先分类：两套根因，判据完全不同
 
-### A 类：卡片体积超限 → 发送静默失败
-- 判据：日志出现 `发送失败: 230099, Failed to create card content, ext=ErrCode: 200800`
-- 关键数字（实测）：超限点约 **58 步**；单步 detail 均值 272 字符、中位数 80、最大 9003
-  → 单步体积波动极大，**只按步数设限不安全**，必须叠加字符预算
+### A 类：卡片 element 数 / 体积超限 → 发送静默失败
+- 判据：日志 `Failed to create card content`，**先看错误码是哪一种**：
+  - `11310 element exceeds the limit` → **element 数量超限**
+  - `200800 create universal card fail` → 结构非法（如 2.0 用了已移除的 tag）或体积超限
+- **关键实测（2026-09-21，逐个实发标定）**：
+  - `elements=64` ✅ 通过 / `elements=67` ❌ 被拒 → **硬上限约 65 个 element**
+  - `50 步 × 800 字`（4 万字符 / **126KB**）✅ 通过 → **体积不是主要瓶颈**
+  - 故历史上"58 步超限"的主因是 **58 个 collapsible_panel 撞到 65 上限**，
+    而不是字节数。**按体积去优化是错误方向**（曾把 `_PAGE_CHARS` 设 8000，
+    导致每步稍长就 5~19 步翻页，与"50 步一页"的设计意图不符）
+- 现行参数：`_PAGE_STEPS=50`（50步+页眉+按钮区≈52 个 element，留余量）
+  + `_PAGE_CHARS=30000`（仅作体积兜底，防极长 thinking 把单页推到 MB 级）
 - 历史缺陷（2026-09-21 修复，commit `16f9c25`）：
   1. `_rollover_locked` 递增 page_no、清空 msg_id 却未清空 `steps`，而 `_build_locked`
      遍历完整 steps → "新"卡片与超限旧卡片同样大、同样失败，rollover 空转
@@ -48,6 +56,11 @@ sed -n "${last},\$p" logs/feishu_agent.log | grep -c "Failed to create card cont
 ```
 
 ## 关键坑（都踩过）
+- **rollover（换新卡片）绝不可在 patch 失败时触发** —— 它会清空 `steps`，把全部历史丢掉。
+  分页已保证单页不超 element 上限，patch 失败应重试而不是换卡片；只有"新建卡片就失败"
+  （卡片从未建立、无历史可丢）才允许 rollover。症状：**明明有翻页按钮，却又冒出一张新卡片**。
+  2026-09-21 fix（commit `a846395`）—— 原实现把 `_patch_card_result` 的 limit 直接透传，
+  而该 limit 在错误码含 230099 时恒为 True，等于任何 patch 失败都换卡片。
 - **改了卡片 JSON 结构必须实发一张验证**，本地语法/单测全过也没用 —— 字段合法性只有飞书服务端知道。
   案例：把按钮包进 `{"tag":"action"}`（1.0 写法）提交后才由线上报 200861 发现，白折腾一轮。
   自检命令（发一张自带按钮的卡片，返回 success 即通过）见本文件「验证卡片结构」一节。
