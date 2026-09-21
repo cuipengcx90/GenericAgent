@@ -77,6 +77,27 @@ python3 memory/feishu_card_selftest.py <open_id>
 直接指出是哪个 element 的哪个字段不合法。
 
 ## 相关产物
-- 修复提交：`16f9c25`（fsapp.py）、L1 RULE 15（global_mem_insight.txt）
+- 修复提交：`16f9c25`（分页按钮翻页）、`fb96c34`（修正按钮结构）、`2b8ab8f`（本 SOP 与自检脚本）
+- L1 RULE 15（global_mem_insight.txt）、自检脚本 `memory/feishu_card_selftest.py`
 - 上游 Issue：lsdefine/GenericAgent#814（含分析与建议）
-- 补丁备份：`temp/patches/feishu-card-pagination.patch`（temp/ 会被清理，需另存）
+
+### 官方更新后如何保住这套改动
+改动已 commit 在本地 main 分支，官方 `git pull` 属 merge，commit 不会消失；
+仅当官方恰好改了同一行才会冲突，按冲突标记手工合并即可。三层保障：
+
+1. **git commit**（主保障）：`git log --oneline -- frontends/fsapp.py` 可随时找回
+2. **差异补丁**（仓库外，不受 GA 的 temp 清理影响）：
+   - `~/GenericAgent-patches/feishu-card-pagination-vs-official.patch` —— 官方版→当前版
+   - `~/GenericAgent-patches/feishu-card-pagination-commits.patch` —— commit 形式完整脉络
+3. **本 SOP** 记录改动的三条不可丢约束
+
+重放：
+```bash
+cd ~/projects/GenericAgent
+git apply ~/GenericAgent-patches/feishu-card-pagination-vs-official.patch
+```
+
+手工合并时必须保住的三条（丢了任何一条都会复发）：
+- 按钮**直放** `body.elements`，不得套 `{"tag":"action"}` 容器（2.0 已移除）
+- 分页双判据 `_PAGE_STEPS`(50) + `_PAGE_CHARS`(8000)，只按步数会漏
+- `_rollover_locked` 必须清 `steps`、`_push_sync` 新建失败必须回 `limit`
