@@ -160,11 +160,39 @@ team-lead 与 reviewer1 **先后**在同一处被
    `~/.pi/agent/sessions/--private-tmp-ap_unattended_delegation-*/ <最新>.jsonl`，
    grep `"command"` 抽 W0 真实执行的 bash 命令序列——**这是还原"它到底干了什么"的唯一可靠手段**。
 
+## 3.5 僵尸委托锁与升级闭环（2026-09-21 第二轮，真数据验证）
+
+演练首次 FAIL 的**直接根因不是团队起不来，而是通道被自己的僵尸锁堵死**：上一轮 run 死在 `DISPATCHED`，
+`~/.cache/autopilot/delegation.lock` 在盘上留了 6794 秒（< 2h 上限）→ 旧的三级年龄判定把它当**真冲突** →
+新 run `BLOCKED`，而无人值守下没人来清 ⇒ 整条委托链路死锁。三条落地修复：
+
+1. **`acquire-delegation-lock` 增补"证据判据"（在年龄分级之前生效）**：读持有者自己的
+   `~/.cache/autopilot/runs/<holder-run-id>/run-state.json`：
+   - 读不到 → **不猜**，回退原年龄分级（30min 内拒 / 2h 内保守拒 / 超 2h 且无近期事件才回收）；
+   - phase ∈ 终态（`COMPLETED/FAILED/ABORTED/CANCELLED/BLOCKED`）→ 持有人不可能回来，回收；
+   - 该 run 绑过 workspace 而该 workspace（或 lead pane）已不在 `herdr workspace list` → 回收；
+   - state 冻结 > 2h 且其 workspace 内无 agent 在 `working` → 回收。
+   命中即打印 `orphaned holder: <理由>`。**判据红线：没有证据就不动手**（活 workspace 的中段锁、无 run state 的中段锁必须继续被拒，已用回归测试钉住）。
+   **负控手法（复跑用）**：把真实死亡 run 的 state 做成锁，`acquire` 分别对着"去掉该分支的副本"和"现行代码"跑
+   → 前者 `rc=1 BLOCKED`、后者 `rc=0 OK ...(orphaned holder: ...)`，两边都留输出才算证明。
+2. **`release_own_lock(run_id)` + 接入 `watch` 的 `escalate`（G3 闭环）**：升级不再是"写个文件就完"——
+   通知文本与 `NEEDS_HUMAN.md` 里都带 `委托锁: <处置>`，并且**只释放本 run 自己持有的锁**
+   （别人持有的只报告 `lock is held by ...`，绝不代删）。
+3. **`watch` 补进 SKILL.md**：此前实现+测试都有、SKILL.md 却**一个字没提**（驱动窗口等于没有文档）。
+   新增「外层驱动窗口」小节：命令/语义（轮询 phase + W0 真实 agent 状态，`COMPLETED` 退出，idle 就重投"继续推进"）/
+   有界（默认 dry-run、`--once`、`--max-min`）/升级=通知+留痕+释放自有锁/两层窗口组合（外层 watch + 内层 team_drive）。
+
+装置坑：①锁文件里的 `pid` **不参与** stale 判定（禁止 os.kill 判活）；②套件夹具约定是**所有子命令都接受
+`--workspace-id`**（只给 `advance` 加会一次性炸掉 28 个测试）；③`run-state.json` **没有** `updated_at` 字段，
+事件在 `run-events.jsonl`（不是 `events.jsonl`）。
+
 ## 4. 残余风险 / 未覆盖
 
 - 委托**成功路径仍未跑通到 COMPLETED**：修复后虽 6/6 起队到 DISPATCHED，但 W0 **无法驱动已起团队**
   （缺 mailbox/teamctl 桥，见 §2.2），团队 pane 空停在提示符 ⇒ "团队产出质量/交付物正确性"**仍未验证**。
-- 锁滞留只验证到"acquire 被 BLOCKED"，**没有**做满 2h 后自动可回收的端到端复现。
+- ~~锁滞留只验证到"acquire 被 BLOCKED"，**没有**做满 2h 后自动可回收的端到端复现。~~
+  → **2026-09-21 第二轮已覆盖**：改为**证据判据**（读持有者 run-state：终态 / workspace 已消失 / state 冻结 >2h 且无人 working → 判孤儿回收；取不到证据才回退年龄分级），
+  并用**真实死亡 run 的锁**做了端到端负控（去掉分支 `rc=1 BLOCKED` vs 现行 `rc=0 OK ...(orphaned holder: ...)`），非纸面推理。见 §3.5。
 - 并发多任务、长任务（>35min）、网络中断等场景未覆盖。
 - `COMPLETED` 判定过弱：只看 artifact 存在 + 自填 `quality_score≥0.9` + evidence 非空，
   **不校验内容真伪、不独立复跑**；"通过"可能只是文件在。
