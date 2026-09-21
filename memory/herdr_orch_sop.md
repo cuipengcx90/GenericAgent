@@ -108,7 +108,7 @@ kind 取值见 `herdr agent start --help`：pi|claude|codex|gemini|cursor|devin|
 - **跨 repo 团队的 workspace 结构**（用户真实场景：前端/后端/测试是不同工程）：一个 team=一个 workspace；**每个角色 = 一个 tab，`tab create --cwd <该角色的 repo>`**（前端 tab 指前端 repo、后端 tab 指后端 repo、测试 tab 指测试 repo，互不干扰）；tab 内可再 split pane 跑常驻命令（dev server/watch）。**别把多 repo 挤一个 tab**。
 - **纯 Herdr 的可靠协作边界**：skill 负责临时团队的角色路由；`herdr agent prompt` 只作为唤醒，不作为可靠传输。团队目录下的 `herdr-team/bin/mailbox.py` 提供原子 `send`、不可变 `received` ACK、去重和 `status`；完成另发 `kind=result`，超时查状态再重试。它是随团队创建和清理的本地文件协调状态，不是 daemon、外部队列或 CCB 依赖。
 - **P2P 通信取舍**：默认由 lead 路由（hub-and-spoke）；无依赖角色可用同一 mailbox 直聊。禁止从 `--wait` 推断送达，必须以 ACK/status 为准；没有需要持久化的任务则在解散前删除 mailbox。
-- **skill 内固化的真机坑**：never auto-approve trust/hooks 门(blocked→停下问人)；`--wait` 不可靠改 fire-and-forget + 轮询 `agent get`；只 close 自己建的 workspace；`agent read --source recent-unwrapped` 取干净正文；`unknown`≠done。
+- **skill 内固化的真机坑**：trust/hooks 门**分级处理**(旧文"never auto-approve→停下问人"已于 2026-09-21 修订：无人值守时 W0 就是那个人，但只许把**本次 run 自己的工作区**确定性预信任——`herdr-team/bin/pretrust.py --dir <project_dir> --apply`，幂等/备份/拒绝 `/` 与 `$HOME`/写 `unattended-decisions.jsonl`；比工作区更宽的"Trust all"、全局信任、sudo、生产凭据仍必须停下问人)；`--wait` 不可靠改 fire-and-forget + 轮询 `agent get`；只 close 自己建的 workspace；`agent read --source recent-unwrapped` 取干净正文；`unknown`≠done。
 - **2026-09-21 控制面全面评审（autopilot×herdr-team）结论**：威胁模型=documented-path 审计门禁非 OS/RBAC。评审 A/B/C/D 四项风险**全部闭合**：A/B=委托验收回放团队事件+重算 request sha256+绑定 team_id/workspace/lead_pane；C=teamprofile 拒 worker 名 ∈ {lead,monitor}；D=新增 `team_lock()` 使 `delegated_team_acceptance` 全程持团队 `.workflow.lock`（锁序 run→team 无环），并加 TOCTOU 回归测试。证据：单测 52/52、演练 51/51（A/B/C 38 + D 13，驱动脚本在 temp/，隔离 HOME）。坑：`teamctl/autopilotctl` argparse **子命令必须在 --dir 之前**；teamprofile BLOCK 输出 `ERROR:`；工件须真实存在于 project_dir 内；self 模式完成必经 `DISPATCHED`(无 --team-id→mode=self)；委托锁按"内容+时间戳判活"非 flock。独立外部复评本轮不可用(codex 4router 额度不足/gemini 已弃用/无 claude·grok)，为对抗式自查。
 - **2026-09-21 晚补测 R/G 恢复性 + 真 agent 端到端（此前只在会话里口头列过、从未真跑）**：驱动 `temp/drill_recovery.py`（隔离 HOME；`r5`/`e2e` 子参数可单跑），结果 `temp/drill_recovery_results.json`，日志 `temp/drill_recovery_full.log`。R1 lead pane 消失(状态持久、仅原 lead 可写、**无指挥权移交子命令**，leader 真死只能重建团队) / R2 worker 掉线(不卡死、不静默补位) / R3 真杀进程后 pending 事务自动回放、事件只追加不重放(initialized 仅 1 次→断点续跑) / R4 验收证据删改截断一律 BLOCK(以团队事件流回放为准) / R5 真实 `herdr workspace` 建后关：团队态可读、phase 不漂移，**但控制面不校验 pane 存活(R5-6)**，pane 消失仍可推进→workspace 存活检查须放编排层 / G 组：需人工确认时停在 PLAN_READY 且不污染状态、补 REVIEWED 后从断点续跑、未确认期间不空转。真 agent 段：真实 workspace+`herdr agent start pi`+真 pane，`agent prompt --wait` + `agent read --source recent-unwrapped` 取回应答 'OK' 证活，演练后 workspace 已关。总盘 **126 演练 + 52 单测全绿**；详见 DRILL_LOG 第 7/8 节。坑：断言辅助函数要兼容 list/None，否则末段崩溃留下未关的 workspace 与活 agent（先收尾再续调）。
 - **2026-09-21 深夜再补（演练 9/10/11，DRILL_LOG §9~§11）**：①`drill_dag.py` 让 **5 个真 pi agent** 真跑完整 L 路线，
@@ -118,8 +118,16 @@ kind 取值见 `herdr agent start --help`：pi|claude|codex|gemini|cursor|devin|
   会抛 traceback 而非 BLOCKED → 已各加 <20 行结构校验（前后对照 `temp/prefix_bug_evidence.txt`）；③独立复评以
   **全新无上下文 pi agent** 顶替（codex 仍 403 额度不足），代码面未发现新高危绕过，文档面抽查两次自相矛盾（75/37/22 vs 2/3/22）不可采信。
 - **herdr/pi 操作坑（本轮实测）**：**agent 名全局唯一**（跨 workspace 也冲突 → `agent_name_taken`）；
-  **刚建 pane 后 `agent start` 会偶发 `agent_pane_busy: "... is not an available shell"`**（实测约 3/25；
-  与 `--no-focus`/聚焦状态无关，**退避重试即可**；对同 pane 重复 start 也报同一句，别把"已有 agent"误读成"未就绪"）；
+  **刚建 pane 后 `agent start` 会偶发 `agent_pane_busy: "... is not an available shell"`**——
+  2026-09-21 判别实验（`temp/probe_burst2.py`）已给该码定性：herdr 官方定义 available shell =
+  「pane 停在交互提示符、shell 在前台、无前台命令/编辑器/agent」。故该码**有二义性**，判别数据：
+  **真并发**（6 个 pane 建好后同时并行 start）**6/6 成功** ⇒ 与并发/资源无关；
+  **紧贴串行**（建完立刻 start）1/6 失败，且失败 **0.14s 瞬时就返回**、**第一次退避重试即成功** ⇒
+  是 per-pane 就绪竞态；对**已占用** pane 才 3/3 永久失败（那才是真占用）。
+  单点 p≈10~17%，一次连起 6 个成员至少败一个 ≈47~67% ⇒ "启动多"才暴露；**必须包退避重试**，
+  且**别把"已有 agent"和"未就绪"混为一谈**（重试救得回前者之外的竞态，救不回真占用）。
+  ✅已落修：`teamprofile.py` 的 `agent start` 已带退避重试 + `launch` 失败回滚（`probe_fix_verify.py` 3/3）；
+  与 `--no-focus`/聚焦状态无关；
   **`teamprofile.py launch` 非幂等且失败不回滚**（重跑 0.2s 即 `agent_name_taken: team-lead is already used` 并多留 tab），
   **委托失败不释放 `delegation.lock`**（实测下一次 acquire `BLOCKED ... age=311s, too recent to reclaim`，2h 内无法再委托）
   → 无人值守委托必须自己包重试+清理，见 `autopilot_unattended_drill_sop`；
