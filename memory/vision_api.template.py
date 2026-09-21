@@ -9,10 +9,9 @@ from pathlib import Path
 # 常见格式：
 #   xxx_config = {"apibase": "https://.../v1", "apikey": "...", "model": "...", "proxy": None}
 # 不同中转的 apibase/endpoint 可能不同，按实际状态码和响应结构修正。
-CLAUDE_CONFIG_KEY = 'claude_config141'   # mykey.py 中 Claude 配置的变量名
-OPENAI_CONFIG_KEY = 'oai_config1'        # mykey.py 中 OpenAI 配置的变量名
+OPENAI_CONFIG_KEY = 'native_oai_config' # mykey.py 中 OpenAI 兼容视觉配置的变量名
 MODELSCOPE_API_KEY = ''                  # 直接填你的 ModelScope token
-DEFAULT_BACKEND = 'claude'               # 默认后端: 'claude' / 'openai' / 'modelscope'
+DEFAULT_BACKEND = 'openai'               # 默认后端: 'openai' / 'claude' / 'modelscope'
 # =================================================================
 
 MODELSCOPE_API_BASE = 'https://api-inference.modelscope.cn'
@@ -28,9 +27,7 @@ def ask_vision(image_input, prompt="详细描述这张图片的内容", timeout=
     except Exception as e:
         return f"Error: 图片处理失败 - {type(e).__name__}: {e}"
     try:
-        if backend == 'claude':
-            return _call_claude(b64, prompt, timeout)
-        elif backend == 'openai':
+        if backend == 'openai':
             mk = _load_config()
             cfg = getattr(mk, OPENAI_CONFIG_KEY)
             return _call_openai_compat(
@@ -80,24 +77,6 @@ def _prepare_image(image_input, max_pixels=1440000):
 def _load_config():
     import mykey
     return mykey
-
-def _call_claude(b64, prompt, timeout, max_tokens=1024):
-    mk = _load_config()
-    cfg = getattr(mk, CLAUDE_CONFIG_KEY)
-    resp = requests.post(
-        cfg['apibase'] + '/v1/messages',   # endpoint按中转实际情况改：有的apibase已含/v1，或路径不同
-        json={'model': cfg['model'], 'max_tokens': max_tokens, 'messages': [{
-            'role': 'user',
-            'content': [
-                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/jpeg', 'data': b64}},
-                {'type': 'text', 'text': prompt}
-            ]
-        }]},
-        headers={'x-api-key': cfg['apikey'], 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
-        timeout=timeout
-    )
-    resp.raise_for_status()
-    return resp.json()['content'][0]['text']
 
 def _call_openai_compat(b64, prompt, timeout, *, apibase, apikey, model, proxy=None):
     proxies = {'https': proxy, 'http': proxy} if proxy else None

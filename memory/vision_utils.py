@@ -6,9 +6,10 @@
     reply = ask_vision('screenshot.png', '图中有什么文字？')
     reply = ask_vision(pil_img, '描述这张图', backend='openai')
 
-后端: claude(default) | openai
-配置: mykey.py 中 native_claude_config0 / native_oai_config
-      proxy: mykey.py 顶层 'proxy' 字段（同 llmcore）
+后端: openai（默认） / deepseek（官方 DeepSeek-V4.1-Flash）
+配置: openai 使用 mykey.py 中 native_oai_config
+      deepseek 使用 macOS Keychain：service=GenericAgent，account=deepseek_api_key
+      proxy: mykey.py 顶层 'proxy' 字段（同 llmcore，可选）
 """
 
 import base64, os, sys, json, requests, socket as _socket
@@ -41,9 +42,9 @@ for _p in [os.path.join(_DIR, '..'), _DIR]:
         sys.path.insert(0, _p)
 
 # ── 配置常量 ──────────────────────────────────────────────────
-DEFAULT_BACKEND = 'claude'     # 'claude' | 'openai'
-_CLAUDE_KEY     = 'native_claude_config0'
-_OAI_KEY        = 'native_oai_config'
+DEFAULT_BACKEND = 'openai'
+# The verified OpenAI-compatible Vision route; do not fall back to retired Claude config0.
+_OAI_KEY = 'native_oai_config'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -57,19 +58,33 @@ def ask_vision(image_input, prompt="详细描述这张图片的内容",
     Args:
         image_input : 文件路径(str/Path) | PIL.Image 对象 | bytes(raw image)
         prompt      : 提问文本
-        backend     : 'claude'(default) | 'openai'
+        backend     : 'openai'（默认）或 'deepseek'（官方 DeepSeek-V4.1-Flash）
         timeout     : 请求超时秒数
         max_pixels  : 图片最大像素，超出自动缩放，默认 1440000
 
     Returns:
         str — 模型回答；出错返回 "Error: ..."
     """
+    backend = backend.lower().strip()
+    if backend not in ('openai', 'deepseek'):
+        return f"Error: 不支持的 vision backend '{backend}'；可选: openai / deepseek"
     try:
         b64, mime = _prepare_image(image_input, max_pixels)
     except Exception as e:
         return f"Error: 图片处理失败 — {type(e).__name__}: {e}"
 
-    mk = _load_mykeys()
+    # DeepSeek only needs the system Keychain credential. mykey.py is optional
+    # here and is consulted solely for its existing proxy preference.
+    try:
+        mk = _load_mykeys()
+    except FileNotFoundError:
+        mk = {}
+    if backend == 'openai' and _OAI_KEY not in mk:
+        return f"Error: OpenAI Vision 配置缺失 — 请在 mykey.py 配置 {_OAI_KEY}"
+    try:
+        cfg = mk[_OAI_KEY] if backend == 'openai' else _load_deepseek_config()
+    except Exception as e:
+        return f"Error: DeepSeek Keychain 配置不可用 — {type(e).__name__}: {e}"
     proxy = mk.get('proxy', 'http://127.0.0.1:2082')
 
     # ── 自动探测代理可用性，不可用则降级直连 ──────────────────
@@ -89,12 +104,7 @@ def ask_vision(image_input, prompt="详细描述这张图片的内容",
     last_err = None
     for _px, _label in attempts:
         try:
-            if backend == 'claude':
-                return _call_claude(b64, mime, prompt, timeout, _px, mk[_CLAUDE_KEY])
-            elif backend == 'openai':
-                return _call_openai(b64, mime, prompt, timeout, _px, mk[_OAI_KEY])
-            else:
-                return f"Error: 未知 backend '{backend}'，可选: claude / openai"
+            return _call_openai(b64, mime, prompt, timeout, _px, cfg)
         except requests.exceptions.Timeout:
             last_err = f"timeout(>{timeout}s) via {_label}"
             continue
@@ -137,6 +147,19 @@ def _load_mykeys():
         raise FileNotFoundError('[vision_utils] 未找到 mykey.py / mykey.json')
     with open(p, encoding='utf-8') as f:
         return json.load(f)
+
+
+def _load_deepseek_config():
+    """Load the official DeepSeek Vision credential from macOS Keychain only."""
+    import keyring
+    api_key = keyring.get_password('GenericAgent', 'deepseek_api_key')
+    if not api_key:
+        raise RuntimeError('macOS Keychain 中不存在 GenericAgent/deepseek_api_key')
+    return {
+        'apibase': 'https://api.deepseek.com',
+        'apikey': api_key,
+        'model': 'deepseek-flash',
+    }
 
 
 def _prepare_image(image_input, max_pixels=1_440_000):

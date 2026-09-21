@@ -1,0 +1,7 @@
+{
+  "schedule": "09:00",
+  "repeat": "weekly_last_workday",
+  "enabled": false,
+  "max_delay_hours": 6,
+  "prompt": "执行 smyze/bar release-marshal 只读预检。必须运行 skills/release-marshal/scripts/preflight.sh，生成候选发布单和报告；禁止 merge、push、tag、deploy、生产 SQL。运行报告写入 scheduler 注入的报告路径。启用前必须补齐真实发布群、时间窗、quota、责任人和自动修复白名单。"
+}

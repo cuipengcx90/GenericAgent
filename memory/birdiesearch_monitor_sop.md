@@ -37,5 +37,14 @@
 - ⚠️坑：验证新词有效性会直接调用真实 search 接口，消耗当日免费搜索额度，可能导致当天定时任务因额度不足提前停止。批量测词前需权衡，尽量安排在非任务时段，或接受当天主任务受影响。
 - 已知会被平台屏蔽的词：命中平台侵权/敏感策略时返回 `code=-1` 且 `msg` 含"相关内容已删除"（如"极客时间"），此类词即使曾有资源也应排除，不纳入 KEYWORDS。
 
+## 站点不可达时的诊断手法(2026-09-20 实测验证)
+- 症状：脚本 `exit=1` 止于 `birdie_client.py sign_in()`(`POST /api/user/sign`)，报 `ProxyError ... handshake operation timed out` / `SSLEOFError` / `SSL_ERROR_SYSCALL`。签到是第一步，**早于搜索与推送** → 此时不推送、不耗额度，属"站点侧不可达"而非限额。
+- 快速定性三步（勿盲目重试脚本）：
+  1. `curl -s -o /dev/null -w '%{http_code}' --max-time 20 -x http://127.0.0.1:7897 https://www.google.com/generate_204` 应为 204（排除代理整体故障；代理来自 macOS 系统代理，无 `*_proxy` 环境变量）。
+  2. Clash 逐节点测目标站（只读）：`curl -s --unix-socket /tmp/verge/verge-mihomo.sock "http://localhost/proxies/<urlencoded节点名>/delay?timeout=8000&url=https%3A%2F%2Fwww.birdiesearch.com%2F"`。可用节点名用 `/proxies` 查；`DIRECT` 亦返回 Timeout 可排除"单节点被封"。
+  3. 第三方独立出口旁证：`curl -x http://127.0.0.1:7897 'https://r.jina.ai/https://www.birdiesearch.com/'`（超时/422 = 站点对境外机房也不可达）。
+- ⚠️ 坑：Clash TUN 开启时本机"直连"同样被接管，`--noproxy '*'` 或裸 socket 的结果**不能**作为真实直连证据；域名解析走 fake-ip(198.18.x)，真实 IP 需用 DoH(`https://1.1.1.1/dns-query?name=...&type=A`)查。
+- 历史：自 2026-09-13 起连续多日同一阶段失败且**全程静默**（脚本签到即崩 → 从不推送，用户无感知），判定为站点级持续故障，非本机/节点问题；此类长期静默需人工介入（建议增加连续失败告警）。
+
 ## 已知噪音(勿误判为故障)
 脚本 stderr 中出现的 numpy/sklearn 版本警告，来自 `llmcore`/`mykey.py` 导入链的后台线程噪音，与本任务无关，`exit_code=0` 即代表脚本本身执行成功。
