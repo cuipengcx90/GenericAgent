@@ -547,7 +547,7 @@ def _build_step_detail(resp, tool_calls):
 class _TaskCard:
     """飞书任务卡片：后台线程 create/patch，避免飞书 API 慢时阻塞 agent 主循环。"""
     _DETAIL_LIMIT = 4000
-    _FINAL_LIMIT = 4000
+    _FINAL_LIMIT = 8000       # 最终总结上限；与 _PAGE_CHARS(38000字符≈114KB) 合计需 ≤150KB，故上限约 13200
     _QUEUE_LIMIT = 8
     # 实测（2026-09-21）：飞书的硬限制是 **element 数量**（约 65 个），不是体积。
     # elements=64 通过、67 被拒（报 11310 element exceeds the limit）；
