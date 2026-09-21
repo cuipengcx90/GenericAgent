@@ -48,6 +48,14 @@ sed -n "${last},\$p" logs/feishu_agent.log | grep -c "Failed to create card cont
 ```
 
 ## 关键坑（都踩过）
+- **改了卡片 JSON 结构必须实发一张验证**，本地语法/单测全过也没用 —— 字段合法性只有飞书服务端知道。
+  案例：把按钮包进 `{"tag":"action"}`（1.0 写法）提交后才由线上报 200861 发现，白折腾一轮。
+  自检命令（发一张自带按钮的卡片，返回 success 即通过）见本文件「验证卡片结构」一节。
+- **卡片 JSON 2.0 已移除 `action` 容器标签**：按钮/下拉等交互组件必须直接作为 element
+  放进 `body.elements`；套容器会报 `200861 unsupported tag action`。
+- **按钮回调需双端齐备**：①代码注册 `register_p2_card_action_trigger`；②开发者后台「事件与回调」
+  订阅 `card.action.trigger`。只做①则点击无任何反应（飞书不会推送）。
+- 卡片回调硬约束：响应须 3 秒内、交互有效期 30 天、可更新有效期 14 天。
 - `history_info` 里的 `[Agent] 任务完成：…` 只是该轮 `<summary>` 文本，**不代表 loop 退出**；
   据此判断"模型提前收工"会误判 —— 本 SOP 的排查最初就走错了这个方向
 - `put_task` 是**队列**：用户说"继续"只是排队，**不中断**正在跑的工具，
@@ -55,6 +63,18 @@ sed -n "${last},\$p" logs/feishu_agent.log | grep -c "Failed to create card cont
 - `_fold_earlier` 显示的 `（55 turns）` 是历史累计轮数，不等于当次 loop 的 turn
 - 判断"日志停更"必须先看 `ps` 有无子进程：有 `sleep` → B 类；无子进程且卡在 kevent → 查网络/回调
 - 重启 fsapp 后要**只统计最后一次"已启动"标记之后**的失败，否则会把重启前的残留当成新问题
+
+## 验证卡片结构（改完卡片相关代码必做）
+本地语法检查与单测**测不出字段合法性**，必须实发一张卡片让飞书校验：
+
+```bash
+cd ~/projects/GenericAgent
+python3 memory/feishu_card_selftest.py <open_id>
+# open_id 取法: grep "收到消息" logs/feishu_agent.log | tail -1
+```
+
+输出 `success=True` 即通过；失败会带 `ErrPath`（形如 `body.elements[6](tag: action)`），
+直接指出是哪个 element 的哪个字段不合法。
 
 ## 相关产物
 - 修复提交：`16f9c25`（fsapp.py）、L1 RULE 15（global_mem_insight.txt）
