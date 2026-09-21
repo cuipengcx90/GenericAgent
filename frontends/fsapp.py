@@ -623,8 +623,9 @@ class _TaskCard:
         return pages
 
     def _page_buttons(self, total):
-        """翻页按钮：column_set 三列等宽横排，value 回传 card uid + 目标页。
-        注意：卡片 JSON 2.0 已移除 `action` 容器；按钮直放 elements 或 column 内。
+        """翻页按钮：两列等宽横排，value 回传 card uid + 目标页。
+        三列会被挤成"◀ ..."（实测 2026-09-21 截图确认），且页码已显示在标题里，
+        故只用两列。卡片 JSON 2.0 已移除 `action` 容器；按钮直放 column 内。
         首尾页用 disabled 置灰而非隐藏，避免按钮位置跳动。"""
         def _col(btn):
             return {"tag": "column", "width": "weighted", "weight": 1, "elements": [btn]}
@@ -633,14 +634,12 @@ class _TaskCard:
                 "disabled": self.page_idx <= 0,
                 "text": {"tag": "plain_text", "content": "◀ 上一页"},
                 "value": {"ga_card": self.uid, "page": self.page_idx - 1}}
-        cur = {"tag": "button", "type": "text", "size": "small", "width": "fill",
-               "text": {"tag": "plain_text", "content": f"{self.page_idx + 1} / {total}"}}
         nxt = {"tag": "button", "type": "primary", "size": "small", "width": "fill",
                "disabled": self.page_idx >= total - 1,
                "text": {"tag": "plain_text", "content": "下一页 ▶"},
                "value": {"ga_card": self.uid, "page": self.page_idx + 1}}
         return [{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
-                 "columns": [_col(prev), _col(cur), _col(nxt)]}]
+                 "columns": [_col(prev), _col(nxt)]}]
 
     def goto_page(self, idx):
         with self._lock:
