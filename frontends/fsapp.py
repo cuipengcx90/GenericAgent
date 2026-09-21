@@ -553,7 +553,7 @@ class _TaskCard:
     # elements=64 通过、67 被拒（报 11310 element exceeds the limit）；
     # 而 50 步 × 800 字（4 万字符 / 126KB）照样通过，故体积预算可大幅放宽。
     _PAGE_STEPS = 50           # 50 步 + 页眉 + 按钮区 ≈ 52 个 element，留足余量
-    _PAGE_CHARS = 30000        # 体积兜底：防止极长 thinking 把单页推到 MB 级
+    _PAGE_CHARS = 38000        # 体积兜底：实测 148.5KB 通过 / 155.8KB 被拒（上限约 150KB）
     _STEP_FLUSH_INTERVAL = 3.0
     _REGISTRY_MAX = 200        # 翻页注册表上限，超出丢弃最早的，防长跑内存累积
     _registry = {}             # uid -> _TaskCard，翻页回调据此找回卡片实例
