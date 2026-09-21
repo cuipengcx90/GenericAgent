@@ -629,13 +629,13 @@ class _TaskCard:
         def _col(btn):
             return {"tag": "column", "width": "weighted", "weight": 1, "elements": [btn]}
 
-        prev = {"tag": "button", "type": "default", "width": "fill",
+        prev = {"tag": "button", "type": "default", "size": "small", "width": "fill",
                 "disabled": self.page_idx <= 0,
                 "text": {"tag": "plain_text", "content": "◀ 上一页"},
                 "value": {"ga_card": self.uid, "page": self.page_idx - 1}}
-        cur = {"tag": "button", "type": "text", "width": "fill",
+        cur = {"tag": "button", "type": "text", "size": "small", "width": "fill",
                "text": {"tag": "plain_text", "content": f"{self.page_idx + 1} / {total}"}}
-        nxt = {"tag": "button", "type": "primary", "width": "fill",
+        nxt = {"tag": "button", "type": "primary", "size": "small", "width": "fill",
                "disabled": self.page_idx >= total - 1,
                "text": {"tag": "plain_text", "content": "下一页 ▶"},
                "value": {"ga_card": self.uid, "page": self.page_idx + 1}}
@@ -670,7 +670,10 @@ class _TaskCard:
             card = self._build_locked()
             msg_id = self.msg_id
         if msg_id:
-            return _patch_card_result(msg_id, card)
+            ok, _ = _patch_card_result(msg_id, card)
+            # 分页已保证单页不超 element 上限；patch 失败透传 limit 会触发 rollover
+            # 清空 steps 丢掉全部历史，得不偿失。仅新建失败(卡片从未建立)才允许换卡片。
+            return ok, False
         msg_id = _send_raw(self.rid, card, "interactive", self.rtype)
         with self._lock:
             if msg_id:
