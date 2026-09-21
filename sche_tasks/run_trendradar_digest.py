@@ -287,6 +287,69 @@ class ReportQualityError(RuntimeError):
         self.report = report  # 保留失败时的真实生成文本，便于人工核查/降级兜底
 
 
+# 分类标题兼容多种风格：'## 分类' / '### 分类' / 加粗独占行 '**🎨 AI画图**'
+_CATEGORY_LINE_RE = re.compile(r'^(?:#{2,6}\s+\S|\*\*[^*\n]+\*\*\s*$|\*[^*\n]+\*\s*$)')
+_FOOTER_MARKER = '📡 数据来源：TrendRadar'
+
+
+def _extract_report_body(raw: str, icon: str, title_word: str) -> str:
+    """从 LLM 原始输出里抽出真正的报告正文。
+
+    背景（2026-09-21 复发事故）：模型常先输出一版"草稿正文 + 过程思考"，
+    再重复输出一遍正式正文；旧实现只找第一个 '## ' 分类标题，一旦模型改用
+    加粗分类标题（**🎨 AI画图**）就零匹配，于是草稿与思考过程被整段推送。
+
+    策略：取最后一个「其后能定位到分类标题行、且整体含页脚」的标题出现处，
+    其后的内容即正文；都不满足则退回第一个标题；再退回原文。
+    """
+    if not raw:
+        return raw
+    title_pattern = f'{icon} **IT情报{title_word}'
+    positions = [m.start() for m in re.finditer(re.escape(title_pattern), raw)]
+    if not positions:
+        return raw
+
+    def _locate(pos: int):
+        lines = raw[pos:].split('\n')
+        cat_idx = next(
+            (i for i, ln in enumerate(lines[1:], 1) if _CATEGORY_LINE_RE.match(ln.strip())),
+            None,
+        )
+        return lines, cat_idx
+
+    chosen = None
+    for cand in sorted(positions, reverse=True):
+        lines, cat_idx = _locate(cand)
+        if cat_idx is not None and _FOOTER_MARKER in raw[cand:]:
+            chosen = (cand, lines, cat_idx)
+            break
+    if chosen is None:
+        lines, cat_idx = _locate(positions[0])
+        chosen = (positions[0], lines, cat_idx)
+
+    pos, lines, cat_idx = chosen
+    title_line = lines[0]
+    if cat_idx is not None:
+        if cat_idx > 1:
+            print(f'⚠️  已过滤标题后 {cat_idx - 1} 行思考/草稿（正文起点=分类标题行）')
+        body = '\n'.join(lines[cat_idx:])
+    else:
+        body = '\n'.join(lines[1:]).strip()
+    if pos > 0:
+        print(f'⚠️  已过滤 {pos} 字符的前置思考/草稿（标题共出现 {len(positions)} 次）')
+    return f'{title_line}\n\n{body}'.strip()
+
+
+# CoT/过程文本特征词（2026-09-21 事故）：出现即视为模型思考过程泄漏
+_COT_MARKERS = ('Let me ', "I'll ", 'Now, output', 'Write it out', '用户要求', '让我先')
+
+
+def _cot_head_hits(report: str) -> list[str]:
+    """正文头部（前 900 字）命中 CoT/过程文本特征词则返回命中项（空列表=干净）。"""
+    head = report[:900]
+    return [m for m in _COT_MARKERS if m in head]
+
+
 def _validate_report_quality(period: str, report: str) -> None:
     date_str = datetime.now().strftime('%Y-%m-%d')
     title_word = '晨报' if period == 'morning' else '晚报'
@@ -307,6 +370,12 @@ def _validate_report_quality(period: str, report: str) -> None:
         raise ReportQualityError(f'report contains stream interruption marker: {markers}', report=report)
     if missing:
         raise ReportQualityError(f'report missing required parts: {missing}', report=report)
+    # 过程/思考文本探针（2026-09-21）：正文头部出现 CoT 特征词即判质量失败，
+    # 触发 build_report 重试，避免把模型思考过程推到飞书/钉钉。
+    cot_hit = _cot_head_hits(report)
+    if cot_hit:
+        raise ReportQualityError(f'report head contains process/CoT text: {cot_hit}', report=report)
+
     if len(report.strip()) < 1800:
         raise ReportQualityError(f'report too short: {len(report.strip())} chars', report=report)
 
@@ -337,30 +406,8 @@ def build_report(period: str, material: dict[str, Any]) -> str:
     msg = {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}
     report = _strip_llm_tags(''.join(sess.ask(msg))).strip()
     
-    # 🔧 过滤LLM思考过程：定位真正报告开头（标题+第一个分类标题）
-    title_pattern = f'{icon} **IT情报{title_word}'
-    if title_pattern in report:
-        title_idx = report.find(title_pattern)
-        # 从标题后查找第一个分类标题（## 开头）
-        import re
-        lines = report[title_idx:].split('\n')
-        category_start = 0
-        for i, line in enumerate(lines):
-            if re.match(r'^##\s+', line.strip()):
-                category_start = i
-                break
-        
-        if category_start > 1:  # 标题和分类标题之间有思考过程
-            # 重构报告：标题行 + 分类标题开始的内容
-            title_line = lines[0]
-            content_from_category = '\n'.join(lines[category_start:])
-            report = f'{title_line}\n\n{content_from_category}'
-            print(f'⚠️  已过滤标题后的 {category_start-1} 行思考过程')
-        elif title_idx > 0:  # 只有标题前有思考过程
-            removed = report[:title_idx].strip()
-            report = report[title_idx:].strip()
-            print(f'⚠️  已过滤 {len(removed)} 字符的前置思考过程')
-    
+    # 🔧 过滤LLM思考过程/草稿：定位真正的报告正文（见 _extract_report_body）
+    report = _extract_report_body(report, icon, title_word)
     if f'IT情报{title_word}' not in report:
         report = f'{icon} **IT情报{title_word} · {date_str}**\n\n' + report
     if ARCHIVE_URL not in report:
@@ -518,7 +565,8 @@ def run(period: str, dry_run: bool = False, force: bool = False, self_test: bool
                         and 'missing required parts' not in str(e)
                         and 'stream interruption' not in str(e)
                     )
-                    if only_too_short and last_report.strip():
+                    # 降级发送前同样过 CoT 探针：宁可不发，也不把思考过程推出去
+                    if only_too_short and last_report.strip() and not _cot_head_hits(last_report):
                         report = (
                             f'⚠️（今日素材较少，篇幅低于常规标准，仍完整发送）\n\n'
                             + last_report
