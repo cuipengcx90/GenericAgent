@@ -77,6 +77,31 @@ sed -n "${last},\$p" logs/feishu_agent.log | grep -c "Failed to create card cont
 - 判断"日志停更"必须先看 `ps` 有无子进程：有 `sleep` → B 类；无子进程且卡在 kevent → 查网络/回调
 - 重启 fsapp 后要**只统计最后一次"已启动"标记之后**的失败，否则会把重启前的残留当成新问题
 
+## 验证分页/翻页的正确方法（血泪教训，栽过两次）
+
+### ❌ 错误做法一：用 `message.create` 逐页发送
+```python
+for page in (0, 1, 2):
+    card.page_idx = page
+    cli.im.v1.message.create(...)   # ← 每次都新建一条消息
+```
+后果：会话里出现 N 条**独立**消息，每条卡片上都带翻页按钮 —— 看起来像"分页"，其实是刷屏；
+且按钮 value 指向的卡片实例存活在测试子进程里，**子进程一退注册表就空，按钮必然点不动**
+（用户反馈"点了完全没反应"就是这么来的）。
+
+### ✅ 正确做法：验证「同一条消息被 patch」
+
+构造 `_TaskCard` 后连续调 `_push_sync()`，断言两次 `msg_id` 相同：
+
+- 第 1 次 push（`msg_id` 为空）→ 走 `_send_raw` **新建**，记下 `card.msg_id`
+- 改 `card.page_idx` 后再 push → 走 `_patch_card_result` **更新同一条**
+- 断言 `id1 == id2` 且**两者非空**，才证明是 patch 而非新建
+
+### ⚠️ 坑：`client` 未初始化会让验证静默失真
+
+`_send_raw` / `_patch_card_result` 用的是**模块级** `client`（在 `main()` 里才赋值）。
+独立脚本忘了初始化会打印 `'NoneType' object has no attribute 'im'`，此时两次 `msg_id`
+**都是 None**，`id1 == id2` 成立却是假象 —— 所以断言里必须带 `msg_id` 非空。
 ## 验证卡片结构（改完卡片相关代码必做）
 本地语法检查与单测**测不出字段合法性**，必须实发一张卡片让飞书校验：
 
