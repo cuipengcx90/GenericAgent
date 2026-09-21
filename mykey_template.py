@@ -136,7 +136,7 @@ mixin_config = {
 # ── 1a. CC switch 适配渠道（最常用）────────────────────────────────────────
 #  这类渠道把 Claude Code 协议透传到上游，apikey 格式各异（sk-user-*, sk-*, cr_*
 #  等），统一走 Bearer 鉴权。必须设置 fake_cc_system_prompt=True。
-# native_claude_config0 = {
+# native_claude_config = {
 #     'name': 'cc-relay-1',                        # /llms 显示名 & mixin 引用名
 #     'apikey': 'sk-user-<your-relay-key>',        # 非 sk-ant- 前缀 → Bearer 鉴权
 #     'apibase': 'https://<your-cc-switch-host>/claude/office',   # CC switch 端点
