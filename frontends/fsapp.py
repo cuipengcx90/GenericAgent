@@ -552,7 +552,7 @@ class _TaskCard:
     # 实测（2026-09-21）：飞书的硬限制是 **element 数量**（约 65 个），不是体积。
     # elements=64 通过、67 被拒（报 11310 element exceeds the limit）；
     # 而 50 步 × 800 字（4 万字符 / 126KB）照样通过，故体积预算可大幅放宽。
-    _PAGE_STEPS = 50           # 50 步 + 页眉 + 按钮区 ≈ 52 个 element，留足余量
+    _PAGE_STEPS = 55           # 55 步 + 页眉/总结/按钮 ≈ 60 个 element，实测上限约 65
     _PAGE_CHARS = 38000        # 体积兜底：实测 148.5KB 通过 / 155.8KB 被拒（上限约 150KB）
     _STEP_FLUSH_INTERVAL = 3.0
     _REGISTRY_MAX = 200        # 翻页注册表上限，超出丢弃最早的，防长跑内存累积
@@ -605,7 +605,8 @@ class _TaskCard:
         base = self.turn_base + sum(len(p) for p in pages[:self.page_idx])
         for i, (s, d) in enumerate(pages[self.page_idx], base):
             els.append(self._step_panel(i, s, d))
-        if self.final:
+        # 最终总结只属于最后一页：否则翻到任何一页都会重复看到同一段结尾
+        if self.final and self.page_idx == total - 1:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
         if total > 1:
             els.extend(self._page_buttons(total))
