@@ -118,7 +118,11 @@ kind 取值见 `herdr agent start --help`：pi|claude|codex|gemini|cursor|devin|
   会抛 traceback 而非 BLOCKED → 已各加 <20 行结构校验（前后对照 `temp/prefix_bug_evidence.txt`）；③独立复评以
   **全新无上下文 pi agent** 顶替（codex 仍 403 额度不足），代码面未发现新高危绕过，文档面抽查两次自相矛盾（75/37/22 vs 2/3/22）不可采信。
 - **herdr/pi 操作坑（本轮实测）**：**agent 名全局唯一**（跨 workspace 也冲突 → `agent_name_taken`）；
-  **刚 `workspace create` 后立刻 `agent start` 可能失败/agent 秒消失**，要等 pane `interactive_ready` 再启（或重试）；
+  **刚建 pane 后 `agent start` 会偶发 `agent_pane_busy: "... is not an available shell"`**（实测约 3/25；
+  与 `--no-focus`/聚焦状态无关，**退避重试即可**；对同 pane 重复 start 也报同一句，别把"已有 agent"误读成"未就绪"）；
+  **`teamprofile.py launch` 非幂等且失败不回滚**（重跑 0.2s 即 `agent_name_taken: team-lead is already used` 并多留 tab），
+  **委托失败不释放 `delegation.lock`**（实测下一次 acquire `BLOCKED ... age=311s, too recent to reclaim`，2h 内无法再委托）
+  → 无人值守委托必须自己包重试+清理，见 `autopilot_unattended_drill_sop`；
   **pi 启动到可交互约 20-25s**，早于此发 prompt 会被吞（agent 停在 idle 欢迎屏）→ 先 sleep 25s 或看 pane 内容确认；
   `agent prompt` 可 fire-and-forget 后用 `agent get` 轮询 `agent_status`（长任务别用 `--wait` 干等）；
   **pi 一次读太多大文件会撞 `400 context_length_exceeded`** → 复评/派活 prompt 必须限定文件与行数范围。
