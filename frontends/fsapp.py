@@ -603,7 +603,7 @@ class _TaskCard:
         if self.final:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
         if total > 1:
-            els.append(self._page_buttons(total))
+            els.extend(self._page_buttons(total))
         return _card_raw(els)
 
     def _paginate(self):
@@ -618,19 +618,21 @@ class _TaskCard:
         return pages
 
     def _page_buttons(self, total):
-        """翻页按钮：value 回传 card uid + 目标页，由 handle_card_action 处理。"""
+        """翻页按钮：value 回传 card uid + 目标页，由 handle_card_action 处理。
+        注意：卡片 JSON 2.0 已移除 `action` 容器标签（1.0 才有），按钮必须直接
+        作为 element 放进 body.elements，否则报 200861 unsupported tag action。"""
         acts = []
         if self.page_idx > 0:
-            acts.append({"tag": "button", "type": "default", "size": "small",
+            acts.append({"tag": "button", "type": "default",
                          "text": {"tag": "plain_text", "content": "◀ 上一页"},
                          "value": {"ga_card": self.uid, "page": self.page_idx - 1}})
-        acts.append({"tag": "button", "type": "text", "size": "small",
+        acts.append({"tag": "button", "type": "text",
                      "text": {"tag": "plain_text", "content": f"{self.page_idx + 1}/{total}"}})
         if self.page_idx + 1 < total:
-            acts.append({"tag": "button", "type": "primary", "size": "small",
+            acts.append({"tag": "button", "type": "primary",
                          "text": {"tag": "plain_text", "content": "下一页 ▶"},
                          "value": {"ga_card": self.uid, "page": self.page_idx + 1}})
-        return {"tag": "action", "actions": acts}
+        return acts
 
     def goto_page(self, idx):
         with self._lock:
