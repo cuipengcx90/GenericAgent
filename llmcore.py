@@ -1129,6 +1129,9 @@ class MixinSession:
         self._native = native_groups.pop()
         self._ask_impl = selected[0].ask.__func__
         self._cur_idx, self._switched_at = 0, 0.0
+        # Authentication/permission failures cannot recover by retrying. Keep the
+        # affected backend out of this live mixin until sessions are rebuilt.
+        self._disabled_indices = set()
 
         primary = self._sessions[0]
         self.name = '|'.join(s.name for s in self._sessions)
@@ -1168,8 +1171,20 @@ class MixinSession:
     def raw_ask(self, messages):
         base, n = self._pick(), len(self._sessions)
         test_error = lambda x: isinstance(x, str) and x.lstrip().startswith(('!!!Error:', '[Error:'))
-        for attempt in range(self._retries + 1):
-            idx = (base + attempt) % n
+        def is_auth_failure(x):
+            if not isinstance(x, str):
+                return False
+            text = x.lower()
+            return any(token in text for token in (
+                'http 401', 'http 403', 'status 401', 'status 403',
+                'unauthorized', 'forbidden', 'authentication failed',
+                'permission denied', 'invalid api key',
+            ))
+        candidates = [(base + offset) % n for offset in range(n)
+                      if (base + offset) % n not in self._disabled_indices]
+        if not candidates:
+            return (yield '!!!Error: all MixinSession backends are disabled after authentication failures')
+        for attempt, idx in enumerate(candidates[:self._retries + 1]):
             session = self._sessions[idx]
             gen = session.raw_ask(self._prepare(idx, messages))
             print(f'[MixinSession] Using session ({session.name})')
@@ -1187,16 +1202,13 @@ class MixinSession:
                     self._cur_idx = (idx + 1) % n; self._switched_at = time.time()
                     print(f'[MixinSession] Partial failure, next call → s{self._cur_idx} ({self.current.name})')
                 return return_val
-            if attempt >= self._retries:
+            if is_auth_failure(last_chunk):
+                self._disabled_indices.add(idx)
+                print(f'[MixinSession] Disabled session ({session.name}) after authentication failure')
+            if attempt >= min(self._retries, len(candidates) - 1):
                 yield last_chunk; return return_val
-            nxt = (base + attempt + 1) % n
-            if nxt == base:
-                rnd = (attempt + 1) // n
-                delay = min(30, self._base_delay * (1.5 ** rnd))
-                print(f'[MixinSession] {last_chunk[:80]}, round {rnd} exhausted, retry in {delay:.1f}s')
-                time.sleep(delay)
-            else:
-                print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
+            nxt = candidates[attempt + 1]
+            print(f'[MixinSession] {last_chunk[:80]}, retry {attempt+1}/{self._retries} (s{idx}→s{nxt})')
 
 THINKING_PROMPT_ZH = """
 ### 行动规范（持续有效）
