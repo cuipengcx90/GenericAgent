@@ -20,7 +20,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | tmwebdriver_sop | jshook_runtime_sop | js_runtime_hooking_playbook_sop | vision_sop | ljqCtrl_sop
 || launchpad_folder_sop(分类基线/验收/持续调整)
 | sophub_sop | sophub_security_sops | sophub_6a69733c(UUYC网易UU远程CLI操作SOP: uuyc-cli设备/云电脑/终端/远程协助命令参考,raw端点匿名可访问) | codex_jailbreak_risk_sop | ctf_core_contract_risk_sop | llm_prompt_bypass_risk_sop
-| keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md
+| keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md | asr_cli.py/asr_sop(幻觉判据/VAD反例)
 | cc_disguise_knowledge(CC伪装机制/工具映射/排错,无部署)
 | deepresearch_sop(多来源深度研究DAG) | hcaptcha_sop | github_project_learning_sop(陌生代码库学习)
 | baidu_pan_transfer_sop(网盘转存/资源入库保留URL+提取码+边界)
