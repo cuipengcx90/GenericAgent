@@ -1,7 +1,0 @@
-{
-  "schedule": "03:00",
-  "repeat": "daily",
-  "enabled": true,
-  "max_delay_hours": 48,
-  "prompt": "【autonomous报告同步任务】执行 temp/bridge_autonomous.py，将 autonomous_reports/ 中的 L2 记忆草稿同步到 memory/global_mem.txt。"
-}

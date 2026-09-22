@@ -1,7 +1,0 @@
-{
-  "schedule": "00:00",
-  "repeat": "every_1h",
-  "enabled": true,
-  "max_delay_hours": 48,
-  "prompt": "【加密货币价格监控】执行 reflect_scripts/06_price_alert.py 的 check() 函数，监控BTC/ETH价格波动≥5%时分析原因并推送飞书。数据源：CoinGecko免费API。"
-}
