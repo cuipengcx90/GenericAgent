@@ -38,9 +38,9 @@
 
 ```bash
 # 从零复现（会自动下载样本、校验 sha256、解码、转写）
-bash tools/silk_repro.sh /tmp/silk_repro tiny
+bash temp/silk_fixture/repro.sh /tmp/silk_repro tiny
 ```
-* 脚本：`tools/silk_repro.sh`（耐久版，随 git 走；`temp/silk_fixture/repro.sh` 是同内容临时副本，因 `temp/` 不入 git）（钉死 commit `d888a4b51ed0840da4db6b26820acfb0df8c6cce`，sha256 前缀不符即 `exit 2`）
+* 脚本：`temp/silk_fixture/repro.sh`（钉死 commit `d888a4b51ed0840da4db6b26820acfb0df8c6cce`，sha256 前缀不符即 `exit 2`）
 * 工具：`tools/silk_to_text.py`（可复用于将来拿到任意 `.silk`）
   * `decode a.silk [-o DIR]` → silk→pcm→wav，打印字节数/时长
   * `text a.wav|a.silk [-m tiny] [--lang zh]` → 转写（给 `.silk` 会自动先解码）
