@@ -254,6 +254,37 @@ def redirect_log(script_file, log_name, label, allowed):
     print(f"[{label}] allow list: {allowed_label(allowed)}")
 
 
+def extract_ask_user_question(ctx):
+    """从 turn-end ctx 的 exit_reason 里取出 ask_user 的提问。
+
+    模型调 ask_user 请示时，真正的问题在工具参数里，正文往往只有一个 <summary>。
+    前端若只渲染正文，用户看不到要回答什么，只能反复发"继续"。
+    返回 (question, candidates)，没有则返回 None。
+    """
+    exit_reason = (ctx or {}).get("exit_reason") or {}
+    if not isinstance(exit_reason, dict) or exit_reason.get("result") != "EXITED":
+        return None
+    payload = exit_reason.get("data")
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") != "INTERRUPT" or payload.get("intent") != "HUMAN_INTERVENTION":
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    question = str(data.get("question") or "").strip()
+    if not question:
+        return None
+    candidates = [str(c).strip() for c in (data.get("candidates") or []) if str(c).strip()]
+    return question, candidates
+
+
+def build_ask_user_text(question, candidates):
+    """把 ask_user 提问渲染成人类可读文本（各前端共用措辞）。"""
+    lines = [f"❓ 需要你确认：{question}"]
+    if candidates:
+        lines.append("候选项：" + " / ".join(candidates))
+    return "\n".join(lines)
+
+
 class AgentChatMixin:
     label = "Chat"
     source = "chat"
@@ -319,6 +350,19 @@ class AgentChatMixin:
     async def run_agent(self, chat_id, text, **ctx):
         state = {"running": True}
         self.user_tasks[chat_id] = state
+        ask_user_box = {}
+        hook_key = f"askuser_{self.source}_{chat_id}"
+        if not hasattr(self.agent, "_turn_end_hooks"):
+            self.agent._turn_end_hooks = {}
+
+        def _capture_ask_user(inner_ctx):
+            # done 走队列只带文本，拿不到 exit_reason；靠 turn-end 钩子把
+            # ask_user 的提问截下来，否则用户看不到要回答什么。
+            found = extract_ask_user_question(inner_ctx)
+            if found:
+                ask_user_box["value"] = found
+
+        self.agent._turn_end_hooks[hook_key] = _capture_ask_user
         try:
             await self.send_text(chat_id, "思考中...", **ctx)
             dq = self.agent.put_task(f"{FILE_HINT}\n\n{text}", source=self.source)
@@ -332,7 +376,12 @@ class AgentChatMixin:
                         last_ping = time.time()
                     continue
                 if "done" in item:
-                    await self.send_done(chat_id, item.get("done", ""), **ctx)
+                    final = item.get("done", "")
+                    if ask_user_box.get("value"):
+                        question, candidates = ask_user_box["value"]
+                        ask_text = build_ask_user_text(question, candidates)
+                        final = f"{final}\n\n{ask_text}" if final.strip() else ask_text
+                    await self.send_done(chat_id, final, **ctx)
                     break
             if not state["running"]:
                 await self.send_text(chat_id, "⏹️ 已停止", **ctx)
@@ -343,6 +392,7 @@ class AgentChatMixin:
             await self.send_text(chat_id, f"❌ 错误: {e}", **ctx)
         finally:
             self.user_tasks.pop(chat_id, None)
+            self.agent._turn_end_hooks.pop(hook_key, None)
 
 
 def install_agent_extensions(agent_cls=None):

@@ -3,7 +3,7 @@ import fcntl, glob, json, os, queue as Q, re, sys, threading, time, uuid
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 os.chdir(PROJECT_ROOT)
-from frontends.chatapp_common import format_restore
+from frontends.chatapp_common import build_ask_user_text, extract_ask_user_question, format_restore
 from frontends.continue_cmd import handle_frontend_command as handle_continue_frontend, reset_conversation
 
 
@@ -739,29 +739,6 @@ class _TaskCard:
         self._enqueue("fail", force=True)
 
 
-def _extract_ask_user_question(ctx):
-    """从 exit_reason.data 里取出 ask_user 的提问，供飞书展示。
-
-    模型调 ask_user 请示时，正文往往只有一个 <summary>，真正的问题在工具参数里。
-    飞书卡片若只渲染 response.content，剥掉标签后只剩"（无文本输出）"，
-    用户不知道该回答什么，只能反复发"继续"。
-    """
-    exit_reason = (ctx or {}).get('exit_reason') or {}
-    if not isinstance(exit_reason, dict) or exit_reason.get('result') != 'EXITED':
-        return None
-    payload = exit_reason.get('data')
-    if not isinstance(payload, dict):
-        return None
-    if payload.get('status') != 'INTERRUPT' or payload.get('intent') != 'HUMAN_INTERVENTION':
-        return None
-    data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
-    question = str(data.get('question') or '').strip()
-    if not question:
-        return None
-    candidates = [str(c).strip() for c in (data.get('candidates') or []) if str(c).strip()]
-    return question, candidates
-
-
 def _make_task_hook(card, done_event, on_final):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
     def hook(ctx):
@@ -769,13 +746,9 @@ def _make_task_hook(card, done_event, on_final):
             if ctx.get('exit_reason'):
                 resp = ctx.get('response')
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
-                ask = _extract_ask_user_question(ctx)
+                ask = extract_ask_user_question(ctx)
                 if ask:
-                    question, candidates = ask
-                    lines = [f"❓ 需要你确认：{question}"]
-                    if candidates:
-                        lines.append("候选项：" + " / ".join(candidates))
-                    card.done("\n".join(lines))
+                    card.done(build_ask_user_text(*ask))
                 else:
                     card.done(_display_text(raw))
                 on_final(raw)

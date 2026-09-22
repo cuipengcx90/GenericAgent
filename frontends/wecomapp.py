@@ -17,9 +17,10 @@ TurnHookFn = Callable[[TurnContext], None]
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agentmain import GeneraticAgent
-from chatapp_common import (AgentChatMixin, FILE_HINT, build_done_text, clean_reply,
-                            ensure_single_instance, extract_files, public_access,
-                            redirect_log, require_runtime, split_text, strip_files)
+from chatapp_common import (AgentChatMixin, FILE_HINT, build_ask_user_text, build_done_text,
+                            clean_reply, ensure_single_instance, extract_ask_user_question,
+                            extract_files, public_access, redirect_log, require_runtime,
+                            split_text, strip_files)
 from llmcore import mykeys
 
 try:
@@ -165,6 +166,9 @@ class WeComApp(AgentChatMixin):
                     resp = ctx.get("response")
                     result["raw"] = resp.content if hasattr(resp, "content") else str(resp)
                     result["summary"] = ctx.get("summary")
+                    # ask_user 的提问在 exit_reason.data 里，正文可能只有一个 <summary>；
+                    # 不单独取出来展示，用户就看不到要回答什么。
+                    result["ask_user"] = extract_ask_user_question(ctx)
                     done_event.set()
                     return
                 summary = ctx.get("summary")
@@ -198,7 +202,12 @@ class WeComApp(AgentChatMixin):
 
             if result.get("raw") is not None:
                 self._stats["completed"] += 1
-                await self.send_done(chat_id, result["raw"])
+                final = result["raw"]
+                if result.get("ask_user"):
+                    question, candidates = result["ask_user"]
+                    ask_text = build_ask_user_text(question, candidates)
+                    final = f"{final}\n\n{ask_text}" if final.strip() else ask_text
+                await self.send_done(chat_id, final)
                 label = result.get("summary") or f'{len(result["raw"])} 字'
                 _tprint(f"[{_ts()}] ✅ Done ({chat_id}) — {label}")
             elif not state["running"]:
