@@ -58,3 +58,5 @@ print(get_todo())       # 查看待办
 同一 TODO 条目在 18:09 已被另一运行归档为 R353，本运行 18:29 又独立跑了一遍（ASR 全量 ~29min 算力双耗）并把编号推到 R354。
 - 收尾前**先查重**：`ls -t temp/autonomous_reports | head -5` + `grep -n '<任务关键词>' memory/autonomous_reports/INDEX.md temp/TODO.txt`；若条目已 `[x]`，直接改 `[x] R<编号>` 并放弃本轮产出（或合并差异），不要再调 `complete_task`。
 - `helper.complete_task` 的编号分配非原子（`_next_report_number()` 扫目录），并发下会撞号 ⇒ 与 TODO「自主报告『编号复用』根治」合并规划（认领锁 `temp/.todo_claim.json` + `O_EXCL` 建目标文件）。
+- **编号分配补丁已就绪待批（R355，2026-09-22）**：`temp/R355_helper_numbering.patch`（一键 `bash temp/R355_apply_patch.sh`，带备份/回滚），夹具 `temp/rnum_fixture.py` 六组用例全绿（并发 160 次分配：旧 15/20 轮重号共 20 个，新 0/20）。**未应用（改 GA 源码需批准）⇒ 下一轮勿重造轮子**：先看该 patch 是否仍在、TODO 里「等待批准·勿重做」条目是否已放行。
+- **两树收敛是两步、缺一不可**：`tools/autonomous_reports_archive.py sync --apply` 只拷 .md（**不动 history.txt**）+ `inventory --apply`（重写归档 history/INDEX）——只跑前者会留下「归档有文件、history 缺行」的半同步态（2026-09-22 实测）。
