@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-22
-- 正文已恢复: 93 / 索引可见 351 个编号
+- 正文已恢复: 94 / 索引可见 352 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -359,3 +359,4 @@
 | R349 | ✅正文 | helper压缩死引用修复(压缩器落地) | 8880B R349_fix-compress-deadref.md | 交付 tools/log_compress.py(copytruncate;夹具3/3+真链路无损:12.10MiB→1.00MiB/归档1.82MiB/NUL=0)+temp s |
 | R350 | ✅正文 | - | 14716B R350_product-freshness-audit.md |  |
 | R351 | ✅正文 | 内网/云主机连接命题验证(只读) | 15801B R351_内网云主机连接命题验证.md | 成立:known_hosts 30 台含 openclaw-server.tailf82c5b.ts.net(=100.112.252.36,GCP,google_compute_ |
+| R352 | ✅正文 | TrendRadar拆词修复效果A/B离线复算 | 11154B R352_TrendRadar拆词修复效果A-B离线复算.md | 判定批修法A(条件式):29天A整串=0/B逐词pair=1384(与R343同区间完全对齐)/去重1283(44.2条/天,单日最高73,零命中0天);净新增1253条(与当日R |
