@@ -483,10 +483,34 @@ class GenericAgentHandler(BaseHandler):
         if not response or (not content.strip() and not thinking.strip()):
             yield "[Warn] LLM returned an empty response. Retrying...\n"
             return self._retry_or_exit("[ERROR] Blank response, regenerate and tooluse")
+        # 退化输出（推理模型偶发，deepseek-flash / gpt-5.6-luna 实测都有）：
+        # 剥掉代码块/行内代码/成对内部标签后，这一轮没有任何可读正文；
+        # 或剥离后仍残留未配对标签（输出被截断：真实样本就是 <summary> 无闭标签 + 协议碎片）。
+        # 旧判空只覆盖"正文与思考都空"，这些形态会一路走到最后被当成最终回答返回，
+        # 用户侧表现为静默结束 / 飞书卡片显示"（无文本输出）"。
+        # 先剥离再判，避免把"讲解协议标记"的正常回复当成畸形（本仓库自维护/复盘类任务常谈到这些标记）。
+        stripped = re.sub(r'```.*?```', '', content, flags=re.DOTALL)
+        stripped = re.sub(r'`[^`\n]*`', '', stripped)
+        stripped = re.sub(r'<thinking>.*?</thinking>', '', stripped, flags=re.DOTALL | re.IGNORECASE)
+        stripped = re.sub(r'<summary>.*?</summary>', '', stripped, flags=re.DOTALL | re.IGNORECASE)
+        # 真实畸形样本：以 <summary> 开头但没有闭标签（输出被截断）。收紧为"开头形态"，
+        # 否则讲解协议标记的正常回复会被误判（本仓库自维护/复盘类任务经常谈到这些标记）。
+        unclosed_summary = stripped.lstrip().startswith('<summary>') and '</summary>' not in stripped
+        visible = re.sub(r'</?(?:summary|thinking)>', '', stripped, flags=re.IGNORECASE).strip()
+        has_readable = bool(re.search(r'[\w\u4e00-\u9fff]', visible))
+        # 协议碎片只认闭合形态（全角竖线夹 DSML），宽松匹配会误伤正文里的正常提及
+        leaked_protocol = bool(re.search(r'</\uff5c\uff5cDSML\uff5c\uff5c', content))
+        if (not has_readable) or unclosed_summary or leaked_protocol:
+            yield "[Warn] LLM returned a degenerate response (no usable text). Retrying...\n"
+            return self._retry_or_exit(
+                "[ERROR] Degenerate response (no readable text / truncated markup). "
+                "Regenerate and output a complete answer."
+            )
         if '[!!! 流异常中断' in content[-100:] or '!!!Error:' in content[50:][-100:] or (content.endswith('</summary>') and len(content) < 100):
             return self._retry_or_exit("[ERROR] Incomplete response. Regenerate and tooluse.")
         if 'max_tokens !!!]' in content[-100:]:
             return self._retry_or_exit("[ERROR] max_tokens limit reached. Use multi small steps to do it.")
+        self._empty_ct = 0  # 必须放在全部退化/异常判断之后：否则旧防护线的连错计数会被提前清零而永不退出
         
         if self._in_plan_mode() and any(kw in content for kw in ['任务完成', '全部完成', '已完成所有', '🏁']):
             if 'VERDICT' not in content and '[VERIFY]' not in content and '验证subagent' not in content:
