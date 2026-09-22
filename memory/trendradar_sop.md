@@ -177,3 +177,14 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - 观察：同一轮内模型仍会**先写草稿再重写正文**（标题出现 2-4 次，被过滤 8.6k~15k 字符），因此"取最后一个标题"这一策略是当前最稳的起点判据；探针是最后一道闸门。
 - 通用教训：**过滤器的锚点不能依赖"模型这一次用了什么格式"**；上游模型（本例为 Claude 系 mixin 路由）的风格会随端侧/版本漂移，锚点要用结构并集 + 兜底闸门，并**定期统计历史产物里锚点命中数**（如 `grep -c '^## ' output/*.txt`）以提前发现漂移。
 
+---
+
+## §13 信源有效性审计（2026-09-22，TODO#2/R343）
+
+- **工具**：`tools/trendradar_source_audit.py`（GA 仓，幂等只读；子命令 `scan` 扫描产出 / `report` 每源贡献表 / `check` 14 源 HTTP 实测 / `verdict [天数]` 零产出·极低产出·近期静默三清单 / `impact [天数]` 关键词通道损失量化）。报告 `temp/autonomous_reports/R343_*.md`，原始数据 `temp/trendradar_source_audit/`。
+- **★平台检索通道整串失配坑（实测铁证）**：TrendRadar `mcp_server/tools/search_tools.py::_search_by_keyword_mode` 是**整串子串**匹配（`query.lower() in title.lower()`），而 GA 侧 `sche_tasks/run_trendradar_digest.py` 的 `KEYWORDS` 把 7~8 个词拼成一个长串去查 → **永远 0 命中**。证据：132 份 `*.material.json` 里两处查询全 `success=true` 但 `total=0`（2026-07-14~09-21 全 0），而同日 DB 实有 11 平台/1274 条标题、单关键词 `华为` 实测命中 7 条；拆词后 30 天可捞回 1396 条。**排查时看到 material.json「success 但 total=0」不要当成库空**（消息里已写"可用数据: 2025-12-21 至今"）。
+- **采纳口径**：报告正文里的来源标注（`（VEX）`/`（Solidot）`等）才算采纳；DB 里 title 有记录 ≠ 采纳（平台 11 源就是这样"天天抓、零采纳"）。RSS 侧 14 源里 hacker-news 占采纳 68%（985/1451），其余多为长尾或零产出。
+- **死源判定必须有 HTTP 实测**：本次 `ai-weekly`（AIbase 快讯）HTTP 404，另测 4 个候选地址全 404（该站已废 RSS）；配置里给它加 `enabled: false` 即与既有 `yahoo-finance` 同法停用。config 只读挂载，改动只出建议（见 `temp/pending_decisions/DECISIONS_R343.md`）。
+- **坑**：`output/news/YYYY-MM-DD.db` 的 `platforms` 表能给平台 id→中文名映射，但报告里写的名字混用中英（`财联社` vs `财联社热门`）→ 比对时要走别名表；读 DB 用 `sqlite3 file:...?mode=ro`（容器写的库，直接 connect 可能锁）。
+
+
