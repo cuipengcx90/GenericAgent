@@ -91,7 +91,8 @@
 3. 若采纳，落地命令（批准后执行）：
    - L1：`file_patch memory/global_mem_insight.txt`（在「定时/自主/反射」行尾追加上述句子）
    - L2：`file_patch memory/global_mem.txt` 追加「## 本机存储与灾备事实」小节（内存模块 patch，非覆盖）
-4. 边界说明（沿用 R355 §9.4 的同一问题）：SOP 要求「需写入报告待审」，而 L1 现状存在直写实践 ⇒ 本轮继续一律进报告待审，等您定口径。
+4. **RULES #15 需修正（本机实测，2026-09-22）**：macOS **无 `setsid`** 命令（实跑报 `setsid: command not found`），RULE 15 给的 `setsid nohup ...` 启动法在本机不可用；本轮实测可行替代＝`nohup <cmd> </dev/null > log 2>&1 & disown`（立即返回、子进程存活、后台 subagent 跑约 20 分钟后正常产出，且未占住本会话通道）。建议 RULE 15 第①步改为「macOS 用 `nohup ... </dev/null & disown` 并重定向 stdin；仅当系统存在 setsid 时才加 setsid」。
+5. 边界说明（沿用 R355 §9.4 的同一问题）：SOP 要求「需写入报告待审」，而 L1 现状存在直写实践 ⇒ 本轮继续一律进报告待审，等您定口径。
 
 ---
 附：本轮关键文件——`temp/TODO.txt`（已更新为第 4 批）、`temp/review_todos4.txt`（候选原文）、`temp/review_todos4.out.txt`（评审原文）。
