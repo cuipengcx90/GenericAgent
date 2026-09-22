@@ -558,13 +558,15 @@ class _TaskCard:
     # elements=64 通过、67 被拒（报 11310 element exceeds the limit）；
     # 而 50 步 × 800 字（4 万字符 / 126KB）照样通过，故体积预算可大幅放宽。
     _PAGE_STEPS = 55           # 55 步 + 页眉/总结/按钮 ≈ 60 个 element，实测上限约 65
+    _ASK_PAGE_STEPS = 45       # 出现候选按钮时收紧：按钮最多再占 ~10 个 element 预算
     _PAGE_CHARS = 38000        # 体积兜底：实测 148.5KB 通过 / 155.8KB 被拒（上限约 150KB）
     _STEP_FLUSH_INTERVAL = 3.0
     _REGISTRY_MAX = 200        # 翻页注册表上限，超出丢弃最早的，防长跑内存累积
     _registry = {}             # uid -> _TaskCard，翻页回调据此找回卡片实例
 
-    def __init__(self, receive_id, rid_type):
+    def __init__(self, receive_id, rid_type, owner_open_id=None):
         self.rid, self.rtype = receive_id, rid_type
+        self.owner_open_id = owner_open_id   # 发起人：ask 候选按钮只受理他的点击
         self.uid = uuid.uuid4().hex[:12]
         self.page_idx = 0
         self._follow_tail = True   # 默认跟随最新页，用户手动翻页后置 False
@@ -574,6 +576,7 @@ class _TaskCard:
         self.steps = []          # [(summary, detail), ...]
         self.status = "🤔 思考中..."
         self.final = None
+        self.ask_menu = None     # ask_user 菜单：{menu_id, question, candidates}
         self.msg_id = None
         self.page_no = 1
         self.turn_no = 0
@@ -613,16 +616,22 @@ class _TaskCard:
         # 最终总结只属于最后一页：否则翻到任何一页都会重复看到同一段结尾
         if self.final and self.page_idx == total - 1:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
+        if self.ask_menu:
+            els += [{"tag": "hr"}] + self._ask_buttons()
         if total > 1:
             els.extend(self._page_buttons(total))
         return _card_raw(els)
 
     def _paginate(self):
-        """按「步数 + 字符预算」双判据切页：常态装满 _PAGE_STEPS 步，遇大步骤则提前翻页。"""
+        """按「步数 + 字符预算」双判据切页：常态装满 _PAGE_STEPS 步，遇大步骤则提前翻页。
+
+        ask 候选按钮会额外占 element 预算（飞书实测上限约 65），此时用 _ASK_PAGE_STEPS 留位。
+        """
+        cap = self._ASK_PAGE_STEPS if self.ask_menu else self._PAGE_STEPS
         pages, cur, n = [], [], 0
         for s, d in self.steps:
             size = len(s) + len(d)
-            if cur and (len(cur) >= self._PAGE_STEPS or n + size > self._PAGE_CHARS):
+            if cur and (len(cur) >= cap or n + size > self._PAGE_CHARS):
                 pages.append(cur); cur, n = [], 0
             cur.append((s, d)); n += size
         if cur or not pages: pages.append(cur)
@@ -646,6 +655,29 @@ class _TaskCard:
                "value": {"ga_card": self.uid, "page": self.page_idx + 1}}
         return [{"tag": "column_set", "flex_mode": "none", "horizontal_spacing": "8px",
                  "columns": [_col(prev), _col(nxt)]}]
+
+    _ASK_MAX_CANDIDATES = 8   # 候选按钮上限：飞书实测单卡 element 上限约 65，需留足余量
+
+    def _ask_buttons(self):
+        """ask_user 候选按钮：每个候选独占一行（实测三列会被挤成省略号），末行是取消。
+
+        value 回传卡片 uid 与候选序号；点击由 handle_card_action 校验发起人后受理。
+        """
+        all_cands = self.ask_menu["candidates"]
+        shown = all_cands[:self._ASK_MAX_CANDIDATES]
+        els = []
+        for i, cand in enumerate(shown):
+            label = str(cand).strip()[:60] or f"选项 {i + 1}"
+            els.append({"tag": "button", "type": "default", "size": "medium", "width": "fill",
+                        "text": {"tag": "plain_text", "content": label},
+                        "value": {"ga_card": self.uid, "ask_idx": i}})
+        if len(all_cands) > len(shown):
+            els.append({"tag": "markdown",
+                        "content": f"_另有 {len(all_cands) - len(shown)} 个候选未列出，可直接回复文字_"})
+        els.append({"tag": "button", "type": "default", "size": "small", "width": "fill",
+                    "text": {"tag": "plain_text", "content": "取消"},
+                    "value": {"ga_card": self.uid, "ask_cancel": True}})
+        return els
 
     def goto_page(self, idx):
         with self._lock:
@@ -738,6 +770,25 @@ class _TaskCard:
             self.status = f"❌ {msg}"
         self._enqueue("fail", force=True)
 
+    def set_ask_menu(self, question, candidates):
+        """登记 ask_user 菜单。调用方随后会 done()，由那次渲染带上按钮，这里不单独入队。"""
+        cands = [str(c).strip() for c in (candidates or []) if str(c).strip()]
+        if not cands:
+            return
+        with self._lock:
+            self.ask_menu = {"menu_id": uuid.uuid4().hex[:12],
+                             "question": question, "candidates": cands}
+
+    def resolve_ask(self, chosen):
+        """候选已选定（或取消）：撤掉按钮，并在卡片上留一行结果。"""
+        with self._lock:
+            if not self.ask_menu:
+                return
+            self.ask_menu = None
+            note = f"✅ 已选择：{chosen}" if chosen else "⏹️ 已取消选择"
+            self.final = f"{self.final}\n\n{note}" if self.final else note
+        self._enqueue("ask-done", force=True)
+
 
 def _make_task_hook(card, done_event, on_final):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
@@ -748,6 +799,8 @@ def _make_task_hook(card, done_event, on_final):
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
                 ask = extract_ask_user_question(ctx)
                 if ask:
+                    # 有候选项就渲染成按钮；没有则只显示问题文本（用户直接回复文字）。
+                    card.set_ask_menu(ask[0], ask[1])
                     card.done(build_ask_user_text(*ask))
                 else:
                     card.done(_display_text(raw))
@@ -760,16 +813,78 @@ def _make_task_hook(card, done_event, on_final):
             print(f"[fs hook] error: {e}")
     return hook
 def handle_card_action(data):
-    """卡片翻页按钮回调：按 value 里的 uid 找回实例并切页。"""
+    """卡片按钮回调：翻页，以及 ask_user 候选选择。"""
     try:
         v = data.event.action.value or {}
         if isinstance(v, str):
             v = json.loads(v or '{}')
         card = _TaskCard._registry.get(v.get('ga_card'))
-        if card and isinstance(v.get('page'), int):
+        if not card:
+            return
+        if isinstance(v.get('page'), int):
             card.goto_page(v['page'])
+            return
+        if v.get('ask_idx') is not None or v.get('ask_cancel'):
+            _handle_ask_choice(data, card, v)
     except Exception as e:
         print(f"[fs card action] error: {e}")
+
+
+def _handle_ask_choice(data, card, value):
+    """受理 ask_user 候选点击：校验发起人 → 更新卡片 → 以选项文本发起新任务。
+
+    语义提醒：GA 的 ask_user 不阻塞，任务在提问那一刻就已结束，所以这里发起的是
+    一个**新任务**（等价于用户手打该选项），不是接续原任务。
+    """
+    menu = card.ask_menu
+    if not menu:
+        return
+    operator = getattr(getattr(data.event, 'operator', None), 'open_id', None)
+    owner = card.owner_open_id
+    if owner and operator and operator != owner:
+        print(f"[fs ask] 非发起人点击忽略: operator={operator} owner={owner}")
+        return
+    chosen = None
+    if not value.get('ask_cancel'):
+        try:
+            chosen = menu['candidates'][int(value.get('ask_idx'))]
+        except (TypeError, ValueError, IndexError):
+            return
+    card.resolve_ask(chosen)
+    if chosen:
+        threading.Thread(target=_run_ask_followup, args=(card, chosen), daemon=True).start()
+
+
+def _run_ask_followup(card, text):
+    """把候选点击当作用户发言发起新任务。
+
+    刻意不复用 handle_message 里的 run_agent：那是闭包，抽出来要动现有可用路径，
+    这里十几行重复换来零回归风险。
+    """
+    try:
+        ag = get_agent()
+        receive_id, rid_type = card.rid, card.rtype
+        done_event = threading.Event()
+        hook_key = f"fs_ask_{receive_id}"
+        new_card = _TaskCard(receive_id, rid_type, owner_open_id=card.owner_open_id)
+        new_card.start()
+        on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
+        if not hasattr(ag, '_turn_end_hooks'):
+            ag._turn_end_hooks = {}
+        ag._turn_end_hooks[hook_key] = _make_task_hook(new_card, done_event, on_final)
+        try:
+            ag.put_task(text, source="feishu")
+            start = time.time()
+            while not done_event.wait(timeout=3):
+                if time.time() - start > AGENT_TIMEOUT_SEC:
+                    ag.abort()
+                    new_card.fail("任务超时")
+                    break
+        finally:
+            ag._turn_end_hooks.pop(hook_key, None)
+    except Exception as e:
+        print(f"[fs ask] follow-up 异常: {e}")
+        traceback.print_exc()
 
 
 def handle_message(data):
@@ -796,7 +911,7 @@ def handle_message(data):
         rid_type = "chat_id" if chat_id else "open_id"
         done_event = threading.Event()
         hook_key = f"fs_{open_id}"
-        card = _TaskCard(receive_id, rid_type)
+        card = _TaskCard(receive_id, rid_type, owner_open_id=open_id)
         card.start()
         on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
         ag = get_agent()
