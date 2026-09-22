@@ -20,7 +20,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | tmwebdriver_sop | jshook_runtime_sop | js_runtime_hooking_playbook_sop | vision_sop | ljqCtrl_sop
 || launchpad_folder_sop(分类基线/验收/持续调整)
 | sophub_sop | sophub_security_sops | sophub_6a69733c(UUYC网易UU远程CLI操作SOP: uuyc-cli设备/云电脑/终端/远程协助命令参考,raw端点匿名可访问) | codex_jailbreak_risk_sop | ctf_core_contract_risk_sop | llm_prompt_bypass_risk_sop
-| keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md | asr_cli.py/asr_sop(幻觉判据/VAD反例)
+| keychain.py/keychain_sop | procmem_scanner.py/procmem_scanner_sop | ui_detect.py | vision_utils.py | subagent.md | asr_cli.py/asr_sop(幻觉判据/VAD反例/批量器audio_asr_batch+预筛audio_vad_scan)
 | cc_disguise_knowledge(CC伪装机制/工具映射/排错,无部署)
 | deepresearch_sop(多来源深度研究DAG) | hcaptcha_sop | github_project_learning_sop(陌生代码库学习)
 | baidu_pan_transfer_sop(网盘转存/资源入库保留URL+提取码+边界)
@@ -63,7 +63,7 @@ L4: L4_raw_sessions/
 12. 拼接URL/ID禁凭直觉套模板，须用真实返回值实测打开；出错要批量回刷历史数据非只改模板
 13. 禁空报完成: GUI/发布类任务须OCR或等价证据核验后才可报成功；未打通步骤须明示，禁把中间态当完成；口头「已沉淀SOP」须grep memory确认文件真实存在
 14. 网络诊断: Clash TUN 开启时本机"直连"同样被接管，--noproxy/裸socket 结果不可作真实直连证据；站点不可达时逐节点验证用 Clash API(`curl --unix-socket /tmp/verge/verge-mihomo.sock http://localhost/proxies/<urlenc>/delay?timeout=8000&url=...`)对照 Google/generate_204，跨网旁证用 r.jina.ai 抓取该站
-15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环；期间通道零输出，飞书卡片停"思考中"看似卡死，用户被迫喊"继续"而 put_task 只是排队并不中断)。正确两步法: ①只启动立即返回 `nohup xxx > log 2>&1 & echo pid=$!`；②后续每轮用一次 code_run 查状态 `tail -3 log; ps -p <pid> >/dev/null 2>&1 || echo DONE`。每次调用秒级返回，通道持续有心跳，多花轮数由 max_turns=180 兜底
+15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环；期间通道零输出，飞书卡片停"思考中"看似卡死，用户被迫喊"继续"而 put_task 只是排队并不中断)。正确两步法: ①只启动立即返回 `setsid nohup xxx > log 2>&1 < /dev/null & disown; echo pid=$!`(⚠️2026-09-22实测裸`nohup ... & echo pid=$!`仍会挂满 code_run 超时被强杀=后台子进程占住通道;setsid+`</dev/null`+disown 立即返回,且超时强杀不杀已 setsid 的后台进程,用它起长任务更稳)；②后续每轮用一次 code_run 查状态 `tail -3 log; ps -p <pid> >/dev/null 2>&1 || echo DONE`。每次调用秒级返回，通道持续有心跳，多花轮数由 max_turns=180 兜底
 16. 审「测试全绿」先验测试本身是否真执行: 内联/mock 执行器(如桩PA)会无条件写 PASS、把从未运行过的工具记成 exit_code=0 成功记录→只证明管道通不证明能力通,须用真执行替身复跑；桩替身还须校验**接口形状**(flag名/取值域/必填项)——只校验调用次数与顺序会放走 `--timeout-ms` 这类笔误(假herdr照单全收,17例全绿却真机必败)
 17. 拷本机数据库做只读快照必须连 -wal/-shm 一起拷(缺 -wal 会"假空":实测 Notes 2→8 对象),查询走 `file:...?mode=ro`;macOS 容器目录(~/Library/Containers)递归 `find -type f` 会被 TCC **挂起**(>25s 不返回≠返回 0)→只能 `ls` 限深+显式超时,判"空库"要用第二来源交叉证
 18. 并行调研子任务的完整需求书在 `prompts/<名>.md`(父消息常被截断)：动手前先读全该文件+ls prompts/ 确认产出清单，写完回对每条要求(实测漏问/漏硬约束)

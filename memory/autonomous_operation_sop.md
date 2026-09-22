@@ -53,3 +53,8 @@ print(get_todo())       # 查看待办
 
 ## 等待用户审查
 - 用户归来后审查报告，决定批准、修改或拒绝方案
+
+## 坑：同一 TODO 会被**并行会话重复执行**（2026-09-22 实证 R353/R354）
+同一 TODO 条目在 18:09 已被另一运行归档为 R353，本运行 18:29 又独立跑了一遍（ASR 全量 ~29min 算力双耗）并把编号推到 R354。
+- 收尾前**先查重**：`ls -t temp/autonomous_reports | head -5` + `grep -n '<任务关键词>' memory/autonomous_reports/INDEX.md temp/TODO.txt`；若条目已 `[x]`，直接改 `[x] R<编号>` 并放弃本轮产出（或合并差异），不要再调 `complete_task`。
+- `helper.complete_task` 的编号分配非原子（`_next_report_number()` 扫目录），并发下会撞号 ⇒ 与 TODO「自主报告『编号复用』根治」合并规划（认领锁 `temp/.todo_claim.json` + `O_EXCL` 建目标文件）。

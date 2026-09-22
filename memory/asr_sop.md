@@ -26,3 +26,9 @@
 - 去重口径：全字节 sha256（同一视频的 `.mp4`/`.MP3` 副本会重复转写，先判重）。
 - ★盘点工具 `tools/audio_asset_inventory.py`（已入库）计数口径曾歧义：`unique` 一词同时指向「含 not_media」与「可播/可转写」两个不同集合 ⇒ 已改为 `unique`=可转写、`unique_incl_not_media`=含非媒体并在 md 头写明；报数时**必须两个都念**（本机实测 46 命中 → 30 含非媒体 / 28 可转写，差 2 条是扩展名像音轨但 ffprobe 解析不了的 `.ts` 之类）。改脚本后须用临时夹具真跑（真 wav + 文本改名 `.ts` + 字节重复副本）核对 json/md 两个数字一致，别只看代码。
 - macOS **无 `timeout` 命令**；需要超时用 python/`perl -e alarm` 或后台+轮询。
+- ★**批量现成工具（本次落盘，仓库根目录跑，均已冒烟 rc=0）**：
+  - `/opt/anaconda3/bin/python3 tools/audio_vad_scan.py --assets temp/audio_assets --inventory temp/audio_assets/inventory.json --out temp/audio_assets/vad_scan.json --wavdir /tmp/wav_vad [--only N]`（silero 预筛，≈257× 实时）
+  - `/opt/anaconda3/bin/python3 tools/audio_asr_batch.py --assets temp/audio_assets --inventory temp/audio_assets/inventory.json --outdir temp/audio_assets/asr --model small --beam 1 --threads 8 [--only N] [--force]`（逐条 json、幂等 skip、内置 VAD）
+  - 两者路径全部可覆盖（`--assets/--out/--outdir`），默认仍指 `temp/audio_assets`；`--only` 只跑前 N 条做冒烟。
+- ★`memory/asr_cli.py` **对相对路径敏感**：传相对路径会按 cwd 解析并报 FileNotFoundError（实测踩到一次）⇒ 一律传**绝对路径**。
+- 同一条音频：`asr_cli.py`（默认 greedy、无 VAD）与批量工具（beam=1+VAD）结果**语义一致但断句/繁简可能不同**（实测 28s 条：`你們倆吃累不累啊…` vs `你们两只累不累…`）⇒ 交叉校验只比语义，别逐字比对。
