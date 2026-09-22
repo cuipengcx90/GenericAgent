@@ -19,6 +19,12 @@ phase 停在哪个状态、`data/` 文件是否还在、`git log` 是否被改�
 
 ## 1. 装置与用法
 
+**起队前先跑能力预检**（2026-09-22 补，提交 27698c8）：`python3 herdr-team/bin/teamprofile.py doctor --profile <项目>/docs/team-profile.yaml`
+（加 `--strict` 有缺失即非零退出，适合 CI；不带 `--profile` 体检全部 kind，`--json` 给机器读）
+——1 秒、零副作用，专门拦"profile 里配了本机**没装**的 CLI"。不跑它的代价不对称：
+launch 里表现为**白等** `--timeout`×6 级退避重试（本机 `muse/qodercli/kiro` 就是 pane 上
+`command not found`）；预检 1 秒 << 白等一轮几分钟。顺带 `kinds` 打印白名单并对照本机 herdr 实际取值。
+
 ```bash
 # 正例（self=轻量 / delegation=复杂委托；跑前需 eval_prompt/preflight 就绪）
 python3 temp/drill_autopilot_unattended.py --scenario self       --max-min 30
@@ -186,7 +192,33 @@ team-lead 与 reviewer1 **先后**在同一处被
 `--workspace-id`**（只给 `advance` 加会一次性炸掉 28 个测试）；③`run-state.json` **没有** `updated_at` 字段，
 事件在 `run-events.jsonl`（不是 `events.jsonl`）。
 
-## 4. 残余风险 / 未覆盖
+## 3.6 W0 自己猝死：驱动窗口不能是单点（G6，2026-09-21 第三轮）
+
+**现象与根因**：第二轮真委托演练里 W0 打到 `REVIEWED` 就**再也没动**。pane 里没有报错对话框、
+`agent_status` 照样能查——因为 pane 停在一个**死掉的会话**上。铁证来自 pi 会话 jsonl：
+`input=93610` 的那次请求成功，同一链路的**下一次**请求被判 `context_length_exceeded`；
+而 `~/.pi/agent/models.json` 里 hxi 网关声明的是 1M 窗口 ⇒ **声明值不可信，真实可用窗口 ~94K**。
+（W0 会话是"读整份 SKILL.md + 简报 + 全程单会话"堆起来的，一回合一读就爆。）
+
+**为什么旧装置救不了**：`watch` 的 `nudge` 只会**反复投 prompt**。会话已死 ⇒ 每次投递必然失败，
+于是"驱动窗口"自己成了单点，只能一路耗到 `--max-min` 预算尽，再 escalate——**没人值守时就是静默卡死**。
+
+**修复（`watch` 的复活路径）**：prompt 返回**非 0**（且 tail 命中死亡特征）即：
+1. `death_reason()` 读 pane 尾部判定死因（`context_length_exceeded` / `session not found` / 进程没了）；
+2. `herdr agent start <name> --kind <原kind> --pane <原pane>` —— **同一个 pane、新会话**，pane 身份不变；
+3. 投 `WATCH_REVIVE`：**阶段化续跑指令**——先 `status` 读 `run-state.json` + `run-events.jsonl` 恢复现场，
+   **只重读当前 phase 需要的那一节 SKILL.md**（上一次会话就是"整篇重读"把窗口撑爆的），
+   已完成阶段复用既有证据、不重做；
+4. 有界 `--max-revives`（默认 2）；重启失败或次数用尽 → 照旧 `escalate`（写 `NEEDS_HUMAN.md` + 通知 + 释放自有锁 + rc 2）。
+留痕 `revive_lead` / `revive_prompted`（带 `reason`、`attempt`）。**dry-run 永不复活；健康 W0 永不误重启**（回归测试钉住）。
+
+**推广规律**：任何"长会话 agent"都可能被自己的上下文撑死（尤其被要求"先通读整个 SKILL"时）。
+⇒ ①长任务 prompt 必须**按需读文档**，别让人通读；②驱动窗口必须能**重启被驱动者**，只会重投消息的驱动窗口不算驱动窗口。
+
+**装置侧**：`drill_autopilot_unattended.py` 现在自己并行放一个**真执行**的外层 `watch`（`--no-watch` 作负控），
+演练从"驱动方轮询"升级为端到端；独立复核口径改为**场景感知**（delegation 查 ordercalc 六文件 + `unittest discover`，
+此前写死 self 场景的 `src/calc.py`，delegation 必然误判 FAIL）。
+
 
 - 委托**成功路径仍未跑通到 COMPLETED**：修复后虽 6/6 起队到 DISPATCHED，但 W0 **无法驱动已起团队**
   （缺 mailbox/teamctl 桥，见 §2.2），团队 pane 空停在提示符 ⇒ "团队产出质量/交付物正确性"**仍未验证**。
@@ -257,3 +289,100 @@ herdr 对**自己上报生命周期**的 agent（pi/codex 都走 hook）**不做
 原规则保护的是"别替用户改机器的信任状态"。新政策保留了这条：**作用域严格=本 run 的工作区**、
 **可回滚**（备份+一节可删）、**留痕**（决策日志带理由）、**更宽的仍然停**。
 真正的改进是：把"问人"从**每次 run 的阻塞点**变成**一次显式、可审计、有边界的决定**。
+
+---
+
+## 第六轮真委托（2026-09-21 18:34 起，run `ap-unattended-1789986148`，ws `w22`）— G11/G12：**看门狗自己的假阳性**
+
+这一轮的价值不是"跑通"，而是**真跑到队之后被自己的看门狗当场判死**：
+18:36:02 起队 6/6 健康 → 18:36:11（9 秒后）驱动进程 `team_drive.py` **首轮 cycle 就升级**
+`escalate_notified why="unfixable exception class"`（`blocked=2, kinds=["ready","unreadable","update_banner"]`），
+写出 `NEEDS_HUMAN.md`。W0 判定为假阳性并接管驱动窗口（`unattended-decisions.jsonl` 有 `tool_false_positive_takeover` 记录）。
+
+### G11 ——"读不到" ≠ "卡住"（无人值守链 9 秒自毁的根因）
+- `herdr agent read` 在 pane **working** 时**必然**返 `agent_not_idle`（rc≠0）。旧逻辑只看 rc≠0 → 判
+  `unreadable`（blocking）→ 升级。**读不到是健康状态的正常结果**，不是故障。
+- 修法（`agent_unstick.classify`）：read 失败后**必须再取一个独立信号**（`herdr agent get` 真状态）：
+  `working`/`done` → 新 kind `working_unreadable`（**非阻塞**，remedy=None）；真状态也异常才落 `unreadable` 升级。
+- 通法：**任何"探测失败即判故障"的看门狗，升级前都要有第二个独立证据**，否则健康会被判死。
+
+### G12 —— 终端的 chrome 不是内容（驱动窗口正准备往健康成员里按 Enter）
+- pi 静止 pane 的最底行**永远是状态栏** `· DS cache 13/13·0.75M/0.78M 95.6%`（其上是模型/上下文行、
+  `🔌 MCP: 10 servers enabled`、输入框边框）⇒ **状态栏在最底 = turn 已结束，下面不可能有对话框**。
+- 少了这条判据：成员**自己输出的正文**用编号列表收尾（`4. CLI：sys.path 自举后绝对导入…`、
+  `5. 含税口径：total = 小计 − 折扣…`）会命中 `DIALOGISH`（菜单形）→ 判 `dialog_unknown` → remedy=`["enter"]`
+  → **往健康成员里按键**。"未知对话框默认按 Enter"这条兜底，在误配时比不动作更有害。
+- 修法：`classify_text` 最前端加 `PI_STATUS_BAR` → 新 kind `turn_at_rest`（非阻塞）；
+  `team_drive.idle_members` 一并纳入"停在提示符"的唤醒路径（此前只看 `ready`）。
+- 通法：**先剥容器 chrome（状态栏/输入框/横幅）再匹配形态**。
+
+### 复验与套件
+- 改后只读探针（不动现役 run）：`blocked=0`；7 名成员 = 3×`working_unreadable` + 2×`turn_at_rest` +
+  `ready` + `update_banner`。改前同一支队伍 `blocked=2` + 首轮升级。
+- `herdr-team` 23 passed（20 + 5 条新回归，G12 夹具**逐字抄自真机 tail**）；`autopilot` 109 passed / 12 subtests。
+- 已进 `herdr-team/SKILL.md`（分类表两行 + 三条硬规则）与 `DRILL_LOG.md` §15；`agent_unstick.py` 文件头同表同步。
+
+### 教训
+1. 看门狗的第一原则是**别把健康判死**：升级必须是最后动作，第一个 cycle 就升级等于把"还没开始"当"已经卡死"。
+2. 形态匹配前先分清**容器**与**内容**。
+
+### 同日补充：G13/G14（拿修好的脚本对**现役队伍**做有界 dry-run 复跑时炸出）
+
+- **G13 `--apply` 缺席 ≠ 惰性（真机实测）**：dry-run 仍**真写了 `NEEDS_HUMAN.md`**（覆盖了 18:36 假警报原文），
+  且**真走通知通道**——生产若设了 `TEAM_DRIVE_NOTIFY_CMD`，一个"看一眼"的探针就会 **push 给人**。
+  ⇒ 修：`escalate(..., apply=False)` 全惰性（不写文件/不通知，只打印 `WOULD ESCALATE`），dry-run 日志分文件
+  `supervisor.dryrun.jsonl`。验证：修复后复跑，现役 `NEEDS_HUMAN.md` mtime 未变。
+  **通法：会写文件/发通知的探针就是生产的一部分，"只读"必须真只读。**
+- **G14 停滞看门狗判到"正在干活"的队伍头上**：连续 cycles 5–8 `stall_watchdog(working=3)`（成员在写 37KB 设计文档，
+  产物 mtime 停 5 分钟）。⇒ 修：`working_seen > 0` 只延后不升级（`stall_deferred_working`），交给 `--max-min` 兜底；
+  验证 cycles 5–8 全部延后、无升级无杀队。**通法：没有新产物 ≠ 没人干活。**
+- **G16 `working` 面具下的批准框（同 run 第二道坎，798 秒空转）**：同一 run、同一成员 `coder1`（`w22:p6`）自报
+  `working`、pane 里 spinner 在转、session jsonl 13 分钟无新消息——raw pane 缓冲显示它卡在**自家护栏**的
+  `Delete pre-existing workspace files?` / `Allow this exact deletion?` 模态上。G11 的修复把"working 时读不到"
+  一律当健康（`working_unreadable` 非阻塞），于是探针报 `blocked=0`，**驱动窗口永远以为队伍在干活**。
+  ⇒ 修：①新 kind `delete_approval`（LIVE_ONLY、blocking）；②`classify()` 在 working/done 且 read 被拒
+  （`agent_not_idle`）时**退回 raw pane 缓冲**（`herdr pane read <pane> --lines N`）找 live 对话框；
+  ③`keys_guarded` 安全门＝路径非空 ∧ 每条都是可再生缓存 ∧ 解析后在本 run 工作区内（`workspace_root()` 读
+  `workflow-state.json` 的 `project_dir`），否则 `ESCALATED` **一个键都不按**（模态默认就是 Yes，看不见就批=删用户代码）。
+  验证（真机，非自证）：只读探针 `[BLOCKED] delete_approval`；`--apply --allow-trust` → `answered ... YES for
+  mundane paths [...] rc=0`、recheck `blocked=0`；**解锁后 coder1 立即继续干活**（raw pane 出现
+  `python3 -m unittest discover -s tests -v`，pi `DS cache` 17/17→19/19）。
+  **通法：①"健康"的判据不能同时当"在推进"的证据（判活≠判进）；②正经通道被拒时必须有兜底通道，否则
+  "通道被拒"与"真没内容"混为一谈；③凡是代按 Yes 的动作都要有可机械判定的边界，边界外宁可停。**
+- 套件：`herdr-team` 25 passed（+G13 两条回归）；`autopilot` 109 passed / 12 subtests；G16 后 `test_unstick_rules.py` 24 passed。
+- **结局（同日 19:40，无人干预）**：G16 解掉后 17 分钟内该 run 自己走完 `IMPLEMENTED`(18:59,unittest 22 OK)
+  →`REVIEW_PASSED`(19:17,codex round1 FAIL→修→round2 PASS,25 tests)→`TEST_PASSED`(19:19,tester 独立复跑×3)
+  →**`ACCEPTED`**(19:40,lead 逐条核验 R1–R12 全过)。⇒ 卡点一解，闭环自完成；`workflow-events.jsonl` 全链留证。
+- **G17 清场不是自动的（用户当场发现，2026-09-21）**：`ACCEPTED` 后 2 小时 7 个 pane 还活着——因为"关工作区"
+  属于**外层驱动窗口的收尾动作**，而那个窗口 19:0x 随会话中断死了，收尾没发生（上一轮演练的 `w21` 也挂着）。
+  ⇒ 修：`bin/reap.py`（**独立于会话**的兜底扫描：读 `~/.cache/herdr/teams/*/workflow-state.json` → 逐个判定；
+  **唯一清场信号＝`CLOSE_READY`（lead 显式"可解散"）**；`ACCEPTED` 一律 KEEP——**验收通过≠可以关**，之后还要
+  补填/优化；`ABORTED/CANCELLED` 默认留、`--include-aborted` 才清；默认 dry-run、`--apply` 才动；跳过调用者自身
+  workspace；`NEEDS_HUMAN` 不关；无 team 目录者永不入候选；另清该 workspace 的 `focus-notify`/`alerter`）。
+  **不挂定时/hook，只认显式调用**。`bin/test_reap.py` 11 passed + 真机 e2e（ACCEPTED 存活 / CLOSE_READY 被关）已验。
+  **通法：任务完成 ≠ 资源释放，两件事；且"可以释放"需要一个显式信号——既防没人收，也防收早了。**
+
+- **通用性契约（用户提问触发，2026-09-21 实测核过）**：herdr-team / autopilot 两个 skill **不含任何 GA 专有依赖**，
+  PI / OMP / 裸 shell / CI 都能跑。实测：`ast` 扫描全部 `bin/*.py` 的非标准库 import 只有 `yaml`（仅
+  `teamprofile.py` 用，其余纯 stdlib）；无 GA 模块 import、无 `/Users/cuip/projects/GenericAgent` 硬编码；
+  `herdr` 走 `HERDR_BIN`、team 状态目录走 `--teams-dir`/`HERDR_TEAMS_DIR`（默认 `~/.cache/herdr/teams`）、
+  通知走 `TEAM_DRIVE_NOTIFY_CMD`/`AUTOPILOT_NOTIFY_CMD`（**没有厂商默认值**：不设就只落日志，不会偷偷打电话）。
+  ★**herdr 会向它启动的每个 pane 注入 `HERDR_ENV=1`/`HERDR_WORKSPACE_ID`/`HERDR_TAB_ID`/`HERDR_PANE_ID`
+  （真机 `herdr pane run` 拷 env 实测，v0.9.0）**——所以脚本能知道自己"在谁的窗格里"，与启动它的驱动器无关。
+  ★**由此新增护栏（真机 e2e 已证）**：`reap.py` 靠 `HERDR_WORKSPACE_ID` 认出自家的 workspace 并 **SKIP**
+  （关掉自己所在 workspace＝自杀式中断）；非 herdr 驱动器用 `--my-workspace <id>` 显式告知；`--force-self` 才允许
+  自收，且自收走 **detached Popen** 让 close 在进程死后仍落地。实测：pane 内跑→`[SKIP] the caller's own workspace`、
+  目标存活；pane 外跑→`released by phase CLOSE_READY`、目标被关。`bin/test_reap.py` 15 passed，套件 47 passed。
+  ★装置坑：`herdr pane run <pane> <cmd> <args...>` 会把参数**拼成一行交给 shell**——多参数命令会被吃掉首词
+  （曾把 `bash -lc "..."` 变成裸 `python3` 进 REPL，产出一个"看着通过其实没跑"的假阳性）。**要投多参数命令就写
+  一个 wrapper 脚本，然后 `pane run <pane> /path/w.sh` 单参数调用。**
+  通用性契约已写进 `herdr-team/SKILL.md §11 Portability`。
+  ★**PyYAML 依赖实测（用户追问"其他 Agent 里能不能解析"，2026-09-21）**：起真 `pi` 与真 `omp` agent（抛荒 workspace，
+  prompt 让它们原样执行后贴回原始输出），两者都得到 `PYTHON /opt/homebrew/opt/python@3.13/bin/python3.13 6.0.3`
+  → `---validate---` → `OK members=2` → `rc=0`：**pi/omp 环境下 teamprofile.py 端到端可用，不需要改**。
+  本机解释器矩阵：homebrew 3.13 ✅6.0.3、`/usr/bin/python3` 3.9.6 ✅6.0.3、anaconda 3.12 ✅6.0.1、
+  **uv 管理的裸 CPython 3.10/3.11（`~/.local/share/uv/python/*`）❌ ModuleNotFoundError**——即"uv run / 全新 venv /
+  精简容器"是唯一已知会挂的场景。真要兜底也别手写 YAML 子解析器（profile 用流式映射
+  `{name: x, kind: y}`，不是合法 JSON，`json.loads` 兜不住；且 `import yaml` 与 line 222 的
+  `except (..., yaml.YAMLError)` 是**两处**要一起改，而套件没有"缺库"用例）——投入产出比为负，
+  正确做法是缺库时报"pip install pyyaml"的人话错误。

@@ -5,6 +5,16 @@
 
 授权你进行自主行动，只要不对环境造成副作用都可进行。
 
+## 触发机制（2026-09-22 实测核实，勿凭印象）
+- **入口1**：launchd `com.cuip.genericagent-autonomous.plist` → `agentmain.py --reflect reflect/autonomous.py`，常驻，`INTERVAL=1800s` 检查一次。
+- **入口2**：GUI 桌面聊天面板开关（`qtapp.py`，默认 OFF），idle>30min 且距上次触发>120s 才注入。
+- **守卫（关键）**：`reflect/autonomous.py::check()` 先读 `temp/TODO.txt`，**没有 `[ ]` 未完成项 → 返回 None，完全不调用 LLM（0 token）**。有 → 注入 `[AUTO]🤖...` 任务，这才起一轮 agent（开烧）。
+- ⚠️ **死锁坑**：守卫刻意"无TODO不调用"，而规划模式又只在"无TODO"时进入 ⇒ **TODO.txt 必须至少留 1 条 `[ ]` 种子项，否则规划流程永远进不去，自主模式静默永不触发**。规划完成后应保留下一条种子，不要清空。
+- ⚠️ **反射器无 idle 判断**：只要 TODO 有 `[ ]`，就按 INTERVAL 持续触发（跑完一轮 → sleep 1800 → 再触发），**与"用户是否离开"无关**；prompt 里"用户已经离开超过30分钟"是文案，不是事实。要真"仅离开时触发"需改源码加 idle 判断。
+- **停止开关**：① 把 `temp/TODO.txt` 里的 `[ ]` 全标成 `[x]` 或清空（下一轮守卫即静默）；② `launchctl unload ~/Library/LaunchAgents/com.cuip.genericagent-autonomous.plist`。
+- **活跃TODO唯一事实源 = `temp/TODO.txt`**（守卫与 `helper.set_todo()` 同指此处；`memory/autonomous_operation_sop/TODO.txt` 是历史快照，勿再用）。
+- 定时任务是**另一套**（`com.cuip.genericagent-scheduler.plist` + `reflect/scheduler.py`），**与自主开关无关，始终在跑**，且每次触发都是一轮完整 agent（如 `folder_watcher`/`price_alert` 曾各 23 轮/天，2026-09-22 folder_watcher 已降为 every_4h）。
+
 ## 启动（第一步）
 - update_working_checkpoint: `自主行动｜收尾时重读SOP | from autonomous_operation_sop.helper import *; set_todo()/complete_task(tasktitle, historyline, report_path)`
 

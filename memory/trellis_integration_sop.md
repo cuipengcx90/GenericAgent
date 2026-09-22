@@ -37,6 +37,21 @@ python3 .ga/trellis_runtime.py <command> [args]
 - 需要质量检查: `skill check-backend` 或 `agent check`
 - 查看设计指令: `cmd design kickoff`
 
+### L2 决策票据地图（只读视图层，2026-09-22 起）
+> **单一入口文档**：想知道"现在跑什么/到哪一步/有什么问题"先看 `temp/ROOT_MAP.md`（通盘规划 `temp/DRIVER_AUTOPILOT_ROADMAP.md`，工具用法 `temp/l2_v0/README.md`）。
+> 现状（2026-09-22）：**只做了 L2；L1/L3 未做**；阶段一进行中，阶段二/三未开始；GA gate = 0 ERROR / 2 WARN。
+
+Trellis 管"单票状态机"，L2 管**跨票视图**：需求→票据→依赖→状态→**证据**。工具在 GA `temp/l2_v0/`（只读 `.trellis/`，产物写 `<repo>/.ga/l2/`；**权威永远是 `task.py`**）。
+
+```bash
+temp/l2_v0/bin/l2 next     # 开工前：现在能接的活 + 接力包（在仓库任意子目录可用，自动向上找 .trellis）
+temp/l2_v0/bin/l2 gate     # 验收前：rc=0 通过 / rc=2 有 ERROR ⇒ 不得 ACCEPTED / CLOSE_READY
+temp/l2_v0/bin/l2 index    # 派生活动过时（票据改了没重建索引）时重建
+```
+- **依赖边**来源优先级：官方可选字段 `task.json.meta.depends_on` > GA 本地台账 `.ga/l2/deps.json` > 旧写法 `dependsOn/dependencies`（`parent` 视为隐式前置）。官方对 `meta.depends_on` 是"不要求填、不生成、不写回，有就用"。
+- `completed/archived` 必须能指出证据（commit/pr_url/**票据目录里除 task.json/prd.md 外的任何产物文件**）否则 ERROR ⇒ 所以 agent 干完活要留下痕迹，不能只改状态。
+- 保活：反射器 `07_l2_gate.py`（30 min，全绿静默，仅 ERROR 私信，指纹去重 24h）。
+
 ### 用户如何使用（对话示例）
 
 用户不需要手动执行任何脚本。正常用自然语言下达任务即可，GA 内部自动走 Trellis 流程。
@@ -89,6 +104,10 @@ GA 自动执行: skill brainstorm → 输出方案
 - `enter` 依赖 `.trellis/scripts/get_context.py`，确保其 common/ 依赖完整
 - task archive 前必须确认代码已 commit
 - 简单改动（typo/格式）可跳过 before-write/after-write
+- **任务会话态（2026-09-22 实测修复）**：Trellis 活跃任务只认会话键（`.trellis/.runtime/sessions/<key>.json`），无会话身份时不猜（多会话并存会拒绝）。适配层已自动注入 `TRELLIS_CONTEXT_ID=<GA会话键>`+`TRELLIS_PLATFORM=ga` ⇒ GA 下 `task current` 可解析（实测 rc=0）；`task current` 无任务时改为输出诊断（此前是 rc=1 零输出）；新增 `task adopt` 把遗留 `.current-task` 采纳为会话任务
+- `.ga/` 在 opserver `.gitignore:79` 被忽略 ⇒ 适配层改动不进版本控制（换机/升级需另存）
+- **L2 的两个真坑（已修，勿回退）**：①归档票据在 `tasks/archive/<YYYY-MM>/<id>/`，取证必须走解析器否则对归档任务全部假阳性报"无证据"；②证据规则别只认少数文件名（会漏 check.jsonl/implement.jsonl/research/ 这类约定产物）。验收器自己就会误判 ⇒ 必须有负样例夹具（`temp/l2_v0/fixtures/`）。
+- 反射器（`agentmain --reflect`）循环是**先 `check()` 再 sleep(INTERVAL)**，上电即跑一轮；`check()` 返 None 就不唤起 Agent（零 LLM 成本）。判断"守护进程里跑没跑"要看副作用（产物 mtime），不能看日志——全绿本来就没输出。
 
 ### 设计原则
 - 不修改 .trellis/ 核心代码（只读引用）

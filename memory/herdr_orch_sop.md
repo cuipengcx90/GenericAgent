@@ -97,6 +97,17 @@ kind 取值见 `herdr agent start --help`：pi|claude|codex|gemini|cursor|devin|
 - **关键事实（真机核验）**：
   - Herdr **无队列/无角色/无编排**——只提供 workspace/tab/agent/pane 原语。官方 `herdr --skill` 全文(12600字)逐词统计 team/role/orchestrat/spawn/delegate/disband **全为 0**，只教机械调 CLI。「拉群组队/角色/依赖/解散」是工作流层，官方没有 = CCB 补的那层。故自写 skill 骑在官方原语上（互补不重复）。
   - `herdr workspace create --cwd --label --env --focus/--no-focus` 返回带 workspace_id 的 JSON；`herdr workspace close <id>` 解散。→ **一个团队 = 一个专属 workspace，解散 = close 它**。
+  - ⚠️**G17（2026-09-21 用户发现并定策略）：close 不会自动发生，而且只在 `CLOSE_READY` 才该收**——close 属于外层驱动
+    窗口的收尾动作，窗口中途死了，`ap-unattended-*` 的 pane 会永久挂着（agent 空转 + finished 弹窗一直响）。
+    **「任务完成」≠「资源释放」**；更要紧的是**「验收通过」≠「可以关」**：`ACCEPTED` 之后还要补填/优化/再走一轮，
+    关了 pane 就把上下文一起扔了。⇒ 唯一信号＝`CLOSE_READY`；兜底＝`herdr-team/bin/reap.py`（**独立于会话**可跑：
+    只认 `teams/*/workflow-state.json` 里 **`CLOSE_READY`** 且当前仍活的 workspace，`ACCEPTED` 一律 KEEP 并写明理由，
+    `ABORTED/CANCELLED` 默认留（`--include-aborted` 才清），默认 dry-run、`--apply` 才关、跳过调用者自己所在 workspace、
+    `NEEDS_HUMAN` 不关（留给人看的证据）、**没有 team 目录的 workspace 永不入候选**——用户自己的 wF 就是这样被保住的，
+    顺带清 `focus-notify`/`alerter` 遗留弹窗；`bin/test_reap.py` 11 passed + 真机 e2e 已证：ACCEPTED 存活 / CLOSE_READY 被关。
+    **不挂定时、不挂 hook，只认显式调用**；**必须在目标 workspace 之外调用**（herdr 会给每个 pane 注入
+    `HERDR_WORKSPACE_ID`，真机实证 v0.9.0；reap 据此认出自家 workspace 并 SKIP，从 pane 内跑＝自杀式中断；
+    非 herdr 驱动器用 `--my-workspace <id>`，`--force-self` 才自收且走 detached，e2e 已证）。
   - `herdr workspace list` 实测返回 `.result.workspaces[].workspace_id`（如 `wF`）；create 的具体 JSON 路径 skill 里标注「运行时从真实响应读、勿预测 ID」。
 - **交付物（单一事实源 = 本机统一 skill 源 `~/.agents/skills/`，非另起门户！）**：
   - 本机早有统一源 `~/.agents/skills/`（lark-*/ask/computer-use 全在此），各 agent 的 skills 目录都软链进它（qoder/droid 的 `computer-use L->~/.agents/skills/computer-use` 为铁证）。故 herdr skill 必须并入此源，**禁止另起 `~/.herdr-skills` silo**（已犯此错并迁回）。
@@ -134,3 +145,101 @@ kind 取值见 `herdr agent start --help`：pi|claude|codex|gemini|cursor|devin|
   **pi 启动到可交互约 20-25s**，早于此发 prompt 会被吞（agent 停在 idle 欢迎屏）→ 先 sleep 25s 或看 pane 内容确认；
   `agent prompt` 可 fire-and-forget 后用 `agent get` 轮询 `agent_status`（长任务别用 `--wait` 干等）；
   **pi 一次读太多大文件会撞 `400 context_length_exceeded`** → 复评/派活 prompt 必须限定文件与行数范围。
+---
+
+## 驾驶窗口的分类契约（`agent_unstick` / `team_drive`，2026-09-21 第六轮真机定案）
+
+驱动窗口的职责是"队伍里任何异常都必须被处置"（没人会来按 yes）。但**看门狗最大的风险是把健康判死**，
+第六轮真机（run `ap-unattended-1789986148`，ws `w22`）就在**起队 9 秒后误升级**，两个假阳性：
+
+1. **G11 "读不到" ≠ "卡住"**：`herdr agent read` 在 pane **working** 时**必然**返 `agent_not_idle`（rc≠0）。
+   旧逻辑只看 rc≠0 → 判 `unreadable`（blocking）→ 升级。
+   ⇒ 判故障前**必须再取一个独立信号**（`herdr agent get` 真状态）：`working`/`done` 时读不到 = 新 kind
+   `working_unreadable`（非阻塞）；真状态也异常才 `unreadable` 升级。
+2. **G12 终端 chrome 不是内容**：pi 静止 pane 的**最底行永远是状态栏** `· DS cache 13/13·0.75M/0.78M 95.6%`
+   （其上是模型/上下文行、`🔌 MCP:` 行、输入框边框）⇒ **状态栏在最底 = turn 已结束，下面不可能有对话框**。
+   缺这条判据时，成员**自己正文里的编号列表**（`4. CLI：…`）会命中菜单形正则 → 判 `dialog_unknown`
+   → remedy=`["enter"]` → **往健康成员里按键**（比不动作更有害）。
+   ⇒ 新 kind `turn_at_rest`（非阻塞），且 `team_drive.idle_members` 与 `ready` 一并作为"停在提示符"唤醒。
+
+3. **G13 探针不是只读**：`--apply` 缺席时 dry-run **仍写 `NEEDS_HUMAN.md` 且走通知通道**——生产设了
+   `TEAM_DRIVE_NOTIFY_CMD` 时，一次"看一眼"的复跑就会**给人打电话**（且把真故障原文覆盖成自己的假警报）。
+   现 `escalate(..., apply=False)` 全惰性，dry-run 日志进 `supervisor.dryrun.jsonl`。
+4. **G14 停滞看门狗要看"有没有人在 turns 里"**：成员在写大文档时产物 mtime 可以五分钟不动，
+   `working_seen > 0` 时只延后（`stall_deferred_working`），由 `--max-min` 兜底。
+5. **G16 `working` ≠ "在推进"（2026-09-21 真机，798 秒空转）**：成员自报 `working`、pane 里 spinner 转圈，
+   实际卡在**自家护栏的删除批准模态**（`Delete pre-existing workspace files?` / `Allow this exact deletion?`），
+   人不在就永远等。G11 修好后"working 时读不到"被当成健康，**盲区就此产生**（探针报 `blocked=0`，队伍冻结）。
+   ⇒ 新 kind `delete_approval`（LIVE_ONLY、blocking）+ `classify()` 在 working/done 且 read 被拒时**退回
+   raw pane 缓冲**（`herdr pane read <pane> --lines N`，不看 agent 状态）找 live 对话框；remedy `keys_guarded`
+   （`elevated`，需 `--allow-trust`）＝**只在每条路径都是本 run 工作区内可再生缓存时才按 Enter**，
+   列表为空/含源码/在工作区外 → `ESCALATED` 不按键。真机验证：`--apply --allow-trust` 后 recheck `blocked=0`，
+   **解锁后成员立刻继续干活**（出现 `python3 -m unittest ...`，`DS cache` 17→19）。
+
+**通法**：①探测失败即判故障的看门狗，升级前要有第二个独立证据；②形态匹配前先剥容器 chrome；
+③"只读"要真只读（会写文件/发通知就是生产）；④"没新产物"≠"没人干活"。
+⑤ **`herdr agent get` 的 JSON 路径是 `result.agent.agent_status`**（外层还有 `{"id": "cli:agent:get"}`）——
+按顶层字段解析会得到全 `None`，看起来像"成员全都不存在"，2026-09-21 亲测差点据此误判"队伍塌了"。同理
+`read`/`send-keys` 的结果也在 `result` 下；解析 herdr 输出先看一层 `result`。
+
+**通法两条**：①任何"探测失败即判故障"的看门狗，升级前要有第二个独立证据；②形态匹配前先剥容器 chrome。
+分类表权威在 `herdr-team/SKILL.md`（与 `agent_unstick.py` 文件头同表）；回归测试 G12 夹具逐字抄自真机 pane tail。
+只读体检：`python3 bin/agent_unstick.py --dir "$TEAM" --json`（现役 7 成员实测 `blocked=0`）。
+
+## 工程化：仓 = 唯一事实源（2026-09-21 落地，改 skill 前必读）
+
+三个 skill（`herdr-handoff` / `herdr-team` / `autopilot`）**不再以裸目录存在于 `~/.agents/skills`**，
+而是分层安装：
+
+```
+事实源    ~/develop/herdr-agents            私有仓 https://github.com/cuipengcx90/herdr-agents
+安装点    ~/.agents/skills/<name>           软链 -> 仓
+agent 面  ~/.claude|.codex|.gemini|.cursor|.qoder|.factory/skills/<name>   软链 -> 安装点
+```
+
+**铁律：改 skill 先改仓**（`git commit` + `bash run_tests.sh` + push 看 CI 绿），再 `bash install.sh`；
+直接改 `~/.agents/skills/**` 现在等于改仓内文件（是软链），会绕过版本控制。`install.sh --check` 只报告漂移不改动。
+
+- 统一测试入口 `bash run_tests.sh`（遍历 `*/bin` 跑 pytest）：本机 47 + 109(+12 subtests) + 15（`tools/bin`：原生插件树契约）；
+  已验证**无 `herdr`、空 `HOME`** 下同样全绿 ⇒ 套件与环境解耦，可上 CI。
+- CI：`.github/workflows/tests.yml`，ubuntu-latest + macos-latest 双平台（首跑真绿）。
+- ★踩过的坑：**旧 `_herdr-install.sh` 只装 handoff/team，漏装 autopilot**；且 `autopilot` 在
+  gemini/cursor/qoder/factory 四个 agent 里缺链接（只在 claude/codex 有）。新 `install.sh` 一次对齐 6 agent × 3 skill，
+  并用"每个 skill 必须有 SKILL.md"做前置校验。
+- ★提交前先 `git status` 看有没有混进 `__pycache__` / 本地 `.bak-*` 备份目录（已写进 `.gitignore`）。
+- **原生安装面（方案B ⑤，2026-09-21 首验 v0.4.0 → 2026-09-22 三面真机验证 v0.5.1）**：`tools/native_plugins.py` 把三个 skill 打包成
+  三家 agent 的原生树（默认 `~/.herdr-agents/native/`），`install.sh --native` 安装、`--native-only` 只装原生、
+  `--uninstall-native` 卸载；默认软链矩阵行为不变。三个决定性事实：
+  1) codex 的 `plugin.json` 里 `skills` 必须指**具名子目录**（`"./skills/"`，其下每个技能一个目录）；
+     指包根 `"./"`(SKILL.md 在根) **不会注入**。验证口径=`codex debug prompt-input` 里能看到 `herdr-agents:<skill>`。
+  2) gemini 用 `extensions link <dir> --consent`（`extensions install <本地路径>` 实测**挂死** >5 分钟）；
+     `link` **非幂等**（重复 link 报 "already installed"）⇒ 装前用 `extensions list` 探测，
+     且该 list 的输出走 **stderr**（`2>&1` 才能 grep 到）。
+  3) 所有 agent CLI 调用在 `install.sh` 里都过 `guarded()`：`perl -e 'alarm N; exec @ARGV'` + `< /dev/null`
+     （macOS 无 `timeout`）。未加护栏的 CLI 会把安装脚本挂住（实测被 300s 超时杀掉）。
+  边界（2026-09-22 **更正旧结论**）：\"本机没有 `claude` CLI\"是**假阴性**——官方安装器把它放在 `~/.local/bin/claude`
+ （2.1.278），非交互 shell 的 PATH 里没这个目录 ⇒ `command -v` 测不到。故 `install.sh` 改 `resolve_cli()`：
+ 先 `command -v`，再按 `HERDR_CLI_DIRS`（含 `~/.local/bin` / `~/bin` / Homebrew，与 `teamprofile.search_dirs` 同一批）
+ 找真文件 + 校验可执行位，调用一律用绝对路径（`--uninstall-native` 同步修）。真机 `claude plugin list`
+ 显 `herdr-agents@herdr-agents v0.5.1 ✔ enabled`；`muse` 确认本机没有。
+ ★**native 树是拷贝不是软链，会与仓库漂移**：改完 skill / bump CHANGELOG 后必须三步连做
+ ① `native_plugins.py build --out ~/.herdr-agents/native` ② `install.sh --native-only` ③
+ `claude plugin update herdr-agents@herdr-agents`（claude 走就地加载，内容即时生效，但**版本号记录**要 update 才刷新）。
+ 踩过的坑：native 树建得比 CHANGELOG bump 早 ⇒ 树里还写 v0.5.0 而 CHANGELOG 已 v0.5.1（版本号有**两处**：
+ CHANGELOG + 构建产物）。另：剥光 PATH 跑 `install.sh` 会 `env: node: No such file`（node 在 /opt/homebrew/bin）
+ → codex/gemini 被**静默 skip**，用自然 PATH 重跑即可。
+  验证方法可复制：假 `HOME=` 跑 `install.sh --native-only`，连跑两遍查幂等，再 `--uninstall-native` 查卸载干净。
+
+- **方案B 五块全部落地（2026-09-21，权威文档=仓内 `docs/PLAN-B.md`，CHANGELOG v0.2.0→v0.5.0）**：
+  ①a `--new-workspace` 团队自有 workspace（治理窗隔离）｜② 可视 lead tab｜③ 阶段推进契约化｜④ 邮箱 v2｜⑤ 原生安装面。
+  ①b 补充（v0.5.0，commit e6e795e）：teamprofile profile 支持可选成员键 `reports_to`（值=成员名或字面量 `lead`），
+  缺省＝直接向 team-lead 汇报（老 profile 语义不变）；**两遍解析**（先收齐成员再连边）⇒ 前向引用合法（防被"优化"成单遍）；
+  非法层级 fail fast rc=2（未知引用/自环/环/指向只读 `monitor`）；`validate` 印一行 `hierarchy: lead -> L1[...] -> L2[...]`，
+  新增 `hierarchy [--json]` 输出缩进树 / `levels`+`edges`，`plan`/`launch` 的 JSON 带 `hierarchy`。
+  **语义边界**：层级只编排汇报关系——不改 workspace 布局（全员仍各占团队 workspace 内一个可见 tab）、不改阶段状态机、
+  不新增 herdr 原语（⇒ 无需新的真机原语验证）。③ 同批：`autopilotctl contract [--json]` 把阶段转移表变成可查询的声明式契约
+  （曾经的 `expected_phases` 硬编码重复定义已删，改由契约表派生）。
+  坑：`render_tree` 已自带两空格/层缩进，CLI 打印时别再补缩进（双重缩进会炸测试断言）。
+
+**通法**：skill/工具的"家目录裸目录"是负债——没有版本、没有测试、没有回退；落仓 + 软链 + 一键安装/漂移检查，
+比"在原地小心改"便宜得多。
