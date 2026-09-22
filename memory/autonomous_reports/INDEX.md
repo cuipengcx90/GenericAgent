@@ -1,14 +1,14 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-22
-- 正文已恢复: 90 / 索引可见 348 个编号
+- 正文已恢复: 93 / 索引可见 351 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
 
 | R | 状态 | 主题 | 证据 | 结论摘要 |
 |---|---|---|---|---|
-| R1 | ⚠️仅索引 | 分析model_responses 9文件(1.4MB)历史对话 | 探索XXX.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
+| R1 | ⚠️仅索引 | 分析model_responses 9文件(1.4MB)历史对话 | R334,缺31个号)；R*.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
 | R2 | ✅正文 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 4023B R002_reflect脚本审计报告.md | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议 |
 | R3 | ✅正文 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送 | 5266B R003_SOP覆盖盲区审计.md | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_c |
 | R4 | ✅正文 | 扫描510个Python包+188个brew工具，识别7个未利用能力节点 | 4515B R004_本机未利用能力扫描.md | TOP3：keyring(解P1安全盲区)/watchdog(文件监控零成本激活)/gh-CLI(简化GitHub操作)；fastapi可加Agent外部接口 |
@@ -356,5 +356,6 @@
 | R346 | ✅正文 | 下批TODO生成(第3批·独立评审) | 7386B R346_规划模式第3批_下一批TODO生成与独立评审.md | 批判读history(314行)识别三类低价值模式(元分析循环/无消费者工具化/重复验证) → 6条候选经**独立subagent**评审(其自跑6项物理探测:音轨扫描33个含15 |
 | R347 | ✅正文 | knowledgeC 快照器与首份数字行为底稿 | 5292B R347_knowledgeC快照器与首份数字行为底稿.md | 交付 tools/kc_snapshot.py(snapshot/report/verify/list/prune；幂等实测=连跑2次第二次 skip 不重写；verify rc= |
 | R348 | ✅正文 | 报告唯一副本防复发 | 11307B R348_报告「唯一副本」防复发端到端验证（TODO#5）.md | 真树负控证双写未生效；补丁C2/C3/C4沙箱端到端跑通(镜像sha一致+回滚3/3字节级)，落地待批 |
-| R349 | ✅正文 | helper压缩死引用修复(压缩器落地) | 7280B R349_fix-compress-deadref.md | 工具tools/log_compress.py(copytruncate;夹具3/3+真链路无损12.10MiB→1.00MiB/归档1.82MiB/NUL=0)+temp shim即时消WARN;按TODO「恢复脚本」路线验收达标;helper第29行改指tools/提案待批 |
-| R350 | ✅正文 | 定时/反射任务「产物级」新鲜度审计 | 14048B R350_product-freshness-audit.md | 21行产物矩阵+5条结论;真静默失败仅1个=**x_ai_intel_daily**(产物停在08-17=36天、近30份报告30/30全含「跳过」却每日照跑写已完成);eia_weekly无持久产物+无API_KEY;weekly_report_reminder真产物=temp/content.json(命名漂移,孤儿weekly_content.json陈旧17.9天);trendradar 31份failed中28份=质量重试丢弃稿、**3份真漏发**(07-26晚/07-27晨晚,57天前,后自愈);bridge_autonomous/folder_watcher空转213/2303次已移入sche_tasks/disabled(触发止09-21 23:26);★归档覆盖率**401/433=92.6%**(32跳过=31 failed+1 filtered_test);★坑=index.html自包含无href,按basename算覆盖率得0/433假结论,产物路径须从done/报告取真值;零配置改动 |
+| R349 | ✅正文 | helper压缩死引用修复(压缩器落地) | 8880B R349_fix-compress-deadref.md | 交付 tools/log_compress.py(copytruncate;夹具3/3+真链路无损:12.10MiB→1.00MiB/归档1.82MiB/NUL=0)+temp s |
+| R350 | ✅正文 | - | 14716B R350_product-freshness-audit.md |  |
+| R351 | ✅正文 | 内网/云主机连接命题验证(只读) | 15801B R351_内网云主机连接命题验证.md | 成立:known_hosts 30 台含 openclaw-server.tailf82c5b.ts.net(=100.112.252.36,GCP,google_compute_ |
