@@ -1,14 +1,14 @@
 # 自主报告归档清单（抢救重建）
 
-- 生成: 2026-09-22
-- 正文已恢复: 98 / 索引可见 356 个编号
+- 生成: 2026-09-23
+- 正文已恢复: 100 / 索引可见 357 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
 
 | R | 状态 | 主题 | 证据 | 结论摘要 |
 |---|---|---|---|---|
-| R1 | ⚠️仅索引 | 分析model_responses 9文件(1.4MB)历史对话 | R334,缺31个号)；R*.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
+| R1 | ✅正文(未落盘) | 分析model_responses 9文件(1.4MB)历史对话 | 2573B /Users/cuip/develop/herdr-agents/docs/product/R1_CONTRACT_WIRING_PLAN.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
 | R2 | ✅正文 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 4023B R002_reflect脚本审计报告.md | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议 |
 | R3 | ✅正文 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送 | 5266B R003_SOP覆盖盲区审计.md | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_c |
 | R4 | ✅正文 | 扫描510个Python包+188个brew工具，识别7个未利用能力节点 | 4515B R004_本机未利用能力扫描.md | TOP3：keyring(解P1安全盲区)/watchdog(文件监控零成本激活)/gh-CLI(简化GitHub操作)；fastapi可加Agent外部接口 |
@@ -112,7 +112,7 @@
 | R102 | ⚠️仅索引 | EIA+Comtrade供应链摘要飞书推送闭环 | EIA供应链摘要飞书推送闭环.md | 推送函数已补写+scheduler已注册，阻塞：keychain未配置feishu_webhook_supply_chain |
 | R103 | ⚠️仅索引 | LLMLingua后台预热线程验证 | LLMLingua预热线程验证.md | 实测5s内加载成功，_llmlingua_ready=True，压缩走LLMLingua路径，机制正常无需修改 |
 | R104 | ⚠️仅索引 | LangGraph近期重大变更调研 | R104_LangGraph变更调研.md | v1主要变更：create_react_agent弃用+Python3.10+要求；GA代码库无langgraph直接使用，风险低 |
-| R105 | ⚠️仅索引 | GA FastAPI /run_task端点完整调用链验证 | fastapi_run_task_validation.md | 实测/health+/status+POST /task+GET /task全通，调用链submit→put_task→_run_task→done无断点，API_KEY未配置需修 |
+| R105 | ⚠️仅索引 | GA FastAPI /run_task端点完整调用链验证 | R105_FastAPI调用链验证.md | 实测/health+/status+POST /task+GET /task全通，调用链submit→put_task→_run_task→done无断点，API_KEY未配置需修 |
 | R106 | ⚠️仅索引 | scheduler健康度报告 | autonomous_execution_summary.md | 11任务扫描：10健康/1从未运行(supply_chain_digest缺webhook)/1禁用，守护进程正常28次触发 |
 | R107 | ⚠️仅索引 | reflect日志失败模式 | task_planning.md | top5：import(125)/timeout(104)/network(72)/路径(47)/subagent(35)；4条可落地改进建议 |
 | R108 | ⚠️仅索引 | adb手机探测 | R114已完成，TODO全[x]。按SOP无TODO→进入规划模式，需读task_planning.md | adb可用(37.0.0)但当前0台设备，产出无设备报告与后续接入建议 |
@@ -302,7 +302,7 @@
 | R292 | ⚠️仅索引 | R288 | 见 history/日志 | clipboard_utils.py扩展RTF+PNG+类型嗅探；5项实测全通过 |
 | R293 | ⚠️仅索引 | R289 | 见 history/日志 | hook_log_parser.py解析js_hook日志→JSON+schema摘要；10条实测断言全通过 |
 | R294 | ⚠️仅索引 | 2026-05-05 | 见 history/日志 | R290 scheduler活跃窗口效果回看;activate_window 3/3✅;scheduler 12/20对齐60%;关键缺口:两工具未联动 |
-| R295 | ⚠️仅索引 | 新批次TODO规划R295 | 3；立即一次性执行：枚举brew+CLI工具、扫描memory收录状态、找gap、写list_report.md | 产出4条高价值TODO(procmem实战/hook管道/ocr+vision决策矩阵/scheduler补丁)，删除2条低分项(泛采集/adb无设备) |
+| R295 | ⚠️仅索引 | 新批次TODO规划R295 | 1_*.md | 产出4条高价值TODO(procmem实战/hook管道/ocr+vision决策矩阵/scheduler补丁)，删除2条低分项(泛采集/adb无设备) |
 | R296 | ✅正文 | procmem_scanner macOS实战：ctypes自进程扫描4/4验证通过+hex偏移记录，跨进程需root/Frida留待用户决策 | 687B R296_procmem_scanner_macOS实战：ctypes自进程扫描4_4验证通过+hex偏移记录，跨进程需root_Frida待用户决策.md | ✅验收达标 |
 | R297 | ⚠️仅索引 | 2026-05-05 | mac本地工具gap扫描.md | mac本地工具vs memory SOP gap扫描：brew 145个formula，7个高价值GAP(tesseract9/ffmpeg8/tmux8/sqlite7/htop |
 | R298 | ⚠️仅索引 | ocr_utils vs vision_utils联合实战 | ocr_utils+vision_utils联合实战决策矩阵.md | OCR本地15s/12390字✅ Vision代理不通需网络; 决策矩阵6场景+screencapture全路径修复 |
@@ -364,3 +364,4 @@
 | R354 | ✅正文 | 本机音频资产（TODO#17） | 17175B R354_本机音频资产去重-挑人声-长音频转写备忘.md | 26条有音轨(2.11h)全量VAD+ASR：13条纯音乐占31.7%时长被筛除，12条有语音中仅6条可用；本批ASR 1726s≈4.4x实时；新增 tools/audio_va |
 | R355 | ✅正文 | 自主报告「编号复用」根治 | 11961B R355_自主报告编号复用根治（补丁就绪待批）.md | 根因=编号只扫LIVE树+分配非原子(文件名锁无效+history截断窗读到空→R1);补丁已就绪待批(两树max+1+号码级O_EXCL claim锁+收尾自动sync/inve |
 | R356 | ✅正文 | 规划模式第4批：下一批TODO生成与独立评审 | 11514B R356_生成下一批TODO（规划模式·第4批）.md | 批判读history(323条)+实测取证(本机零备份/数据卷97%仅剩15G/logs 1.7G/llama.cpp 0.4.1在而0权重)→出6条候选交独立subagent评审 |
+| R357 | ✅正文 | knowledgeC 每日快照落地（零新增定时 + 当日补采） | 11807B R357_knowledgeC每日快照落地.md | 当日补采 18277 对象/13.1MB/verify rc=0（较 09-22 的 17463 对象 +814）；★实测反射脚本不会“放进目录就生效”（各需专属 plist）⇒  |
