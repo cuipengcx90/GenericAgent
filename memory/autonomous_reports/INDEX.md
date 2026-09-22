@@ -351,3 +351,4 @@
 | R341 | ✅正文 | 生成下一批TODO(规划模式第2批) | 6792B R341_下一批TODO规划.md | 批判读history(309行,R1-R340;类型字段非受控词表达30+种写法,月份分布04月200/05月58/09月6)识别低价值模式(自我报告元分析/浅层可用性验证/泛采集 |
 | R342 | ✅正文 | 待审项收口:一条一行·一键决策清单+落地器 | 5222B R342_待审项收口_一键决策清单与落地器.md | 把R335-R341七份报告里散落的'待批准/记忆更新建议'收成 temp/pending_decisions/(DECISIONS.md 18条一条一行 + apply.py 执 |
 | R343 | ✅正文 | TrendRadar 信源有效性审计 | 10923B R343_TrendRadar 信源有效性审计.md | 三线交叉(283报告/132物料/157日库);RSS 14源HTTP实测:1真死(ai-weekly 404,另4候选地址全404)+4极低效(采纳率≤0.75%);★根因=平台检索通道恒0(132期material.json两查询success但total=0,而库内1274标题/日;search_tools整串子串匹配 vs GA拼7~8关键词;拆词后30天可捞1396条);工具5子命令幂等;config diff仅建议未应用 |
+| R344 | ✅正文 | 本机个性化数据源可用性地图(只读) | 5641B R344_本机个性化数据源可用性地图.md | 12源实测:11个Sqlite/bplist副本直读零授权(无需额外TCC),必须连-wal拷(-wal缺失致假空:Notes 2→8对象);微信容器递归find被TCC挂起(>25s不返回)只能ls限深;可读≠有料——Messages/Mail/Photos/Reminders/Notes全空库,KnowledgeC(17400条/app/usage)与Chrome(12501 URL)才有料;★推荐knowledgeC做"时间去哪了v2"(与Timing2 300K条交叉验证) |
