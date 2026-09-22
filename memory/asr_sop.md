@@ -24,4 +24,5 @@
 ## 其它坑
 - 源文件路径**勿凭直觉拼**（本次 `~/Downloads` 猜测致交叉校验失败一次）；路径来自 `tools/audio_asset_inventory.py --bases <CSV 目录>`，先拷副本（源可能被清理）。
 - 去重口径：全字节 sha256（同一视频的 `.mp4`/`.MP3` 副本会重复转写，先判重）。
+- ★盘点工具 `tools/audio_asset_inventory.py`（已入库）计数口径曾歧义：`unique` 一词同时指向「含 not_media」与「可播/可转写」两个不同集合 ⇒ 已改为 `unique`=可转写、`unique_incl_not_media`=含非媒体并在 md 头写明；报数时**必须两个都念**（本机实测 46 命中 → 30 含非媒体 / 28 可转写，差 2 条是扩展名像音轨但 ffprobe 解析不了的 `.ts` 之类）。改脚本后须用临时夹具真跑（真 wav + 文本改名 `.ts` + 字节重复副本）核对 json/md 两个数字一致，别只看代码。
 - macOS **无 `timeout` 命令**；需要超时用 python/`perl -e alarm` 或后台+轮询。
