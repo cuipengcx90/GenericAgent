@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-22
-- 正文已恢复: 84 / 索引可见 342 个编号
+- 正文已恢复: 89 / 索引可见 347 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -350,7 +350,8 @@
 | R340 | ✅正文 | 记忆更新欠账清单 | 16577B R340_记忆更新欠账清单.md | 135区块判定(已落地54/部分40/待评估26/丢弃5/空转10,落地率69.6%);★口径纠偏=TODO称'332处'无法复现,实测zip(L4月度归档)行首header仅10 |
 | R341 | ✅正文 | 生成下一批TODO(规划模式第2批) | 6792B R341_下一批TODO规划.md | 批判读history(309行,R1-R340;类型字段非受控词表达30+种写法,月份分布04月200/05月58/09月6)识别低价值模式(自我报告元分析/浅层可用性验证/泛采集 |
 | R342 | ✅正文 | 待审项收口:一条一行·一键决策清单+落地器 | 5222B R342_待审项收口_一键决策清单与落地器.md | 把R335-R341七份报告里散落的'待批准/记忆更新建议'收成 temp/pending_decisions/(DECISIONS.md 18条一条一行 + apply.py 执 |
-| R343 | ✅正文 | TrendRadar 信源有效性审计 | 10923B R343_TrendRadar 信源有效性审计.md | 三线交叉(283报告/132物料/157日库);RSS 14源HTTP实测:1真死(ai-weekly 404,另4候选地址全404)+4极低效(采纳率≤0.75%);★根因=平台检索通道恒0(132期material.json两查询success但total=0,而库内1274标题/日;search_tools整串子串匹配 vs GA拼7~8关键词;拆词后30天可捞1396条);工具5子命令幂等;config diff仅建议未应用 |
-| R344 | ✅正文 | 本机个性化数据源可用性地图(只读) | 5641B R344_本机个性化数据源可用性地图.md | 12源实测:11个Sqlite/bplist副本直读零授权(无需额外TCC),必须连-wal拷(-wal缺失致假空:Notes 2→8对象);微信容器递归find被TCC挂起(>25s不返回)只能ls限深;可读≠有料——Messages/Mail/Photos/Reminders/Notes全空库,KnowledgeC(17400条/app/usage)与Chrome(12501 URL)才有料;★推荐knowledgeC做"时间去哪了v2"(与Timing2 300K条交叉验证) |
-| R345 | ✅正文 | 微信语音 .silk→wav→转写全链路（能力补齐） | 5231B R345_微信语音silk解码转写全链路.md | 公开真实样本 fishCoder/Silk_v3_decoder@d888a4b5(钉 commit+sha256 校验)：hello.silk 3615B→wav 94124B/1960ms→「你好」，test.silk 2517B→wav 70124B/1460ms→"It's up to you."；交付 tools/silk_to_text.py(decode/text/batch/probe, 头不符即拒转) + tools/silk_repro.sh(耐久版,干净目录 rc=0 一次复现)；纠正 R339：本机 pilk 0.2.4 早已装且含 encoder(缺的是样本非解码器)，pilk.decode 返回值不可信(实测 2/1ms) 须用 get_duration；本机无微信语音目录三证据仍成立 |
-| R346 | ✅正文 | 规划模式第3批：下批 TODO 生成 + 独立 subagent 评审 | 7386B R346_规划模式第3批_下一批TODO生成与独立评审.md | 批判读 history(314行) 识别三类低价值模式；6 条候选经独立 subagent 评审（其自跑 6 项物理探测：音轨扫描 33 个含 15 无音轨 / knowledgeC 17455 对象仅 33 个日期 / HF 缓存 bge+reranker 但 sentence_transformers 仍缺 / pending_decisions 已含 DECISIONS_R343.md / ssh·tailscale·云CLI / 归档站新鲜）评分 A5 B7 C4 D4 E6 F7 → 删 C、D，A 改口径，保留 6 条 + 评审推荐 2 条（拆词 A/B 离线复算、报告防复发端到端验证）；评审原文 temp/review_todos3.review.md |
+| R343 | ✅正文 | 2026-09-22 | 10923B R343_TrendRadar 信源有效性审计.md | R343 完成：TrendRadar 信源有效性审计——283份报告+132份物料+157个日库三线交叉；RSS侧1真死源(ai-weekly HTTP404)+4极低效源(采纳率 |
+| R344 | ✅正文 | 本机个性化数据源可用性地图 | 5641B R344_本机个性化数据源可用性地图.md | 12源只读实测:11个Sqlite/bplist副本直读零授权(必须连-wal,-wal缺失会假空:Notes 2→8条),微信容器递归find被TCC挂起(>25s不返回)只能l |
+| R345 | ✅正文 | 微信语音 .silk→wav→转写全链路 | 5231B R345_微信语音silk解码转写全链路.md | 公开真实样本(fishCoder仓钉commit d888a4b5,sha256校验)端到端打通:hello.silk 3615B→wav 94124B/1960ms→「你好」,t |
+| R346 | ✅正文 | 下批TODO生成(第3批·独立评审) | 7386B R346_规划模式第3批_下一批TODO生成与独立评审.md | 批判读history(314行)识别三类低价值模式(元分析循环/无消费者工具化/重复验证) → 6条候选经**独立subagent**评审(其自跑6项物理探测:音轨扫描33个含15 |
+| R347 | ✅正文 | knowledgeC 快照器与首份数字行为底稿 | 5292B R347_knowledgeC快照器与首份数字行为底稿.md | 交付 tools/kc_snapshot.py(snapshot/report/verify/list/prune；幂等实测=连跑2次第二次 skip 不重写；verify rc= |
