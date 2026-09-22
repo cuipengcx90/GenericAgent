@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-23
-- 正文已恢复: 100 / 索引可见 358 个编号
+- 正文已恢复: 101 / 索引可见 358 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -365,4 +365,4 @@
 | R355 | ✅正文 | 自主报告「编号复用」根治 | 11961B R355_自主报告编号复用根治（补丁就绪待批）.md | 根因=编号只扫LIVE树+分配非原子(文件名锁无效+history截断窗读到空→R1);补丁已就绪待批(两树max+1+号码级O_EXCL claim锁+收尾自动sync/inve |
 | R356 | ✅正文 | 规划模式第4批：下一批TODO生成与独立评审 | 11514B R356_生成下一批TODO（规划模式·第4批）.md | 批判读history(323条)+实测取证(本机零备份/数据卷97%仅剩15G/logs 1.7G/llama.cpp 0.4.1在而0权重)→出6条候选交独立subagent评审 |
 | R357 | ✅正文 | knowledgeC 每日快照落地（零新增定时 + 当日补采） | 12723B R357_knowledgeC每日快照落地.md | 当日补采 18277 对象/13.1MB/verify rc=0（较 09-22 的 17463 对象 +814）；★实测反射脚本不会“放进目录就生效”（各需专属 plist）⇒  |
-| R358 | ⚠️仅索引 | 备份缺口收口(TODO#0) | 见 history/日志 | 实测本机零备份(tmutil=No destinations/无外置盘diskutil仅internal/无云客户端/~/Library/LaunchAgents无备份类);数据卷 |
+| R358 | ✅正文 | 备份缺口收口(TODO#0) | 15861B R358_备份缺口收口.md | 实测本机零备份(tmutil=No destinations/无外置盘diskutil仅internal/无云客户端/~/Library/LaunchAgents无备份类);数据卷 |
