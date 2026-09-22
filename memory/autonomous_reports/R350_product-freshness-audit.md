@@ -140,6 +140,8 @@
 | P3 | 死路径清理 | `sche_tasks/sqlite_snapshots/`（06-04 停）、`temp/price_alert_check_*.json`（08-14 停） |
 | P3 | 未提交的任务停用 | `sche_tasks/disabled/` 三个 json 的删除**未入 git**（非本次所为，建议由原操作者收尾） |
 | P3 | `*.failed.txt` 无监控 | 建议在归档/日报侧加「同日无成功件的 failed」告警（本次方法可直接复用） |
+| P3 | ~~history.txt 编号断档~~ **本次已修** | 发现 `memory/autonomous_reports/history.txt` **缺 R349 行**（R349 的那次提交只更新了 `history.md`，两份 history 分裂），导致 `helper._next_report_number()` 会算出 349 → 下一个 `complete_task` 将撞名已存在的 `R349_fix-compress-deadref.md`（`shutil.move` 报错）。本次按 history.md 原文补齐 R349 + 追加 R350，`next=351`，碰撞风险解除 |
+| P3 | 两份 history 分裂 | `history.txt`（helper 编号真源）与 `history.md`（抢救索引）须同步；本次已同时补 R350，但**长期应由 complete_task 统一写或加一致性校验**（待批） |
 
 ---
 

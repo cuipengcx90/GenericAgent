@@ -4,6 +4,7 @@
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R350 | 2026-09-22 | 工程 | 定时/反射任务「产物级」新鲜度审计(TODO#9) | 21行产物矩阵+5条结论;真静默失败仅1个=x_ai_intel_daily(产物停在08-17=36天、近30份报告30/30全含「跳过」却每日照跑写已完成);eia_weekly无持久产物+无API_KEY;weekly_report_reminder真产物=temp/content.json(命名漂移,孤儿weekly_content.json陈旧17.9天);trendradar 31份*.failed.txt中28份=质量重试丢弃稿、3份真漏发(07-26晚/07-27晨晚,57天前,后自愈);bridge_autonomous/folder_watcher空转213/2303次已移入sche_tasks/disabled(触发止09-21 23:26);★归档覆盖率401/433=92.6%(32跳过=31 failed+1 filtered_test);★坑=index.html自包含无href,按basename算覆盖率得0/433假结论,产物路径须从done/报告取真值;零任务配置改动
 R349 | 2026-09-22 | 工程 | helper压缩死引用修复(压缩器落地) | 交付 tools/log_compress.py(copytruncate;夹具3/3+真链路无损:12.10MiB→1.00MiB/归档1.82MiB/NUL=0)+temp shim 即时消WARN;按TODO「恢复脚本」路线验收达标;helper第29行改指tools/提案待批(R349)
 R348 | 2026-09-22 | 灾备 | 报告唯一副本防复发 | 真树负控证双写未生效；补丁C2/C3/C4沙箱端到端跑通(镜像sha一致+回滚3/3字节级)，落地待批
 R347 | 2026-09-22 | 产出 | knowledgeC 快照器与首份数字行为底稿 | 交付 tools/kc_snapshot.py(snapshot/report/verify/list/prune；幂等实测=连跑2次第二次 skip 不重写；verify rc=0；源库全程只读)；首份快照 17463 对象、最长连续日段 29 天，坐实「约 4 周滚动删除」；报告全真数字(ghostty 84.77h/56.1%、通知 5741 条中 Lark 61.7%)；★坑: WAL 库副本只 checkpoint 不改 journal_mode 则 mode=ro 打不开(unable to open database file)；定时注册仅出 plist 提案未安装=待批
