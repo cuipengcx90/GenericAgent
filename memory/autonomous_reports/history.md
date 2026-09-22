@@ -1,9 +1,10 @@
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
-- 采集: 2026-09-22；行数 316
+- 采集: 2026-09-22；行数 317
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R348 | 2026-09-22 | 灾备 | 报告唯一副本防复发 | 真树负控证双写未生效；补丁C2/C3/C4沙箱端到端跑通(镜像sha一致+回滚3/3字节级)，落地待批
 R347 | 2026-09-22 | 产出 | knowledgeC 快照器与首份数字行为底稿 | 交付 tools/kc_snapshot.py(snapshot/report/verify/list/prune；幂等实测=连跑2次第二次 skip 不重写；verify rc=0；源库全程只读)；首份快照 17463 对象、最长连续日段 29 天，坐实「约 4 周滚动删除」；报告全真数字(ghostty 84.77h/56.1%、通知 5741 条中 Lark 61.7%)；★坑: WAL 库副本只 checkpoint 不改 journal_mode 则 mode=ro 打不开(unable to open database file)；定时注册仅出 plist 提案未安装=待批
 R346 | 2026-09-22 | 规划 | 下批TODO生成(第3批·独立评审) | 批判读history(314行)识别三类低价值模式(元分析循环/无消费者工具化/重复验证) → 6条候选经**独立subagent**评审(其自跑6项物理探测:音轨扫描33个含15个无音轨/knowledgeC 17455对象仅33个日期=证4周滚动删除/HF缓存有bge+reranker但sentence_transformers仍缺/pending_decisions已含DECISIONS_R343.md/ssh·tailscale·云CLI/tailscale status=stopped/归档站5.92MB新鲜)评分 A5 B7 C4 D4 E6 F7 → 删C(跨批次重提R341已否)+D(与DECISIONS_R343.md逐条重复),A按改法收窄口径(去重+只挑人声+改走asr_cli.py) → 保留6条(B与R344-D1合并/F与roi_monitor v2划边界/E收敛为可证伪命题) + 评审推荐2条(拆词A/B离线复算、报告防复发端到端验证); 评审报告 temp/review_todos3.review.md
 R345 | 2026-09-22 | 能力 | 微信语音 .silk→wav→转写全链路 | 公开真实样本(fishCoder仓钉commit d888a4b5,sha256校验)端到端打通:hello.silk 3615B→wav 94124B/1960ms→「你好」,test.silk 2517B→wav 70124B/1460ms→"It's up to you.";交付tools/silk_to_text.py(decode/text/batch/probe,头不符即拒转)+temp/silk_fixture/repro.sh一键复现(干净目录rc=0);纠正R339:pilk 0.2.4本机早已装且含encoder,缺的是样本非解码器;pilk.decode返回值不可信(实测2/1ms)须用get_duration
