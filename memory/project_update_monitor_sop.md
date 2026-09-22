@@ -22,6 +22,9 @@
 9. 纯英文原文的翻译固定走本机 `codex exec --sandbox read-only --skip-git-repo-check --ephemeral --output-last-message <tmpfile>`（脚本内确定性调用，非本会话手动翻译）：因为 `monitor.py` 是被 `sche_tasks/project_update_monitor.json` 每 6 小时无人值守唤起的独立子进程，唤起它的临时 agent 会话只转发 stdout，脚本必须能在没有任何 LLM 会话陪同的情况下自主完成翻译，故把"英译中"这一原子操作外包给脚本可直接调用的本机已登录 CLI，其余判断（是否已中文/是否触发翻译/闸门是否通过）保持脚本内确定性代码。返回值要求等长 JSON 字符串数组，逐条校验必须含中文字符，否则抛 `TranslationError`（不静默降级，直接让该来源本轮标记异常、不覆盖旧基线）。
 10. 翻译前必须先清洗两类噪音，否则会误判为翻译失败或残留英文：①同一 bullet 内官方把中文说明和英文重复说明无分隔直接拼接（如"中文句子。 English repeat sentence."），需取最后一个中文句末标点（。！？）之后的剩余文本，若该剩余文本不含中文字符就整段截掉；②纯资源下载链接行（如 `[macOS xxx](url.dmg)`）会被行提取器误当作正文 bullet 收纳，以及裸露无括号包裹的 `by @user in <url>` 落款（不同于已处理的括号内 `(by @user in url)` 格式）需要专门扩展正则清理，二者不过滤会导致该 bullet 全英文突破闸门失败。
 
+11. 本机 CLI 版本探测存在**非交互 shell 假阴性**（2026-09-22 实测确认）：`local_commands` 在脚本子进程里执行，拿不到 `~/.zshrc` 里定义的同名 **zsh 函数**，PATH 里也可能没有真实二进制。已知案例：`ccb`（Claude Codex Bridge）在 `~/.zshrc:301` 是函数 `ccb() { GHOSTTY_SHELL_INTEGRATION= command ccb "$@" ; }`，非交互探测必然失败 → 卡片把"已安装且已升级到 v8.7.1"误报成"本机未检测到安装/项目引用"，进而给出"暂不更新"而非"评估更新"的**错误建议**。新增/维护来源时，`local_commands` 优先选 PATH 上真实存在的二进制（如 `orca --version`），或补 `local_paths`（如 `~/.local/share/codex-dual`、`~/.ccb/ccb.config`）作为旁证；改探测方式前先确认，避免误报。
+12. 判读 stderr 噪音（2026-09-22 实测确认）：本机 `/opt/anaconda3/bin/python3` 的 numpy 已升到 **2.4.4**，而 pyarrow 仍是 NumPy 1.x ABI 编译 → `import sklearn`/`import pyarrow` 直接 `ImportError: numpy.core.multiarray failed to import`。GA 的 `llmcore.py:51 _llmlingua_warmup` 后台线程导入 `llmlingua` 即命中此链，每次进程启动在 stderr 打约 20KB、10 段 traceback（实测 `python3 -c "import llmlingua"` → rc=1，LLMLingua 提示压缩实际不可用），9 月 1 日日志尚无此噪音。判读要点：**只要 exit=0，这就是无害噪音，不是采集异常**（不要当成 exit=2 处理，更不要因此重复推送）；真正的修复属 GA 环境层面的决策（`numpy<2` / 升级 pyarrow / 隔离 venv），需请示后再动。
+
 ## 升级建议分级
 - 安全修复且本机受影响：立即人工处理。
 - 本机已安装的稳定版修复/高价值功能：建议评估更新，先查破坏性变更、依赖和回滚。
