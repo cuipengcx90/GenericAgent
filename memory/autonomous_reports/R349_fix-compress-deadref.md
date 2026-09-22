@@ -124,3 +124,21 @@ print('当前日志首行完整:', cur.split(b'\n',1)[0][:80])
 PY
 ```
 ```
+
+---
+
+## 附录 A. 记忆更新（本任务实际落地 / 待审 清单）
+
+**已落地（随 commit `3d8a054` 入库）**
+- `memory/global_mem_insight.txt`（L1，agent 自身索引）在「定时/自主/反射」段追加一条：
+  `日志压缩 tools/log_compress.py(copytruncate:归档gzip+尾部写回+ftruncate;helper收尾自动调;launchd StandardOutPath=O_APPEND已实证⇒截断安全;temp/compress_log.py仅临时兼容shim,根治需helper第29行改指tools/,提案待批;proc_pidinfo读fd标志在本机不可靠勿用)`
+  —— 依据：L1 是 agent 自身的极简索引，本仓惯例（`605fbf4`「memory: …L1指针」、`cc57f72`「…+L1补knowledgeC」）即为「patch + 同批提交」。
+
+**建议但未落地（待用户批准）**
+1. `memory/autonomous_operation_sop/helper.py` 第 29 行改指（见 §6.1）—— 1 行，是唯一能防复发的一步。
+2. `memory/autonomous_operation_sop.md`（L2 操作 SOP）增补「日志压缩」小节（该文档自身「权限边界」写明 *修改 memory 下 SOP 需写入报告待审*，故只提议不落地）：
+   - 内容建议：`complete_task()` 收尾会自动调用 `tools/log_compress.py` 压缩 `logs/autonomous_reflect.log`（阈值 8 MiB / 保留 1 MiB，可用 `GA_LOG_COMPRESS_THRESHOLD`/`GA_LOG_COMPRESS_KEEP` 调整）；归档落 `logs/archive/*.log.gz`；现经 `temp/compress_log.py` shim 生效。
+3. `logs/archive/*.log.gz` 的保留期/上限策略（§6.3）。
+
+**明确未动**
+- 未删除任何死代码、未改 SOP 正文、未动 `sche_tasks/` 等与本任务无关的工作区脏状态。
