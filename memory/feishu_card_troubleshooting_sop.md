@@ -113,16 +113,40 @@ for page in (0, 1, 2):
 
 ```bash
 cd ~/projects/GenericAgent
-python3 memory/feishu_card_selftest.py <open_id>
-# open_id 取法: grep "收到消息" logs/feishu_agent.log | tail -1
+# ① 翻页卡（手写结构，验 _page_buttons 那套）
+python3 memory/feishu_card_selftest.py <open_id> --delete
+# ② ask_user 候选按钮卡：用 fsapp **真实构建器**产出（手写结构会随 fsapp 改动漂移，这正是旧版弱点）
+python3 memory/feishu_card_selftest.py --ask --from-log --delete
+#   --from-log 自动从 logs/feishu_agent.log 取真人 open_id（跳过单测桩 ou_monitor / ou_intruder）
+#   --delete   发送成功后立刻撤回该消息，零残留
 ```
 
-输出 `success=True` 即通过；失败会带 `ErrPath`（形如 `body.elements[6](tag: action)`），
+输出 `success=True code=0` 即通过；失败会带 `ErrPath`（形如 `body.elements[6](tag: action)`），
 直接指出是哪个 element 的哪个字段不合法。
+
+**坑（2026-09-22 实测）**：`mykey.fs_allowed_users` 配成 `['*']` 时是**通配符**（`PUBLIC_ACCESS=True`），
+它**不是** open_id；拿它当参数会得到 `99992351 The request you send is not a valid {open_id}`。
+真人 open_id 只能从运行时日志取（脚本 `--from-log` 已代劳）。另：`_build_locked()` 返回的是
+JSON **字符串**（不是 dict），别在脚本里对它 `.get()`。
+
+### 按钮类功能的「三段验证」（少任何一段都会误判）
+1. **结构发布校验**（可自动）：`selftest --ask` → 服务端接受 = 卡片 JSON 合法、没撞 65 element 上限。
+   ⚠️ 这种一次性卡片**即便渲染出按钮，点击也不会生效**：回调注册表（`ga_card`）只活在那个子进程里，
+   进程一退就空 —— 历史上用户反馈"点了完全没反应"就是这个原因，别拿它当点击验证。
+2. **权限/回调单测**（可自动）：`temp/test_fsapp_ask_buttons.py`（18 断言，含"非发起人点击应被忽略"）。
+   注意该文件在 `temp/` 会被定期清理，丢失时按 `frontends/fsapp.py` 的 `_handle_ask_choice` 重建。
+3. **点击端到端**（**只能真人**）：只有**线上 fsapp 进程**发出的卡，`ga_card` 才在它自己的注册表里，
+   点击才会走 `handle_card_action → _handle_ask_choice → _run_ask_followup` 起新任务。
+   做法：让 agent 走一次带 candidates 的 `ask_user`，用户在飞书**点按钮**（而不是打字）——
+   若观察到新任务被自动发起 ⇒ 全链路通。
+   ⇒ 所以"改完按钮代码必须重启 fsapp 才有回调"与"重启会掐断正在跑的会话"是一对矛盾，
+   重启时机见下一节。
 
 ## 相关产物
 - 修复提交：`16f9c25`（分页按钮翻页）、`fb96c34`（修正按钮结构）、`2b8ab8f`（本 SOP 与自检脚本）
+- ask_user 按钮提交：`ca80809`（candidates → 卡片按钮 + 取消 + 发起人限制）
 - L1 RULE 15（global_mem_insight.txt）、自检脚本 `memory/feishu_card_selftest.py`
+  （支持 `--ask`/`--from-log`/`--delete`，2026-09-22 扩展）
 - 上游 Issue：lsdefine/GenericAgent#814（含分析与建议）
 
 ### 官方更新后如何保住这套改动
