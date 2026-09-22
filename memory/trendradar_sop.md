@@ -188,3 +188,13 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - **坑**：`output/news/YYYY-MM-DD.db` 的 `platforms` 表能给平台 id→中文名映射，但报告里写的名字混用中英（`财联社` vs `财联社热门`）→ 比对时要走别名表；读 DB 用 `sqlite3 file:...?mode=ro`（容器写的库，直接 connect 可能锁）。
 
 
+
+---
+
+## §14 拆词修复「效果 A/B 离线复算」（2026-09-22，TODO#13/R352）
+
+- **工具**：`tools/trendradar_keyword_ab.py`（GA 仓，只读；`--days/--end/--start/--json/--pair-mode/--boundary`）。产物 `temp/trendradar_keyword_ab/ab_replay.{json,csv,md}`；报告 `memory/autonomous_reports/R352_*.md`。
+- **判定**：**批** R343 修法A（拆词后并集检索），但**必须与 `limit 30→≥80` 同批落地**；ASCII 关键词加词边界；修法B（`search_mode='fuzzy'`）**不批**（th=0.3 仅 58 条/29 天，是拆词的 1/22；th=0.6=0）。不批则平台通道继续 0 条。
+- **数字（29 个已封盘日 08-24~09-21）**：A 整串=0；B 逐词 pair 口径 **1384**（与 R343 同区间 1384 完全对齐）；按标题去重 1283（44.2/天，单日最高 73，零命中 0 天）；词边界口径 1174 ⇒ 子串误召回 109（8.5%，如 `AI` 命中 `AIM-424`）；与当日 RSS 供给**仅重合 1 条**（净新增 1253=99.9%）；成本 ≈400 token/天（泛词命中占 68.4%，平均标题 25.5 字）。
+- **★口径坑（复算必守）**：①R343 的 `token_union` 口径＝**按 `(query, title, platform)` 计数**（同题跨平台算多条），按标题去重会少 7.3%，对账时必须 `--pair-mode` 才逐日逐词全等。②**当日 DB 仍在写入**（TrendRadar 平台持续抓取），拿今天做复算会与历史快照差出几十条 ⇒ 比历史数字必须**剔除当日**。
+- **风险面**：`limit=30` 实测 17 次(query·天)触顶、按现状会丢 180 条(13.2%)；生产 KEYWORDS/limit 属生产配置，改动需批准（本轮未动）。
