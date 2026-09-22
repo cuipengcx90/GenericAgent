@@ -32,7 +32,7 @@
 ### 2.3 真树即时检查（本次收尾自身）
 本报告就是通过真树 `complete_task()` 收尾的；在其返回后**立刻**（尚未执行归档 sync 之前）检查：
 - 检查时间：T+0s（与 complete_task 同一脚本内，无中间步骤）
-- `memory/autonomous_reports/R348_*.md` 是否存在 → **{RESULT}**
+- `memory/autonomous_reports/R348_*.md` 是否存在 → **不存在**（`glob` 返回空列表）⇒ **双写未生效**，与 §2.2 沙箱负控完全一致
 
 > 说明：`memory/autonomous_reports/` 里确实存在 R344–R347 —— 那是**我每轮收尾手动跑 `sync --apply`** 的结果，属于「人肉补丁」，不是 `complete_task()` 自动行为，也正是 C2/C3/C4 要消灭的依赖。
 
@@ -146,3 +146,14 @@ cd /Users/cuip/projects/GenericAgent
 python3 temp/pending_decisions/sandbox_r348_verify.py   # 输出 JSON：control/patched/rollback 三段结论
 ```
 脚本要点：假通知模块 → 沙箱常量重定向 → 负控与实验组各真跑一次 `complete_task()` → 比对 sha → 回滚并复校 sha。
+
+
+---
+
+## 附录 C：记忆更新建议（SOP 要求置于报告末尾）
+
+> SOP 收尾第 2 条原文：「若有记忆更新建议，**附在报告末尾**」——本节置于文末以满足该要求（§6 的同名内容在上方，两处一致）。
+
+1. **L1 建议（待审，未落盘）**：`自主报告防丢失：helper.complete_task 尚无 memory 双写（真树 T+0s 已证）；补丁 C2/C3/C4 沙箱端到端验证通过待批——python3 temp/pending_decisions/apply.py --only C2,C3,C4`
+2. **L1 建议（待审，未落盘）**：`helper.compress_and_archive() 引用的 temp/compress_log.py 全仓库不存在 ⇒ 每次 complete_task 都打 [WARN]，日志压缩从未生效（欠账，非本轮任务范围）`
+3. **流程建议**：批准 C2/C3/C4 时，把 `temp/pending_decisions/{apply.py,actions.py}` 迁入 `tools/pending_decisions/`（受版本控制），否则提案永远睡在易失的 temp/。
