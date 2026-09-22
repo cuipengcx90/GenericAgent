@@ -1,9 +1,11 @@
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
-- 采集: 2026-09-22；行数 321
+- 采集: 2026-09-22；行数 323
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R355 | 2026-09-22 | 工程 | 自主报告「编号复用」根治 | 根因=编号只扫LIVE树+分配非原子(文件名锁无效+history截断窗读到空→R1);补丁已就绪待批(两树max+1+号码级O_EXCL claim锁+收尾自动sync/inventory),夹具六组全绿(并发160次分配:旧15/20轮重号共20个,新0/20);实测现存漂移:LIVE R354 vs 归档 R353;未改GA源码(权限边界),一键 bash temp/R355_apply_patch.sh
+R354 | 2026-09-22 | 工程 | 本机音频资产（TODO#17） | 26条有音轨(2.11h)全量VAD+ASR：13条纯音乐占31.7%时长被筛除，12条有语音中仅6条可用；本批ASR 1726s≈4.4x实时；新增 tools/audio_vad_scan.py + tools/audio_asr_batch.py（可配置路径，冒烟rc=0）
 R353 | 2026-09-22 | 产出 | 本机音频资产：去重→挑人声→长音频转写备忘 | 46命中/14重复/32唯一(含音轨26/无音轨4/非媒体2)；26条2.11h全量转写28.9min(4.4×实时)，25结果中13条零文本(52%)、12条出文本18470字(其中3条为幻觉判不可用)；私密仅1条客服通话录音(4209字)；silero VAD预筛29.6s=ASR成本1.7%，但有2反例不可单独判语音；主交付 temp/audio_assets/MEMO.md
 R352 | 2026-09-22 | 工程 | TrendRadar拆词修复效果A/B离线复算 | 判定批修法A(条件式):29天A整串=0/B逐词pair=1384(与R343同区间完全对齐)/去重1283(44.2条/天,单日最高73,零命中0天);净新增1253条(与当日RSS仅重合1条,99.9%全新);但limit=30有17次触顶丢180条(13.2%)须同步提到>=80;ASCII词加词边界消109条(8.5%)子串误召回(如AIM-424);fuzzy臂th=0.3仅58条/th=0.6=0⇒不批修法B;成本约400token/天
 R351 | 2026-09-22 | 环境 | 内网/云主机连接命题验证(只读) | 成立:known_hosts 30 台含 openclaw-server.tailf82c5b.ts.net(=100.112.252.36,GCP,google_compute_engine 密钥)/100.114.166.15(Safari:18080 visits=6)/阿里云 47.116.119.182 等,+autossh 反向隧道;tailscale 现 stopped 未连;kubectl 无 kubeconfig;docker 仅本地 OrbStack;safari/chrome 交叉已证
