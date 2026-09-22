@@ -1,6 +1,6 @@
 # [Global Memory Insight]
-浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF blob/跨域iframe/CDP)
-键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py
+浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF blob/跨域iframe/CDP;tab id失配报"No tab with given id"→真实id用CDP桥`{"cmd":"tabs"}`取;新开tab无内容脚本须CDP Page.navigate+Runtime.evaluate)
+键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py | ocr_vision.swift(macOS原生Vision本地OCR,中英混合,离线免费~2s/图,`swiftc -O -o ocr_vision ocr_vision.swift`;实测291图3分钟,API逐张需4.6小时)
 密钥/配置: keychain.py | keychain_sop | codex CLI(~/.codex/config.toml: [tui] resume_cwd="current|session" 免resume选目录菜单;真机A/B已证;另codex会自写projects信任项)
 MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)
 进程内存/扫描: procmem_scanner.py | procmem_scanner_sop | 本机数据源目录只读地图: tools/personal_source_map.py(12源实测;副本+连-wal,-wal缺失致假空:Notes 2→8;容器目录递归find被TCC挂起须ls限深;11源零授权可读但Messages/Mail/Photos/Reminders/Notes空库,有料=knowledgeC 17400条/Chrome 12501 URL)
@@ -12,7 +12,7 @@ MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)
 
 需要时 read L2 或 ls ../memory/ 查 L3
 L0: memory_management_sop
-L2: TrendRadar_MCP | GA MCP统一调用 | 用户背景 | CCB(=SeemSeam/claude_codex_bridge;原名bfly123/claude_code_bridge,301改名易主同仓;npm名@seemseam/ccb;装~/.local/share/codex-dual;cca=claude_code_autoflow未装;2026-09-22升至v8.7.1, v5老克隆+空~/.local/share/ccb已清入Trash, ~/.ccb(92M)不可删=v8在用state/python-bin;评估见temp/CCB_V8_REVIEW.md=借纪律8条不借产品面不换血) | smyze/bar代码库架构 | Git Hook生效性 | Quarkus版本风险 | Codeg+GA整合部署 | 周报工具链 | Agent舰队规则体系
+L2: TrendRadar_MCP | GA MCP统一调用 | 用户背景 | CCB(=SeemSeam/claude_codex_bridge;原名bfly123/claude_code_bridge,301改名易主同仓;npm名@seemseam/ccb;装~/.local/share/codex-dual;cca=claude_code_autoflow未装;2026-09-22升至v8.7.1, v5老克隆+空~/.local/share/ccb已清入Trash, ~/.ccb(92M)不可删=v8在用state/python-bin;评估见temp/CCB_V8_REVIEW.md=借纪律8条不借产品面不换血) | smyze/bar代码库架构 | Git Hook生效性 | Quarkus版本风险 | Codeg+GA整合部署 | 周报工具链 | Agent舰队规则体系 | LoopX控制面深调(报告temp/loopx_research/REPORT_LOOPX_DEEP_DIVE.md;v1.1.0深研=UPDATE_v1.1.0_AND_PROMPT_ANSWER.md(prompt由LoopX组装;ready-score/check可做准入闸门;唯一blocker=blocked_by_safety;★答案契约四段定序=结论→基线→依据→缺口+gaps必做页脚);站点canonical=loopx-project.github.io)
 L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_sop
 | scan_and_analyze_sop | test_and_document_sop | root_cause_analysis_sop | trendradar_sop | github_contribution_sop
 | trendradar_sop(晨/晚报重复推送根治:确定性单入口+幂等;稳定双发查通知函数互相转调;Linux.do接入查Docker镜像/CF指纹/RSS混合池limit配额;单次执行可长达10+分钟会被工具60/300s超时误判,应nohup后台起+ps -p轮询,锁文件内含pid可判僵尸锁;build_report实测max_attempts=4,仅"内容过短"原因会降级发送degraded_send=True仍三通道照发非skipped;LLM思考过程污染报告2026-08-12已修复:Claude API 8/9-10服务端adaptive行为变更开始输出CoT,双重定位过滤标题后+分类标题前,正则须^##\s+匹配所有二级标题非限定emoji,两轮修复验证成功过滤74行污染;★2026-09-21复发已根治★:模型改用粗体分类标题(**分类**)致^##\s+零匹配→CoT整段随报告发出;已修=正文起点改多风格并集^(##\s+|\*\*[^*]+\*\*\s*$)+取最后一个标题+_cot_head_hits探针(900字头部)命中即重试,降级发送前也过探针;真链路dry-run已证过滤1.5万字符草稿) | recommendation_pitfalls_sop | ctf_skills_integration_sop
@@ -66,3 +66,4 @@ L4: L4_raw_sessions/
 15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环；期间通道零输出，飞书卡片停"思考中"看似卡死，用户被迫喊"继续"而 put_task 只是排队并不中断)。正确两步法: ①只启动立即返回 `nohup xxx > log 2>&1 & echo pid=$!`；②后续每轮用一次 code_run 查状态 `tail -3 log; ps -p <pid> >/dev/null 2>&1 || echo DONE`。每次调用秒级返回，通道持续有心跳，多花轮数由 max_turns=180 兜底
 16. 审「测试全绿」先验测试本身是否真执行: 内联/mock 执行器(如桩PA)会无条件写 PASS、把从未运行过的工具记成 exit_code=0 成功记录→只证明管道通不证明能力通,须用真执行替身复跑
 17. 拷本机数据库做只读快照必须连 -wal/-shm 一起拷(缺 -wal 会"假空":实测 Notes 2→8 对象),查询走 `file:...?mode=ro`;macOS 容器目录(~/Library/Containers)递归 `find -type f` 会被 TCC **挂起**(>25s 不返回≠返回 0)→只能 `ls` 限深+显式超时,判"空库"要用第二来源交叉证
+18. 并行调研子任务的完整需求书在 `prompts/<名>.md`(父消息常被截断)：动手前先读全该文件+ls prompts/ 确认产出清单，写完回对每条要求(实测漏问/漏硬约束)

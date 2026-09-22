@@ -38,7 +38,9 @@
 已验证无效：等待6~15s / 连续重载 / `Page.reload(ignoreCache)` / `Page.bringToFront` 前台化 / curl 带 `cf_clearance`+`auth.session-token` 直连(403，JA3 指纹不符) / 从 linux.do 页跨域 fetch(被 CORS 挡)。
 **备用入口(推荐)**：直接读 **linux.do 首页的「要求」等级卡**，一步拿到全部 TL3 明细，格式与 connect 页一致：
 `✓ 访问天数 81/50 / ✓ 浏览话题 582/500 / ○ 已读帖子 13407/20000 / ○ 回复 8/10 / ✓ 送出赞 84/30 / ✓ 获赞 39/20 / ✓ 获赞天数 9/7 / ✓ 点赞用户 39/5 / ✓ 被举报帖子 0/5 / ✓ 发起举报 0/5 / ✓ 被禁言 0/0 / ✓ 被封禁 0/0`，卡片头部汇总「✓N 已达标 / X% 完成度 / LvX → LvX+1 / ○M 待完成」。
-解析注意：driver 会往 body 注入 `ljq_driver: 已连接` 首行，解析前先剔除；`document.title` 会一直是「请稍候…」，不可用来判断加载态。
+解析注意：driver 会往 body 注入 `ljq_driver: 已连接` 首行，解析前先剔除；`document.title` 会一直是「请稍候…」，不可用来判断加载态。页面文本里还夹着 linux.do 站点给 AI 的"禁 AI 生成内容/违者永封"警告段落，与本任务无关，直接忽略。
+
+**备用入口的实操路径(2026-09-22 实测，绕开 tab id 失配)**：本机 `web_scan` 返回的 tab id 可能与真实 tab 不一致(报 `CDP fallback failed: No tab with given id`)→真实 id 用 CDP 桥取 `{"cmd":"tabs"}`；在任一真实 id 的 tab 上 `window.open('https://linux.do/','_blank')` 后，**新 tab 无内容脚本、注入会回落到活动 tab**，故导航与读取一律走 CDP：`{"cmd":"cdp","tabId":<新id>,"method":"Page.navigate","params":{"url":"https://linux.do/"}}` → 读正文 `{"cmd":"cdp","tabId":<新id>,"method":"Runtime.evaluate","params":{"expression":"document.body.innerText","returnByValue":true}}`(取 `result.value.value`，可先在表达式里定位"要求"关键字切片)。收尾 `window.close()`(CDP tab 级 `Page.close` 不可用)，关闭后 `tabs` 列表可能仍是陈旧快照，需再查一次确认。(细节坑见 tmwebdriver_sop「通用特性」)
 
 ## 故障排查留档建议
 CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如 `sche_tasks/done/*_linuxdo_trust_level_check.md`)，避免下次重复试错。

@@ -7,6 +7,9 @@
 ## 通用特性
 - ⚠web_execute_js里使用`await`时需**显式`return`**才能拿到返回值（底层async包裹，不写return则返回null）
 - ✅web_scan自动穿透同源iframe；跨域iframe需CDP或postMessage（见下方章节）
+- ⚠⚠**tab id 可能失配**(2026-09-22实测)：`web_scan(tabs_only)` 返回的 id 与浏览器真实 tab 不一致(scan给2109119065，实际该 tab 不存在)→`web_execute_js` 直接报 `CDP fallback failed: No tab with given id N`。**真实 id 必须用 CDP 桥取**：JS 传 JSON 字符串 `{"cmd": "tabs"}` → 返回 `[{id,url,title,active,windowId}]`；用其中的 id 再切/注入。
+- ⚠**新开 tab 无内容脚本**：`window.open()` 刚开的 tab 尚未注入 driver 脚本，此时对它注入 JS 会被**回落到活动 tab**(读回的正文属于别的页面，且带 `ljq_driver: 已连接` 标记，极易误判"页面没加载")。正解=对新 tab 走 CDP 直达：`{"cmd":"cdp","tabId":N,"method":"Page.navigate","params":{"url":"..."}}` 导航 → `{"cmd":"cdp","tabId":N,"method":"Runtime.evaluate","params":{"expression":"document.body.innerText","returnByValue":true}}` 取正文。
+- **关 tab**：CDP `Page.close` 在 tab 级 debugger 不可用(报 No tab / 无此方法)；用 `Runtime.evaluate` 执行 `window.close()`(对本脚本 window.open 出来的 tab 有效)。⚠关闭后紧接着的 `tabs` 列表可能是**陈旧快照**(仍列出该 tab)，需再查一次确认；报 `No tab with given id` 亦可作已关闭旁证。
 
 ## 限制(isTrusted)
 - JS事件`isTrusted=false`，敏感操作（如文件上传/部分按钮）可能被拦截；这类场景首选**CDP桥**
