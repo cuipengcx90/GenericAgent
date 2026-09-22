@@ -82,6 +82,11 @@ def _display_text(text):
     cleaned = _strip_files(_clean(text))
     if cleaned:
         return cleaned
+    # 没正文时，若模型把结论写进了 <summary>，直接展示它——_clean 会把 summary 整段剥掉，
+    # 不兜这一步就只能回报"（无文本输出）"，信息量为零。
+    m = re.search(r"<summary>(.*?)</summary>", text or "", re.DOTALL)
+    if m and m.group(1).strip():
+        return _strip_files(m.group(1).strip())
     tail = (text or "").strip()[-_TRUNC_TAIL:]
     return "（无文本输出）" + (f"\n…{tail}" if tail else "")
 
@@ -734,6 +739,29 @@ class _TaskCard:
         self._enqueue("fail", force=True)
 
 
+def _extract_ask_user_question(ctx):
+    """从 exit_reason.data 里取出 ask_user 的提问，供飞书展示。
+
+    模型调 ask_user 请示时，正文往往只有一个 <summary>，真正的问题在工具参数里。
+    飞书卡片若只渲染 response.content，剥掉标签后只剩"（无文本输出）"，
+    用户不知道该回答什么，只能反复发"继续"。
+    """
+    exit_reason = (ctx or {}).get('exit_reason') or {}
+    if not isinstance(exit_reason, dict) or exit_reason.get('result') != 'EXITED':
+        return None
+    payload = exit_reason.get('data')
+    if not isinstance(payload, dict):
+        return None
+    if payload.get('status') != 'INTERRUPT' or payload.get('intent') != 'HUMAN_INTERVENTION':
+        return None
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+    question = str(data.get('question') or '').strip()
+    if not question:
+        return None
+    candidates = [str(c).strip() for c in (data.get('candidates') or []) if str(c).strip()]
+    return question, candidates
+
+
 def _make_task_hook(card, done_event, on_final):
     """飞书任务 hook：每轮 patch 卡片状态；结束触发 on_final(raw) 处理附件。"""
     def hook(ctx):
@@ -741,7 +769,15 @@ def _make_task_hook(card, done_event, on_final):
             if ctx.get('exit_reason'):
                 resp = ctx.get('response')
                 raw = resp.content if hasattr(resp, 'content') else str(resp)
-                card.done(_display_text(raw))
+                ask = _extract_ask_user_question(ctx)
+                if ask:
+                    question, candidates = ask
+                    lines = [f"❓ 需要你确认：{question}"]
+                    if candidates:
+                        lines.append("候选项：" + " / ".join(candidates))
+                    card.done("\n".join(lines))
+                else:
+                    card.done(_display_text(raw))
                 on_final(raw)
                 done_event.set()
             elif ctx.get('summary'):
