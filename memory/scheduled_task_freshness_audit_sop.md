@@ -20,5 +20,6 @@
 - **`index.html` 是自包含归档页（无 href）** → 按 basename 匹配算覆盖率会得 `0/433` 假结论。
 - `output/` 不含 roi/vault/跨仓产物（如 `roi_history.json` 在仓根、Wiki 在 vault、周巡报告在 `bar_smyze_opserver/`），须从 done 报告或显式已知路径取。
 - 产物目录统计别用 `ls -lt | head`（列不全会看错），写脚本一次算完。
-- 报告编号真源 = `memory/autonomous_reports/history.txt`（**gitignore**；`history.md` 只是抢救索引、`INDEX.md` 只是展示）。本次 history.txt 缺 R349 行（R349 那次只更新了 history.md）→ `helper._next_report_number()` 算出 349 会与已存在文件撞名（`shutil.move` 报错）。
+- 报告编号真源 = **`temp/autonomous_reports/history.txt`**（LIVE 树；`helper.py` 的 `_REPORTS_DIR=_TEMP_DIR/"autonomous_reports"`、`_HISTORY_FILE=_REPORTS_DIR/"history.txt"`，**已核实源码第26-27行**）。归档副本 `memory/autonomous_reports/{history.txt,history.md,INDEX.md}` 由 `tools/autonomous_reports_archive.py sync/inventory` 生成（history.txt **gitignore**、`history.md`/`INDEX.md` 只是展示）。
+- ★**两树会分叉导致编号复用**（2026-09-22 R351 实测）：helper 只写/只读 LIVE 树，归档树仅在被显式 sync 后才更新 ⇒ 若上一轮报告只进了归档树，`_next_report_number()` 按 LIVE 首行算出的编号会**与上轮重号**（本次实测 R350 撞号，两 history 各 319 行仅首行不同）。修法：改 ①报告文件名 ②**LIVE history 首行**（只改首行），再跑 `sync --apply` + `inventory --apply`，末了 `diff` 两 history 必须逐行一致。根治（待批）＝编号取两树 max+1 且收尾自动串联 sync/inventory。
 - 正确收尾姿势：报告写到 cwd → `from autonomous_operation_sop.helper import complete_task; complete_task(name, historyline, report_path)`（它负责编号+移动+prepend history+通知）。**手写报告后不要再手工改编号体系**；若已手工放置，至少跑一次 `max(R###)+1` 校验并与 history.txt 对齐。
