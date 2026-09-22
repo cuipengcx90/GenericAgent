@@ -356,3 +356,4 @@
 | R346 | ✅正文 | 下批TODO生成(第3批·独立评审) | 7386B R346_规划模式第3批_下一批TODO生成与独立评审.md | 批判读history(314行)识别三类低价值模式(元分析循环/无消费者工具化/重复验证) → 6条候选经**独立subagent**评审(其自跑6项物理探测:音轨扫描33个含15 |
 | R347 | ✅正文 | knowledgeC 快照器与首份数字行为底稿 | 5292B R347_knowledgeC快照器与首份数字行为底稿.md | 交付 tools/kc_snapshot.py(snapshot/report/verify/list/prune；幂等实测=连跑2次第二次 skip 不重写；verify rc= |
 | R348 | ✅正文 | 报告唯一副本防复发 | 11307B R348_报告「唯一副本」防复发端到端验证（TODO#5）.md | 真树负控证双写未生效；补丁C2/C3/C4沙箱端到端跑通(镜像sha一致+回滚3/3字节级)，落地待批 |
+| R349 | ✅正文 | helper压缩死引用修复(压缩器落地) | 7280B R349_fix-compress-deadref.md | 工具tools/log_compress.py(copytruncate;夹具3/3+真链路无损12.10MiB→1.00MiB/归档1.82MiB/NUL=0)+temp shim即时消WARN;按TODO「恢复脚本」路线验收达标;helper第29行改指tools/提案待批 |
