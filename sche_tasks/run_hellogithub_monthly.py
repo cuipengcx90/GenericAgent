@@ -37,6 +37,31 @@ def _strip_llm_tags(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+# 真报告正文起点：标题行。模型偶尔会吐出**纯文本**思维链（无 XML 标签，
+# 如 "I need to generate..." / "Let me organize" / "Format:"），
+# _strip_llm_tags 抓不到。此处从**最后一个**标题行起截断正文，
+# 防止思维链里引用的标题把真实正文误截。
+_REPORT_TITLE_RE = re.compile(r"^\s*🌟\s*HelloGitHub\s*精选月报.*$", re.MULTILINE)
+_COT_HEAD_MARKERS = (
+    "I need to", "Let me ", "Let me organize", "Section 1", "Section 2",
+    "Final answer", "requirement", "Format:", "Let me write",
+)
+
+
+def _strip_cot_preamble(text: str) -> str:
+    """Drop leaked plain-text CoT preamble before the real report body."""
+    matches = list(_REPORT_TITLE_RE.finditer(text or ""))
+    if matches:
+        return text[matches[-1].start():].strip()
+    return (text or "").strip()
+
+
+def _cot_head_hits(text: str, n: int = 900):
+    """Probe: which CoT markers still appear in the report head (for logging)."""
+    head = (text or "")[:n]
+    return [m for m in _COT_HEAD_MARKERS if m in head]
+
+
 def _validate_report(report):
     """Block partial/error responses before either notification channel is called."""
     text = (report or '').strip()
@@ -189,7 +214,14 @@ def run():
     sess = build_mixin_session()
     print(f"   统一 Mixin：{sess.name}")
     msg = {"role": "user", "content": [{"type": "text", "text": prompt}]}
-    report = _validate_report(_strip_llm_tags(''.join(sess.ask(msg))))
+    raw = _strip_llm_tags(''.join(sess.ask(msg)))
+    report = _strip_cot_preamble(raw)
+    if len(report) < len(raw):
+        print(f"🧹 已剥离思维链前导 {len(raw) - len(report)} 字")
+    hits = _cot_head_hits(report)
+    if hits:
+        print(f"⚠️ CoT 残留探针命中（仍将推送，请关注）: {hits}")
+    report = _validate_report(report)
     print(f"✅ 报告生成完成并通过质量校验 ({len(report)}字)")
 
     # 推送

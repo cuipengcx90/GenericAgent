@@ -17,3 +17,4 @@
 3. **当月数据不全**：默认取上月(datetime.now().replace(day=1) - timedelta(days=1))
 4. **numpy warning 无害**：LLMLingua warmup 失败不影响主流程，忽略即可
 5. **推送前质量闸门(2026-07-28新增)**：`_validate_report(text)` 校验必备段(HelloGitHub/月度精选/月刊/数据来源)缺失、含中断标记(`!!!Error:`)、正文过短(<约800字)则抛 `ReportQualityError` 阻断推送,绝不发残缺报告。
+6. **头部 CoT(思维链)泄漏(2026-09-22实测)**：模型偶发吐**纯文本**英文 planning(`I need to...`/`Let me organize`/`Format:`/`Final answer`),**无 XML 标签**→`_strip_llm_tags` 抓不到→整段随报告推送(本次前168行≈9376字污染,真报告从第169行起,标题`🌟 HelloGitHub 精选月报`在文中出现两次)。修=新增 `_strip_cot_preamble()` 以标题正则 `^\s*🌟\s*HelloGitHub\s*精选月报.*$` 取**最后一个**标题行起截断 + `_cot_head_hits()` 900字探针告警。同类缺陷见 `run_tech_trends`/trendradar(均"LLM思考过程污染产出物")。
