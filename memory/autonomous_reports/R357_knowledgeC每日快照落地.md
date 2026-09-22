@@ -100,6 +100,7 @@ DRY-RUN：未写盘。加 --apply 执行。
 cd /Users/cuip/projects/GenericAgent
 
 # 启用（B）：注入 4 行钩子 → 反射进程按文件 mtime 自动热重载，无需 bootout
+#   源码证据：agentmain.py:297-303 每轮 `if getmtime(args.reflect) != _mt:` 则 `exec_module(mod)` 并打印 `[Reflect] reloaded`
 python3 temp/R357_kc_hook_07_apply.py            # 先 dry-run 看会改什么
 python3 temp/R357_kc_hook_07_apply.py --apply    # 真注入（自动备份 07_l2_gate.py.bak-r357）
 
