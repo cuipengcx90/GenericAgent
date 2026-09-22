@@ -266,6 +266,7 @@ APP_SECRET = str(mykeys.get("fs_app_secret", "") or "").strip()
 ALLOWED_USERS = _to_allowed_set(mykeys.get("fs_allowed_users", []))
 PUBLIC_ACCESS = not ALLOWED_USERS or "*" in ALLOWED_USERS
 AGENT_TIMEOUT_SEC = 3600  # was 900; other frontends (tg/streamlit/qt/discord) have no hard cutoff at all
+_ASK_IDLE_WAIT_SEC = 180  # 候选点击后等 agent 空闲再注册 hook 的上限（见 _run_ask_followup）
 FEISHU_CLIENT_TIMEOUT_SEC = 8
 CARD_PATCH_WARN_SEC = 2.0
 
@@ -616,7 +617,9 @@ class _TaskCard:
         # 最终总结只属于最后一页：否则翻到任何一页都会重复看到同一段结尾
         if self.final and self.page_idx == total - 1:
             els += [{"tag": "hr"}, {"tag": "markdown", "content": self.final}]
-        if self.ask_menu:
+        # 候选按钮只跟最后一页（最新状态）走：翻到历史页还显示按钮，会让人以为
+        # 那是"这一页/这一轮"专属的候选，而它其实是卡片级的全局状态。
+        if self.ask_menu and self.page_idx == total - 1:
             els += [{"tag": "hr"}] + self._ask_buttons()
         if total > 1:
             els.extend(self._page_buttons(total))
@@ -745,6 +748,7 @@ class _TaskCard:
         self.final = None
         self.turn_base = self.turn_no + 1   # 新页从当前轮继续编号
         self.steps = []                      # 必须清空：否则新卡片与旧卡片同样超限，rollover 失效
+        self.ask_menu = None                 # 旧卡片消息仍留着候选按钮，不清会两条消息都显示同一组
         self.note = "📄 上一条工作卡片已满，本页继续；往上翻可查看完整历史。"
 
     # ── 公开接口 ──
@@ -841,8 +845,11 @@ def _handle_ask_choice(data, card, value):
         return
     operator = getattr(getattr(data.event, 'operator', None), 'open_id', None)
     owner = card.owner_open_id
-    if owner and operator and operator != owner:
-        print(f"[fs ask] 非发起人点击忽略: operator={operator} owner={owner}")
+    # 默认拒绝：拿不到发起人或操作者时一律不受理。
+    # 放行的话，群内任何成员都能操作这组按钮（卡片在群里对所有人可见），
+    # 而这组按钮表达的是发起人的选择。
+    if not owner or owner != operator:
+        print(f"[fs ask] 点击未受理: operator={operator} owner={owner}")
         return
     chosen = None
     if not value.get('ask_cancel'):
@@ -860,31 +867,65 @@ def _run_ask_followup(card, text):
 
     刻意不复用 handle_message 里的 run_agent：那是闭包，抽出来要动现有可用路径，
     这里十几行重复换来零回归风险。
+
+    hook 注册时机是关键：GA 是单线程串行队列，put_task 只是入队；而 agent._turn_end_hooks
+    是全局共享字典，每轮 turn_end 会无差别调用其中**所有** hook。若在别的任务正跑着时
+    注册，那个无关任务的 turn_end 会立刻驱动本 hook（提前 done_event 并把自己 pop 掉），
+    本次点击真正发起的那一轮跑完时就没人更新卡片了。所以必须等 agent 空闲再注册。
     """
+    ag = get_agent()
+    new_card = None
+    owner = card.owner_open_id
+    receive_id, rid_type = card.rid, card.rtype
     try:
-        ag = get_agent()
-        receive_id, rid_type = card.rid, card.rtype
+        deadline = time.time() + _ASK_IDLE_WAIT_SEC
+        while getattr(ag, "is_running", False) and time.time() < deadline:
+            time.sleep(0.5)
+        if getattr(ag, "is_running", False):
+            print("[fs ask] agent 持续繁忙，放弃本次 follow-up")
+            return
+
         done_event = threading.Event()
-        hook_key = f"fs_ask_{receive_id}"
-        new_card = _TaskCard(receive_id, rid_type, owner_open_id=card.owner_open_id)
+        hook_key = f"fs_ask_{receive_id}_{uuid.uuid4().hex[:6]}"
+        new_card = _TaskCard(receive_id, rid_type, owner_open_id=owner)
         new_card.start()
         on_final = lambda raw: _send_generated_files(receive_id, raw, receive_id_type=rid_type)
         if not hasattr(ag, '_turn_end_hooks'):
             ag._turn_end_hooks = {}
+        if owner:
+            user_tasks[owner] = {"running": True}   # 登记后才能被 /stop 停掉
         ag._turn_end_hooks[hook_key] = _make_task_hook(new_card, done_event, on_final)
         try:
             ag.put_task(text, source="feishu")
             start = time.time()
+            _started = False
             while not done_event.wait(timeout=3):
+                if getattr(ag, "is_running", False):
+                    _started = True
+                elif _started:
+                    # abort() 不经过 hook，必须自己收尾，否则卡片永远停在"工作中"
+                    new_card.fail("任务已中止")
+                    break
+                if owner and not user_tasks.get(owner, {}).get("running", True):
+                    ag.abort()
+                    new_card.fail("已停止")
+                    break
                 if time.time() - start > AGENT_TIMEOUT_SEC:
                     ag.abort()
                     new_card.fail("任务超时")
                     break
         finally:
             ag._turn_end_hooks.pop(hook_key, None)
+            if owner:
+                user_tasks.pop(owner, None)
     except Exception as e:
         print(f"[fs ask] follow-up 异常: {e}")
         traceback.print_exc()
+        if new_card is not None:
+            try:
+                new_card.fail(f"错误: {e}")
+            except Exception:
+                pass
 
 
 def handle_message(data):
