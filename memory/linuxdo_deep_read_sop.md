@@ -152,7 +152,8 @@ function getLikeCount(post) {
 - 附带结论：`connect.linux.do` 的 CF 卡死（见 `linuxdo_trust_level_sop`）与本次 429 是两类不同故障，不要混淆。
 
 ### 正文=纯附件时的取 PDF
-- 这类日报 `posts_count == 1`（无回帖），主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
+- 主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
+- ⚠️ **`posts_count` 不固定**：09-21 期之前=1（无回帖），2026-09-22 期=5（主帖 + 4 条回帖，如「建议弄个黑色主题」「打卡」等）。**不要拿 `posts_count==1` 当判据**；仍按通用规则抓 `post_stream.stream` 分批补齐并机械校验 `posts.length === posts_count`（5 条一次到位）。Raw 里回帖也要落一段「## 回帖（原文提取）」。
 - 主帖里给的是 `/uploads/short-url/xxxx.pdf`（**该路径用 curl/curl_cffi 直连会 404**——short-url 需经浏览器会话重定向）。
 - 正确取法二选一：
   1. 浏览器 fetch 后读 `r.url` 拿真实 CDN 实链，如 `https://cdn3.ldstatic.com/original/4X/0/0/f/<hash>.pdf`，再用 curl_cffi 直连下载（实测 200 / application/pdf）；
@@ -164,6 +165,11 @@ function getLikeCount(post) {
 - Wiki `60 Wiki/topics/linuxdo-ai-daily-YYYY-MM-DD.md`：今日亮点 → 模型/工具 → 教程/实战 → 社区与治理 → 总体趋势（照抄 PDF 末尾「今日技术趋势」）→ 数据概览表（抓取总量/标签新增/历史命中/今日全新话题/昨日话题后续/最终纳入日报/话题组）→ 参考链接。
 - INDEX：`60 Wiki/INDEX.md` 的「### AI 工具 / Claude Code」组按**最新在前**插入一行 `[[topics/linuxdo-ai-daily-...]]`。
 - 播客链接两个都要保留：catbox mp3 + 小宇宙 `https://www.xiaoyuzhoufm.com/podcast/<id>`（后者从主帖文本里直接抄，别套模板）。
+
+### 浏览器与收尾坑（2026-09-22 实测）
+- 临时 tab 收尾：用 CDP `{"cmd":"cdp","tabId":<id>,"method":"Page.close"}`，再用 `{"cmd":"tabs"}` 复核回到原单 tab；页内 `window.close()` 对新开的 CDP 驱动 tab 不保证生效，别依赖。
+- `web_execute_js` 的 script 传 **JSON 数组**（想一次跑 `[{cdp...},{tabs}]`）不被支持 → 报 `Unknown cmd: undefined`；必须逐条单独调用。
+- 归档后要提交 vault git 仓（历史惯例 `chore(vault): 归档 linux.do AI 技术日报 ...`）：`git add` Raw+Wiki+INDEX 三件；**提交前先 `git diff -- "60 Wiki/INDEX.md"` 确认本次只有自己新增的一行**（该文件用户可能同时在改）。若发现上轮遗留未提交的 Raw（如 09-21），顺手单独补一次提交。
 
 ### 验收脚本要点
 Raw/Wiki/INDEX 三文件存在且非空 → frontmatter `sources` 逐条解析到真实文件 → 正文 wikilink ≥2 且均存在 → 正文中每个 linux.do topic URL **只出现一次**（主帖 URL 只放「参考链接」一处）→ 任一 FAIL 则不推送。
