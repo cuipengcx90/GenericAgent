@@ -1,14 +1,15 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-23
-- 正文已恢复: 114 / 索引可见 371 个编号
+- 正文已恢复: 115 / 索引可见 373 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
 
 | R | 状态 | 主题 | 证据 | 结论摘要 |
 |---|---|---|---|---|
-| R1 | ✅正文(未落盘) | 分析model_responses 9文件(1.4MB)历史对话 | 2573B /Users/cuip/develop/herdr-agents/docs/product/R1_CONTRACT_WIRING_PLAN.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
+| R0 | ⚠️仅索引 | - | *.md |  |
+| R1 | ✅正文(未落盘) | 分析model_responses 9文件(1.4MB)历史对话 | 22086B /Users/cuip/projects/GenericAgent/temp/multica_research/R1_multica_core.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
 | R2 | ✅正文 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 4023B R002_reflect脚本审计报告.md | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议 |
 | R3 | ✅正文 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送 | 5266B R003_SOP覆盖盲区审计.md | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_c |
 | R4 | ✅正文 | 扫描510个Python包+188个brew工具，识别7个未利用能力节点 | 4515B R004_本机未利用能力扫描.md | TOP3：keyring(解P1安全盲区)/watchdog(文件监控零成本激活)/gh-CLI(简化GitHub操作)；fastapi可加Agent外部接口 |
@@ -28,9 +29,9 @@
 | R18 | ⚠️仅索引 | LLM context压缩冷门方案调研 | feishu_e2e_test.md | 发现LLMLingua(20x,⭐6k)和tool_result截断(新P1)比滑动窗口更精准，可落地建议已产出 |
 | R19 | ⚠️仅索引 | L2记忆草稿筛选与写入 | R20.md | 写入2条实测事实(GA部署+飞书阈值)，拒绝5条偏好/猜测，严格遵循META-SOP |
 | R20 | ⚠️仅索引 | bridge_autonomous同步效果验证 | l2_memory_update.md | 03:00正常执行，扫描11个报告，无新洞察未修改global_mem |
-| R21 | ⚠️仅索引 | 新一轮TODO产出 | R28规划.md | 7条高价值TODO经subagent评审，FastAPI(9分)优先，3条低分替换 |
+| R21 | ⚠️仅索引 | 新一轮TODO产出 | *.md | 7条高价值TODO经subagent评审，FastAPI(9分)优先，3条低分替换 |
 | R22 | ⚠️仅索引 | FastAPI包装GA能力 | FastAPI包装GA能力.md | 6端点+Bearer认证+速率限制+示例代码，待审批实施 |
-| R23 | ⚠️仅索引 | 141张UI截图OCR分析 | price_alert_verification.md | 5类UI模式+技术栈推断(Vue+ElementUI)+8个可复用组件建议 |
+| R23 | ⚠️仅索引 | 141张UI截图OCR分析 | *.md | 5类UI模式+技术栈推断(Vue+ElementUI)+8个可复用组件建议 |
 | R24 | ⚠️仅索引 | fastmcp供应链MCP Server | tool_calling_cost_BLOCKED.md | 3工具验证通过，20行代码，双向桥接方案，待审批实施 |
 | R25 | ⚠️仅索引 | GitHub Actions触发 | 见 history/日志 | repository_dispatch成功，workflow scope限制，产出3种集成方案，待审批实施 |
 | R26 | ⚠️仅索引 | 供应链SaaS可AI化节点分析 | 见 history/日志 | 5个节点(P0补货预测+异常识别/P1文案生成+营销预测/P2供应商评分)，基于R30 UI分析，待审批实施 |
@@ -379,3 +380,4 @@
 | R369 | ✅正文 | 检索式回忆最小实证（FTS5 是否值得固化） | 9220B R369_检索式回忆最小实证.md | 结论=不固化、留作 temp 可复用原型：有索引人工拆词 top-5 命中 7/12、自动三元组 8/12、单题 0.1–3.3ms；无索引每题扫 37.79MB/0.101s 但 |
 | R370 | ✅正文 | 生成下一批TODO（规划模式·第6批） | 14704B R370_规划模式·第6批TODO.md | 批判读history+7条候选经独立subagent评审(8/8/7/6+1替换)→定稿5条入TODO.txt；删①检索式回忆v2/⑤公益站抽检/⑦网盘台账；反证R364「uv锁被 |
 | R371 | ✅正文 | kc 快照字段可用性矩阵 + 补采口径 | 25616B R371_kc快照字段可用性矩阵与补采口径.md | 完成：16 表/9 有料（ZOBJECT 27/37 列、结构化元数据 17/239 列）；分析代价毫秒级（全表 group by 66.5ms、近 7 天双查询 3.4/4.9m |
+| R372 | ✅正文 | uv 缓存 21G 安全回收 + 锁归因重验 + 收口 C45 | 17053B R372_uv 缓存 21G 安全回收+锁归因重验+收口 C45.md | 完成：~/.cache/uv 21.0G→6.3G（两阶段删 435 个非在用 archive 条目，du 实证 -14.7G；df 仅 +3Gi 的差额由并发写吃掉，iostat |
