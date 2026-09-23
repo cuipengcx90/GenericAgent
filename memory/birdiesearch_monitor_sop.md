@@ -45,7 +45,8 @@
   3. 第三方独立出口旁证：`curl -x http://127.0.0.1:7897 'https://r.jina.ai/https://www.birdiesearch.com/'`（超时/422 = 站点对境外机房也不可达）。
 - ⚠️ 坑：Clash TUN 开启时本机"直连"同样被接管，`--noproxy '*'` 或裸 socket 的结果**不能**作为真实直连证据；域名解析走 fake-ip(198.18.x)，真实 IP 需用 DoH(`https://1.1.1.1/dns-query?name=...&type=A`)查。
 - 复发确认(2026-09-21 11:01 与 11:12 连续两次调度)：仍止于 `/api/user/sign` 的 `SSLEOFError`。当日复测：Clash 组『宝可梦』8/8 节点对目标站 `delay` 测试全失败(`Timeout` / `An error occurred in the delay test`)，**同一批节点 google/generate_204 正常**(308/90/42/188/43/258ms，仅 2 个节点自身超时)；`r.jina.ai` 旁证返回 `422 AssertionFailureError: page.goto: Timeout 15000ms exceeded`。→ 再次独立确认**站点侧不可达**，非节点/配置问题；两次调度均未推送、未耗额度、未写 `birdie_seen_items.json`。
-- 历史：自 2026-09-13 起连续多日同一阶段失败且**全程静默**（脚本签到即崩 → 从不推送，用户无感知），判定为站点级持续故障，非本机/节点问题；此类长期静默需人工介入（建议增加连续失败告警）。
+- 复发确认(2026-09-23 11:00 调度)：同症状 `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 止于 `/api/user/sign`。当日三步复测：①`google/generate_204` = **204（0.89s）** 出口正常 ②Clash `GLOBAL/delay?url=<目标站>` = `Timeout`（同日 GLOBAL 对 google 也 Timeout ⇒ 该 API 的组选择不可单独作证，①已足够）③`r.jina.ai` 旁证 = **422 `page.goto: Timeout 15000ms exceeded`**，而同一调用抓 `example.com` = 200 ⇒ 再次独立确认**站点侧不可达**。本轮零推送、零额度消耗、`birdie_seen_items.json` mtime 仍停 2026-08-07。★附加判据：`socket.create_connection` 能连上 443 只说明连到了 **Clash TUN 假 IP(198.18.0.110)**，**不构成站点可达证据**（勿被"TCP OK"误导）。
+- 历史：自 2026-09-13 起每日同一阶段失败，**截至 2026-09-23 已连续 11 天**（09-18/17/16/15/14/13、09-20/21×2/22 的报告结论均为"不可达/站点侧不可达"；09-09 亦不可达，09-10 为最后一次真正跑通=「无新增」）且**全程静默**（脚本签到即崩 → 从不推送，用户无感知），判定为站点级持续故障，非本机/节点问题；此类长期静默需人工介入（建议增加连续失败告警）。
 
 ## 已知噪音(勿误判为故障)
 脚本 stderr 中出现的 numpy/sklearn 版本警告，来自 `llmcore`/`mykey.py` 导入链的后台线程噪音，与本任务无关，`exit_code=0` 即代表脚本本身执行成功。
