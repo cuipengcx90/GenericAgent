@@ -8,6 +8,7 @@
 2. 从 `done/` 报告里抽**任务自己声明的产物路径** → 对每个产物实测 mtime/大小/尾部抽样，算 age 天数。勿凭任务名猜路径（命名漂移普遍：`weekly_report_reminder` 真产物是 `temp/content.json`，遗留孤儿 `temp/weekly_content.json` 会误导）。
 3. 失败件 `*.failed.txt` 二分类：**同日另有成功件 = 质量重试丢弃稿（非故障）**；**孤儿（fail 无同日成功）= 真漏发**。
 4. 归档覆盖率判据用 `build_output_archive.parse_name`，别用文件名猜。
+5. **快照/diff 类任务专用判据**（2026-09-23 实测补充）：这类任务"无变化"是正常态，不能只看最近一次 diff 就判健康 —— 要 **全量相邻两两对比** 回答"它这辈子触发过告警吗"，并 **同时查被监控目标的 mtime** 区分「真不变」与「探针读空/读错」。两者都指向"目标已冻结"时，结论是**监控目标已死的容量问题**（非静默失败：任务在跑、报告在产、逻辑正确），应建议退役/换活跃目标，不要报故障。
 
 ## 实测结论（2026-09-22 基线，供日后对比）
 - 归档覆盖率 **401/433 = 92.6%**；32 跳过 = 31 份 `*.failed.txt` + 1 份 `*_filtered_test.txt`，均设计内。
@@ -15,6 +16,7 @@
 - `trendradar`：31 份 failed 中 28 份为重试丢弃稿，**3 份真漏发**（07-26 晚 / 07-27 晨晚，因 `bad_report_quality` skipped；57 天前，其后自愈）。
 - `eia_weekly`：无持久产物、无推送、`EIA_API_KEY` 长期缺失（静默降级）。
 - 僵尸任务 `bridge_autonomous`/`folder_watcher` 空转史（213/2303 次 NO_OP）已移入 `disabled/`（触发止 2026-09-21 23:26），删除已提交（`sche_tasks/*` 已 gitignore，disabled 副本留磁盘）。
+- ★**`sqlite_snapshot` = 事实僵尸（2026-09-23 该任务当日实测）**：`temp/sqlite_probe.py` 监控的 2 个库（`temp/message_2_merged.db` mtime=2026-05-19、`temp/hive_coupon_fix/m7hpgl58zzb4.db` mtime=2026-06-04）**早已冻结**；`temp/sqlite_snapshots/` 已有 **106 份快照**（20260611 起），全量相邻两两对比 **105 次变化 0 次** ⇒ 其"delta≠0 → 飞书告警"通路**从未触发过一次**，每日空转产一份 10 KB JSON。任务本身运行/报告/判断均正常（**非静默失败**），属监控目标已死。建议退役 or 改 `MONITORED_DBS` 指向活跃库（待用户决定，未改动）。
 
 ## 坑
 - **`index.html` 是自包含归档页（无 href）** → 按 basename 匹配算覆盖率会得 `0/433` 假结论。
