@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
-- 生成: 2026-09-23
-- 正文已恢复: 115 / 索引可见 373 个编号
+- 生成: 2026-09-24
+- 正文已恢复: 120 / 索引可见 378 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -10,8 +10,8 @@
 |---|---|---|---|---|
 | R0 | ⚠️仅索引 | - | *.md |  |
 | R1 | ✅正文(未落盘) | 分析model_responses 9文件(1.4MB)历史对话 | 22086B /Users/cuip/projects/GenericAgent/temp/multica_research/R1_multica_core.md | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem |
-| R2 | ✅正文 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 4023B R002_reflect脚本审计报告.md | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议 |
-| R3 | ✅正文 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送 | 5266B R003_SOP覆盖盲区审计.md | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_c |
+| R2 | ✅正文 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 4023B R002_multica_runtime.md | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议 |
+| R3 | ✅正文 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送 | 5266B R003_loopx_recheck.md | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_c |
 | R4 | ✅正文 | 扫描510个Python包+188个brew工具，识别7个未利用能力节点 | 4515B R004_本机未利用能力扫描.md | TOP3：keyring(解P1安全盲区)/watchdog(文件监控零成本激活)/gh-CLI(简化GitHub操作)；fastapi可加Agent外部接口 |
 | R5 | ✅正文 | 分析trendradar三任务配置+产出质量 | 3537B R005_trendradar_ROI评估.md | 结论：evening建议调整(schedule改20:00)/morning建议停用(从未执行)/hotspot维持停用；最高优先行动：evening schedule 18:00 |
 | R6 | ✅正文 | 深读langfuse_tracing.py+抽样model_responses，分析LLM调用成本分布 | 4568B R006_LLM成本分析.md | 单日估算$9.2，WORKING MEMORY膨胀是最大瓶颈(成本放大4.7x)，P0建议：滑动窗口截断history可节省60%成本 |
@@ -364,9 +364,9 @@
 | R353 | ✅正文 | 本机音频资产：去重→挑人声→长音频转写备忘 | 19253B R353_本机音频资产转写备忘.md | 46命中/14重复/32唯一(含音轨26/无音轨4/非媒体2)；26条2.11h全量转写28.9min(4.4×实时)，25结果中13条零文本(52%)、12条出文本18470字( |
 | R354 | ✅正文 | 本机音频资产（TODO#17） | 17175B R354_本机音频资产去重-挑人声-长音频转写备忘.md | 26条有音轨(2.11h)全量VAD+ASR：13条纯音乐占31.7%时长被筛除，12条有语音中仅6条可用；本批ASR 1726s≈4.4x实时；新增 tools/audio_va |
 | R355 | ✅正文 | 自主报告「编号复用」根治 | 11961B R355_自主报告编号复用根治（补丁就绪待批）.md | 根因=编号只扫LIVE树+分配非原子(文件名锁无效+history截断窗读到空→R1);补丁已就绪待批(两树max+1+号码级O_EXCL claim锁+收尾自动sync/inve |
-| R356 | ✅正文 | 规划模式第4批：下一批TODO生成与独立评审 | 11514B R356_生成下一批TODO（规划模式·第4批）.md | 批判读history(323条)+实测取证(本机零备份/数据卷97%仅剩15G/logs 1.7G/llama.cpp 0.4.1在而0权重)→出6条候选交独立subagent评审 |
+| R356 | ✅正文 | 规划模式第4批：下一批TODO生成与独立评审 | 11514B R356_规划模式第4批_下一批TODO生成与独立评审.md | 批判读history(323条)+实测取证(本机零备份/数据卷97%仅剩15G/logs 1.7G/llama.cpp 0.4.1在而0权重)→出6条候选交独立subagent评审 |
 | R357 | ✅正文 | knowledgeC 每日快照落地（零新增定时 + 当日补采） | 12723B R357_knowledgeC每日快照落地.md | 当日补采 18277 对象/13.1MB/verify rc=0（较 09-22 的 17463 对象 +814）；★实测反射脚本不会“放进目录就生效”（各需专属 plist）⇒  |
-| R358 | ✅正文 | 备份缺口收口(TODO#0) | 15861B R358_备份缺口收口.md | 实测本机零备份(tmutil=No destinations/无外置盘diskutil仅internal/无云客户端/~/Library/LaunchAgents无备份类);数据卷 |
+| R358 | ✅正文 | 备份缺口收口(TODO#0) | 15861B R358_backup_gap_closure.md | 实测本机零备份(tmutil=No destinations/无外置盘diskutil仅internal/无云客户端/~/Library/LaunchAgents无备份类);数据卷 |
 | R359 | ✅正文 | 日志体量治理dry-run+待批清单 | 9042B R359_日志体量治理_dryrun与待批清单.md | logs/=1.7GiB,四长跑日志净可回收≈1.55GiB(helper从不触碰这些大文件);launch_gui.log=1.13GiB孤儿死日志(无任何plist引用,冻结自 |
 | R360 | ✅正文 | 本机本地推理解锁 | 7314B R360_本地推理解锁.md | 跑通1.5B/3B本地推理(llama-server,1.5B=157MB/77.6tok·s);消费者:trendradar预筛丢88%≈省7420tok/次调用,但haisou |
 | R361 | ✅正文 | 2026-09-23 | 10646B R361_静默失败待批修复包.md | 工程 ｜ 静默失败「待批修复包」：x_ai_intel_daily + eia_weekly ｜ 出两个可独立批准的补丁：①prompt 标记化（启动前只读前置检查→PRECHEC |
@@ -381,3 +381,8 @@
 | R370 | ✅正文 | 生成下一批TODO（规划模式·第6批） | 14704B R370_规划模式·第6批TODO.md | 批判读history+7条候选经独立subagent评审(8/8/7/6+1替换)→定稿5条入TODO.txt；删①检索式回忆v2/⑤公益站抽检/⑦网盘台账；反证R364「uv锁被 |
 | R371 | ✅正文 | kc 快照字段可用性矩阵 + 补采口径 | 25616B R371_kc快照字段可用性矩阵与补采口径.md | 完成：16 表/9 有料（ZOBJECT 27/37 列、结构化元数据 17/239 列）；分析代价毫秒级（全表 group by 66.5ms、近 7 天双查询 3.4/4.9m |
 | R372 | ✅正文 | uv 缓存 21G 安全回收 + 锁归因重验 + 收口 C45 | 17053B R372_uv 缓存 21G 安全回收+锁归因重验+收口 C45.md | 完成：~/.cache/uv 21.0G→6.3G（两阶段删 435 个非在用 archive 条目，du 实证 -14.7G；df 仅 +3Gi 的差额由并发写吃掉，iostat |
+| R373 | ✅正文 | 历史低价值模式量化 v1 | 18444B R373_历史低价值模式量化 v1.md | 完成：temp/history_value/{parse.py,score.py} 把 history.txt 341 条(R1-R372,缺号31) 解析为 entries/sc |
+| R374 | ✅正文 | 记忆订正登记（R366 十一处）+ 索引新鲜度只读探针 | 13614B R374_记忆订正登记与索引新鲜度只读探针.md | 完成：R366 的 10 个条目块（其自称"十一处"系按分类计数、B1 双计）逐条登记为台账 C53–C62；复验更正 2 条——B1「rg 默认搜 temp 得空」被实测推翻（默 |
+| R375 | ✅正文 | temp/ 耐久耦合清账（6 个 enabled 定时任务） | 15314B R375_temp耐久耦合清账.md | 沙盒演练（3 cwd × 原样/修复）取证 + 负控 3/3：weekly_report_reminder 的 ../temp 在 cwd=repo 根必失败 rc=2、effic |
+| R376 | ✅正文 | 规划模式·第7批TODO生成 | 15788B R376_规划模式第7批TODO生成与独立评审.md | 两轮subagent评审(8/7/7/6/6/6入选；淘汰4分能力清单、5分13断链)⇒6条TODO落盘；三处首稿数字复测订正；附ga_api_server崩溃循环坐实 |
+| R377 | ✅正文 | zsh 历史画像 → 别名/包装脚本落地 | 19013B R377_环境-zsh历史画像到别名落地.md | 10005条历史画像:cd 占208471字符(38.8%)=最大成本项;落地 ~/.zsh_ga_aliases(11条实测别名+2函数,守卫式/零密钥/幂等),zsh 逐个 t |
