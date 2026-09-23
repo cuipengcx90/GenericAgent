@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-23
-- 正文已恢复: 101 / 索引可见 358 个编号
+- 正文已恢复: 111 / 索引可见 368 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -366,3 +366,13 @@
 | R356 | ✅正文 | 规划模式第4批：下一批TODO生成与独立评审 | 11514B R356_生成下一批TODO（规划模式·第4批）.md | 批判读history(323条)+实测取证(本机零备份/数据卷97%仅剩15G/logs 1.7G/llama.cpp 0.4.1在而0权重)→出6条候选交独立subagent评审 |
 | R357 | ✅正文 | knowledgeC 每日快照落地（零新增定时 + 当日补采） | 12723B R357_knowledgeC每日快照落地.md | 当日补采 18277 对象/13.1MB/verify rc=0（较 09-22 的 17463 对象 +814）；★实测反射脚本不会“放进目录就生效”（各需专属 plist）⇒  |
 | R358 | ✅正文 | 备份缺口收口(TODO#0) | 15861B R358_备份缺口收口.md | 实测本机零备份(tmutil=No destinations/无外置盘diskutil仅internal/无云客户端/~/Library/LaunchAgents无备份类);数据卷 |
+| R359 | ✅正文 | 日志体量治理dry-run+待批清单 | 9042B R359_日志体量治理_dryrun与待批清单.md | logs/=1.7GiB,四长跑日志净可回收≈1.55GiB(helper从不触碰这些大文件);launch_gui.log=1.13GiB孤儿死日志(无任何plist引用,冻结自 |
+| R360 | ✅正文 | 本机本地推理解锁 | 7314B R360_本地推理解锁.md | 跑通1.5B/3B本地推理(llama-server,1.5B=157MB/77.6tok·s);消费者:trendradar预筛丢88%≈省7420tok/次调用,但haisou |
+| R361 | ✅正文 | 2026-09-23 | 10646B R361_静默失败待批修复包.md | 工程 ｜ 静默失败「待批修复包」：x_ai_intel_daily + eia_weekly ｜ 出两个可独立批准的补丁：①prompt 标记化（启动前只读前置检查→PRECHEC |
+| R362 | ✅正文 | 2026-09-23 | 9070B R362_Chrome历史URL只读挖掘.md | 环境/产出 ｜ Chrome 历史 URL 只读挖掘 ｜ 12,377 唯 URL/31,498 访问(2026-06-25→09-23 正好 90 天滚动);口径: 至少 21. |
+| R363 | ✅正文 | 2026-09-23 | 7547B R363_规划模式·第5批TODO（含独立评审）.md | 产出 ｜ 生成下一批TODO（规划模式·第5批） ｜ 批判读 history(60/362 条)+盘点 memory 85 L3/报告 133 md 后出 6 条候选,经独立 su |
+| R364 | ✅正文 | 磁盘可再生空间回收实测 | 9448B R364_磁盘「可再生空间」回收实测.md | 实收12.7GB(avail 9.5G→20G,数据卷98%→96%):pnpm store prune 4.43G/npm cache 2.80G/updater包2.09G/C |
+| R365 | ✅正文 | 待批台账第2批增量(C19–C47)与超期查询 | 22796B R365_待批台账第2批增量与超期查询.md | 29条散落待批(11份报告 R349–R364)并入既有 R342 台账,共60条未决/最老1天/≥7天0条;新增只读查看器 temp/pending_decisions/view |
+| R366 | ✅正文 | 记忆「过时与矛盾」审计（只提案不改memory） | 16760B R366_记忆过时与矛盾审计.md | 11 处发现（过时4/矛盾3/冗余3/风险1，全部不在 C1–C47 内）+3 处复核准确；关键：rg「未装」为假（15.1.0 可用，静默空真因=.gitignore 忽略 te |
+| R367 | ✅正文 | trendradar预筛离线影子A/B(1.5B) | 10344B R367_本地推理的第二消费者实测：trendradar 预筛「离线影子 A_B」.md | 不接:V5压缩72%但误杀59.4%(hot_kw通道66.7%);V1误杀3.1%但只压缩4.9%;GT理论可丢仅36.4%(R360的88%为未校验口径) |
+| R368 | ✅正文 | 缓存「回收脚本化 + 重建验证」 | 15174B R368_磁盘「可再生空间」回收工具化_cache_reclaim.md | tools/cache_reclaim.py(默认dry-run/20项分档/红线);apply实收1.46GiB(pnpm-store)+T0 sha不变;pnpm与playwr |
