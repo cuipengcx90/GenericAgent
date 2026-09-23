@@ -46,6 +46,14 @@ python3 -m py_compile ../project_update_monitor/monitor.py
 ## 通知与调度
 定时定义放 `../sche_tasks/`。调度间隔建议 `every_6h`，`max_delay_hours` 不大于 8。通知只走已配置的飞书私信、飞书群和钉钉群通道；报告生成与质量校验完成后仅推送一次，避免不同入口重复发送。每次成功检查均用一张飞书交互卡片按 `sources.json` 顺序完整列出全部项目（数量随来源表增删自动变化）：版本标识有变化的项目显示精简中文摘要、更新建议与 Release/Commit 链接；无变化项目只显示"与上次推送相比无版本更新"和当前版本，禁止重复转发长英文原文。采集异常时不发送可能遗漏项目的正常状态卡，避免误报。人工验收/本地预览严禁携带 `--notify` 对真实通道试探，验证一律走只读快照对比。
 
+## exit=2 诊断（2026-09-23 实测沉淀）
+`exit=2` 真实语义（代码级）：本轮 `errors` 非空 → **不建卡、不推送**（L316），且 `can_commit` 为假 → **基线不推进**（L311）。基线即通知幂等键，故 exit=2 = "本轮不出卡"，**不是丢数据**：下一周期会把同一批更新重新报告（绝不静默）。
+- 常见真因：**本机 codex exec 翻译冷启动超时**（`_translate_to_chinese()` 内部 `timeout=120`）。实测单项热态需 ~104s（Paseo），冷态首调直接 >120s → `TranslationError` → 整轮 all-or-nothing 不出卡。GitHub 配额通常没问题（2026-09-23 实测 remaining 4971/5000、8 源 releases API 全 ~1s 200）。
+- 诊断三步（全部零副作用）：①`gh api rate_limit --jq .resources.core` + 逐源 `releases?per_page=1` 快速排除限流；②**不带 `--notify`** 跑 `monitor.py`（不推送、不落盘基线），异常明细在 stderr 的「## 采集异常（未覆盖既有基线）」段；③查 `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` 的起始与末次写入时间，判断翻译调用是否被 120s 内超时掐断。
+- 运行特征坑：脚本全程静默、**结束才一次性打印**；单轮（8 源快照 ~45s + 3 次翻译）可达 **~4 分钟**，用 60s/180s 的工具超时会误判为"卡死"。须后台起 + 轮询。**macOS 无 `setsid`、无 `timeout` 命令**：用 `subprocess.Popen(..., start_new_session=True)` 起后台并立即返回；逐源诊断限时用 `signal.alarm`。
+- 自测陷阱：用 `signal.alarm` 包 `report()` 时抛出的 `TimeoutError` 会被 `except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError)` 吞成 `TranslationError: ... TimeoutError: internal timeout`——**这是脚手架假象而非脚本真错**，别据此下结论（2026-09-23 实际踩到）。
+- 未根治项（提案，属改自身源码需请示）：给翻译调用加"首调放宽超时 / 失败重试 1 次"，避免单个翻译超时导致整轮不出卡。
+
 ## 卡片图标规范
 为提升可读性，卡片固定使用以下图标前缀（改动集中在 `monitor.py` 的 `classify`/`project_card_element`/`build_notification_card`）：
 - 标题：🚀 重点项目更新监控；汇总行：有更新用 🔔，全部无更新用 📊。
