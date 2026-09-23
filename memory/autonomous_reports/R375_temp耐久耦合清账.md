@@ -42,10 +42,11 @@
 1. **cwd 由 launchd 决定**：`plutil -p ~/Library/LaunchAgents/com.cuip.genericagent-scheduler.plist` ⇒ `WorkingDirectory => /Users/cuip/projects/GenericAgent`（`com.cuip.genericagent-autonomous.plist` 同值）⇒ 今天定时任务的 cwd **就是 repo 根**。
 2. **派发链不改 cwd**：`grep -rn 'chdir' agentmain.py reflect/scheduler.py reflect/autonomous.py` ⇒ 无输出。
 3. **temp/ 不入库**：`.gitignore` 第 1、2 行 = `temp/`、`tmp/`；`git check-ignore -v temp/TODO.txt` ⇒ `.gitignore:1:temp/	temp/TODO.txt`。⇒ 放进 `temp/` 的脚本与产物**不入 git**，任何一次 temp 清理即永久灭失。
-4. **残留物证（A 类落点漂移确曾发生）**：`temp/temp/` 真实存在且含 60+ 项历史文件，其中 `temp/temp/efficiency_report_latest.json`（mtime 2026-09-23 09:43）——正是「cwd=repo/temp 时 `./temp` 被解释成 `temp/temp`」的产物。注意：该目录多数文件来自其它历史脚本，**本报告只用它证明该类漂移确实发生过，不逐文件归因**。
+4. **残留物证（A 类落点漂移确曾发生）**：`temp/temp/` 真实存在且含 60+ 项历史文件，其中 `temp/temp/efficiency_report_latest.json`（`ls -la` 实测 mtime 2026-09-20 14:41，早于本会话 ⇒ 非本会话产物）——正是「cwd=repo/temp 时 `./temp` 被解释成 `temp/temp`」的产物。注意：该目录多数文件来自其它历史脚本，**本报告只用它证明该类漂移确实发生过，不逐文件归因**。
 5. **`../temp` 的越界后果**：`~/projects/temp` **不存在**（`ls -d /Users/cuip/projects/temp` ⇒ NOT_EXIST）⇒ cwd=repo 根时 `../temp/get_week_range.py` 必然找不到（§5 有 rc=2 的 stderr 原文）。
 6. **脚本侧同样吃 cwd**：`temp/efficiency_monitor.py` 内含 `Path('./sche_tasks/done')`、`Path('./temp/bridge_autonomous.py')` 与 `./logs`、`./temp/...` 等相对路径（详见 §7 L2）。
 7. 全仓 `sche_tasks/*.json` 共 22 个，其中 **enabled=18**；本轮只清 TODO 指定的 6 个。
+8. **待批台账自身也住在 `temp/`**：`git ls-files temp/pending_decisions/DECISIONS.md` ⇒ 空（NOT TRACKED），`git check-ignore -v ...` ⇒ `.gitignore:1:temp/`。⇒ C1–C65 全部待批项与全部决策留痕同 `temp/` 一处灭失风险下方（本轮新增 C65 同样在其中）；建议单列一项（C66）讨论「台账迁出 temp/」。
 
 ## 4. 演练装置（零副作用边界与保真处理）
 
@@ -133,3 +134,5 @@ rc 取值逐 cwd 顺序 = `repo 根` / `repo/temp` / `elsewhere`。
 拟在 L1「定时/自主/反射」段追加一句（约 130 字，刻意保持极简）：
 
 > temp/ 耐久耦合清账：6 个 enabled 任务中仅 2 个真吃 cwd——weekly_report_reminder 的 `../temp` 在 cwd=repo 根（launchd WorkingDirectory 实值）下必失败 rc=2，efficiency_monitor_daily 的 `./temp` 在 cwd=repo/temp 时写进 temp/temp/ 落点漂移；prompt 头插 `GA_ROOT` 锚定行可修（沙盒 3 cwd 实测 rc=0 落点一致），但「脚本/产物住在 gitignored 的 temp/」才是耐久缺口（负控：移走 temp/ 三条命令 3/3 失败）⇒ 合并为台账 C65，承接 C19/C23/C32；详见 R375。
+
+补充（同上为待批）：台账 `temp/pending_decisions/DECISIONS.md` 不在版本控制内（见 §3 第 8 条），建议在 C65 之外单列 **C66 = 待批台账迁出 `temp/`（或加一道自动快照到 `memory/`）**；本报告只登记，不实施。
