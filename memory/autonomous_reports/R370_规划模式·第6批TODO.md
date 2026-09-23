@@ -82,3 +82,14 @@
 2. **R359–R368 共 10 份归档正文在 git 中仍是 untracked**：durable 副本只存在于工作区、未被版本化（本轮新增的 R369/R370 已随本批一并提交）。收尾链见 `temp/pending_decisions/README.md`（含 `git add`/`commit` 步骤）。
 3. **README 明确踩坑**：该目录里是 `history.md`（不是 `history.txt`），`git add` 写错名字会让整条 `&&` 链静默中断、提交不发生——本批提交已按此名执行并逐条核对。
 4. 归档同步后的自检口径：live 与 durable 的 history 头三行均为 `370/369/368`、`sync` 预览 0 项待同步、live 目录编号无重复（durable 的历史同号见第 1 条，非本批产生）。
+
+## 9. 记忆更新实际执行清单（本轮已落盘，区别于 §5 的待批建议）
+
+本节只列**已实际写入**且经工具核验的记忆改动；§5 中涉及价值判断/口径变更的建议仍未执行、仍待批。
+
+1. `memory/global_mem.txt` §[报告索引系统]（3 行）：
+   - 删去写死的「389行/14954字符」「237份报告 (R0-R230)」等**易变数值**，改为「以 INDEX.md 实时为准」（L0 公理 3：禁存易变状态）。
+   - 新增「★编号权威」行：现装 helper（`memory/autonomous_operation_sop/helper.py`）的 `_next_report_number()` **只**读 live `temp/autonomous_reports/history.txt` 取 `max(R)+1`（本轮逐行读源码取证）⇒ 跳过 `complete_task` 的产物不占号，其他会话复用同号即重号；修复版 = `temp/helper_patched.py`（双树扫 history+文件名 + `_num_taken`），**未应用**。
+   - 新增「归档收尾链」行：live temp(gitignore) → `sync --apply` → `inventory --apply`（重建 INDEX.md+history）→ durable `memory/autonomous_reports`（git 跟踪，history.md 与 history.txt 两份并存，均被跟踪）→ `git add INDEX.md history.md R<NNN>_*.md` + commit。
+2. `memory/global_mem_insight.txt`「定时/自主/反射」行末追加关键词：`自主报告归档=temp→memory双份(...);编号权威=live history.txt,跳complete_task必重号`（L1 只加关键词，未搬细节）。
+3. **未提交**：`memory/global_mem.txt` 位于 `.gitignore:55 memory/**` 之内（`git check-ignore` 实证），本就不入 git；`global_mem_insight.txt` 虽被跟踪，但工作区同时含**其他并行会话**未提交的改动（如「仓库路径」行的 Multica 原料入仓段），为避免替他会话代提交，本轮不对其执行 commit。
