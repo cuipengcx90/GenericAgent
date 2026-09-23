@@ -42,3 +42,11 @@ max_delay_hours（可选，默认6）：超过schedule多少小时后不再触�
 - `schedule` 必须是字符串如 `"08:00"`，不能是数字（整数/浮点均报错）
 - `repeat` 数字部分只支持整数：`every_1h` ✅，`every_0.5h` ❌（int()解析报错）
 - `repeat: "interval"` 无效，不会报错但会fallback到默认冷却，导致任务永不触发
+
+---
+
+## ★收尾提交坑（2026-09-23 实测）：`sche_tasks/done/` 被 `.gitignore` 忽略
+
+- **症状**：`git add memory/xxx.md sche_tasks/done/2026-09-23_1830_yyy.md && git commit -m '...'` 整条**什么都不做**——`git add` 因路径被忽略而 **rc=1**（stderr：`The following paths are ignored by one of your .gitignore files: sche_tasks/done`），`&&` 短路 ⇒ commit 从不执行；而 `git commit -q` 静默更让人误以为已提交。
+- **判据**：`git status --porcelain <记忆文件>` 仍显示 `M ` （首列 M=已暂存未提交）或 `git log --oneline -1` 没变 ⇒ 提交没发生。
+- **正确姿势**：**只 add 记忆文件**（报告不入 git 是既有约定）；如需强制可 `git add -f`（一般不必）。收尾核验固定看 `git log --oneline -1` 的哈希，别只看有无报错。
