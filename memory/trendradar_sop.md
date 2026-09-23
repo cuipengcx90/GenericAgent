@@ -201,3 +201,19 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - **数字（29 个已封盘日 08-24~09-21）**：A 整串=0；B 逐词 pair 口径 **1384**（与 R343 同区间 1384 完全对齐）；按标题去重 1283（44.2/天，单日最高 73，零命中 0 天）；词边界口径 1174 ⇒ 子串误召回 109（8.5%，如 `AI` 命中 `AIM-424`）；与当日 RSS 供给**仅重合 1 条**（净新增 1253=99.9%）；成本 ≈400 token/天（泛词命中占 68.4%，平均标题 25.5 字）。
 - **★口径坑（复算必守）**：①R343 的 `token_union` 口径＝**按 `(query, title, platform)` 计数**（同题跨平台算多条），按标题去重会少 7.3%，对账时必须 `--pair-mode` 才逐日逐词全等。②**当日 DB 仍在写入**（TrendRadar 平台持续抓取），拿今天做复算会与历史快照差出几十条 ⇒ 比历史数字必须**剔除当日**。
 - **风险面**：`limit=30` 实测 17 次(query·天)触顶、按现状会丢 180 条(13.2%)；生产 KEYWORDS/limit 属生产配置，改动需批准（本轮未动）。
+
+
+---
+
+## §15 晚报实测（2026-09-23）：本机启动法 / 重试判读 / 新残留 `Then sections.`
+
+- **本机（macOS）没有 `setsid`**：§14 里 `setsid nohup …` 的写法在本机直接失效（日志仅 37 字节 `bash: setsid: 未找到命令`，任务根本没起）。**可用两法**：
+  - 首选 `subprocess.Popen([...], stdout=open(log,'w'), stderr=subprocess.STDOUT, stdin=DEVNULL, start_new_session=True)` —— **秒级返回**，随后 `ps -p <pid>` 轮询；
+  - 或 `nohup python3 -u script.py </dev/null >log 2>&1 & disown`。
+  - ⚠️ **"包装器超时 ≠ 任务失败"**：用 `subprocess.run(["bash","-lc",cmd], capture_output=True)` 包这条命令时，包装器自身会挂满 timeout 被强杀，但 `& disown` 的后台子进程照跑完 ⇒ **判结局必须回查日志 + `pgrep`**，不能凭包装器退出码下结论。
+- **本轮实测链路（evening，18:30 起）**：启动→锁 `evening_2026-09-23.lock`→约 2 分钟完成→`sent: true / chars 4290 / sha256 d7228c3f…`→三通道 `feishu_dm·feishu_group·dingtalk_group` 全 `ok`→state 写 `2026-09-23:evening`→锁释放→无残留进程。产物 `output/trendradar_evening_2026-09-23.txt`（7994 B / 137 行）。
+- **★重试判读坑**：日志**只为失败打行**（`[run] report quality failed, attempt N/4: …`），成功不打行。本轮 attempt 1/4、2/4 都报 `report too short: 1491/1502 chars`，**第 3 次成功产出 4290 字符**（`chars` 取自最终成功稿）。⇒ 看到 attempt 失败**不等于**将降级；降级与否看最终 JSON 有无 `degraded_send`、`skipped` 是否为 false。CoT 过滤本轮正常：`已过滤标题后 1→3 行` + `已过滤 6163→11280 字符前置草稿`。
+- **★新残留形态：正文首部英文回声 `Then sections.`（2026-09-23 晚报首例）**：报告 1 行标题、**3 行出现孤立英文行** `Then sections.`，夹在标题与首个分类标题之间。**已随 sha256 推送出去**；查近 12 份 TrendRadar 产物**仅此 1 例**（晨报 09-23、晚报 09-22/21/20/18/17 等全 0）⇒ 偶发、非稳定回归。
+  - **根因（策略盲区）**：正文起点策略是「取**最后一个**分类标题出现处」⇒ 只能剥掉**标题之前**的草稿；模型把提示词结构回声成小标题后，该行位于**最后一个标题之后、正文之前**，正好落在盲区。
+  - **建议修法（改源码需先获批准）**：`_validate_report_quality` 增「正文头部孤立纯 ASCII 短行（≤40 字符、无中文、不以 ▸ 开头）」探针，命中即重试；或把 `_cot_head_hits` 的检测窗从"前 900 字"扩到"首个分类标题后前 3 个非空行"。
+- **附：锁目录卫生**：`output/.trendradar_locks/` 存有 8 个历史僵尸锁（`evening_2026-07-28/08-16/08-18/08-19/08-21/08-22`、`morning_2026-08-20/09-05`）。锁名带日期 ⇒ **不影响当日运行**；如清理须先按 §14 用锁内 `pid=` 逐个判活（这些进程均已不存在）再删。
