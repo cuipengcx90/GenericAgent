@@ -375,4 +375,4 @@
 | R365 | ✅正文 | 待批台账第2批增量(C19–C47)与超期查询 | 22796B R365_待批台账第2批增量与超期查询.md | 29条散落待批(11份报告 R349–R364)并入既有 R342 台账,共60条未决/最老1天/≥7天0条;新增只读查看器 temp/pending_decisions/view |
 | R366 | ✅正文 | 记忆「过时与矛盾」审计（只提案不改memory） | 16760B R366_记忆过时与矛盾审计.md | 11 处发现（过时4/矛盾3/冗余3/风险1，全部不在 C1–C47 内）+3 处复核准确；关键：rg「未装」为假（15.1.0 可用，静默空真因=.gitignore 忽略 te |
 | R367 | ✅正文 | trendradar预筛离线影子A/B(1.5B) | 10344B R367_本地推理的第二消费者实测：trendradar 预筛「离线影子 A_B」.md | 不接:V5压缩72%但误杀59.4%(hot_kw通道66.7%);V1误杀3.1%但只压缩4.9%;GT理论可丢仅36.4%(R360的88%为未校验口径) |
-| R368 | ✅正文 | 缓存「回收脚本化 + 重建验证」 | 15174B R368_磁盘「可再生空间」回收工具化_cache_reclaim.md | tools/cache_reclaim.py(默认dry-run/20项分档/红线);apply实收1.46GiB(pnpm-store)+T0 sha不变;pnpm与playwr |
+| R368 | ✅正文 | 缓存「回收脚本化 + 重建验证」 | 15665B R368_磁盘「可再生空间」回收工具化_cache_reclaim.md | tools/cache_reclaim.py(默认dry-run/20项分档/红线);apply实收1.46GiB(pnpm-store)+T0 sha不变;pnpm与playwr |
