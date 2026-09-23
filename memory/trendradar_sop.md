@@ -161,6 +161,9 @@ import re; matches = re.findall(r'data: (.+)', r.content.decode())
 - 现象：定时任务直接同步跑 `python3 sche_tasks/run_trendradar_digest.py --period morning`，被上层工具 60s/300s 超时打断两次；但底层 python 子进程**不受工具超时影响**，独立跑到 ~13 分钟后（LLM 生成+质量重试链路）才结束，此时锁已被 `finally: _release_lock(lock)` 正常释放，但因中途工具层已"认为"失败，未等到真实产物就返回，未留下 `.txt`/`.failed.txt`。
 - 排障法：锁文件 `output/.trendradar_locks/{period}_{date}.lock` 内容含 `pid=<PID> at=<ISO时间>`；若再次运行时因 `O_EXCL` 拿不到锁，先 `cat` 锁文件取 pid，`ps -p <pid>` 判活——进程已不存在即僵尸锁（前次被工具层打断但子进程已跑完/锁已释放），可安全 `rm` 后重跑；进程仍存在则说明前次仍在跑，不要并发起第二个实例，转为轮询等待。
 - 正确做法：改用 `nohup python3 sche_tasks/run_trendradar_digest.py --period morning > /tmp/xxx.log 2>&1 &` 后台启动拿到 pid，用 `ps -p <pid>` 轮询（每 20-25s 一次）等待进程结束，再读日志判断真实 `sent`/`skipped`/`degraded_send` 结果，避免被工具 60/300s 超时误判为失败而重复触发。
+- ★时长波动极大（2026-09-23 实测）：同一 `--period morning` 单入口，本次 10:40:26→**10:40:47 仅 21 秒**即完成（而 08-06/09-17 等历史记录为 10+ 分钟）。**不要把"秒级退出"当异常**——判据只看三件：日志 JSON 的 `send.skipped`（false=真发）、`sha256` 是否为新值、`output/.trendradar_digest_state.json` 当天键是否落账 + 三通道 `ok:true`，外加产物 `.txt` 独立回读。仍应后台起+轮询（避免被工具超时误判），但轮询间隔无需死等 20-25s，头 1 分钟内发现进程已退出即直接判决。
+- ★CoT 过滤在真链路再次验证（2026-09-23）：日志自报 `⚠️ 已过滤标题后 3 行思考/草稿` + `⚠️ 已过滤 10201 字符的前置思考/草稿（标题共出现 2 次）`，交付 `.txt` 首行直接是 `🌅 **IT情报晨报 · 日期**`、无任何元话语 ⇒ 09-21 的"正文起点多风格并集+前置裁剪"修复对**当日真实模型输出**有效（本次裁剪量与历史最严重污染同量级，若未修复会被整段推送）。
+- 同轮还有 8 个**历史残留锁文件**（2026-07-28～09-05）长期未清理：`_release_lock` 只在正常走完时删，被工具层超时打断的轮次会留下永久孤儿锁。它们**不阻塞**（`O_EXCL` 只锁同名 `{period}_{date}.lock`，历史日期不同名），但会让"锁目录"看起来像有并发。可安全按 pid 判活后批量 `rm`。
 - 代码实测更新（与本文件 §12 旧描述有出入，以此为准）：`run()` 里 `build_report` 实际 `max_attempts = 4`（非旧文档写的 2 次）。第 4 次仍失败时，若失败原因**仅是"内容过短"**（`'too short' in str(e)` 且不含 `missing required parts`/`stream interruption`）且拿到的 `last_report` 非空，会走**降级发送**分支：给正文加 `⚠️（今日素材较少，篇幅低于常规标准，仍完整发送）` 前缀后照常写 `.txt` + `send_once()`，返回 `degraded_send: True`（**非 skipped**，三通道仍会收到）；只有缺失必需结构片段或含流中断标记时才真正 `skipped_bad_report`（写 `.failed.txt`，不发送）。
 
 ## 15. ⚠️ CoT 污染复发（2026-09-21）：模型改用**粗体**分类标题，`^##\s+` 过滤整段失效
