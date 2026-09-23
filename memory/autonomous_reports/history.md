@@ -1,9 +1,10 @@
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
-- 采集: 2026-09-24；行数 345
+- 采集: 2026-09-24；行数 346
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R378 | 2026-09-24 | 产出 | L1/L2 记忆「路径与文件断言」机械核验 | 802 断言 pass586/FAIL180/同名36(只读)；实证订正 5 类(根写错/目录消失/归档落点/已删脚本/temp产物)待批，零改 memory
 R377 | 2026-09-24 | 环境 | zsh 历史画像 → 别名/包装脚本落地 | 10005条历史画像:cd 占208471字符(38.8%)=最大成本项;落地 ~/.zsh_ga_aliases(11条实测别名+2函数,守卫式/零密钥/幂等),zsh 逐个 type 验真;.zshrc 零改动(启用留待批)
 R376 | 2026-09-24 | 产出 | 规划模式·第7批TODO生成 | 两轮subagent评审(8/7/7/6/6/6入选；淘汰4分能力清单、5分13断链)⇒6条TODO落盘；三处首稿数字复测订正；附ga_api_server崩溃循环坐实
 R375 | 2026-09-24 | 工程 | temp/ 耐久耦合清账（6 个 enabled 定时任务） | 沙盒演练（3 cwd × 原样/修复）取证 + 负控 3/3：weekly_report_reminder 的 ../temp 在 cwd=repo 根必失败 rc=2、efficiency_monitor_daily 的 ./temp 在 cwd=repo/temp 落点漂移进 temp/temp/；prompt 头插 GA_ROOT 锚定行实测修复（3 cwd rc=0 落点一致）；真耐久缺口=脚本/产物住在 gitignored 的 temp/ ⇒ 合并台账 C65（承接 C19/C23/C32）；生产 prompt 零改动待批
