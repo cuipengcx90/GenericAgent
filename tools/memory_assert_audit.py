@@ -124,8 +124,9 @@ def context_class(line):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--json", default="temp/mem_assert_audit.json")
-    ap.add_argument("--md", default="temp/mem_assert_audit.md")
+    ap.add_argument("--json", default=os.path.join(REPO, "temp/mem_assert_audit.json"),
+                    help="默认锚定 GA 根（与 cwd 无关）")
+    ap.add_argument("--md", default=os.path.join(REPO, "temp/mem_assert_audit.md"))
     ap.add_argument("--negctl", action="store_true", help="负面控制：3 断链必须 FAIL（含合成夹具注入）")
     ap.add_argument("--include-reports", action="store_true", help="语料扩大到 memory/autonomous_reports/*.md")
     a = ap.parse_args()
