@@ -46,7 +46,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | wechat_moments_publish_sop(隐私尚饮/赞评已通)
 | release_marshal_unattended_sop(bar-smyze发版控制面:三组件preflight/state_controller/release_control确定性Stage状态机;权威在SKILL.md;Stage7不可逆硬阻断+attest-deployed受控回接7.5;✅2026-09-21用真执行PA(非桩)真跑通-1→10全13Stage含7.5/9/10无人值守段,28/28通过;旧"仓库测试全绿"实为内联桩PA伪造4个required脚本exit_code=0从未真跑;演练工具=GA temp/rm_real_pa.py+drill_rm_unattended.py+rm_fixture.py,尚未落仓库)
 | feishu_card_troubleshooting_sop(飞书卡片卡死:长任务50-60步后卡片停更/任务显示"进行中"不动/非得说"继续";先分类A卡片体积超限(日志`Failed to create card content` 200800,实测超限点58步×均值272字符) vs B code_run长sleep静默(ps见sleep子进程),两类修法不同;含排查命令与5条关键坑)
-L4: L4_raw_sessions/
+L4: L4_raw_sessions/(原文检索=tools/l4_search.py:流式3.5s扫6zip/415成员/623MB零解压,search/show/grep-file/list/selftest;默认大小写不敏感,与grep对账带--case-sensitive)
 
 [RULES]
 1. 搜索先行: 优先cwd；搜文件名先es；网页搜索只用google；本机rg未装(搜索静默返回空!)→用grep
