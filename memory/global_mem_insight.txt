@@ -1,5 +1,5 @@
 # [Global Memory Insight]
-浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF blob/跨域iframe/CDP;tab id失配报"No tab with given id"→真实id用CDP桥`{"cmd":"tabs"}`取;新开tab无内容脚本须CDP Page.navigate+Runtime.evaluate)
+浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF blob/跨域iframe/CDP;tab id失配报"No tab with given id"→真实id用CDP桥`{"cmd":"tabs"}`取;新开tab无内容脚本须CDP Page.navigate+Runtime.evaluate;★Chrome后台态0窗口⇒扩展SW不唤醒、驱动无会话(web_scan与CDP tabs双空=真无tab,单空=陈旧):osascript建窗+导航任意URL≈3s唤醒)
 键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py | ocr_vision.swift(macOS原生Vision本地OCR,中英混合,离线免费~2s/图,`swiftc -O -o ocr_vision ocr_vision.swift`;实测291图3分钟,API逐张需4.6小时)
 密钥/配置: keychain.py | keychain_sop | codex CLI(~/.codex/config.toml: [tui] resume_cwd="current|session" 免resume选目录菜单;真机A/B已证;另codex会自写projects信任项;★隔离必401(走config自定义provider)⇒只能吃用户配置)
 MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)

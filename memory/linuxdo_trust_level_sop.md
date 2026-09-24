@@ -42,5 +42,7 @@
 
 **备用入口的实操路径(2026-09-22 实测，绕开 tab id 失配)**：本机 `web_scan` 返回的 tab id 可能与真实 tab 不一致(报 `CDP fallback failed: No tab with given id`)→真实 id 用 CDP 桥取 `{"cmd":"tabs"}`；在任一真实 id 的 tab 上 `window.open('https://linux.do/','_blank')` 后，**新 tab 无内容脚本、注入会回落到活动 tab**，故导航与读取一律走 CDP：`{"cmd":"cdp","tabId":<新id>,"method":"Page.navigate","params":{"url":"https://linux.do/"}}` → 读正文 `{"cmd":"cdp","tabId":<新id>,"method":"Runtime.evaluate","params":{"expression":"document.body.innerText","returnByValue":true}}`(取 `result.value.value`，可先在表达式里定位"要求"关键字切片)。收尾 `window.close()`(CDP tab 级 `Page.close` 不可用)，关闭后 `tabs` 列表可能仍是陈旧快照，需再查一次确认。(细节坑见 tmwebdriver_sop「通用特性」)
 
+**⚠️ 起始无窗口/无会话(2026-09-24 实测，关掉最后一个 tab 后次日必现)**：Chrome 后台态 0 窗口 ⇒ `web_scan(tabs_only)` 空 **且** CDP 桥 `{"cmd":"tabs"}`/`/link get_all_sessions` 也空(两者都空=真无 tab) ⇒ 驱动扩展 SW 未被唤醒。恢复：`osascript -e 'tell application "Google Chrome" to make new window'` + `osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "https://linux.do/"'`（导航触发页面加载唤醒 SW，约 3 秒后 `/link get_all_sessions` 出现 `type=ext_ws` 会话），随后按常规路径读「要求」等级卡即可(本次首读即放行，未再走 2–3 分钟 CF 等待)。判据/细节见 tmwebdriver_sop「连不上排查」⓪。
+
 ## 故障排查留档建议
 CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如 `sche_tasks/done/*_linuxdo_trust_level_check.md`)，避免下次重复试错。

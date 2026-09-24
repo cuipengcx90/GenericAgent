@@ -137,6 +137,7 @@ web_execute_js script='{"cmd": "batch", "commands": [...]}'
 
 ## 连不上排查
 web_scan失败时按序排查（自动检测优先，用户参与放最后）：
+⓪**浏览器在跑但窗口数=0**(2026-09-24 实测，本机最常见)：Chrome 后台态(`--no-startup-window`)无任何页面 ⇒ MV3 扩展 `tmwd_cdp_bridge` 的 service worker 不被唤醒 ⇒ 不连 `ws://127.0.0.1:18765`。判据：`web_scan(tabs_only)` 与 CDP 桥 `{"cmd":"tabs"}` **双空**才算真无 tab(只有一个空=陈旧快照，勿误判)。恢复两步：①`osascript -e 'tell application "Google Chrome" to make new window'`(仅建窗不够：只建窗后 20s 内仍无会话) ②`osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "<任意http地址>"'` 触发页面加载唤醒 SW，**约 3 秒** `/link get_all_sessions` 即出现 `type=ext_ws` 会话。★代价提示：主动关掉最后一个 tab 会让下一任务必现此状态。
 ①浏览器没开？→检查浏览器进程是否在跑(tasklist/ps)，没有则启动并打开正常URL（⚠about:blank等内部页不加载扩展）
 ②WS后台挂了？→本机18766端口没监听即dead→手动**后台持续运行**`from TMWebDriver import TMWebDriver; TMWebDriver()`起master
 ③扩展没装？→读Chrome用户目录下`Secure Preferences`→`extensions.settings`中找`path`含`tmwd_cdp_bridge`的条目
