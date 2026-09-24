@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-24
-- 正文已恢复: 127 / 索引可见 385 个编号
+- 正文已恢复: 128 / 索引可见 386 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -394,3 +394,4 @@
 | R384 | ✅正文 | L1 索引瘦身草案(73行/17879tok→27行/1216tok,-93.2%)+三重零丢失自证+子代理A/B(15/15 vs 15/15)+tools/l1_budget.py(负控4/4);memory零改动,2条待批 | 12340B R384_L1索引瘦身与token预算校验器.md | L1 索引瘦身草案(73行/17879tok→27行/1216tok,-93.2%)+三重零丢失自证+子代理A/B(15/15 vs 15/15)+tools/l1_budget. |
 | R386 | ✅正文 | R386 待批台账 TOP-N 排序器 | 9517B R386_待批台账 TOP-N 排序器(view_pending --top).md | view_pending --top 就绪：影响面/阻塞度/可逆性/风险/积压五项打分+一屏Markdown+集中度与边界同分提示；只读(台账sha1前后一致)、负控3/3、原5模 |
 | R385 | ✅正文 | 磁盘98%复发归因_索引增量与df抖动判据 | 12437B R385_磁盘98%复发归因_索引增量与df抖动判据.md | 定位单点=IDEA索引单次重建9.86GiB(09-24 10:27)+df分钟级抖动(churn)非真增长;顶层du构成+5条处置台账待批;零删除(只读 |
+| R387 | ✅正文 | 小众工具实测 R387 | 21924B R387_冲浪-小众工具实测(BasicMemory+Hammerspoon).md | Basic Memory 0.23.2（CLI 21 工具 + codex/claude 双端 MCP 真调用 + 中文向量检索命中）与 Hammerspoon 1.1.1（bre |
