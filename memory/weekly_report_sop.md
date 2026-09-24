@@ -98,6 +98,13 @@ Sam，您好：
 - 周报必须基于**上周已发送成功**的周报邮件继续 reply，不能基于历史错误草稿或废弃 reply
 - 若用户要“追加回复”效果，必须使用 `set_reply_body` 保留 `has_quoted_content=true` 的引用块；误用 `set_body` 会把 reply 变成仅剩新正文
 - **【实锤·2026-09-11】patch 的 `set_reply_body` 只认内联 `value`（HTML 字符串），写 `value_file` 字段会被 lark-cli 静默忽略**：当次用 `{"op":"set_reply_body","value_file":"weekly_body.html"}` 打补丁，回执 `ok:true` 无报错，但正文根本没写进去——线上 `verify --draft-id` 检出 `my_content_len=12`（仅剩包装标签）、5 项内容 FAIL 被拦截。根治：patch 里必须把 HTML 读进来内联到 `value` 字段（`json.dump` 序列化），禁用任何 `*_file` 变体；打完补丁**必须**再跑线上 `verify --draft-id`，凭 `my_content_len` 与 ALL PASS 确认正文真的落库，不能只看补丁回执 `ok:true`
+- **【实锤·2026-09-24】lark-cli 三个参数硬约束（各白跑一轮，务必先按此写命令）**：
+  - `mail +reply --body-file` / `+draft-edit --patch-file` **只接受 cwd 内相对路径**（`./weekly_body.html`）；传绝对路径报 `validation/invalid_argument: --file must be a relative path within the current directory`（`--body-file` 还支持 `-` 走 stdin）
+  - `im +chat-messages-list --page-size` **上限 50**（写 100 报 `must be between 1 and 50`）；分页读 `data.messages` + `data.has_more` + `data.page_token`，循环翻页直至 `has_more=false`（本周软件智能化小组-内 184 条 = 4 页）
+  - 群消息一律走 `+chat-messages-list`（外部群/研发组本周实测 0 条要**照实写进报告**，`ok:true` 即正常空、非权限异常）
+- **【实锤·2026-09-24】工具真实落点与读取命令**：生成器/校验器实际都在 **GA `temp/`**（`temp/weekly_report_verify.py`、`temp/weekly_report_gen.py`，gitignored ⇒ 属 C65 耐久缺口，勿在 `tools/` 下找）；跑法 `cd <GA> && python3 temp/weekly_report_verify.py --draft-id <ID> --exec-date <YYYY-MM-DD>`，rc=0 且末行 `=== ALL PASS ✅ ===` 才算过。读草稿**没有** `mail +drafts get`，用 `lark-cli mail user_mailbox.drafts get --params '{"user_mailbox_id":"me","draft_id":"<ID>"}'`（只给 `--draft-id` 会报 `missing required path parameter: user_mailbox_id`）
+- **【本周实测证据·2026-09-24】**：`rc=0`，`full_len=228830 my_content_len=13817 subject='Re: 【周报】-崔朋（2026.09.21 - 2026.09.24）' delivery_to=['sam.zhang@smyze-ch.com'] thread_id='MWQ4NGU5ZjYtMzg3OS00N2NkLWIyMDktYWY1NjUwZWU4MzFk' in_reply_to=None`（reply 线程判据取 `thread_id != message_id`，此处成立），12 项全 PASS
+- **【实锤·2026-09-24】收尾无需 git 提交**：周报产物 `temp/content.json`/`temp/weekly_body.html`/`temp/weekly_patch.json` 与完成报告 `sche_tasks/done/` **都在 .gitignore 内**（`sche_tasks/done/` 见 .gitignore:157），`git add` 会被静默拒绝 → 不要为"提交报告"白跑一轮；本任务闭环判据＝草稿 ID + `verify --draft-id` ALL PASS + 私信 `code=0`
 - **【版式根治·2026-07-10】格式反复出错的真因＝我每次徒手写 HTML，靠"记住 SOP 文字"必漂移。文字规范不是控制力，代码才是。已把版式变成可执行工具链，以后禁止徒手写正文 HTML：**
   - 生成：`weekly_report_gen.py content.json -o weekly_body.html` —— LLM 只产 content.json（纯内容数据，schema 见脚本顶部），HTML 每层包裹标签由脚本固定，无法漂移
   - 校验：`weekly_report_verify.py --draft-id <ID>` —— 发用户前的强制闸门，机械检查：加粗数字标题/真`<ul>`列表/无`（一）`中文括号编号/无手打`•`/引用块保留/主题全角括号+Re空格/**引言干净一行(『工作汇报。』与『一、』之间禁任何导语)**/**投递安全(To 精确等于 sam.zhang@smyze-ch.com、禁止 peng.cui@smyze.cn、必须有 reply 线程证据)**；ALL PASS(退出码0)才可通知，任何 FAIL 先修正
