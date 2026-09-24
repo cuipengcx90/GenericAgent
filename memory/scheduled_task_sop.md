@@ -37,6 +37,7 @@ max_delay_hours（可选，默认6）：超过schedule多少小时后不再触�
 - 写完报告**必须用真实工具回读核验文件存在**（`os.path.exists`+size 或 file_read），不能凭"已写入"的回显判断。
 - 事故现象：连续多次 `file__write` 被当成文本回显、实际未执行，报告文件始终不存在，若不核验就会"空报完成"（违反 RULE 13）。
 - 判据：write 返回的 `writed_bytes` 须与后续独立读取的真实 size 对得上；对不上或 exists=False 即为未落盘，重写。
+- ⚠️ **口径坑（2026-09-24 实测）**：`file_write` 返回的 `writed_bytes` 是**字符数**（UTF-8 字符），而 `ls -l`/`os.path.getsize` 给的是**字节数**；中文报告里两者必然不等（实测同一文件 `writed_bytes=4576` vs 磁盘 `7154 B`，`len(text)==4576` 恰好成立）。**别拿字节数与它对比**，否则每次都误判"未落盘"去重写。正确核验：`os.path.exists` + 回读后 `len(text)` 对上 `writed_bytes`（或用 `wc -m`），再看首/尾行与行数是否符合预期。
 
 ## ⚠️ 格式坑点（已验证）
 - `schedule` 必须是字符串如 `"08:00"`，不能是数字（整数/浮点均报错）
