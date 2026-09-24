@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-25
-- 正文已恢复: 131 / 索引可见 389 个编号
+- 正文已恢复: 134 / 索引可见 392 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -397,4 +397,6 @@
 | R386 | ✅正文 | R386 待批台账 TOP-N 排序器 | 9517B R386_待批台账 TOP-N 排序器(view_pending --top).md | view_pending --top 就绪：影响面/阻塞度/可逆性/风险/积压五项打分+一屏Markdown+集中度与边界同分提示；只读(台账sha1前后一致)、负控3/3、原5模 |
 | R387 | ✅正文 | 小众工具实测 R387 | 21924B R387_冲浪-小众工具实测(BasicMemory+Hammerspoon).md | Basic Memory 0.23.2（CLI 21 工具 + codex/claude 双端 MCP 真调用 + 中文向量检索命中）与 Hammerspoon 1.1.1（bre |
 | R388 | ✅正文 | BasicMemory 语义索引试挂(TODO#12) | 12246B R388_BasicMemory语义检索试挂TODO12.md | 结论=不接:16题×3模式+双grep基线,中文最优bge-small-zh-v1.5 hit@5=11/16 < grep_naive 12/16(语义增益0:grep漏的4题B |
-| R389 | ✅正文 | Hammerspoon事件触发实测(TODO#11) | 15165B R389_Hammerspoon事件触发实测.md | 零授权可触发4类事件源(Wi-Fi电源/进程启停/文件落地/剪贴板)真跑;快捷键投递需辅助功能授权(0命中);setFrame布局生效;不纳入常驻(属用户决策);零改动~/.hammerspoon |
+| R389 | ✅正文 | Hammerspoon 系统事件触发实测 | 15165B R389_Hammerspoon事件触发实测.md | 零授权可触发4类事件源(Wi-Fi电源/进程启停/文件落地/剪贴板);快捷键投递需辅助功能授权(0命中);setFrame布局动作生效;未启用常驻(属用户决策);全程零改动~/.h |
+| R390 | ✅正文 | 规划模式·第9批TODO生成（2份独立subagent评审；第3路超窗口未回） | 6620B R390_规划模式第9批TODO生成与独立评审.md | 7候选→保留4+衍生1/淘汰2：密钥体检8·7(最高)、kc快照守卫+30天消费(合并)、日志治理(限定根因+执行R359)、冲浪(换真冷门话题)、待批项一页决策包；淘汰Watch |
+| R391 | ✅正文 | 本机密钥/令牌泄漏体检（只读+掩码+金丝雀负控） | 23555B R391_密钥体检.md | 2026-09-25 完成：pass1 68616 文件/4283MB→72309 命中，其中 97.7% 为 ≥80 位 base64 泛配（40 条抽样解码 36 条为二进制/ |
