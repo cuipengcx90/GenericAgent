@@ -29,7 +29,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | orchestration_discipline_sop(编排三铁律=①角色产出语义程序提交权威②Authority boundary表每个输出写"语义owner/验证提交owner"③mixed outcome不得降格pass;附五条次律exact-once+revision fence+digest/恢复只信journal不读prose/未实现绝不画成已实现/容量不足显式冲突/诊断三段式;源=CCB v8.7.1评估herdr-agents:docs/reviews/CCB_V8_REVIEW.md)
 | codex_web_auditor_prompt_sop(Web逆向/API签名破限prompt,5态状态机+CDP注入)
 | weekly_inspection_sop(opserver SLS周巡检: 扫描→下钻→DB验证→报告; 三层防线根治格式漂移: ①生成层gen_report_skeleton.py按问题清单JSON生成锁死结构骨架(LLM只填{填:}槽不碰结构;填槽须token级替换:纯占位符行整行替换/混排行只replace token,整行覆盖会吃掉内嵌占位符的**根因**标题,校验器报'**根因出现0次') ②校验层weekly_inspection_verify.py机械校验 ③推送层verify_then_notify.py通知必达(PASS正常/FAIL降级告警/缺失异常都推送,绝不静默))
-|| weekly_report_sop(父邮件关联兜底+日期防漂移+结构化生成校验;⚠️P0级根因事故2026-09-04:定时任务prompt步骤4表述不清"按业务域分类commit"→LLM只做技术分类不做业务归纳→content.json变成commit流水账→周报质量崩溃;根治:prompt明确写死业务归纳规则(禁止直译/横向合并/粒度3-5条/正反示例/引用SOP行号),不依赖LLM智能推断;定时任务涉及内容生成的关键步骤必须写明具体做法非只写"做什么")
+|| weekly_report_sop(父邮件关联兜底+日期防漂移+结构化生成校验;⚠️P0级根因事故2026-09-04:定时任务prompt步骤4表述不清"按业务域分类commit"→LLM只做技术分类不做业务归纳→content.json变成commit流水账→周报质量崩溃;根治:prompt明确写死业务归纳规则(禁止直译/横向合并/粒度3-5条/正反示例/引用SOP行号),不依赖LLM智能推断;定时任务涉及内容生成的关键步骤必须写明具体做法非只写"做什么";★2026-09-24实测:工具真实落点=GA temp/(weekly_report_verify/gen,gitignored);lark-cli --body-file/--patch-file只吃cwd相对路径、im --page-size≤50(分页读data.messages/has_more/page_token);读草稿=user_mailbox.drafts get --params带user_mailbox_id;产物+done报告均在.gitignore内⇒收尾无需提交)
 | performance_self_review_sop(季度绩效考评表: 季初目标制定+季末自评. git取数→KPI域→高大上叙事)
 | ga_desktop_env_override_sop(GA桌面.app接管本地源码环境: 改lib.rs加force_*+替换二进制ad-hoc重签;升级会覆盖二进制;消息通道开关灰=IM进程态非配置,IM自启归launchd)
 | dingtalk_message_digest_sop(钉钉消化入Wiki需读正文+保留URL/提取码/边界)
