@@ -7,6 +7,8 @@
 - 读prompt文件→执行→结果写`prompt.out.txt`→退出，主agent读完可删
 - 后台启动(print PID)，加`--nobg`前台同步等结果
 - 适用：单次任务、并行map、不需要追问的场景
+- ★槽位可用性（2026-09-25 实测·规划批评审 4 路）：`--llm_no 0 / 2 / 4` 可用；`1 / 3 / 5 / 6` 直接 HTTP 403 无权（模型未授权）⇒ 一次起 0/2/4 三路即可，别把轮次浪费在 1/3
+- ★主 agent 侧判活：启动后父进程会**瞬间退出**（agentmain 自孵化子进程）⇒ 不能用父 PID 判活，须 `pgrep -fl <prompt 文件名>`；产出落在 `<同一目录>/<prompt>.out.txt`，尾部出现 `[ROUND END]`（`--task` 模式）即完成
 
 ### --task 持续协作模式
 - `python agentmain.py --task {name} [--input "短文本"] [--llm_no N]`（cwd=代码根）
