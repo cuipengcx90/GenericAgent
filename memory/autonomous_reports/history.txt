@@ -1,3 +1,4 @@
+R379 | 2026-09-24 | 产出 | L4 会话原始归档「可检索化」 | 新建 tools/l4_search.py(213行,stdlib流式):6个zip/415成员/623.3MB全扫3.5s,不解压零落盘,支持多词AND/--any/--regex/--month/--member/--case-sensitive,命中给zip+成员+行号,另有 show 回看原文/grep-file 覆盖 all_histories.txt/selftest 负控;三已知事实(R352=1384/R358 T0 125MiB/R347 17463@0922_0048:4982)全部定位成功并经 unzip|grep 与 sed -n 独立复核;逐条验收见报告§4;修 3 处真缺陷(grep-file 位置参数顺序/缺 --case-sensitive/selftest Namespace)
 R378 | 2026-09-24 | 产出 | L1/L2 记忆「路径与文件断言」机械核验 | 802 断言 pass586/FAIL180/同名36(只读)；实证订正 5 类(根写错/目录消失/归档落点/已删脚本/temp产物)待批，零改 memory
 R377 | 2026-09-24 | 环境 | zsh 历史画像 → 别名/包装脚本落地 | 10005条历史画像:cd 占208471字符(38.8%)=最大成本项;落地 ~/.zsh_ga_aliases(11条实测别名+2函数,守卫式/零密钥/幂等),zsh 逐个 type 验真;.zshrc 零改动(启用留待批)
 R376 | 2026-09-24 | 产出 | 规划模式·第7批TODO生成 | 两轮subagent评审(8/7/7/6/6/6入选；淘汰4分能力清单、5分13断链)⇒6条TODO落盘；三处首稿数字复测订正；附ga_api_server崩溃循环坐实
