@@ -169,6 +169,8 @@ function getLikeCount(post) {
 ### 浏览器与收尾坑（2026-09-22 实测）
 - 临时 tab 收尾：用 CDP `{"cmd":"cdp","tabId":<id>,"method":"Page.close"}`，再用 `{"cmd":"tabs"}` 复核回到原单 tab；页内 `window.close()` 对新开的 CDP 驱动 tab 不保证生效，别依赖。
 - `web_execute_js` 的 script 传 **JSON 数组**（想一次跑 `[{cdp...},{tabs}]`）不被支持 → 报 `Unknown cmd: undefined`；必须逐条单独调用。
+- ★收尾关 tab 的**假象坑（2026-09-24 实测）**：`web_execute_js(switch_tab_id=<临时 tab>)` 执行 `window.close()` 时，注入**可能回落到活动 tab**（返回的 diff 里 DOM 是活动 tab 的页面，而非目标 tab）⇒ close 实际送到活动 tab；Chrome 对「非脚本打开的 tab」直接忽略 close，所以可能既没关掉临时 tab 又白冒一次关错风险。判据不能只看 `web_scan`/驱动快照（可能是陈旧或失联），要用**无歧义的真列表**权威核实：
+  `osascript -e 'tell application "Google Chrome" to get (URL of every tab of every window)'`（本轮实测：真实只剩 1 个 tab = 用户 linux.do 主页，临时 search.json tab 已消失 ⇒ 未关错）。主 tab 若被误关，用同一 AppleScript `make new tab ... with properties {URL:"https://linux.do/"}` 复原。
 - 归档后要提交 vault git 仓（历史惯例 `chore(vault): 归档 linux.do AI 技术日报 ...`）：`git add` Raw+Wiki+INDEX 三件；**提交前先 `git diff -- "60 Wiki/INDEX.md"` 确认本次只有自己新增的一行**（该文件用户可能同时在改）。若发现上轮遗留未提交的 Raw（如 09-21），顺手单独补一次提交。
 
 ### 验收脚本要点
