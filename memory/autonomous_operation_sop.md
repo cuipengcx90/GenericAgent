@@ -59,3 +59,11 @@ print(get_todo())       # 查看待办
 - 收尾前**先查重**：`ls -t temp/autonomous_reports | head -5` + `grep -n '<任务关键词>' memory/autonomous_reports/INDEX.md temp/TODO.txt`；若条目已 `[x]`，直接改 `[x] R<编号>` 并放弃本轮产出（或合并差异），不要再调 `complete_task`。
 - `helper.complete_task` 的编号分配非原子（`_next_report_number()` 扫目录），并发下会撞号 ⇒ 与 TODO「自主报告『编号复用』根治」合并规划（认领锁 `temp/.todo_claim.json` + `O_EXCL` 建目标文件）。
 
+## 收尾实测坑（2026-09-23 R365 实操复核）
+- **TODO 未完成条目行首无前导空格**：`temp/TODO.txt` 里是 `[ ] 产出 | …` 直接顶格 ⇒ 用 `startswith(' [ ]')` 过滤会**一条都匹配不到**（本轮标记失败一次）；改用 `l.startswith('[ ]')` 或 `grep -n '^\[ \]'`。
+- **`complete_task` 会移动并重新编号报告**：它把 `report_path` 移入 `autonomous_reports/R{XX}_{taskname}.md`，编号由 `_next_report_number()` 扫目录取 ⇒ 若报告已按 `R365_*.md` 命名放在该目录，编号会**自增**（实测会变 R366）。做法：报告先写在别处（cwd/临时名），再调 `complete_task`。
+- **`complete_task` 自带 IM 推送**（飞书 + 钉钉各 1 条）⇒ 报告里禁写「未发任何通知」这类绝对表述，须写明「未新增/未实现推送逻辑，收尾推送为工具既有行为」。
+- **报告入库灾备（既有工具，收尾可跑）**：`python3 tools/autonomous_reports_archive.py sync --apply`（`temp/autonomous_reports` → `memory/autonomous_reports` 增量、逐字）+ `inventory --apply`（重生成 `INDEX.md`/`history.txt`）⇒ **`memory/autonomous_reports/` 才是受 git 跟踪的 durable 归档**（`temp/` 被 `.gitignore` 忽略），`INDEX.md` 行号≈报告编号；两个子命令**不带 `--apply` 即为零副作用预览**，先预览再落盘。
+  - **两个子命令分工别搞混（2026-09-25 R390 实测+源码复核）**：`sync --apply` **只搬报告 `.md`，不搬 `history.txt`**；`archive/history.txt`（=`memory/autonomous_reports/history.txt`）只有 **`inventory --apply`** 会写（源码 `cmd_inventory` 末尾把 live history 原样拷入，并另存 `history.md`）⇒ 收尾只跑 sync 时，archive 索引会**落后新报告整条**（实测落后 R390 一条）。
+  - **只想对齐 history 时的安全做法**：手动前插一行更省事——live 与 archive 的 history 均为**降序**（新条目在**首行**）；`inventory --apply` 除写 history 外还会顺带按 live history 主题**重命名**归档文件（即 C51 待批风险，实测曾把 8 份定稿报告改名），故不想触发重命名就别跑它；补完 `git add` 该**单文件**提交。
+
