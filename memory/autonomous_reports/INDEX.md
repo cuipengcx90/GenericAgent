@@ -397,3 +397,4 @@
 | R386 | ✅正文 | R386 待批台账 TOP-N 排序器 | 9517B R386_待批台账 TOP-N 排序器(view_pending --top).md | view_pending --top 就绪：影响面/阻塞度/可逆性/风险/积压五项打分+一屏Markdown+集中度与边界同分提示；只读(台账sha1前后一致)、负控3/3、原5模 |
 | R387 | ✅正文 | 小众工具实测 R387 | 21924B R387_冲浪-小众工具实测(BasicMemory+Hammerspoon).md | Basic Memory 0.23.2（CLI 21 工具 + codex/claude 双端 MCP 真调用 + 中文向量检索命中）与 Hammerspoon 1.1.1（bre |
 | R388 | ✅正文 | BasicMemory 语义索引试挂(TODO#12) | 12246B R388_BasicMemory语义检索试挂TODO12.md | 结论=不接:16题×3模式+双grep基线,中文最优bge-small-zh-v1.5 hit@5=11/16 < grep_naive 12/16(语义增益0:grep漏的4题B |
+| R389 | ✅正文 | Hammerspoon事件触发实测(TODO#11) | 15165B R389_Hammerspoon事件触发实测.md | 零授权可触发4类事件源(Wi-Fi电源/进程启停/文件落地/剪贴板)真跑;快捷键投递需辅助功能授权(0命中);setFrame布局生效;不纳入常驻(属用户决策);零改动~/.hammerspoon |
