@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 """const_number_audit.py — 记忆/SOP/定时 prompt「数值断言」↔ 源码常量 只读对账器（TODO 第15批 C5）
 
-背景（RULE21 实锤）：`memory/dpdomain_renew_sop.md` 写「scheduler 冷却是 27 天」，
-而 `tools/dpdomain_renew.py:61` 的 `RENEW_COOLDOWN_DAYS = 25` —— 文字口径与代码常量分叉，
-靠人眼发现。本工具把它机械化。
+背景（RULE21）：dpdomain 续期有「两个数别混」的口径坑 —— 脚本手动去重 `RENEW_COOLDOWN_DAYS = 25`
+（`tools/dpdomain_renew.py:61`）与 scheduler 调度冷却（`reflect/scheduler.py:62` `timedelta(days=27)`）。
+文字（SOP / 定时 prompt / 记忆）里写下的数到底是哪一个，过去只能靠人眼比对源码。本工具把它机械化：
+「同段出现的 .py 路径」= 该段自认的来源，据此回源取常量值再比对。
+（2026-09-26 复核订正：本器默认语料实测唯一 MISMATCH 命中在 `temp/TODO.txt` 的描述句自身；
+`memory/dpdomain_renew_sop.md` 与 `sche_tasks/dpdomain_renew.json` 实文都已同时写明 25/27 并各自绑对。）
 
 口径声明（报告同步）：
   语料（--corpus 可改）= memory/**/*.md + memory/**/*.txt（默认剔除 autonomous_reports/ 与
         L4_raw_sessions/；--include-reports 打开） + sche_tasks/*.json（顶层；--sche-recursive 递归）
-        + memory/global_mem_insight.txt(L1) + memory/global_mem.txt(L2)
+        + memory/global_mem_insight.txt(L1) + memory/global_mem.txt(L2) + temp/TODO.txt（显式列入，见 corpus_files）
   断言 = 「数字 + 时间单位」的 token 对（天/日/小时/分钟/秒/毫秒 + day(s)/hour(s)/min(ute)(s)/sec(ond)(s)/ms），
          **必须同段出现 .py 路径**（同行；同行无路径时回看同段落连续非空行 ≤ --block-lines 行）——无路径不判。
   常量面 = 该 .py 路径解析出的：
