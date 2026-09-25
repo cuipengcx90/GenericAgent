@@ -2,8 +2,8 @@
 
 **入口**
 - 工具: `tools/dpdomain_renew.py`（stdlib-only）
-  - `check [--json]` 只读盘点 / `run [--apply] [--notify]`（默认 dry-run）/ `--selftest`
-  - 退出码: `0` 正常（含"无需续费"）/ `2` 无已登录 dashboard 标签页 / `3` 有域名续费失败 / `4` 用法错 / `5` 自测失败
+  - `check [--json]` 只读盘点 / `run [--apply] [--notify]`（默认 dry-run）/ `--selftest` / `--no-auto-login`（关闭会话自动恢复）
+  - 退出码: `0` 正常（含"无需续费"）/ `2` 无已登录 dashboard 标签页 / `3` 有域名续费失败 / `4` 用法错 / `5` 自测失败 / `6` 会话失效且自动恢复失败（需人工登录）
 - 定时: `sche_tasks/dpdomain_renew.json`（`repeat=monthly`、`schedule=10:20`、`max_delay_hours=72`；scheduler 冷却是 **27 天**，见 `reflect/scheduler.py::_parse_cooldown`）
 - 状态: `temp/dpdomain_renew_state.json`（同域名 27 天内不重复，丢失无害）
 
@@ -22,6 +22,15 @@
 - 走 **TMWebDriver 桥**(`127.0.0.1:18766/link`) 在页面内 `fetch` ⇒ 自动携带登录 Cookie，**不需要** 用户名密码/token
 - ⇒ 浏览器必须已有**已登录**的 `dashboard.digitalplat.org` 标签页；否则 `rc=2`（桥**没有** open-tab 命令，任务 prompt 用 `window.open` 兜底重试一次，仍失败则私信提醒人工登录）
 - 脚本会校验所选会话的 `location.host` 是否真为目标站（防 tab id 陈旧指向别的站点）
+
+**会话自动维护（2026-09-25 新增：自动登录 + 自愈）**
+- Cookie 实测寿命（直接读 Chrome `Default/Cookies` 的 `expires_utc`）：`panel_session` ≈ **5 天**（2026-09-30）、`remember_token` ≈ **1 年**（2027-09-25，**HttpOnly**）、`cf_clearance` 2026-11-20
+- ⇒ 只要浏览器带着 `remember_token` 访问过该站点，站点会自己重建 `panel_session`；因此 `location.reload()` 就是**主恢复路径**
+- `ensure_login(sid)` 三段式：① `GET /_panel_api/api/auth/me` 探活 → ② `location.reload()` + 等 `LOGIN_RELOAD_WAIT`(=8s) 再探 → ③ 密码登录兜底；返回 `method` ∈ `existing|reload|password`
+- 密码登录（兜底，非主路径）：`POST /_panel_api/api/auth/login`，body `{email, password, turnstile_token}`；须先在同一页面渲染 Turnstile（sitekey `0x4AAAAAAAxuMrGCYFcOwd1N`，取自登录 chunk 8863 / 模块 56136）并轮询取 token
+- 凭据来源：环境变量 `DPDOMAIN_EMAIL` / `DPDOMAIN_PASSWORD` 优先，其次 macOS Keychain（`service=GenericAgent.dpdomain_renew`，`account=` 邮箱）；**取不到凭据就绝不发登录请求**，直接判为恢复失败
+- ★**实测结论**：本机出口是数据中心 IP，真 sitekey 能正常加载并渲染，但 20s 轮询内**零 token** ⇒ 密码登录在本机实际不可用。所以恢复失败一律 `rc=6` 且 `--notify` 私信「需人工登录」，**绝不静默成功**
+- 自动恢复只在探测到鉴权类失败（HTTP 401/403 或返回码含 `unauthorized` / `session_expired` / `login*`）时触发；`--no-auto-login` 可完全关闭
 
 **坑**
 1. 写路径**可以安全验证**: 用一个不存在的域名跑 renew，服务端回 `403 You do not have permission to manage this domain` = 说明 CSRF/请求形状已过鉴权层（若是 CSRF 问题会回 `csrf_failed`）。真实"续费成功"分支只在进入窗口时才会跑到。
