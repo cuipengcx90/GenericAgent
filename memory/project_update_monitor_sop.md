@@ -53,6 +53,9 @@ python3 -m py_compile ../project_update_monitor/monitor.py
 - 运行特征坑：脚本全程静默、**结束才一次性打印**；单轮（8 源快照 ~45s + 3 次翻译）可达 **~4 分钟**，用 60s/180s 的工具超时会误判为"卡死"。须后台起 + 轮询。**macOS 无 `setsid`、无 `timeout` 命令**：用 `subprocess.Popen(..., start_new_session=True)` 起后台并立即返回；逐源诊断限时用 `signal.alarm`。
 - 自测陷阱：用 `signal.alarm` 包 `report()` 时抛出的 `TimeoutError` 会被 `except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError)` 吞成 `TranslationError: ... TimeoutError: internal timeout`——**这是脚手架假象而非脚本真错**，别据此下结论（2026-09-23 实际踩到）。
 - 未根治项（提案，属改自身源码需请示）：给翻译调用加"首调放宽超时 / 失败重试 1 次"，避免单个翻译超时导致整轮不出卡。
+- ★第二真因：**翻译产物在合法 JSON 之后多出文本**（2026-09-25 首跑实测 `JSONDecodeError: Extra data: line 1 column 898`）——`monitor.py:180` 的严格 `json.loads` 整体失败 → `TranslationError` → 同样 exit=2、不推送、不落盘，与超时无关。判据：堆栈出现 `Extra data` 且不是 `TimeoutError` 型。
+- 处置（temp 侧，不改仓源码）：`temp/pum_wrapper2.py` = `import monitor` 后 patch ①`subprocess.run` timeout 120→420 ②`_translate_to_chinese` 容错版（剥 ``` 围栏 → `json.loads` → 退 `raw_decode` 取**首个** JSON 数组 → 3 次尝试；仍失败留样 `temp/pum_translate_dbg/` 并抛错，保持 all-or-nothing 不静默）。自带 `--selftest` 负控 7/7（含"两数组拼接但首数组条数不足**必须拒**"）。
+- 实测节奏：08:06:25 起 → 08:11:47 落盘（≈5.4 分钟，8 源），必须 `Popen(start_new_session=True)` 后台起 + 轮询；成功判据=`state.json` mtime/sha1 推进（推送失败 `return 3` 且不落盘 ⇒ 推进充要于"卡片已送达"）。
 
 ## 卡片图标规范
 为提升可读性，卡片固定使用以下图标前缀（改动集中在 `monitor.py` 的 `classify`/`project_card_element`/`build_notification_card`）：
