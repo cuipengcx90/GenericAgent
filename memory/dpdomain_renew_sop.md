@@ -48,7 +48,7 @@
 
 **健康检查（判据表已登记，无需新接）**
 - 上次执行: `ls sche_tasks/done/*_dpdomain_renew.md`；调度日志: `grep dpdomain_renew temp/reflect_logs/scheduler_<date>.log`
-- `tools/freshness_criteria.json` 已含 `id=dpdomain_renew`（monthly / `max_run_gap_days=40` / 运行证据 glob）⇒ `python3 tools/task_freshness.py --once` 会一并巡检静默失败
+- `tools/freshness_criteria.json` 已含 `id=dpdomain_renew`（monthly / `max_run_gap_days=40` / 运行证据 glob）⇒ `python3 tools/task_freshness.py --only dpdomain_renew` 会一并巡检静默失败（实测 2026-09-25 输出 `dpdomain_renew sche monthly 6.48h / 40d … OK`；**无 `--once`/`--no-notify` 参数**，真参数为 `--only <id>` / `--json` / `--diff` / `--selftest`）
 
 **端到端实证（2026-09-25 16:28，无人值守真跑）**
 - 任务文件落盘后 scheduler（2min 一跳）立即 `TRIGGER dpdomain_renew (repeat=monthly, schedule=10:20, last_run=None, attempt=1)`
