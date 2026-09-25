@@ -2,14 +2,17 @@
 
 **入口**
 - 工具: `tools/dpdomain_renew.py`（stdlib-only）
-  - `check [--json]` 只读盘点 / `run [--apply] [--notify]`（默认 dry-run）/ `--selftest` / `--no-auto-login`（关闭会话自动恢复）
+  - `check [--json]` 只读盘点 / `run [--apply] [--notify]`（默认 dry-run）/ `--selftest`（离线，47/47）/ `--no-auto-login`（关闭会话自动恢复）
+  - 调试旋钮: `--session <sid>` 指定桥会话 / `--domains a,b` 只跑指定域名 / `--json` 机器可读；env `DPDOMAIN_STATE` 覆盖状态路径、`GA_TMWD_ENDPOINT` 覆盖桥地址
   - 退出码: `0` 正常（含"无需续费"）/ `2` 无已登录 dashboard 标签页 / `3` 有域名续费失败 / `4` 用法错 / `5` 自测失败 / `6` 会话失效且自动恢复失败（需人工登录）
 - 定时: `sche_tasks/dpdomain_renew.json`（`repeat=monthly`、`schedule=10:20`、`max_delay_hours=72`；scheduler 冷却是 **27 天**，见 `reflect/scheduler.py::_parse_cooldown`）
-- 状态: `temp/dpdomain_renew_state.json`（同域名 27 天内不重复，丢失无害）
+- 状态: `temp/dpdomain_renew_state.json`（**首次成功续费前不存在=正常**：`save_state` 只在真有域名续费成功后才写；丢失无害）
+- 去重是**两个数别混**（曾把 27 写成脚本身）：脚本侧 `RENEW_COOLDOWN_DAYS=25` 天（手动运行时兜底，`tools/dpdomain_renew.py:61`），定时侧 scheduler 冷却 27 天先拦
+- 域名清单: `DEFAULT_DOMAINS` = `cuipengcx.dpdns.org`、`nbdash.dpdns.org`（同一任务一起检查；改清单只改这一处 + prompt）
 
 **规则（站点源码 i18n 原文，非猜测）**
 - `renewalNotice` = "到期前 120 天内可免费续费。提前续费请使用积分。"
-- ⇒ **窗口外一律跳过**（提前续费要花积分）；窗口 = 到期日前 120 天内（`FREE_WINDOW_DAYS` 常量）
+- ⇒ **窗口外一律跳过**（提前续费要花积分）；窗口 = 到期日前 120 天内（`WINDOW_DAYS` = `tools/dpdomain_renew.py:57`；注意真名**不是** FREE_WINDOW_DAYS）
 - 每月检查 + 120 天窗口 ⇒ 每年约 4 次机会；续费成功到期日 +1 年即退出窗口，不会重复扣
 
 **接口（从前端源码提取 + 实测）**
@@ -36,7 +39,16 @@
 1. 写路径**可以安全验证**: 用一个不存在的域名跑 renew，服务端回 `403 You do not have permission to manage this domain` = 说明 CSRF/请求形状已过鉴权层（若是 CSRF 问题会回 `csrf_failed`）。真实"续费成功"分支只在进入窗口时才会跑到。
 2. 续费后**必须复核**列表里 `expiry_date` 是否真 +1 年，否则记失败（禁止只看 HTTP 200 就报成功）。
 3. 通知只在"续费成功/续费失败/检查失败/无会话"时发，窗口外完全静默。
-4. 窗口天数若站点改口径，改 `FREE_WINDOW_DAYS` 一处即可。
+4. 窗口天数若站点改口径，改 `WINDOW_DAYS` 一处即可（脚本内所有默认参数都引用它）。
+
+**人工介入 runbook**
+- `rc=6`（会话失效且自动恢复失败）：本机密码登录因数据中心 IP 在 20s 内取不到 Turnstile token 而基本不可用 ⇒ 人工打开 `https://dashboard.digitalplat.org` 登录并**保留该标签页**，再手动重跑 `run --apply --notify`；rc=6 已由 `--notify` 私信告警，勿重复提醒
+- `rc=2`（桥里没有目标站标签页）：在任意**已存在**标签页 `window.open(url)` 兜底一次再重跑；仍失败即按上一条人工处理
+- 凭据（可选，仅密码登录兜底需要）：`security add-generic-password -s GenericAgent.dpdomain_renew -a <邮箱> -w '<密码>'`（读取顺序 env `DPDOMAIN_EMAIL/DPDOMAIN_PASSWORD` > Keychain）
+
+**健康检查（判据表已登记，无需新接）**
+- 上次执行: `ls sche_tasks/done/*_dpdomain_renew.md`；调度日志: `grep dpdomain_renew temp/reflect_logs/scheduler_<date>.log`
+- `tools/freshness_criteria.json` 已含 `id=dpdomain_renew`（monthly / `max_run_gap_days=40` / 运行证据 glob）⇒ `python3 tools/task_freshness.py --once` 会一并巡检静默失败
 
 **端到端实证（2026-09-25 16:28，无人值守真跑）**
 - 任务文件落盘后 scheduler（2min 一跳）立即 `TRIGGER dpdomain_renew (repeat=monthly, schedule=10:20, last_run=None, attempt=1)`
