@@ -4,6 +4,7 @@
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
+R405 | 2026-09-25 | 能力 | 网络分层诊断单入口 tools/net_doctor.py(四层探测+三段式判定) | 四层探测(链路/Clash控制面/基线/目标站)+三段式判定(LOCAL_DOWN/PROXY_NODE_BAD/SITE_FAILURE/+EGRESS_BAD)每段带证据链与下一步命令;假IP(198.18/15)与DNS_FAIL显式排除出站点故障判据(SITE_FAILURE_CLASSES仅TCP/TLS/HTTP四码);无Clash控制面时自动降级只跑链路+目标站;selftest 13/13(2条e2e假mihomo夹具含接口形状+4条负控正控+4条合成判定);真机四目标混跑=baidu OK·不可达域名 DNS_FAIL·198.18.0.112 FAKE_IP(不发连接)·expired.badssl.com TLS_FAIL⇒SITE_FAILURE;固定矩阵+台账temp/net_doctor_history.jsonl(禁标永久结论);★实测PATH无/sbin|/usr/sbin⇒route/ifconfig须绝对路径否则误判本机断网;★本机当前无mihomo控制面(仅ClashVerge特权helper)
 R404 | 2026-09-25 | 工程 | 记忆引用断链复核与修复提案(只读) | 18候选名全盘basename重扫:16/17 GONE,唯一EXISTS=view_pending.py(推翻R380"全盘无"旧断言,41引用仍有效);语料318文件/3299314B/46661行,MEM引用9条全落2文件;★范围收窄=只修现役记忆(global_mem.txt 5行+wechat_signals_sop.md 1行),历史快照memory/autonomous_reports与L1不动;候选替代词根命中全为无关同名⇒"改新路径"不成立;落patch草案6条单行尾注+备份命令+批准语,证据包temp/R404_evidence/;自证含负控negctl=True+2正控(log_compress/view_pending)2负控(合成假名/16断链名);订正R380行号337→347与temp/archive不存在;未执行任何memory写入
 R403 | 2026-09-25 | 工程 | 待批项前提复测降载(只读) | 台账108未决中仅18条(16.7%)声明机器可复测前提;今日复测=ACTIVE14/REWRITE2(C14/C16目标已存在内容不同)/STALE1(C11锚点0命中)/manual1;★建议关闭3条(C11意图已由L1落地; C14/C16 SOP已建成) 仍需拍板15条;批A文件存在前提6/6全成立;交付premise_recheck.py(自测6/6含负控)+只读自证(目标14文件sha改动0/台账mtime全早于会话);复现R401 C11判定✓
 R402 | 2026-09-25 | 产出 | 规划模式第11批TODO生成 | 量化n=370(LOW 41=11.1%)；6候选经两轮三路评审(llm_no 0/2/4)保留6条淘汰1条，最高8.33=待批项前提复测；TODO净增6条+种子项
