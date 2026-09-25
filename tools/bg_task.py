@@ -29,7 +29,7 @@ bg_task.py — 一次性长任务的「起后台 + 事后轮询」管理器（st
     python3 tools/bg_task.py tail --name job1 --lines 40
     python3 tools/bg_task.py stop --name job1 --grace 5      # SIGTERM → 超时升级 SIGKILL
     python3 tools/bg_task.py list
-    python3 tools/bg_task.py --state-dir /tmp/bt --selftest  # 隔离自测（真起真杀）
+    python3 tools/bg_task.py --state-dir /tmp/bt selftest  # 隔离自测（真起真杀）
 
 状态机（status 输出）
 --------------------------------------------------------------------
