@@ -137,7 +137,7 @@ function getLikeCount(post) {
 
 ## 「人工智能技术日报+播客」每日归档专用链路（2026-09-21 实测沉淀）
 
-适用：定时任务 `linuxdo_ai_daily_summary`（每天处理**至多一篇**新日报 → 归档 Obsidian → 仅新增且验收通过才飞书私信）。
+适用：定时任务 `linuxdo_ai_daily_summary`（每天处理**至多一篇**新日报 → 归档 Obsidian → 仅新增且验收通过才飞书私信）。任务定义文件 = `GenericAgent/sche_tasks/linuxdo_ai_daily_summary.json`（`repeat: daily` / `schedule: 10:00` / `max_delay_hours: 8`；由反射调度器拉起，日志见 `sche_tasks/scheduler.log` 的 `TRIGGER linuxdo_ai_daily_summary`）。排查"为什么没归档"时先看这里，别以为是用户手点。
 
 ### 发现（比 Google 更可靠）
 - 日报作者固定 `xtc0809`（分类 前沿快讯 cat 78），标题形如 `linux.do人工智能技术日报+播客-YY-MM-DD`（**标题日期 = 发布日**；PDF 里的数据日期 = 标题日期 - 1）。
@@ -153,7 +153,9 @@ function getLikeCount(post) {
 
 ### 正文=纯附件时的取 PDF
 - 主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
-- ⚠️ **`posts_count` 不固定**：09-21 期之前=1（无回帖），2026-09-22 期=5（主帖 + 4 条回帖，如「建议弄个黑色主题」「打卡」等）。**不要拿 `posts_count==1` 当判据**；仍按通用规则抓 `post_stream.stream` 分批补齐并机械校验 `posts.length === posts_count`（5 条一次到位）。Raw 里回帖也要落一段「## 回帖（原文提取）」。
+- ⚠️ **`posts_count` 不固定**：09-21 期之前=1（无回帖），2026-09-22 期=5（主帖 + 4 条回帖，如「建议弄个黑色主题」「打卡」等）。**不要拿 `posts_count==1` 当判据**；仍按通用规则抓 `post_stream.stream` 分批补齐并机械校验 `posts.length === posts_count`（5 条一次到位）。Raw 里回帖也要落一段，标题格式随期漂移，现行=`## 回帖原文（post 2-N / 共 N 楼）`。
+- ⚠️ **数字必须回源核对**：PDF 末尾自带「统计」卡片（抓取总量 / 标签新增 / 历史命中 / 今日全新话题 / 昨日话题后续 / 话题组），`pdftotext -layout` 后在输出尾段（实测 09-23 期在 out.txt 第 726-732 行）。写 Wiki「数据概览」时数字一律 grep 原文取，禁凭印象/推算，否则极易编出看起来合理的假数字。
+- ⚠️ **PDF 自身也会串帖**：09-23 期回帖 @Jon_Snow 就指出「第 11 条把严文韬入职 DS 总结成顶级逆向专家，感觉和其他帖子串了」。此类源内容勘误不算我的错，但**回帖须原文落库**（是日报质量的可追溯证据），不要在 Wiki 里替源做纠正或粉饰。
 - 主帖里给的是 `/uploads/short-url/xxxx.pdf`（**该路径用 curl/curl_cffi 直连会 404**——short-url 需经浏览器会话重定向）。
 - 正确取法二选一：
   1. 浏览器 fetch 后读 `r.url` 拿真实 CDN 实链，如 `https://cdn3.ldstatic.com/original/4X/0/0/f/<hash>.pdf`，再用 curl_cffi 直连下载（实测 200 / application/pdf）；
@@ -172,6 +174,16 @@ function getLikeCount(post) {
 - ★收尾关 tab 的**假象坑（2026-09-24 实测）**：`web_execute_js(switch_tab_id=<临时 tab>)` 执行 `window.close()` 时，注入**可能回落到活动 tab**（返回的 diff 里 DOM 是活动 tab 的页面，而非目标 tab）⇒ close 实际送到活动 tab；Chrome 对「非脚本打开的 tab」直接忽略 close，所以可能既没关掉临时 tab 又白冒一次关错风险。判据不能只看 `web_scan`/驱动快照（可能是陈旧或失联），要用**无歧义的真列表**权威核实：
   `osascript -e 'tell application "Google Chrome" to get (URL of every tab of every window)'`（本轮实测：真实只剩 1 个 tab = 用户 linux.do 主页，临时 search.json tab 已消失 ⇒ 未关错）。主 tab 若被误关，用同一 AppleScript `make new tab ... with properties {URL:"https://linux.do/"}` 复原。
 - 归档后要提交 vault git 仓（历史惯例 `chore(vault): 归档 linux.do AI 技术日报 ...`）：`git add` Raw+Wiki+INDEX 三件；**提交前先 `git diff -- "60 Wiki/INDEX.md"` 确认本次只有自己新增的一行**（该文件用户可能同时在改）。若发现上轮遗留未提交的 Raw（如 09-21），顺手单独补一次提交。
+
+### 幂等与并发（2026-09-23 实测，务必先做）
+- ⚠️ 本任务会**双发**：2026-09-23 的 10:02 定时任务同时被两个会话拉起（一个走反射/调度通道、一个走用户 IM 会话），两边各把同一期日报（topic 2938213）从头做了一遍；先跑完的那个已 commit（`ce40abd3`）并发了私信，后跑的**直接覆盖了已提交的 Raw/Wiki**（且后写版本更差：Wiki 7.5KB vs HEAD 15KB）。
+- **写入前**必须先查当日是否已归档（10 秒）：
+  - `git -C ~/develop/obsidian-note log --oneline -3`（找当日 `chore(vault): 归档 linux.do AI 技术日报` 提交）
+  - `grep -n "linuxdo-ai-daily-<YYYY-MM-DD>" "60 Wiki/INDEX.md"`
+  - 同时看 `git -C ~/develop/obsidian-note status --short` 里当日两文件的 M 状态。
+- 判定：**当日条目已存在且工作树干净 → 本期已闭环（含私信）**，本会话直接静默收尾（不重写、不再发通知，否则重复推送）；只有 INDEX 无当日行 / git log 无当日提交，才算"新增"。
+- 若自己已经写完才发现 HEAD 里已有更完整版本：**`git checkout -- "<Raw>" "<Wiki>"` 回滚到 HEAD**，禁止手工合并或"以我的为准"；回滚后按上一条静默收尾。
+- 交叉证据（判"别人是否已发过私信"）：`grep -n "飞书已送达\|推送飞书私信简报" logs/feishu_agent.log | tail`，命中且紧跟在当期 `归档 2026-09-23` 提交步骤之后即视为已送。
 
 ### 验收脚本要点
 Raw/Wiki/INDEX 三文件存在且非空 → frontmatter `sources` 逐条解析到真实文件 → 正文 wikilink ≥2 且均存在 → 正文中每个 linux.do topic URL **只出现一次**（主帖 URL 只放「参考链接」一处）→ 任一 FAIL 则不推送。
