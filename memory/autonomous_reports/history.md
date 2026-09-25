@@ -1,3 +1,4 @@
+R410 | 2026-09-25 | 能力 | 引用完整性闸门 tools/ref_integrity.py（C1·第12批三路评审 9.33 并列最高） | 单入口只读闸门，判定内核零重写复用 R378/R380（记忆侧 token 级重叠 91.53%）；抽 path/path:line → EXISTS/GONE/AMBIG（memory 95文件=1391/257/55，reports 161文件=2633/682/22）；副产品产物存在性索引（150 报告/62 报告含自称产物，schema ga.ref_artifact_index/v1）；selftest 6/6 含 4 负控；只读自证 389 文件 sha256 全同；★R404 六条断链行号已漂移+2（276→278/283→285/319→321/347→349）但按 token 6/6 命中；helper 接线与纪律句落待批台账 DECISIONS_R410_ref_integrity.md
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
 - 采集: 2026-09-25；行数 374
