@@ -1,7 +1,7 @@
 # 自主报告归档清单（抢救重建）
 
 - 生成: 2026-09-25
-- 正文已恢复: 136 / 索引可见 394 个编号
+- 正文已恢复: 137 / 索引可见 395 个编号
 - 索引来源: temp/autonomous_reports/history.txt(已随本目录一同抢救)
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
@@ -404,3 +404,4 @@
 | R395 | ✅正文 | 冲浪·冷门工具实测：taskpolicy + footprint/heap/leaks | 13050B R395_冲浪-冷门工具实测-taskpolicy与内存三件套.md | taskpolicy 免 root 降 QoS(pri 20→4)+footprint/heap/leaks 只读内存剖面；头条=phys_footprint≠ps RSS 两口径(17.3G vs 18.8M)
 | R396 | ✅正文 | 规划模式·第10批TODO生成与三路独立评审 | 13362B R396_规划模式第10批_三路评审与下一批TODO.md | 全量重算 R1–R395 低价值量化（n=364、LOW 40=14.1%、P1 12/P3 29/P4 13/P5 1/P6 42，中位 6620B）+ 7 候选经三路独立 subagent 评审（llm_no 0/2/4）→ 保留 5 条（归档完整性闸门 8.00 最高）/ C7 并入 C6 / 淘汰 C5 冲浪 3.33（连续两轮同题）；含 4 项自验事实：归档 11 组同号（10 组同字节、R337 真冲突）、fsapp 现值 4892MB vs peak 17GB、ga-api 0 消费者、helper 抢号仍无锁 |
 | R397 | ✅正文 | 归档完整性闸门：报告编号复用/改名事故的只读检测器 | 14762B R397_归档完整性只读检测器.md | 只读检测器 6/6 负控全过且自证语料计数（跑前后 152 文件 sha256/mtime/字节全等=零改动）；11 组同号=10 组 sha1 全同（改名对）+R337 拆分对⇒0 组真冲突；硬缺口 2=9 编号有正文无 history 行、INDEX 比 history 多 33 编号(24 仅索引)；空洞 0；处置全待批 |
+| R398 | ✅正文 | 后台长任务工具化：tools/bg_task.py（start/status/tail/stop/list） | 13322B R398_后台长任务工具化bg_task.md | 与 memory/tmux_utils.py 逐项比对后只补 3 缺口(退出码/PID复用/文件日志)，不重写 tmux 层；真机证据=start 后 ppid=1 脱离父进程、RUNNING/EXITED_OK/GONE_UNKNOWN 三态可辨、stop 走 SIGTERM→SIGKILL；隔离自测 12/12 含 4 负控(不存在任务/僵尸 pid 文件/PID 复用/日志确已写入)；零第三方依赖且不 import tmux，本机无 setsid 已写进注释与 --help |
