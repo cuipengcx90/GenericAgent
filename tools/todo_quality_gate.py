@@ -53,6 +53,20 @@ ARTIFACT_PATH = [r"\btools/[A-Za-z0-9_./-]+", r"\bmemory/[A-Za-z0-9_./-]+",
                  r"\bsche_tasks/[A-Za-z0-9_./-]+", r"\breflect_scripts/[A-Za-z0-9_./-]+",
                  r"LaunchAgents", r"\btemp/[A-Za-z0-9_./-]+"]
 VAGUE = ["提升", "优化", "完善", "增强", "关注", "梳理", "加强", "改进"]
+
+# 新判据（TODO 第12行 C5）：候选的「落地」是否依赖外部（用户）批准。
+# 设计口径：只认「必须由人拍板才能落地」的语言信号；提示级，不改变既有 A/B/C 判定。
+APPROVAL_PATS = [
+    (r"(待|需|须|须经|等待)\s*(?:用户|人工|人)?\s*(?:批准|审批|拍板|确认|授权|同意)", "待用户批准"),
+    (r"(?:用户|人工)\s*(?:批准|审批|拍板|授权|确认|决定)", "用户决策"),
+    (r"批准语", "批准语"),
+    (r"pending_decisions", "待批台账落点"),
+    (r"DECISIONS_[A-Za-z0-9_]+\.md", "决策文件落点"),
+    (r"决策包", "决策包"),
+    (r"不可逆", "不可逆操作"),
+    (r"\bsudo\b|提权|root 权限", "提权/系统级"),
+]
+NEG_BEFORE = re.compile(r"(不涉及|无需|不需|免于|非|无|免|勿)\s*$")
 CAND_RE = re.compile(r"^\s*(C\d+)\b[\s:：]*(.*)$")
 
 
@@ -124,16 +138,38 @@ def verdict_of(cid, body, min_mech=2, consumer_mode="reject"):
             notes.append("consumer=弱信号+落点")
     if re.search(r"不得|禁", body):
         notes.append("含禁止项")
+    ap_hits = approval_flag(body)
     return {"id": cid, "verdict": v, "mech": mech, "aux": aux, "consumer_strong": strong,
             "consumer_weak": weak, "artifacts": paths, "vague": vague,
-            "chars": len(body), "tokens": len(hard_tokens(body)), "notes": notes}
+            "chars": len(body), "tokens": len(hard_tokens(body)), "notes": notes,
+            "approval": ap_hits, "approval_flag": bool(ap_hits)}
+
+
+def approval_flag(body):
+    """返回 [(label, 命中文本, 位置)]；命中被近似否定语（不涉及/无需…）直接前置者剔除。"""
+    raw = []
+    for pat, label in APPROVAL_PATS:
+        for m in re.finditer(pat, body):
+            pre = body[max(0, m.start() - 8):m.start()]
+            if NEG_BEFORE.search(pre) or re.search(r"不涉及|无需|不需|免于", m.group(0)):
+                continue
+            raw.append({"label": label, "text": m.group(0), "pos": m.start(), "end": m.end()})
+    # 同一处被多规则命中（如「须用户批准」同时命中两条）只保留最早最长的一条，避免噪声
+    raw.sort(key=lambda h: (h["pos"], -(h["end"] - h["pos"])))
+    hits, last_end = [], -1
+    for h in raw:
+        if h["pos"] < last_end:
+            continue
+        last_end = h["end"]
+        hits.append({"label": h["label"], "text": h["text"], "pos": h["pos"]})
+    return hits
 
 
 def run(cands, min_mech=2, consumer_mode="reject"):
     return [verdict_of(cid, body, min_mech, consumer_mode) for cid, body in cands]
 
 
-def fmt(r):
+def fmt(r, flag=False):
     line = f"[{r['id']}] {r['verdict']}  chars={r['chars']} tokens={r['tokens']} mech={len(r['mech'])}"
     if r["notes"]:
         line += " | " + ",".join(r["notes"])
@@ -147,6 +183,11 @@ def fmt(r):
         line += " / 落点:" + ",".join(r["artifacts"][:4])
     if r["vague"]:
         line += "\n      空话词: " + ",".join(r["vague"])
+    if flag:
+        if r["approval_flag"]:
+            line += "\n      批准依赖: FLAG(" + ",".join(f"{h['label']}:'{h['text']}'" for h in r["approval"]) + ")"
+        else:
+            line += "\n      批准依赖: AUTO(无信号)"
     return line
 
 
@@ -202,7 +243,24 @@ def selftest():
     rs = run([("C1", good), ("C2", noacc), ("C3", vague), ("C4", nocons)])
     chk("NC6 计数自证 4 条 3 类拒收", len(rs) == 4 and sum(1 for x in rs if x["verdict"].startswith("REJECT")) == 3,
         f"n={len(rs)} reject={sum(1 for x in rs if x['verdict'].startswith('REJECT'))}")
-    print(f"selftest {6 - len(fails)}/6")
+
+    # --- 新增判据的负控（TODO 第12行 C5 验收③）---
+    need_approval = ("C7 【产出】把待批台账的 3 条假死项关闭\n验收：①只读复测 rc=0 ②输出决策包草案 "
+                     "③本项 apply 须用户批准后才能执行 ④落点 tools/x.py")
+    r = verdict_of("C7", need_approval)
+    chk("NC7 合成「需用户批准」候选必标 FLAG", r["approval_flag"] is True,
+        f"flag={r['approval_flag']} hits={[h['label'] for h in r['approval']]}")
+    auto_only = ("C8 【工程】给 tools/y.py 加 selftest 用例并复跑\n验收：①`python3 tools/y.py --selftest` "
+                 "8/8 含 2 负控 ②rc=0 ③输出 sha256 自证只读 ④消费者=下一批规划模式")
+    r = verdict_of("C8", auto_only)
+    chk("NC8 纯自动候选不得误报 FLAG", r["approval_flag"] is False,
+        f"flag={r['approval_flag']} hits={[h['label'] for h in r['approval']]}")
+    neg_guard = ("C9 【产出】本项全程只读，不涉及不可逆操作，无需用户批准即可落地。\n验收：①rc=0 ②selftest 3/3 "
+                 "③消费者=报告")
+    r = verdict_of("C9", neg_guard)
+    chk("NC9 否定语（不涉及不可逆/无需批准）不得误报", r["approval_flag"] is False,
+        f"flag={r['approval_flag']} hits={[h['label'] for h in r['approval']]}")
+    print(f"selftest {9 - len(fails)}/9")
     return 1 if fails else 0
 
 
@@ -214,6 +272,8 @@ def main():
     ap.add_argument("--consumer-mode", choices=["reject", "warn"], default="reject",
                     help="reject=缺消费者即拒收（C4 验收要求）；warn=只告警（旧格式候选文本实测会全量假拒收）")
     ap.add_argument("--json")
+    ap.add_argument("--flag-approval", action="store_true",
+                    help="干跑新判据：逐条打「落地是否依赖外部批准」（提示级，不改既有判定与退出码）")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--prove-ghost", action="store_true")
     a = ap.parse_args()
@@ -233,8 +293,11 @@ def main():
         print("# 语料计数自证：0 条候选 ⇒ 不作为「全部通过」的结论，退出码 2"); sys.exit(2)
     rs = run(cands, a.min_mech, a.consumer_mode)
     for x in rs:
-        print(fmt(x))
+        print(fmt(x, a.flag_approval))
     rej = [x["id"] for x in rs if x["verdict"].startswith("REJECT")]
+    if a.flag_approval:
+        fl = [x["id"] for x in rs if x["approval_flag"]]
+        print(f'\n# 批准依赖统计 {json.dumps({"candidates": len(rs), "flag": len(fl), "auto": len(rs) - len(fl), "flagged_ids": fl}, ensure_ascii=False)}')
     print(f"\n# 统计 {json.dumps({'candidates': len(rs), 'pass': len(rs) - len(rej), 'reject': len(rej), 'rejected_ids': rej}, ensure_ascii=False)}")
 
     if a.labels:

@@ -385,3 +385,4 @@ R4 | 2026-04-23 | 环境 | 扫描510个Python包+188个brew工具，识别7个�
 R3 | 2026-04-23 | 产出 | 盘点memory/14个SOP，发现2处冲突(scheduled格式/procmem路径)、4个缺失SOP(keychain/notify/error_recovery/llm_call)、3处需补充；优先级P1:密钥管理+通知推送
 R2 | 2026-04-23 | 产出 | 审计reflect_scripts/6脚本+sche_tasks/3任务 | 结论：01-06全部沉默失效(4未启动/2未配置)；真实运行仅autonomous+scheduler；晨报永远SKIP/hotspot配置损坏；给出4条改进建议
 R1 | 2026-04-23 | 产出 | 分析model_responses 9文件(1.4MB)历史对话 | 产出7条L2草稿(架构/部署/飞书痛点/任务质量观/工作习惯/技术偏好/待验假设)，待用户审批写入global_mem
+R422 | 2026-09-26 | 工程 | 规划批次「落地率」回测+批准依赖 FLAG 判据 | 第11批 7 条候选(6 条有声明产物)落地 6/6=100%、1 条无声明产物未判定；需外部批准仅 1 条(14.3%,C1)；新 tools/plan_landing_backtest.py(只读,selftest 6/6)+闸门加 --flag-approval(selftest 9/9,含3负控)；plan13 回归与 R417 逐字一致(pass5/reject1)；当前候选干跑 FLAG=1/6(C6=本任务自身)；产物 12 条 10 tracked+2 gitignored；提案 R422A/B/C
