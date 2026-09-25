@@ -39,3 +39,10 @@
 - 冲浪规则：每次≤2话题，必须读正文提炼洞察，禁标题搬运；发现好工具→下轮TODO加实测任务
 
 禁区：❌ Hacker News · 刷新闻头条 · 泛采集标题/无目标刷新闻 · 探索知名工具基础用法 · 调研弱于当前框架的AI工具 · 调研其他web自动化/computer use框架 · 读取自身代码库 · 使用im工具发送信息
+
+## 批次收尾约定（收官必做，2026-09-25 R402 实测补）：
+- **种子行**：常驻种子项行**保持 `[ ]` 永不标 [x]**（标了=下轮规划死锁）；本批产出记录**追加**到该行尾（`｜ 最近一次产出：R<n>（日期·第N批）：批次摘要 + 报告文件名`），**不新增**「第N批」种子行（重复种子=下轮重复消费）。
+- **执行完的任务**各自标 `[x] R<n> 类型 | …`（R 编号取 complete_task 返回值；报告路径一律给绝对路径）。
+- **落账后三步**：① `python3 tools/autonomous_reports_archive.py sync`（先 dry-run 核清单，再 `--apply`）② memory 侧三索引（`history.txt` / `history.md` / `INDEX.md`）各补本批一行——编号权威=temp 侧 `history.txt` 首行、逐字复用；memory 侧文件含他会话未提交行时用「`git show HEAD:<f>` 作基座 → `hash-object -w` → `update-index --cacheinfo`」只提交自己那一行，**提交后必须把同一行也插回 worktree**（否则他会话 `commit -a` 会把它从 HEAD 抹掉）③ 提交后核 `git show HEAD --stat` 的新增行数=自己预期（多出=误带他人行）。
+- **数字口径**：报告里的字节数用 `stat -f %z` 现取；`file_write` 返回的 writed_bytes 是**字符数**非字节数（草稿与定稿字节数会因回填而变，交付前重测）。
+- **后台**：本机无 `setsid`；`tools/bg_task.py status` 对「自守护（`start_new_session`）子会话」会误报已退出，判结局须回查日志与产物。
