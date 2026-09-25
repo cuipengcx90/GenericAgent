@@ -17,6 +17,23 @@
 phase 停在哪个状态、`data/` 文件是否还在、`git log` 是否被改、有没有新增 team 目录、
 `~/.cache/autopilot/runs/<run_id>/run-state.json` 与 `run-events.jsonl`。
 
+## 0.5 授权档位：`ask` / `scoped` / `unattended`（2026-09-25 起，E4 剩余半）
+
+成员卡在模态框（trust / 审批 / 菜单）时"装置能不能替人按键"的三档语义。
+**唯一实现** = `herdr-team/bin/agent_unstick.py` 的 `auto_approve_decision`（T18 用 grep 守：调用方**不得**自己分支档位）。
+
+| 档 | 触发 | 行为 |
+|---|---|---|
+| `ask`（fail-closed 默认） | 默认；`--no-trust` / `--no-unattended` 退回此档 | 只报不动；拒绝理由会同时给出两条授权途径 |
+| `scoped` | `--allow-trust` | 仅答"本 run 自己工作区内"的模态；删除模态仍限工作区内可再生缓存 |
+| `unattended` | `--unattended`（autopilot 委托模式的默认档） | 四闸门内按默认项代按；逐条落 `auto-approvals.md` + `unattended-decisions.jsonl` |
+
+**四闸门**（`unattended` 才谈得上）：模态路径非空 ∧ 每条路径都在本工作区内且可再生 ∧ resolve 后仍在工作区内 ∧ 该 driver 具备键鼠能力。
+**硬停四条**（**任何**档位都拒，属能力边界而非授权级别）：模态在问凭据 / 模态不可读（拒绝盲按键）/ 删除模态解析不出路径 / 目标是系统根或 `$HOME` 本身。
+
+真机证据（2026-09-25，规格 §11）：真 codex trust 门代按后 `rc=0` 且 `recheck=working`（`handoff-needs-human.md` 记 healed）；注入 quota 类失败 ⇒ 零按键。
+三档 × 四 kind 的完整判据表见 `docs/product/E4_RETRY_WHITELIST_AND_CONCURRENCY_SPEC.md` §3.9。
+
 ## 1. 装置与用法
 
 **起队前先跑能力预检**（2026-09-22 补，提交 27698c8）：`python3 herdr-team/bin/teamprofile.py doctor --profile <项目>/docs/team-profile.yaml`
