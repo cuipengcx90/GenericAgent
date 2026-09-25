@@ -36,6 +36,8 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -95,11 +97,42 @@ SOURCES = {
              '★该流按 ~23 天滚动删除 ⇒ 它的跨度就是真实"窗口长度"'),
         ],
     },
+    'pmset': {
+        'title': '电源/睡眠日志（/var/log/powermanagement 全目录：*.asl + StoreData）',
+        'kind': 'dir_copy',                  # 目录型滚动源：逐文件拷贝 + 内容寻址去重（硬链接）
+        'src_dir': Path('/var/log/powermanagement'),
+        'include': ['*.asl', 'StoreData'],
+        'root': GA / 'temp' / 'pmset_snapshots',
+        'artifact': 'events.json',           # 「窗口」= 解析产物（睡眠/唤醒/充电事件统计）
+        'parse': 'powermanagement',
+        'irreplaceability': 10,
+        'coverage': '零覆盖（全仓无任何 powermanagement 快照；实测窗口 2026.09.12–今 ≈15 天）',
+        'window': [],
+        'window_note': '解析窗口：逐 .asl 用官方解码器 `syslog -f` 抽「睡眠/暗唤醒/唤醒/供电」事件；'
+                       '★窗口长度由文件轮转决定（实测 15 天），不可再生',
+    },
+    'wifilog': {
+        'title': 'WiFi 日志（/var/log/wifi.log，newsyslog 每日 00:30 轮转）',
+        'kind': 'file_copy',
+        'src_file': Path('/var/log/wifi.log'),
+        'root': GA / 'temp' / 'wifi_snapshots',
+        'artifact': 'wifi.log',
+        'parse': 'wifilog',
+        'irreplaceability': 8,
+        'coverage': '零覆盖（全仓无任何 wifi.log 快照）',
+        'window': [],
+        'window_note': '解析窗口：airport 事件计数 + DHCP 状态变更；并与同日 pmset 快照的睡眠窗口对账'
+                       '（只回答「睡眠窗口内是否仍有网络活动」，不输出 SSID）',
+    },
 }
 
 # 已知滚动源但**未实现**采集（只登记，不装定时；评审建议：别单独立项）
 NOTES = {
-    'pmset': '电源/睡眠日志：`pmset -g log` 与 /var/log/powermanagement 亦滚动；本轮仅登记未实现',
+    'pmset': 'R420 已实现采集（见源 pmset / wifilog）；本工具只做「源接入 + 解析」，**未接定时**（待批）',
+    'wifi-rotated': '★边界：/var/log/wifi.log.N.bz2（N=0..10，各 ~100–370KB）**未纳入采集**；'
+                    '只采当前 wifi.log（newsyslog 每日 00:30 轮转）⇒ 更早窗口的「睡眠内网络活动」对账不可得',
+    'pmset-store': '★边界：/var/log/powermanagement/StoreData（8B 索引）随目录整体拷贝；'
+                   '`pmset -g log` 是**活性视图**（按 ASL 索引滚动读，实测回溯仅到 2026-09-19），它本身不落盘',
 }
 
 METHOD = 'rolling_source_snapshot/v1'
@@ -461,6 +494,194 @@ def snapshot_copy_source(src: dict, date_s: str, force: bool, quiet: bool = Fals
             'src_verdict': src_verdict, 'window': wins, 'manifest': str(manifest_p)}
 
 
+# ---------------------------------------- 采集：dir_copy / file_copy 源（R420）
+def _dir_source_files(src: dict) -> list:
+    d = Path(src['src_dir'])
+    if not d.exists():
+        return []
+    pats = src.get('include') or ['*']
+    return [p for p in sorted(d.iterdir()) if p.is_file() and any(p.match(g) for g in pats)]
+
+
+def _sha_index(root: Path) -> dict:
+    """历史快照内容索引 sha256 → 首次落盘路径（跨日同内容文件以**硬链接**去重，不重复占盘）。
+
+    ★ 依据：这些源是「同一天内容不变、但会被轮转删除」的日志 ⇒ 相邻两日快照存在大量重叠
+      （实测 09.26 与 09.25 有 14/16 份文件同 sha256），硬链接使快照体积≈**增量**而非全量。
+    """
+    idx, root = {}, Path(root)
+    if not root.exists():
+        return idx
+    for d in sorted(root.iterdir()):
+        if not d.is_dir():
+            continue
+        mf = d / 'manifest.json'
+        if not mf.exists():
+            continue
+        try:
+            rev = (json.loads(mf.read_text(encoding='utf-8')).get('revisions') or [{}])[-1]
+        except Exception:  # noqa: BLE001
+            continue
+        for f in rev.get('files') or []:
+            p = d / f['name']
+            if p.exists():
+                idx.setdefault(f['sha256'], p)
+    return idx
+
+
+def dircopy_selfproof(before: dict, after: dict) -> dict:
+    """目录/文件型源的「源侧只读」证据：逐文件 {bytes,mtime,sha256} 前后比对（同 verdict() 口径）。"""
+    per = {}
+    for n in sorted(set(before) | set(after)):
+        b, a = before.get(n), after.get(n)
+        if b is None:
+            per[n] = 'appeared'
+        elif a is None:
+            per[n] = 'disappeared'
+        else:
+            per[n] = verdict(b, a)
+    changed = {n: v for n, v in per.items() if v != 'unchanged'}
+    return {'verdict': 'unchanged' if not changed else 'changed-by-live-writer',
+            'n_files': len(per), 'per_file': per, 'changed': changed}
+
+
+def _write_manifest(manifest_p: Path, src: dict, rev: dict, date_s: str) -> None:
+    m = {'tool': METHOD, 'source': src['name'], 'title': src.get('title'), 'date': date_s,
+         'src_dir': str(src.get('src_dir') or src.get('src_file')), 'revisions': []}
+    if manifest_p.exists():
+        try:
+            m.update(json.loads(manifest_p.read_text(encoding='utf-8')))
+            m['revisions'] = list(m.get('revisions') or [])
+        except Exception:  # noqa: BLE001
+            pass
+    m['revisions'].append(rev)
+    manifest_p.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def snapshot_dir_copy_source(src: dict, date_s: str, force: bool, quiet: bool = False) -> dict:
+    """目录型非数据库源：整体拷贝 + 逐文件 sha256 + 源侧前后自证 (+ .asl 事件解析)。"""
+    def say(*a):
+        if not quiet:
+            print(*a)
+
+    d, root = Path(src['src_dir']), Path(src['root'])
+    dest = root / date_s
+    mf = dest / 'manifest.json'
+    if mf.exists() and not force:
+        try:
+            last = (json.loads(mf.read_text(encoding='utf-8')).get('revisions') or [{}])[-1]
+        except Exception:  # noqa: BLE001
+            last = {}
+        if str(last.get('date'))[:10] == date_s:
+            say('[SKIP] %s 当天快照已存在（%s，%d 文件 / %d B，--force 可重采）'
+                % (src['name'], dest, last.get('n_files') or 0, last.get('total_bytes') or 0))
+            return {'source': src['name'], 'status': 'already-done', 'rc': 0,
+                    'artifact': str(dest / src['artifact']), 'bytes': last.get('total_bytes'),
+                    'sha256': last.get('fileset_sha256'), 'n_files': last.get('n_files')}
+    if not d.exists():
+        say('[FAIL] 缺少源目录: %s' % d)
+        return {'source': src['name'], 'status': 'missing-source', 'rc': 2}
+    files = _dir_source_files(src)
+    if not files:
+        say('[FAIL] 源目录无可采文件（include=%s）: %s' % (src.get('include'), d))
+        return {'source': src['name'], 'status': 'empty-source', 'rc': 2}
+
+    before = {p.name: _stat(p) for p in files}
+    dest.mkdir(parents=True, exist_ok=True)
+    idx, recs = _sha_index(root), []
+    for p in files:
+        b, tgt = before[p.name], dest / p.name
+        if tgt.exists():
+            tgt.unlink()
+        prev, mode = idx.get(b['sha256']), 'copy'
+        if prev is not None:
+            try:
+                os.link(prev, tgt)                       # ▲ 硬链接去重（同内容跨日不重复占盘）
+                mode = 'hardlink'
+            except OSError:
+                mode = 'copy'
+        if not tgt.exists():
+            shutil.copy2(p, tgt)
+        recs.append(dict(b, name=p.name, mode=mode, dst_sha256=sha256_file(tgt),
+                         dst_match=sha256_file(tgt) == b['sha256']))
+    after = {p.name: _stat(p) for p in _dir_source_files(src)}
+    proof = dircopy_selfproof(before, after)
+    total = sum(r['bytes'] for r in recs)
+    fileset = hashlib.sha256(''.join('%s:%s\n' % (r['name'], r['sha256']) for r in recs)
+                             .encode()).hexdigest()
+    parsed = parse_powermanagement(dest) if src.get('parse') == 'powermanagement' else {'summary': {}}
+    rev = {'ts': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'date': date_s,
+           'n_files': len(recs), 'total_bytes': total, 'fileset_sha256': fileset,
+           'files': recs, 'src_dir': str(d), 'readonly_selfproof': proof,
+           'parse': parsed.get('summary'), 'parse_kind': src.get('parse')}
+    _write_manifest(mf, src, rev, date_s)
+    hl = sum(1 for r in recs if r['mode'] == 'hardlink')
+    say('  ├ 源目录      : %s' % d)
+    say('  ├ 快照        : %s（%d 文件 / %d B，硬链接去重 %d 份）'
+        % (dest, len(recs), total, hl))
+    say('  ├ 文件集 sha256: %s   逐字节校验: %s'
+        % (fileset, 'all-match' if all(r['dst_match'] for r in recs) else 'MISMATCH'))
+    say('  └ 源侧自证    : %s（%d/%d 未变；changed=%s）'
+        % (proof['verdict'], proof['n_files'] - len(proof['changed']), proof['n_files'],
+           list(proof['changed'].items()) or '[]'))
+    return {'source': src['name'], 'status': 'ok', 'rc': 0, 'artifact': str(dest / src['artifact']),
+            'bytes': total, 'sha256': fileset, 'n_files': len(recs), 'integrity': 'file-set-hash',
+            'src_verdict': proof['verdict'], 'readonly_selfproof': proof, 'parse': parsed.get('summary'),
+            'manifest': str(mf), 'root': str(dest)}
+
+
+def snapshot_file_copy_source(src: dict, date_s: str, force: bool, quiet: bool = False) -> dict:
+    """单文件型源：拷贝 + 源侧自证 + 文本解析（wifi.log）。"""
+    def say(*a):
+        if not quiet:
+            print(*a)
+
+    f, root = Path(src['src_file']), Path(src['root'])
+    dest = root / date_s
+    mf = dest / 'manifest.json'
+    art = dest / src['artifact']
+    if mf.exists() and art.exists() and not force:
+        try:
+            last = (json.loads(mf.read_text(encoding='utf-8')).get('revisions') or [{}])[-1]
+        except Exception:  # noqa: BLE001
+            last = {}
+        if str(last.get('date'))[:10] == date_s:
+            say('[SKIP] %s 当天快照已存在（%s，%d B，--force 可重采）'
+                % (src['name'], art, art.stat().st_size))
+            return {'source': src['name'], 'status': 'already-done', 'rc': 0, 'artifact': str(art),
+                    'bytes': art.stat().st_size, 'sha256': last.get('sha256')}
+    if not f.exists():
+        say('[FAIL] 缺少源文件: %s' % f)
+        return {'source': src['name'], 'status': 'missing-source', 'rc': 2}
+    before = {'': _stat(f)}
+    dest.mkdir(parents=True, exist_ok=True)
+    if art.exists():
+        art.unlink()
+    shutil.copy2(f, art)
+    st = _stat(art)
+    after = {'': _stat(f)}
+    proof = dircopy_selfproof(before, after)
+    wins = None
+    if src.get('parse') == 'wifilog':
+        wins = _pm_windows_for(date_s)
+        if wins is None:
+            say('  │ [WARN] 缺同日 pmset 快照 ⇒ 本次只解析 wifi.log 自身，跳过「睡眠窗口对账」')
+    parsed = parse_wifilog(art, windows=wins) if src.get('parse') == 'wifilog' else {}
+    rev = {'ts': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'date': date_s,
+           'artifact': art.name, 'bytes': st['bytes'], 'sha256': st['sha256'], 'src_file': str(f),
+           'readonly_selfproof': proof, 'src_before': before, 'src_after': after,
+           'parse': parsed, 'window': []}
+    _write_manifest(mf, src, rev, date_s)
+    say('  ├ 源文件      : %s' % f)
+    say('  ├ 快照        : %s (%d B, sha256 %s)' % (art, st['bytes'], st['sha256']))
+    say('  └ 源侧自证    : %s（before=%s / after=%s）'
+        % (proof['verdict'], before['']['sha256'][:12], after['']['sha256'][:12]))
+    return {'source': src['name'], 'status': 'ok', 'rc': 0, 'artifact': str(art), 'bytes': st['bytes'],
+            'sha256': st['sha256'], 'src_verdict': proof['verdict'], 'readonly_selfproof': proof,
+            'integrity': 'file-sha256', 'window': [], 'parse': parsed, 'manifest': str(mf),
+            'root': str(dest)}
+
+
 # ---------------------------------------------------------------- 采集：delegate 源
 def snapshot_delegate_source(src: dict, date_s: str, force: bool) -> dict:
     """复用既有采集器（如 tools/kc_snapshot.py）；本工具只做包壳+统一复核。"""
@@ -502,7 +723,242 @@ def snapshot_one(name: str, date_s: str, force: bool) -> dict:
     print('▶ %s — %s' % (name, src['title']))
     if src['kind'] == 'copy':
         return snapshot_copy_source(src, date_s, force)
+    if src['kind'] == 'dir_copy':
+        return snapshot_dir_copy_source(src, date_s, force)
+    if src['kind'] == 'file_copy':
+        return snapshot_file_copy_source(src, date_s, force)
     return snapshot_delegate_source(src, date_s, force)
+
+
+# ================================================================= 解析层（R420）
+# 目标源是**非 SQLite** 的二进制/文本日志，故「窗口」不由 SQL 表达，而由解析器给出。
+# 全部解析器对**快照副本**运行（可事后复跑），且与 `pmset -g log` 交叉对账过（见报告 R420）。
+PMSET_EVENTS = ('sleep_enter', 'darkwake', 'wake', 'ac', 'battery')
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'])}
+RAW_PROBES = ('Entering Sleep state', 'DarkWake from', 'Wake from')
+
+
+def _year_from_name(name: str):
+    m = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', name)
+    return int(m.group(1)) if m else None
+
+
+def _ts_from_line(ln: str, year):
+    """`Sep 20 00:01:12 host powerd[100] <Notice>: …` / `Sat Sep 26 00:35:15.909 [airport] …` → ISO 秒串。
+
+    ★ 两个源的时间戳都**不含年份**（ASL 按日轮转、wifi 由 newsyslog 轮转）⇒ 年份取自快照文件名/日期。
+    """
+    t = ln
+    # ★ 坑（selftest T10 抓出）：wifi 行有星期前缀 `Sat Sep 26 00:35:15.909`。若先用
+    #   `^[A-Z][a-z]{2} ([A-Z][a-z]{2} )` 剥离星期，会把**月份一起吃掉**（'Sat Sep ' 全被匹配）
+    #   ⇒ 剩下的 '26 00:35:15' 再也匹配不到月份 ⇒ 时间戳恒为 0。改用单条可选组正则交给回溯。
+    m = re.match(r'^(?:[A-Z][a-z]{2} )?([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2})', t)
+    if not m or m.group(1) not in MONTHS:
+        return None
+    try:
+        return datetime.datetime(year or datetime.date.today().year, MONTHS[m.group(1)],
+                                 int(m.group(2)), int(m.group(3)), int(m.group(4)),
+                                 int(m.group(5))).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
+
+
+def decode_asl(path: Path, timeout: int = 60) -> dict:
+    """官方解码器 `syslog -f`；不可用/空则回退「原始字节扫描」并**如实标注 method**。
+
+    ★ 为什么要双路：`.asl` 是 ASL 二进制库，消息文本以明文存在串表里 ⇒ 原始字节扫描能独立
+      复核解码器是否**吞了事件**（实测 09.19–09.24 五份文件两路口径**逐日相等**，见报告 R420）。
+    """
+    lines, method, rc = [], None, None
+    try:
+        p = subprocess.run(['syslog', '-f', str(path)], capture_output=True, text=True, timeout=timeout)
+        rc = p.returncode
+        lines = (p.stdout or '').splitlines()
+        if rc == 0 and lines:
+            method = 'syslog -f（官方 ASL 解码器）'
+    except Exception as e:  # noqa: BLE001
+        rc = 'exc:%s' % type(e).__name__
+    raw = path.read_bytes().decode('utf-8', 'replace')
+    raw_counts = {k: raw.count(k) for k in RAW_PROBES}
+    if method is None:
+        lines = [ln for ln in re.split(r'[\x00\n]', raw) if ln.strip()]
+        method = 'raw-bytes 扫描（回退：syslog -f rc=%s）' % rc
+    return {'lines': lines, 'method': method, 'syslog_rc': rc, 'raw_counts': raw_counts}
+
+
+def _close_window(cur: dict, ts) -> dict:
+    secs = None
+    if cur.get('enter') and ts:
+        try:
+            a = datetime.datetime.strptime(cur['enter'], '%Y-%m-%d %H:%M:%S')
+            b = datetime.datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+            secs = int((b - a).total_seconds())
+        except ValueError:
+            secs = None
+    return {'enter': cur.get('enter'), 'wake': ts, 'reason': cur.get('reason'), 'secs': secs}
+
+
+def parse_pm_text(lines: list, year) -> dict:
+    """powerd 消息 → 睡眠/唤醒/供电事件计数 + 睡眠窗口（Entering Sleep → 下一次 Wake/DarkWake）。
+
+    ★ 陷阱：`DarkWake from …` 里**含子串** `Wake from` ⇒ 必须先判 DarkWake，否则唤醒数虚高。
+    """
+    ev = {k: 0 for k in PMSET_EVENTS}
+    reasons, windows, cur, last_charge = {}, [], None, None
+    for ln in lines:
+        ts = _ts_from_line(ln, year)
+        if 'Entering Sleep state' in ln:
+            ev['sleep_enter'] += 1
+            m = re.search(r"due to '([^']*)'", ln)
+            r = m.group(1) if m else '不明'
+            reasons[r] = reasons.get(r, 0) + 1
+            cur = {'enter': ts, 'reason': r}
+        elif 'DarkWake from' in ln:
+            ev['darkwake'] += 1
+            if cur:
+                windows.append(_close_window(cur, ts))
+                cur = None
+        elif 'Wake from' in ln:
+            ev['wake'] += 1
+            if cur:
+                windows.append(_close_window(cur, ts))
+                cur = None
+        elif 'Using AC' in ln:
+            ev['ac'] += 1
+            m = re.search(r'Charge:\s*(\d+)', ln)
+            if m:
+                last_charge = int(m.group(1))
+        elif 'Using Battery' in ln:
+            ev['battery'] += 1
+    if cur:
+        windows.append(_close_window(cur, None))
+    return {'events': ev, 'reasons': reasons, 'windows': windows, 'last_charge': last_charge}
+
+
+def parse_powermanagement(dest: Path, write: bool = True, quiet: bool = False) -> dict:
+    """对一个快照目录里的全部 *.asl 解析 → events.json / events.tsv / windows.tsv。"""
+    files = sorted(p for p in Path(dest).iterdir() if p.suffix == '.asl')
+    rows, all_win, tot = [], [], {k: 0 for k in PMSET_EVENTS}
+    for f in files:
+        d = decode_asl(f)
+        r = parse_pm_text(d['lines'], _year_from_name(f.name))
+        rc_ = d['raw_counts']
+        raw_wake_plain = rc_.get('Wake from', 0) - rc_.get('DarkWake from', 0)
+        ok = (r['events']['sleep_enter'] == rc_.get('Entering Sleep state', 0)
+              and r['events']['darkwake'] == rc_.get('DarkWake from', 0)
+              and r['events']['wake'] == raw_wake_plain)
+        for k in tot:
+            tot[k] += r['events'][k]
+        all_win.extend(r['windows'])
+        rows.append({'file': f.name, 'bytes': f.stat().st_size, 'decoder': d['method'],
+                     'syslog_rc': d['syslog_rc'], 'decoded_lines': len(d['lines']),
+                     'events': r['events'], 'sleep_windows': len(r['windows']),
+                     'sleep_secs': sum(w['secs'] or 0 for w in r['windows']),
+                     'reasons': r['reasons'], 'last_charge': r['last_charge'],
+                     'raw_counts': rc_, 'decoder_match': ok})
+    summary = {'n_files': len(rows), 'n_decoded_lines': sum(r['decoded_lines'] for r in rows),
+               'events_total': tot, 'sleep_windows_total': len(all_win),
+               'sleep_secs_total': sum(w['secs'] or 0 for w in all_win),
+               'decode_days_with_events': sum(1 for r in rows if r['events']['sleep_enter']
+                                              or r['events']['darkwake'] or r['events']['wake']),
+               'decoder_match_all': all(r['decoder_match'] for r in rows) if rows else None}
+    if write:
+        out = {'tool': METHOD, 'source': 'pmset', 'snapshot_dir': str(dest),
+               'method': 'syslog -f 解码（回退 raw-bytes）→ 逐行归类；窗口=Entering Sleep→下一次 Wake/DarkWake',
+               'known_boundary': 'pmset -g log 是活性视图（本机实测回溯仅到 2026-09-19）；'
+                                 '快照副本才是可复跑的权威来源',
+               'files': rows, 'summary': summary, 'windows': all_win}
+        (Path(dest) / 'events.json').write_text(json.dumps(out, ensure_ascii=False, indent=2),
+                                                encoding='utf-8')
+        (Path(dest) / 'events.tsv').write_text(
+            'file\tbytes\tdecoded_lines\tsleep_enter\tdarkwake\twake\tac\tbattery\twindows\tsleep_secs\n'
+            + ''.join('%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\n'
+                      % (r['file'], r['bytes'], r['decoded_lines'], r['events']['sleep_enter'],
+                         r['events']['darkwake'], r['events']['wake'], r['events']['ac'],
+                         r['events']['battery'], r['sleep_windows'], r['sleep_secs']) for r in rows),
+            encoding='utf-8')
+        (Path(dest) / 'windows.tsv').write_text(
+            'enter\twake\tsecs\treason\n'
+            + ''.join('%s\t%s\t%s\t%s\n' % (w['enter'] or '', w['wake'] or '',
+                                            '' if w['secs'] is None else w['secs'], w['reason'])
+                      for w in all_win), encoding='utf-8')
+    if not quiet:
+        print('  ├ 解析        : %d 份 .asl → 解码 %d 行（days_with_events=%d，decoder_match_all=%s）'
+              % (summary['n_files'], summary['n_decoded_lines'],
+                 summary['decode_days_with_events'], summary['decoder_match_all']))
+        print('  │  事件合计    : %s' % ' '.join('%s=%d' % (k, v) for k, v in tot.items()))
+        print('  └  睡眠窗口    : %d 段，共 %.1f 小时'
+              % (len(all_win), summary['sleep_secs_total'] / 3600.0))
+    return {'summary': summary, 'files': rows, 'windows': all_win, 'method': 'parse_powermanagement'}
+
+
+def _in_windows(ts: str, windows: list) -> bool:
+    for w in windows:
+        if not (w.get('enter') and w.get('wake')):
+            continue
+        if w['enter'] <= ts <= w['wake']:          # ISO 串可直接比较
+            return True
+    return False
+
+
+def parse_wifi_text(lines: list, year, windows=None) -> dict:
+    """wifi.log → 行数/时间跨度/DHCP 事件，并与 pmset 睡眠窗口对账（只答「睡时是否仍有网络活动」）。
+
+    ★ 本机 wifi.log 当前实现**只记录 airport 事件计数 + DHCP 状态变更**，无 SSID、无链路 up/down
+      ⇒ 严格说无法证明「断网」，只能给出「睡眠窗口内是否有 airport/DHCP 活动」这一**更弱**的对账。
+    """
+    ts_all, dhcp, in_win, dhcp_in = [], 0, 0, 0
+    for ln in lines:
+        ts = _ts_from_line(ln, year)
+        if ts:
+            ts_all.append(ts)
+        if 'DHCP' in ln:
+            dhcp += 1
+        if ts and windows and _in_windows(ts, windows):
+            in_win += 1
+            if 'DHCP' in ln:
+                dhcp_in += 1
+    return {'n_lines': len(lines), 'n_timestamped': len(ts_all),
+            'first': min(ts_all) if ts_all else None, 'last': max(ts_all) if ts_all else None,
+            'dhcp_lines': dhcp, 'n_windows_used': len(windows or []),
+            'lines_in_sleep_windows': in_win, 'dhcp_in_sleep_windows': dhcp_in,
+            'verdict': (None if not windows else
+                        ('quiet-during-sleep' if in_win == 0 else 'activity-during-sleep')),
+            'boundary': 'wifi.log 由 newsyslog 每日 00:30 轮转；更早窗口在 wifi.log.N.bz2 内（本工具未采）'}
+
+
+def parse_wifilog(path: Path, write: bool = True, windows=None, quiet: bool = False) -> dict:
+    txt = Path(path).read_text(encoding='utf-8', errors='replace')
+    lines = txt.splitlines()
+    year = datetime.date.today().year
+    got = parse_wifi_text(lines, year, windows)
+    if write:
+        out = {'tool': METHOD, 'source': 'wifilog', 'file': str(path),
+               'method': '逐行抽时间戳 + DHCP/airport 关键词 → 与同日 pmset 睡眠窗口对账',
+               'result': got}
+        Path(path).parent.joinpath('events.json').write_text(
+            json.dumps(out, ensure_ascii=False, indent=2), encoding='utf-8')
+    if not quiet:
+        print('  ├ 解析        : %d 行（带时间戳 %d），DHCP 行 %d' % (got['n_lines'], got['n_timestamped'], got['dhcp_lines']))
+        print('  └ 睡眠对账    : 窗口 %d 段 → 窗口内 %d 行（DHCP %d）⇒ %s'
+              % (got['n_windows_used'], got['lines_in_sleep_windows'], got['dhcp_in_sleep_windows'],
+                 got['verdict'] or '未提供睡眠窗口（缺同日 pmset 快照）'))
+    return got
+
+
+def _pm_windows_for(date_s: str) -> list:
+    """读同日 pmset 快照的 events.json 取睡眠窗口（供 wifi 对账；缺则返回 None=不臆造）。"""
+    src = SOURCES.get('pmset')
+    if not src:
+        return None
+    p = Path(src['root']) / date_s / 'events.json'
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding='utf-8')).get('windows') or []
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # ---------------------------------------------------------------- list / window
@@ -524,8 +980,10 @@ def cmd_list(args) -> int:
             rows.append({'date': d, 'bytes': art.stat().st_size if art.exists() else None, 'sha256': sha})
         out['sources'][name] = {'title': src['title'], 'root': str(root), 'days': days, 'n_days': len(days),
                                 'latest': days[-1] if days else None, 'rows': rows,
+                                'kind': src['kind'],
                                 'irreplaceability': src['irreplaceability'], 'coverage': src['coverage'],
-                                'window_note': src['window'][-1][2]}
+                                'window_note': (src.get('window_note')
+                                                or (src['window'][-1][2] if src.get('window') else None))}
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0
@@ -553,6 +1011,31 @@ def cmd_window(args) -> int:
         for d in (days if args.all_days else days[-1:]):
             art = root / d / src['artifact']
             if not art.exists():
+                continue
+            if src['kind'] in ('dir_copy', 'file_copy'):
+                # 非 SQLite 源：窗口由解析器给出（events.json / 采集返回值），不跑 SQL
+                ev = root / d / 'events.json'
+                info = {}
+                if ev.exists():
+                    try:
+                        info = json.loads(ev.read_text(encoding='utf-8'))
+                    except Exception:  # noqa: BLE001
+                        info = {}
+                wins = [{'name': 'parse', 'note': src.get('window_note') or '',
+                         'row': [None, None, None], 'parsed': info.get('summary') or info.get('result')}]
+                res.setdefault(name, {})[d] = wins
+                if not args.json:
+                    print('■ %s  %s  (解析产物: %s)' % (name, d, ev if ev.exists() else '（缺 events.json）'))
+                    s = wins[0]['parsed'] or {}
+                    if 'events_total' in s:
+                        print('   - 事件合计   %s' % ' '.join('%s=%d' % (k, v) for k, v in s['events_total'].items()))
+                        print('   - 睡眠窗口   %d 段 / %.1f 小时（解码行 %d，decoder_match_all=%s）'
+                              % (s.get('sleep_windows_total'), (s.get('sleep_secs_total') or 0) / 3600.0,
+                                 s.get('n_decoded_lines'), s.get('decoder_match_all')))
+                    elif 'n_lines' in s:
+                        print('   - wifi 行数  %d（时间戳 %d，DHCP %d）'
+                              % (s.get('n_lines'), s.get('n_timestamped'), s.get('dhcp_lines')))
+                        print('   - 睡眠对账   %s' % (s.get('verdict') or '未提供睡眠窗口'))
                 continue
             wins = run_window_queries(art, src['window'])
             res.setdefault(name, {})[d] = wins
@@ -638,6 +1121,65 @@ def selftest() -> int:
            'root': work / 'o2', 'artifact': 'a.db', 'window': []}
     r5 = snapshot_delegate_source(bad, '2026-01-01', force=False)
     ok('T5 负控-委派失败不假绿', r5.get('status') == 'delegate-failed' or r5.get('rc') not in (0, None))
+
+    # T6 正例：目录型滚动源（dir_copy）→ 逐文件哈希 + 源侧自证 + .asl 事件解析
+    asl_dir = work / 'fake_pm'
+    asl_dir.mkdir()
+    (asl_dir / '2026.09.20.asl').write_text(
+        "Sep 20 00:01:12 host powerd[100] <Notice>: Entering Sleep state due to 'Idle Sleep': Using AC\n"
+        "Sep 20 03:11:00 host powerd[100] <Notice>: DarkWake from Deep Idle [CDN] : due to RTC\n"
+        "Sep 20 07:20:00 host powerd[100] <Notice>: Entering Sleep state due to 'Maintenance Sleep': Using Battery\n"
+        "Sep 20 09:30:00 host powerd[100] <Notice>: Wake from Normal Sleep [CDNVA]\n", encoding='utf-8')
+    (asl_dir / 'StoreData').write_bytes(b'\x00' * 8)
+    fake_pm = {'name': 'fakepm', 'title': 'x', 'kind': 'dir_copy', 'src_dir': asl_dir,
+               'include': ['*.asl', 'StoreData'], 'root': work / 'out_pm', 'artifact': 'events.json',
+               'parse': 'powermanagement', 'window': [], 'irreplaceability': 10, 'coverage': 'x'}
+    r6 = snapshot_dir_copy_source(fake_pm, '2026-01-01', force=False, quiet=True)
+    ev6 = (r6.get('parse') or {}).get('events_total') or {}
+    ok('T6 正例-目录快照生成+事件解析', r6.get('status') == 'ok' and ev6.get('sleep_enter') == 2
+       and ev6.get('darkwake') == 1 and ev6.get('wake') == 1, str(ev6))
+    ok('T6 正例-解码器/原始字节双路口径一致', (r6.get('parse') or {}).get('decoder_match_all') is True)
+    ok('T6 正例-源侧自证 unchanged', r6.get('src_verdict') == 'unchanged')
+    ok('T6 正例-逐文件逐字节校验', all(f['dst_match'] for f in json.loads(
+        (Path(fake_pm['root']) / '2026-01-01' / 'manifest.json').read_text(encoding='utf-8')
+    )['revisions'][-1]['files']))
+    (work / 'no-such-dir-marker').write_text('')       # 占位，确保 work 可写
+
+    # T7 正例：跨日同内容 → 硬链接去重（快照体积≈增量）
+    snapshot_dir_copy_source(fake_pm, '2026-01-02', force=False, quiet=True)
+    rev7 = json.loads((Path(fake_pm['root']) / '2026-01-02' / 'manifest.json').read_text(encoding='utf-8'))['revisions'][-1]
+    ok('T7 正例-同内容硬链接去重', all(f['mode'] == 'hardlink' for f in rev7['files']),
+       str({f['name']: f['mode'] for f in rev7['files']}))
+
+    # T8 负控：空目录/不匹配 include 必须报错，不得假绿
+    empty = work / 'empty_dir'
+    empty.mkdir()
+    fake_e = dict(fake_pm); fake_e.update({'src_dir': empty, 'root': work / 'out_e'})
+    r8 = snapshot_dir_copy_source(fake_e, '2026-01-01', force=False, quiet=True)
+    ok('T8 负控-空源被拒(rc=2)', r8.get('status') == 'empty-source' and r8.get('rc') == 2)
+
+    # T9 负控：DarkWake 子串陷阱（若把 DarkWake 误计为 wake，此处必炸）
+    ev9 = parse_pm_text(["Sep 21 01:00:00 host powerd[1] <Notice>: DarkWake from Deep Idle [CDN]"],
+                        year=2026)['events']
+    ok('T9 负控-DarkWake 不计入 wake', ev9['darkwake'] == 1 and ev9['wake'] == 0, str(ev9))
+
+    # T10 正例/负控：wifi 与睡眠窗口对账（窗口内=有活动 / 窗口外=安静）
+    wf = work / 'wifi.log'
+    wf.write_text("Sat Sep 26 00:35:15.909 [airport] DHCP lease bound\n"
+                  "Sat Sep 26 05:00:00.000 [airport] BOOTP 0\n", encoding='utf-8')
+    inwin = [{'enter': '2026-09-26 00:00:00', 'wake': '2026-09-26 02:00:00', 'reason': 'x', 'secs': 7200}]
+    outwin = [{'enter': '2026-09-26 10:00:00', 'wake': '2026-09-26 11:00:00', 'reason': 'x', 'secs': 3600}]
+    ok('T10 正例-窗口内判 activity', parse_wifi_text(wf.read_text().splitlines(), 2026, inwin)['verdict']
+       == 'activity-during-sleep')
+    ok('T10 负控-窗口外判 quiet', parse_wifi_text(wf.read_text().splitlines(), 2026, outwin)['verdict']
+       == 'quiet-during-sleep')
+
+    # T11 正例：单文件源（file_copy）采集 + 缺同日 pmset 时不臆造窗口
+    fake_w = {'name': 'fakewifi', 'title': 'x', 'kind': 'file_copy', 'src_file': wf,
+              'root': work / 'out_wifi', 'artifact': 'wifi.log', 'parse': 'wifilog', 'window': []}
+    r11 = snapshot_file_copy_source(fake_w, '2026-01-03', force=False, quiet=True)
+    ok('T11 正例-单文件快照+解析+自证', r11.get('status') == 'ok' and (r11.get('parse') or {}).get('n_lines') == 2
+       and r11.get('src_verdict') == 'unchanged', str((r11.get('parse') or {}).get('n_lines')))
 
     shutil.rmtree(work, ignore_errors=True)
     bad_n = [n for n, c, _ in cases if not c]
