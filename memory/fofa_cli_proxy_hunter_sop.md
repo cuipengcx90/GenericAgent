@@ -91,3 +91,9 @@ A=实调 usable｜B=列表有但限流/配额(429)｜C=上游auth/服务不可�
 
 ## 最终报告格式
 两张表（可用表：Target/可调用模型数/模型族/key可用性/判定；列表表：Target//v1/models/失败原因/判定）+ 证据文件块（`*_probe.jsonl` / `*_summary.json`）。
+
+## 本机访问证据里的中转/公益站种子（选填，非 FOFA 结果）
+只读工具 `tools/domain_gap.py` 会把「本机 Chrome 高频访问、而 memory+报告语料零提及」的域名列出来，其中 A 节即 New API / 公益站 / 镜像类（2026-09-27 快照：20 域 / 657 次，如 `api.fengwind.com` 74、`routerpark.com` 67、`web4.52pokemon.cc` 65、`api-welfalre.fengwind.com` 50）。
+- 用途：给 `--profile newapi` 或类 `url.txt` 轻量快检**备一批候选 base URL**，先 `--models-only` 出候选，再按本 SOP 三段决策实调。
+- 清单落点：`memory/domain_gap/COLLECTION_CANDIDATES.md`（A 节）；重算＝`python3 tools/domain_gap.py scan`（数据源随每日 Chrome 快照更新）。
+- ★口径限制：这些域名**只是本机访问过的站点**，不等于已验证可用的代理；也不保证收录进 FOFA——是否 usable 仍以本 SOP 的实调结果为准。
