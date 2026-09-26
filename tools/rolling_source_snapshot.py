@@ -62,6 +62,11 @@ SOURCES = {
         'artifact': 'History',
         'irreplaceability': 9,
         'coverage': '零覆盖（全仓无任何 Chrome 历史快照）',
+        'profiles': {
+            'root': HOME / 'Library/Application Support/Google/Chrome',
+            'note': '默认只采 Default；--profiles all 才逐 profile 采（R430 实测非 Default 面占全机 http '
+                    '8.48%=2788/32886）。本机带 History 的目录=Default + Guest Profile + Profile 3/4/6/7/8/9/10/11',
+        },
         'window': [
             ('visits 全表',
              "select count(*) n, datetime(min(visit_time)/1000000.0-11644473600,'unixepoch','localtime') oldest,"
@@ -384,14 +389,20 @@ def _raw_copy_rollback_vacuum(db: Path, sidecars: list, raw: Path, dest: Path) -
 
 
 # ---------------------------------------------------------------- 采集：copy 源
-def snapshot_copy_source(src: dict, date_s: str, force: bool, quiet: bool = False) -> dict:
+def snapshot_copy_source(src: dict, date_s: str, force: bool, quiet: bool = False,
+                         dest_override=None) -> dict:
+    """`dest_override`（R445 新增，默认 None ⇒ 原行为逐字不变）：显式指定产物目录。
+
+    Chrome 全 profile 模式需要把 N 个 profile 放进同一天的目录树
+    （`<root>/<date>/profiles/<name>/`），而 `root/date_s` 的默认拼法只能表达一层。
+    """
     def say(*a):
         if not quiet:
             print(*a)
 
     db = Path(src['db'])
     root = Path(src['root'])
-    dest = root / date_s
+    dest = Path(dest_override) if dest_override else root / date_s
     art = dest / src['artifact']
     manifest_p = dest / 'manifest.json'
 
@@ -961,6 +972,304 @@ def _pm_windows_for(date_s: str) -> list:
         return None
 
 
+# ---------------------------------------- Chrome 全 profile 采集（R445 · TODO 第17批 C4）
+# 背景：本工具默认只采 Default；R430 实测非 Default 面占全机 http 访问 8.48%（2788/32886），
+#       R437 已逐 profile 归因，但**每日快照仍只覆盖 Default** ⇒ 本条只补「采集器能力位」。
+# 边界：①只在 `--profiles all` 时生效（默认 off ⇒ 原代码路径逐字不变，不动默认采集面）
+#       ②不接定时（接线属 R423-D6 待批）③只读源库：逐 profile 走与单 profile **同一条**拷贝路径
+#         （backup API 子进程 / raw 拷贝+回滚+VACUUM INTO），不开源库、不写源库
+# 口径：per-profile http 访问数**复用 R430 内核** tools/chrome_profiles_consume.py::profile_stats，
+#       与 temp/chrome_profiles/consume_*.json 基线同一口径（禁自造计数口径）
+PROFILE_CHROME_ROOT = HOME / 'Library' / 'Application Support' / 'Google' / 'Chrome'
+PROFILE_SIDECARS = ('-journal', '-wal', '-shm')
+
+
+def _load_cpc():
+    """复用 R430 口径内核；不可用时返回 None（调用方走内联回退并在记录里标注口径，绝不静默假绿）。"""
+    try:
+        if str(GA / 'tools') not in sys.path:
+            sys.path.insert(0, str(GA / 'tools'))
+        import chrome_profiles_consume as _cpc
+        return _cpc
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _cpc_call(fn, *a, **kw):
+    """CPC 复用护栏。
+
+    ★R445 实测坑：`chrome_profiles_consume.discover_profiles` 对**不存在的根目录**不是返回 []，
+      而是 `raise SystemExit('[ERR] Chrome 根目录不存在：…')`（SystemExit 属 BaseException ⇒
+      `except Exception` 接不住）——直接复用会把主进程/整轮 selftest 静默带走（无 traceback、rc≠0）。
+      故所有 CPC 调用点都由此函数包裹，异常一律降级为 None/[]。
+    """
+    try:
+        return fn(*a, **kw)
+    except BaseException:  # noqa: BLE001
+        return None
+
+
+def discover_chrome_profiles(root) -> list:
+    """带 History 的 profile 目录（含 Guest / System 等不在 info_cache 的目录）。"""
+    cpc = _load_cpc()
+    if cpc is not None:
+        got = _cpc_call(cpc.discover_profiles, Path(root))
+        if got:
+            return [{'profile': p['profile'], 'history': Path(p['history']), 'bytes': p['bytes'],
+                     'wal': p['wal'], 'shm': p['shm']} for p in got]
+    root = Path(root)
+    out = []
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            h = d / 'History'
+            if d.is_dir() and h.is_file():
+                out.append({'profile': d.name, 'history': h, 'bytes': h.stat().st_size,
+                            'wal': Path(str(h) + '-wal').exists(), 'shm': Path(str(h) + '-shm').exists()})
+    return out
+
+
+def profile_metrics(history) -> dict:
+    """per-profile 计数（口径=R430）。CPC 不可用时退化为内联 SQL 并在记录里标明。"""
+    cpc = _load_cpc()
+    if cpc is not None:
+        st = _cpc_call(cpc.profile_stats, Path(history))
+        if st:
+            return {'http_visits': st['http_visits'], 'raw_visits': st['raw_visits'],
+                    'distinct_hosts': st['distinct_hosts'], 'first_visit': st['first_visit'],
+                    'last_visit': st['last_visit'], 'metric': 'cpc.profile_stats(R430 口径)'}
+    con = _ro_conn(Path(history))
+    try:
+        raw = con.execute('select count(*) from visits').fetchone()[0]
+        http = con.execute("select count(*) from visits v join urls u on u.id=v.url"
+                           " where u.url like 'http%'").fetchone()[0]
+    finally:
+        con.close()
+    return {'http_visits': http, 'raw_visits': raw, 'distinct_hosts': None, 'first_visit': None,
+            'last_visit': None, 'metric': 'inline-sql 回退（CPC 不可用，口径可能与基线有差）'}
+
+
+PRODUCT_METHOD_MARKERS = ('vacuum-into', 'backup-api')
+
+
+def audit_sidecars(src_sidecars, art_sidecars, method: str) -> dict:
+    """侧车审计（负控：**纯** raw 路径缺 -wal/-shm 必报）。
+
+    判据按「**产物级**语义」而非「方法串是否含 raw 字样」——
+    - 产物是**自足单文件**（方法串含 `vacuum-into` / `backup-api`，即 VACUUM INTO 或备份 API 产物）：
+      源侧侧车已被**消费**（`_raw_copy_rollback_vacuum` 先连侧车一起 raw 拷贝、可写打开让 SQLite 用
+      journal 回滚到一致态，再 VACUUM INTO 出干净单文件并删掉临时侧车）⇒ 归档里侧车缺席是**预期**，
+      记 `consistent-vacuum`；此时一致性由产物自带 `PRAGMA quick_check`（integrity）自证。
+    - 产物是**纯 raw 文件拷贝**（无上述产物标记）：侧车必须随副本入档；缺 = 副本可能是截断的中间态
+      （已提交事务落在 -wal/-journal 里而没带上）⇒ 违例 SIDECAR_MISSING。
+
+    ★R445 真跑修正：初版只看 `'raw-file-copy' in method` ⇒ 把真实 Default 的
+      `raw-file-copy+rollback+vacuum-into`（产物=干净 VACUUM 单文件、integrity=ok）误判成缺 côté
+      侧车并让整源 rc=2（假失败）。方法串**同时**含 raw 与产物标记时，以产物标记为准。
+    """
+    src_present, art_present = set(src_sidecars or ()), set(art_sidecars or ())
+    m = method or ''
+    is_product = any(k in m for k in PRODUCT_METHOD_MARKERS)
+    violations = []
+    if is_product:
+        verdict = 'consistent-vacuum'
+        note = '产物=自足单文件（VACUUM INTO/备份 API）⇒ 一致性由 integrity 自证，侧车缺席符合预期'
+    elif 'raw-file-copy' in m:
+        for s in sorted(src_present - art_present):
+            violations.append({'kind': 'SIDECAR_MISSING', 'sidecar': s})
+        verdict = 'raw-sidecar-missing' if violations else 'raw-sidecars-ok'
+        note = 'raw 拷贝：侧车必须随副本入档'
+    else:
+        verdict = 'consistent-vacuum'
+        note = '方法未知：按产物自证处理，侧车缺席不违例（已记录源侧侧车供人工核）'
+    return {'verdict': verdict, 'violations': violations, 'src_sidecars': sorted(src_present),
+            'artifact_sidecars': sorted(art_present), 'method': method,
+            'artifact_kind': 'product' if is_product else ('raw-copy' if 'raw-file-copy' in m else 'unknown'),
+            'note': note}
+
+
+def reconcile_profiles(rows, base_profiles, base_total, tol: float = 0.05,
+                       base_default=None, default_name: str = 'Default',
+                       expect_total=None) -> dict:
+    """与 R430/R437 冻结基线对账（逐 profile + 总量）。**下界式**判定：允许增长，缩水超容差即 FAIL。
+
+    rows         本次快照逐 profile 计数（含 Default）
+    base_profiles 基线非 Default 行；base_total 基线全机总量；base_default 基线 Default 计数
+    违例：PROFILE_MISSING（基线里的 profile 本次没采到=目录消失/改名）、
+          PROFILE_SHRINK（缩水超容差）、TOTAL_MISMATCH（总量低于容差下界）
+    """
+    now = {r['profile']: int(r.get('http_visits') or 0) for r in rows}
+    base = {p['profile']: int(p.get('http_visits') or 0) for p in (base_profiles or [])}
+    if base_default is not None:
+        base[default_name] = int(base_default)
+    violations, per = [], []
+    for name in sorted(base):
+        if name not in now:
+            violations.append({'kind': 'PROFILE_MISSING', 'profile': name})
+            per.append({'profile': name, 'base': base[name], 'now': None, 'verdict': 'missing'})
+            continue
+        b, n = base[name], now[name]
+        floor = b * (1.0 - tol)
+        if b > 0 and n < floor:
+            violations.append({'kind': 'PROFILE_SHRINK', 'profile': name, 'base': b, 'now': n,
+                               'floor': round(floor, 2)})
+            kind = 'fail'
+        elif n > b:
+            kind = 'grown'
+        else:
+            kind = 'same'
+        per.append({'profile': name, 'base': b, 'now': n, 'delta': n - b, 'verdict': kind})
+    extra = sorted(set(now) - set(base))
+    for name in extra:
+        per.append({'profile': name, 'base': None, 'now': now[name], 'verdict': 'extra'})
+    ref = expect_total if expect_total is not None else base_total
+    tot = {'now': sum(now.values()), 'base': base_total, 'expect': expect_total, 'verdict': 'n/a'}
+    if ref:
+        tot['ref'] = int(ref)
+        tot['delta'] = tot['now'] - int(ref)
+        tot['floor'] = round(int(ref) * (1.0 - tol), 2)
+        if tot['now'] < int(ref) * (1.0 - tol):
+            violations.append({'kind': 'TOTAL_MISMATCH', 'now': tot['now'], 'ref': int(ref),
+                               'floor': tot['floor']})
+            tot['verdict'] = 'fail'
+        else:
+            tot['verdict'] = 'grown' if tot['now'] > int(ref) else 'same'
+    return {'verdict': 'ok' if not violations else 'mismatch', 'violations': violations,
+            'rows': per, 'totals': tot, 'tol': tol, 'extra_profiles': extra,
+            'note': '下界式判定：允许增长；缺 profile / 缩水超容差 / 总量低于下界 ⇒ FAIL'}
+
+
+def find_baseline(explicit=None):
+    """基线 JSON：显式路径 > temp/chrome_profiles/consume_*.json 中最新一份 > None。"""
+    if explicit:
+        p = Path(explicit)
+        return p if p.exists() else None
+    cands = sorted((GA / 'temp' / 'chrome_profiles').glob('consume_*.json'))
+    return cands[-1] if cands else None
+
+
+def _baseline_parts(bj: dict) -> dict:
+    return {'profiles': bj.get('profiles') or [],
+            'total': (bj.get('combined_all_profiles') or {}).get('http_visits'),
+            'default': (bj.get('base_default_only') or {}).get('http_visits')}
+
+
+def snapshot_chrome_profiles(src, date_s, force=False, quiet=False, root=None, chrome_root=None,
+                             baseline_path=None, baseline_obj=None, tol=0.05,
+                             expect_total=None) -> dict:
+    """逐 profile 采集（默认行为之外的**新增模式**；不改动 Default-only 的既有落点）。
+
+    产物：`<root>/<date>/profiles/<name>/{History,manifest.json}`
+          `<root>/<date>/profiles/index.json`（逐 profile sha256/计数/侧车审计/对账结论）
+    """
+    def say(*a):
+        if not quiet:
+            print(*a)
+
+    out_root = Path(root or src['root'])
+    croot = Path(chrome_root or (src.get('profiles') or {}).get('root') or PROFILE_CHROME_ROOT)
+    profiles = discover_chrome_profiles(croot)
+    if not profiles:
+        say('[FAIL] 未发现任何带 History 的 profile 目录：%s' % croot)
+        return {'status': 'no-profiles', 'rc': 2, 'chrome_root': str(croot), 'profiles': [],
+                'note': 'profile 目录消失/根路径错误 ⇒ 必报（不得静默当 0 个 profile 采集成功）'}
+
+    day_dir = out_root / date_s / 'profiles'
+    recs, rows, hard_fail = [], [], []
+    say('■ Chrome 全 profile 快照  %s  根=%s' % (date_s, croot))
+    try:
+        for p in profiles:
+            name, dest_dir = p['profile'], day_dir / p['profile']
+            sub = dict(src)
+            sub.update({'name': 'chrome:%s' % name, 'title': 'Chrome 历史（%s/History）' % name,
+                        'db': Path(p['history']), 'root': dest_dir})
+            rec = snapshot_copy_source(sub, date_s, force=force, quiet=True, dest_override=dest_dir)
+            art = Path(rec.get('artifact')) if rec.get('artifact') else (dest_dir / 'History')
+            mf = dest_dir / 'manifest.json'
+            rev = {}
+            if mf.exists():
+                try:
+                    rev = (json.loads(mf.read_text(encoding='utf-8')).get('revisions') or [{}])[-1]
+                except Exception:  # noqa: BLE001
+                    rev = {}
+            if rec.get('status') == 'already-done':
+                # ★R445 修复：already-done 分支只回 status/artifact/bytes/sha256 ⇒ 若直接用它拼
+                # index 记录，重复采集会把 method/完整性/只读自证**降级为空**，audit_sidecars 随之
+                # 落回「方法未知/artifact_kind=unknown」＝侧车审计在幂等复跑后静默失去判据。
+                # 回填源**只能是**同目录 manifest.json 的存档 revision（旧 index.json 本身可能已被降级）。
+                rec = dict(rec)
+                for k in ('method', 'integrity', 'src_verdict', 'bytes', 'sha256'):
+                    if not rec.get(k):
+                        rec[k] = rev.get(k)
+                if not rec.get('readonly_selfproof'):
+                    rec['readonly_selfproof'] = rev.get('readonly_selfproof') or {}
+            src_sidecars = [k for k in (rev.get('src_before') or {}) if k]
+            art_sidecars = [s for s in PROFILE_SIDECARS if Path(str(art) + s).exists()]
+            audit = audit_sidecars(src_sidecars, art_sidecars, rec.get('method'))
+            metrics = profile_metrics(art) if art.exists() else {}
+            if metrics:
+                rows.append({'profile': name, **{k: metrics.get(k) for k in ('http_visits', 'raw_visits',
+                                                                            'distinct_hosts', 'last_visit')}})
+            if rec.get('rc') not in (0, None) or audit['violations']:
+                hard_fail.append(name)
+            recs.append({'profile': name, 'status': rec.get('status'), 'rc': rec.get('rc'),
+                         'artifact': str(art), 'bytes': rec.get('bytes'), 'sha256': rec.get('sha256'),
+                         'integrity': rec.get('integrity'), 'method': rec.get('method'),
+                         'sidecar_audit': audit, 'metrics': metrics,
+                         'src_verdict': rec.get('src_verdict'),
+                         'readonly_selfproof': (rec.get('readonly_selfproof') or {}).get('verdict'),
+                         'manifest': str(mf) if mf.exists() else None})
+            say('  ├ %-14s %10s B  sha256 %s  http=%-6s [%s] %s' % (
+                name, rec.get('bytes'), (rec.get('sha256') or '')[:16], metrics.get('http_visits'),
+                rec.get('status'), ('侧车违例=%d' % len(audit['violations'])) if audit['violations'] else ''))
+    except Exception as e:  # noqa: BLE001
+        return {'status': 'profiles-error', 'rc': 3, 'chrome_root': str(croot),
+                'profiles': recs, 'detail': '%s: %s' % (type(e).__name__, e)}
+
+    bpath, bj = None, None
+    if baseline_obj is not None:
+        parts, bpath = baseline_obj, None
+    else:
+        bpath = find_baseline(baseline_path)
+        if bpath is not None:
+            try:
+                bj = json.loads(bpath.read_text(encoding='utf-8'))
+                parts = _baseline_parts(bj)
+            except Exception:  # noqa: BLE001
+                parts, bpath = None, bpath
+        else:
+            parts = None
+    if parts is None:
+        recon = {'verdict': 'skipped', 'violations': [],
+                 'note': '无基线 JSON（temp/chrome_profiles/consume_*.json 不存在或不可解析）⇒ 本次不做对账'}
+    else:
+        recon = reconcile_profiles(rows, parts.get('profiles'), parts.get('total'), tol=tol,
+                                   base_default=parts.get('default'), expect_total=expect_total)
+    if bpath is not None:
+        recon['baseline'] = str(bpath)
+
+    idx = {'tool': METHOD, 'kind': 'chrome-profiles', 'date': date_s, 'chrome_root': str(croot),
+           'root': str(day_dir), 'n_profiles': len(recs), 'profiles': recs, 'reconcile': recon,
+           'hard_fail_profiles': hard_fail,
+           'note': 'R445 新增模式（默认关闭）；未接定时（接线属 R423-D6 待批）'}
+    day_dir.mkdir(parents=True, exist_ok=True)
+    idx_p = day_dir / 'index.json'
+    idx_p.write_text(json.dumps(idx, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    tot = recon.get('totals', {}) or {}
+    non_def = sum(int(r.get('http_visits') or 0) for r in rows if r['profile'] != 'Default')
+    base_prof = sum(int(x.get('http_visits') or 0) for x in ((parts or {}).get('profiles') or []))
+    say('  ├ 非 Default 合计 http=%s（基线非 Default %s）  total=%s（基线全机 %s）' % (
+        non_def, base_prof if parts else 'n/a', tot.get('now'), tot.get('base')))
+    say('  └ 对账: %s%s    index=%s' % (
+        recon['verdict'],
+        ('  违例=%s' % recon['violations']) if recon.get('violations') else '', idx_p))
+    rc = 3 if hard_fail else (1 if recon.get('verdict') == 'mismatch' else 0)
+    return {'status': 'ok' if rc == 0 else 'issues', 'rc': rc, 'date': date_s, 'chrome_root': str(croot),
+            'root': str(day_dir), 'index': str(idx_p), 'n_profiles': len(recs),
+            'profiles': recs, 'reconcile': recon, 'hard_fail_profiles': hard_fail,
+            'non_default_http': non_def}
+
+
 # ---------------------------------------------------------------- list / window
 def cmd_list(args) -> int:
     out = {'sources': {}, 'notes': NOTES}
@@ -1181,6 +1490,136 @@ def selftest() -> int:
     ok('T11 正例-单文件快照+解析+自证', r11.get('status') == 'ok' and (r11.get('parse') or {}).get('n_lines') == 2
        and r11.get('src_verdict') == 'unchanged', str((r11.get('parse') or {}).get('n_lines')))
 
+    # T12 正例/负控：Chrome 全 profile 模式（合成 3 个 profile；逐 profile 拷贝/逐 profile sha256/index.json）
+    froot = work / 'fake_chrome'
+    for nm, nrow in (('Default', 60), ('Profile 3', 20), ('Guest Profile', 1)):
+        d = froot / nm
+        d.mkdir(parents=True)
+        _mk_fixture_db(d / 'History', n_rows=nrow)
+    fsrc12 = dict(SOURCES['chrome'])
+    fsrc12.update({'root': work / 'out_prof'})
+    pr12 = snapshot_chrome_profiles(fsrc12, '2026-01-05', force=False, quiet=True,
+                                    root=work / 'out_prof', chrome_root=froot,
+                                    baseline_obj={'profiles': [], 'total': None})  # 隔离：不吃真仓基线
+    ok('T12 正例-全 profile 采集(3/3, rc=0)', pr12.get('status') == 'ok' and pr12.get('n_profiles') == 3
+       and pr12.get('rc') == 0, str((pr12.get('status'), pr12.get('n_profiles'), pr12.get('rc'))))
+    idx12 = json.loads(Path(pr12['index']).read_text(encoding='utf-8'))
+    ok('T12 正例-逐 profile sha256 与产物逐字一致',
+       all(r['sha256'] == sha256_file(Path(r['artifact'])) for r in idx12['profiles']))
+    ok('T12 正例-落点=<date>/profiles/<name>/（三 profile 齐）',
+       {r['profile'] for r in idx12['profiles']} == {'Default', 'Profile 3', 'Guest Profile'}
+       and all(Path(r['artifact']).parent.name == r['profile'] for r in idx12['profiles']))
+    pr12b = snapshot_chrome_profiles(fsrc12, '2026-01-05', force=False, quiet=True,
+                                     root=work / 'out_prof', chrome_root=froot,
+                                     baseline_obj={'profiles': [], 'total': None})
+    ok('T12 正例-二次运行幂等(全 already-done)',
+       all(r['status'] == 'already-done' for r in pr12b['profiles']))
+    # T19 幂等「不降级」：already-done 分支本身只回 status/artifact/bytes/sha256 ⇒
+    #     必须从同目录 manifest.json 的存档 revision 回填 method/完整性/只读自证，
+    #     否则复跑会把 index 记录降级成「方法未知」（侧车审计随之静默失去判据）。★R445 修复
+    idx12b = json.loads(Path(pr12b['index']).read_text(encoding='utf-8'))
+
+    def _norm19(r):
+        d = dict(r)
+        d['status'] = 'done' if d['status'] in ('ok', 'already-done') else d['status']
+        return d
+
+    ok('T19 正例-幂等复跑 index 记录与首跑逐字段一致(仅 status 归一)',
+       [_norm19(r) for r in idx12b['profiles']] == [_norm19(r) for r in idx12['profiles']],
+       str([[k for k in m19k if m19k[k] != m19b[k]] for m19k, m19b in
+            zip(sorted(idx12['profiles'], key=lambda x: x['profile']),
+                sorted(idx12b['profiles'], key=lambda x: x['profile']))]))
+    m19 = {r['profile']: r for r in idx12['profiles']}
+    m19b = {r['profile']: r for r in idx12b['profiles']}
+    ok('T19 正例-回填到 method/完整性/只读自证(非空)',
+       all(m19[k].get('method') and m19b[k].get('method') == m19[k].get('method')
+           and m19b[k].get('integrity') == m19[k].get('integrity')
+           and m19b[k].get('readonly_selfproof') == m19[k].get('readonly_selfproof')
+           for k in m19),
+       str({k: (m19[k].get('method'), m19b[k].get('method')) for k in m19}))
+    # 负控：把存档 revision 的 method 抹掉 ⇒ 回填源确实取不到（证明上面断言非恒真）
+    ncdir = work / 'out_prof_legacy'
+    shutil.copytree(str(work / 'out_prof' / '2026-01-05'), str(ncdir / '2026-01-05'))
+    for mfp in (ncdir / '2026-01-05' / 'profiles').glob('*/manifest.json'):
+        mm = json.loads(mfp.read_text(encoding='utf-8'))
+        for rv in mm.get('revisions') or []:
+            rv.pop('method', None)
+        mfp.write_text(json.dumps(mm, ensure_ascii=False, indent=2), encoding='utf-8')
+    p19nc = snapshot_chrome_profiles(fsrc12, '2026-01-05', force=False, quiet=True, root=ncdir,
+                                     chrome_root=froot, baseline_obj={'profiles': [], 'total': None})
+    ok('T19 负控-存档 revision 无 method ⇒ 记录确实取不到(回填非恒真)',
+       p19nc['profiles'] and all(r.get('method') is None for r in p19nc['profiles']),
+       str([(r['profile'], r.get('method')) for r in p19nc['profiles']]))
+    no_prof = snapshot_chrome_profiles(fsrc12, '2026-01-06', quiet=True, root=work / 'out_prof',
+                                      chrome_root=work / 'no_such_root')
+    ok('T12 负控-根目录不存在 ⇒ rc=2 且不带走进程(CPC SystemExit 护栏生效)',
+       no_prof.get('rc') == 2 and no_prof.get('status') == 'no-profiles')
+    # T18 基线口径：显式不存在的路径 ⇒ None；_baseline_parts 字段映射正确
+    ok('T18 正例-显式基线不存在 ⇒ None', find_baseline(work / 'no_such_baseline.json') is None)
+    bp18 = _baseline_parts({'profiles': [{'profile': 'Profile 3', 'http_visits': 276}],
+                            'combined_all_profiles': {'http_visits': 32886},
+                            'base_default_only': {'http_visits': 30098}})
+    ok('T18 正例-基线字段映射(profiles/total/default)',
+       bp18 == {'profiles': [{'profile': 'Profile 3', 'http_visits': 276}], 'total': 32886,
+                'default': 30098}, str(bp18))
+
+    # T13 侧车审计（负控：raw 路径缺 -wal/-shm 必报；正例：备份 API/VACUUM 产物侧车缺席=预期）
+    a13 = audit_sidecars(['-journal', '-wal'], [], 'raw-file-copy')
+    ok('T13 负控-纯 raw 拷贝缺侧车必报', a13['verdict'] == 'raw-sidecar-missing'
+       and {v['sidecar'] for v in a13['violations']} == {'-journal', '-wal'}, str(a13['violations']))
+    ok('T13 正例-纯 raw 侧车齐 ⇒ ok',
+       audit_sidecars(['-wal'], ['-wal'], 'raw-file-copy')['verdict'] == 'raw-sidecars-ok')
+    a13b = audit_sidecars(['-journal'], [], 'raw-file-copy+rollback+vacuum-into')
+    ok('★T13 回归(真跑 Default)-raw+rollback+vacuum 产物缺侧车不算违例',
+       a13b['verdict'] == 'consistent-vacuum' and a13b['violations'] == []
+       and a13b['artifact_kind'] == 'product', str(a13b))
+    ok('T13 正例-备份 API/VACUUM 侧车缺席=预期',
+       audit_sidecars(['-wal'], [], 'sqlite3-backup-api(child-proc, ro-src)')['verdict'] == 'consistent-vacuum')
+
+    # T14 逐 profile 对账（负控：基线 profile 消失必报；正例：完全一致 ⇒ ok）
+    rc14 = reconcile_profiles([{'profile': 'Profile 3', 'http_visits': 5}],
+                              [{'profile': 'Profile 3', 'http_visits': 5},
+                               {'profile': 'Profile 7', 'http_visits': 7}], base_total=12)
+    ok('T14 负控-基线 profile 消失必报(PROFILE_MISSING)', rc14['verdict'] == 'mismatch'
+       and any(v['kind'] == 'PROFILE_MISSING' and v['profile'] == 'Profile 7' for v in rc14['violations']),
+       str(rc14['violations']))
+    ok('T14 正例-逐 profile 一致 ⇒ ok',
+       reconcile_profiles([{'profile': 'Profile 3', 'http_visits': 5}],
+                          [{'profile': 'Profile 3', 'http_visits': 5}], base_total=5)['verdict'] == 'ok')
+
+    # T15 总量对账（负控：总量对不上必报 TOTAL_MISMATCH；正例：允许增长）
+    bad15 = reconcile_profiles([{'profile': 'Default', 'http_visits': 100}], [], base_total=32886,
+                               base_default=100)
+    ok('T15 负控-总量对不上必报(TOTAL_MISMATCH)', bad15['verdict'] == 'mismatch'
+       and any(v['kind'] == 'TOTAL_MISMATCH' for v in bad15['violations']), str(bad15['violations']))
+    grow15 = reconcile_profiles([{'profile': 'Default', 'http_visits': 110}], [], base_total=100,
+                                base_default=100)
+    ok('T15 正例-增长不算违例(grown)', grow15['verdict'] == 'ok'
+       and grow15['totals']['verdict'] == 'grown')
+
+    # T16 缩水容差（负控：超容差必报 PROFILE_SHRINK；正例：容差内放行）
+    hard16 = reconcile_profiles([{'profile': 'Profile 3', 'http_visits': 100}],
+                                [{'profile': 'Profile 3', 'http_visits': 276}], base_total=100)
+    ok('T16 负控-缩水超容差必报(PROFILE_SHRINK)',
+       any(v['kind'] == 'PROFILE_SHRINK' for v in hard16['violations']), str(hard16['violations']))
+    soft16 = reconcile_profiles([{'profile': 'Profile 3', 'http_visits': 265}],
+                                [{'profile': 'Profile 3', 'http_visits': 276}], base_total=265)
+    ok('T16 正例-容差内缩水放行', soft16['verdict'] == 'ok')
+
+    # T17 端到端：把 T12 采到的计数当基线回灌 ⇒ 必过（正例）；把总量放大 100 倍 ⇒ 必报（负控）
+    base12 = [{'profile': p['profile'], 'http_visits': p['metrics'].get('http_visits')}
+              for p in idx12['profiles']]
+    tot12 = sum(int(b['http_visits'] or 0) for b in base12)
+    e17 = snapshot_chrome_profiles(fsrc12, '2026-01-07', quiet=True, root=work / 'out_prof',
+                                   chrome_root=froot, baseline_obj={'profiles': base12, 'total': tot12})
+    ok('T17 正例-端到端对账通过(基线=同源)', e17['rc'] == 0 and e17['reconcile']['verdict'] == 'ok',
+       str(e17['reconcile'].get('violations')))
+    e17b = snapshot_chrome_profiles(fsrc12, '2026-01-08', quiet=True, root=work / 'out_prof',
+                                    chrome_root=froot,
+                                    baseline_obj={'profiles': base12, 'total': tot12 * 100})
+    ok('T17 负控-端到端总量不符 ⇒ rc≠0 且报 TOTAL_MISMATCH', e17b['rc'] != 0
+       and any(v['kind'] == 'TOTAL_MISMATCH' for v in e17b['reconcile']['violations']))
+
     shutil.rmtree(work, ignore_errors=True)
     bad_n = [n for n, c, _ in cases if not c]
     print('---\nselftest: %d/%d PASS%s' % (len(cases) - len(bad_n), len(cases), '' if not bad_n else '  失败: %s' % bad_n))
@@ -1191,14 +1630,27 @@ def selftest() -> int:
 def cmd_snapshot(args) -> int:
     date_s = args.date or datetime.date.today().isoformat()
     names = list(SOURCES) if args.source == 'all' else [args.source]
-    res = []
+    prof_mode = getattr(args, 'profiles', 'off')
+    prof_only = getattr(args, 'profiles_only', False)
+    res, pres = [], []
     for n in names:
+        if n == 'chrome' and prof_mode == 'all' and prof_only:
+            continue  # --profiles-only：跳过 Default-only 的普通采集（避免 Default 被采两遍）
         res.append(snapshot_one(n, date_s, args.force))
+    if prof_mode == 'all' and 'chrome' in names:
+        pres.append(snapshot_chrome_profiles(SOURCES['chrome'], date_s, force=args.force,
+                                            baseline_path=getattr(args, 'baseline', None),
+                                            tol=getattr(args, 'tol', 0.05),
+                                            expect_total=getattr(args, 'expect_total', None)))
     if args.json:
-        print(json.dumps(res, ensure_ascii=False, indent=2))
-    bad = [r for r in res if r.get('rc') not in (0, None)]
+        if prof_mode == 'all':
+            print(json.dumps({'sources': res, 'chrome_profiles': pres}, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(res, ensure_ascii=False, indent=2))  # 默认路径输出格式逐字不变
+    bad = ([r for r in res if r.get('rc') not in (0, None)]
+           + [p for p in pres if p.get('rc') not in (0, None)])
     if bad:
-        print('[FAIL] %d 个源失败: %s' % (len(bad), [b.get('source') for b in bad]))
+        print('[FAIL] %d 个源失败: %s' % (len(bad), [b.get('source') or 'chrome:profiles' for b in bad]))
         return 2
     # 源侧复核必须给出明确结论（活库允许 changed，但不得为空）
     miss = [r for r in res if r.get('src_verdict') is None and r.get('status') == 'ok' and 'delegate' not in str(r.get('status'))]
@@ -1212,6 +1664,13 @@ def main() -> int:
     sub = ap.add_subparsers(dest='cmd', required=True)
     s = sub.add_parser('snapshot'); s.add_argument('--source', default='all', choices=['all'] + list(SOURCES))
     s.add_argument('--date'); s.add_argument('--force', action='store_true'); s.add_argument('--json', action='store_true')
+    s.add_argument('--profiles', choices=['off', 'all'], default='off',
+                   help='off=仅 Default（默认，行为不变）；all=额外逐 profile 采全机所有带 History 的 profile(R445)')
+    s.add_argument('--profiles-only', action='store_true',
+                   help='配合 --profiles all：跳过 Default-only 普通采集（避免 Default 采两遍）')
+    s.add_argument('--baseline', help='对账基线 JSON（默认=temp/chrome_profiles/consume_*.json 最新一份）')
+    s.add_argument('--tol', type=float, default=0.05, help='对账容差（缩水超此比例即 FAIL；默认 0.05）')
+    s.add_argument('--expect-total', type=int, help='显式给全机总量基准（覆盖基线的 combined_all_profiles）')
     s.set_defaults(func=cmd_snapshot)
     s = sub.add_parser('window'); s.add_argument('--source', default='all', choices=['all'] + list(SOURCES))
     s.add_argument('--all-days', action='store_true'); s.add_argument('--json', action='store_true')
