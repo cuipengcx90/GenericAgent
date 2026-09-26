@@ -138,15 +138,32 @@ def tokenize_keyword(keyword):
     return tokens or [keyword]
 
 
-def is_relevant(keyword, title):
-    """判断搜索结果标题是否与关键词真正相关，防止 haisou OR 式分词匹配带来的垃圾。
-    要求关键词中最长（最具辨识度）的核心词出现在标题中。例如 ``AI Agent``
-    必须命中 ``Agent``，不能仅因命中高频词 ``AI`` 而放行。
-    """
-    title_l = (title or "").lower()
-    tokens = tokenize_keyword(keyword.lower())
-    core_token = max(tokens, key=len)
-    return core_token in title_l
+# --- 相关性判据：单一源 = <repo>/tools/haisou_relevance.py（A/B 复算见报告 R441） ---
+# 旧版按 max(tokens, key=len) 取核心词，对 "AI测试" 等关键词会因等长取首拿到 "ai"
+# ⇒ 含 ai 即放行（2026-09-22/23 累计 4 条假阳性）。新判据先剔通用/弱信号 token 再取最长，
+# 并支持同义词表与 ASCII 连写形态（ClaudeCode/VibeCoding）。
+_JUDGER_SRC = "tools/haisou_relevance.py (单一源)"
+try:
+    _ROOT = Path(__file__).resolve().parents[1]
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from tools.haisou_relevance import is_relevant  # noqa: E402,F401
+except Exception as _e:  # 回退：内联降级版（无同义词表），保证 monitor 不因缺文件而中断
+    _JUDGER_SRC = f"inline-fallback ({type(_e).__name__})"
+    _GENERIC = {
+        "ai", "aigc", "ai+", "大模型", "课程", "教程", "视频", "网课", "全套",
+        "合集", "课程合集", "资源", "资料", "学习", "培训", "训练营",
+    }
+
+    def is_relevant(keyword, title):
+        """降级版：剔除通用/弱信号 token 后，最长核心词须命中标题。"""
+        title_l = (title or "").lower()
+        toks = tokenize_keyword(keyword.lower())
+        cand = [t for t in toks if t not in _GENERIC and not (re.fullmatch(r"[a-z0-9]+", t) and len(t) <= 3)]
+        cand = cand or toks
+        if not cand:
+            return False
+        return max(cand, key=len) in title_l
 
 
 def run():
