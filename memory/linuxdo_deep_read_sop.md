@@ -150,6 +150,8 @@ function getLikeCount(post) {
 - linux.do 在密集请求后会进入 **Cloudflare IP 级 429**：页面顶部返回 `Just a moment...`。特征：**浏览器 fetch 与 curl_cffi（各 impersonate 版本、各 UA）同时 429** → 是 IP 限流而非指纹问题，换指纹/加代理都无用。
 - 对策：**等待约 10 分钟**后自动恢复（实测 200）。不要试图绕 CF、不要切代理硬打。
 - 附带结论：`connect.linux.do` 的 CF 卡死（见 `linuxdo_trust_level_sop`）与本次 429 是两类不同故障，不要混淆。
+- ★2026-09-26 实测（另一类障碍，勿与 429 混淆）：日报帖位于**需登录**的分类 ⇒ 匿名通道（jina / 无 cookies 的 curl）拿不到 `/t/<id>.json`；分类页 cat78「最新 30 条」与作者 `user_actions.json?filter=4`（建帖列表 09-26 实测止于 2026-06-10）**都定位不到当日日报帖**。唯一可靠入口仍是**同源** `search.json?q=人工智能技术日报 order:latest`。
+- ★同条实测：CF 挑战只拦「无登录态」的请求通道；**只要浏览器里已有一个 linux.do 的普通 tab**（哪怕它当前停在挑战页），在该 tab 上同源 fetch `search.json` / `/t/<id>.json` 直接 200 ⇒ **无需**起独立临时 Chrome 注 cookies（下面的「独立临时 Chrome」通道只在完全没有 linux.do tab 时才用）。
 
 ### 正文=纯附件时的取 PDF
 - 主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
