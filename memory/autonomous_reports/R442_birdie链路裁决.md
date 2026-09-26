@@ -73,3 +73,28 @@ curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x http://127.0.0.1:7897 ht
 # 全局不可达复验（第三方节点，需联网提交 rid 后取结果）
 #   见 temp/birdie_triage/checkhost_raw.json 内的请求 URL
 ```
+
+## 8. 附加发现：台账「决策」列口径坑（本轮顺手修，含证据）
+
+**现象**：`view_pending.py` 把本报告对应的 `DECISIONS_R442_birdie_retire.md` 统计为「2 条目 / 未决 0 / 已决 2」——待批项在 `--aging`（积压天数视图）里彻底隐身。
+
+**根因**（源码 `temp/pending_decisions/view_pending.py` L29–L38，`is_decided()`）：`决策` 列语义 = 留空 ⇒ 未决；写了待批/待审/未决/⏳/☐/⬜/`[]` 等字样 ⇒ **仍未决**；其余任何非空 ⇒ 已决。本台账把**动作描述**写进了 `决策` 列 ⇒ 被判已决。
+
+**正解口径**（= 既有 24 份台账惯例，如 R382/R393/R404/R417/R428/R434）：动作写 `变更内容（具体动作）` 列，另设一个**留空的** `决策` 列。
+
+**处置**：
+- 修 `DECISIONS_R442_birdie_retire.md`（本会话新增）与 `DECISIONS_R429_reclaim_candidates.md`（**旧会话遗留，同一缺陷** ⇒ 其 D1–D3 三条已隐身 1 天）。
+- 只做列重排/补空列，单元格文字逐字保留；两个文件均在 gitignored `temp/`，不影响仓库。
+- 全量扫描 28 份台账确认仅此 2 份受影响；`DECISIONS.md` 的 2 行「已决」是真状态（批注 `[已执行 09-23]`），保留不动。
+
+**证据**（2026-09-27 修后复跑 `python3 temp/pending_decisions/view_pending.py`）：
+
+```
+DECISIONS_R429_reclaim_candidates.md               3     3     0      0 天
+DECISIONS_R442_birdie_retire.md                    2     2     0      0 天
+合计 147 条 / 未决 145 条
+```
+
+修前同一命令为：`R429 3/0/3`、`R442 2/0/2`、`合计 147 条 / 未决 140 条`。
+
+**可复用的自检**：新增台账落盘后必跑 `view_pending.py`，确认自己的条目出现在「未决明细」；「条目数对但未决=0」就是本坑的指纹。
