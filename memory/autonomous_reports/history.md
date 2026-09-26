@@ -1,3 +1,4 @@
+R428 | 2026-09-26 | 产出 | 待批台账注意力压缩器(第15批C7) | 交付 tools/attention_compressor.py(577行/30565B,纯stdlib只读): 把 24 台账文件/137 条未决按主题聚成 10 决策包(mem-text49/sched-reflect18/disk-reclaim13/backup-dr11/chain-hook13/ledger-policy11/tools-durable6/report-archive6/audit-gate6/snapshot-source4),每包给一句话决策+不批后果+一包一句批准语;逐条判「只读∧可逆」→ auto_queue 4 条(writes_files129/reversible91/未分类0);覆盖率闸门 pending=137 mapped=137 coverage=100.0%(漏一条必报NC1);--selftest 14/14 含 NC1-NC10 负控(含两轮自我纠错:R408C 实为新建反射器、R405A 实为新增一行被初版误判只读);与 R413 三桶 A 桶 14 条交集为空(互补非替代);自产待批 2 条 DECISIONS_R428_attention_pack.md(D1 SOP 加一行 / D2 apply.py 加 --pack,均 revers=0)
 R427 | 2026-09-26 | 产出 | 记忆/SOP/定时 prompt 数值 ↔ 源码常量 只读对账器 | 交付 tools/const_number_audit.py(760行/36913B/sha256 83e17bd579f01e97,纯stdlib只读,AST抽常量+同段.py路径回源,三态MISMATCH/SUSPECT-NAMED/UNDECIDABLE,弱绑定需字面token且距离<=60,自匹配剔除;--selftest 21/21含4负控[篡改常量必报/无路径不误报/单位族不同不硬判/自匹配剔除]+只读自证);真跑默认口径 121文件/12268行/231断言行/660断言/0.26s -> MISMATCH 1=RULE21 的 dpdomain「27 天」vs RENEW_COOLDOWN_DAYS=25.0(同段 reflect/scheduler.py:62 timedelta.days=27.0 记一致=两数别混的机读证据);含reports 302文件/41536行/1161断言行/2301断言/0.46s -> MISMATCH 2(同指 dpdomain);初版40条假阳性经自匹配剔除+全大写/字面绑定+邻近阈值收紧到1条;待批 DECISIONS_R427_const_number_audit.md:D1 反射器/D2 dpdomain 口径三处同批改/D3 接 complete_task 报告侧提示(均 revers=0)
 R426 | 2026-09-26 | 产出 | kc 熄屏×pmset 睡眠跨源对账器(三源快照首个消费者) | 校准闸门 249.350h==profile.py dark_total_hours rc=0(错值负控 rc=2);同一时点 5/5 天 kc>pmset 差 +0.67~+7.49h 无稳定比例⇒禁互推;订正 L2「方向相反」旧值为不可复现(快照时点差);未接线定时
 R425 | 2026-09-26 | 产出 | 规划模式第15批：三路独立评审与下一批 TODO | 量化 scores.json n=393、LOW 37(13.4%)；6 条候选经**三路**独立评审（槽3 gpt-6-astra/槽4 sonnet5-4router/codex CLI；槽0 两次截断 82B 不计入）→ 保留 4 条（三源快照消费 8.00 / 数值↔常量对账 7.17 / 磁盘回收候选 7.00 收窄 / Chrome 非 Default 对账 6.17 收窄）+ 三路一致提名替换 1 条（删除 C2 P6 ghost 5.33、C6 memory 发现性 5.50，换「待批台账注意力压缩器：132 未决→≤10 主题包 + 可逆∧只读队列」）；本批 5 条写入 temp/TODO.txt 第17–21行；评审原文 temp/plan15/；报告 R425
@@ -16,7 +17,7 @@ R411 | 2026-09-25 | 能力 | 任务与外部通道「产物级新鲜度」每日
 R410 | 2026-09-25 | 能力 | 引用完整性闸门 tools/ref_integrity.py（C1·第12批三路评审 9.33 并列最高） | 单入口只读闸门，判定内核零重写复用 R378/R380（记忆侧 token 级重叠 91.53%）；抽 path/path:line → EXISTS/GONE/AMBIG（memory 95文件=1391/257/55，reports 161文件=2633/682/22）；副产品产物存在性索引（150 报告/62 报告含自称产物，schema ga.ref_artifact_index/v1）；selftest 6/6 含 4 负控；只读自证 389 文件 sha256 全同；★R404 六条断链行号已漂移+2（276→278/283→285/319→321/347→349）但按 token 6/6 命中；helper 接线与纪律句落待批台账 DECISIONS_R410_ref_integrity.md
 # 自主报告 history 索引（抢救自 temp/autonomous_reports/history.txt）
 
-- 采集: 2026-09-25；行数 386；更新: 2026-09-26 追加 R420（history.txt 现 388 行）
+- 采集: 2026-09-25；行数 392；更新: 2026-09-26 追加 R420（history.txt 现 388 行）
 - 格式: `R### | 日期 | 类型 | 主题 | 结论`
 
 ```text
