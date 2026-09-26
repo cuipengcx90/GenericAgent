@@ -57,6 +57,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | dpdomain_renew_sop(DigitalPlat免费域名续期;★两数别混:脚本RENEW_COOLDOWN_DAYS=25天手动去重vs scheduler冷却27天;rc=6本机Turnstile取不到token⇒密码登录不可用,须人工登录并保留标签页;检查=task_freshness.py --only dpdomain_renew)
 | l2_snapshot.py(L2快照/回滚;store=~/.ga/l2_snapshots)
 L4: L4_raw_sessions/(原文检索=tools/l4_search.py:流式3.5s扫6zip/415成员/623MB零解压,search/show/grep-file/list/selftest;默认大小写不敏感,与grep对账带--case-sensitive)
+待批台账批准前证据器(R433)=tools/pending_evidence.py(只读预览+唯一写盘 --approve;--revers-backfill 默认 dry-run;--selftest 18/18 含 7 类负控;真仓 25 台账/142 行=可一句批准 14 条、有 ID 对账我=142 pv=142 集合差 0/0、只读自证 FILES=39 CHANGED=0;★对账口径=行 ID 存 `_id` 非 `ID` 且比 (file,_id) 集合非计数[否则假差 8 行];写盘前须用**原始 cells** 逐字复现校验[用改后 cells 必误拒];报告 R433/笔记 temp/pending_evidence/NOTES_r433.md)
 
 [RULES]
 1. 搜索先行: 优先cwd；搜文件名先es；网页搜索只用google；本机rg未装(搜索静默返回空!)→用grep
