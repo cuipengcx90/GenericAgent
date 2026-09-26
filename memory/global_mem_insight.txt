@@ -58,6 +58,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 | l2_snapshot.py(L2快照/回滚;store=~/.ga/l2_snapshots)
 L4: L4_raw_sessions/(原文检索=tools/l4_search.py:流式3.5s扫6zip/415成员/623MB零解压,search/show/grep-file/list/selftest;默认大小写不敏感,与grep对账带--case-sensitive)
 待批台账批准前证据器(R433)=tools/pending_evidence.py(只读预览+唯一写盘 --approve;--revers-backfill 默认 dry-run;--selftest 18/18 含 7 类负控;真仓 25 台账/142 行=可一句批准 14 条、有 ID 对账我=142 pv=142 集合差 0/0、只读自证 FILES=39 CHANGED=0;★对账口径=行 ID 存 `_id` 非 `ID` 且比 (file,_id) 集合非计数[否则假差 8 行];写盘前须用**原始 cells** 逐字复现校验[用改后 cells 必误拒];报告 R433/笔记 temp/pending_evidence/NOTES_r433.md)
+kc 未消费流首份消费(R434)=tools/kc_app_usage.py(601行/28686B,纯stdlib只读,selftest 18/18含5负控+--readonly-proof 源库sha256前后一致;消费 kc `/app/usage`+`/notification/usage` 两条万级零消费者流:09-25快照 29天窗口(08-28→09-25)10427事件/44app/前台计166.52h(=有数据日600h的27.8%,占696h窗口23.9%;4天无行记UNKNOWN≠0)/Top1 ghostty 92.94h(55.81%)/Chrome 27.77(16.68%)/lark 16.68(10.02%);通知5706条去重5704(99.97%)、Top2 lark2932+Terminal2560=96.3%、密度34.27次每前台小时(分母为前台上界⇒下界);★核心结论=通知流入面与前台占用面几乎不重叠(Terminal通知2560次却在44 app前台榜0行)⇒通知密度非注意力度量、仅熄屏画像得不出;前台∩熄屏(v=0)交叠0.981h/148段=前台信号约0.6%不可信;★口径铁律=kc有迟写回填⇒熄屏/时长量必绑快照时点(本器262.736h==profile.py同快照dark_total_hours 262.74h;sleep_source_crosscheck门249.350h绑live源,禁跨源引用);字段落memory/kc_profile/kc_app_usage_fields.json;台账DECISIONS_R434_kc_streams.md(3条,含口径统一提案,待批))
 
 [RULES]
 1. 搜索先行: 优先cwd；搜文件名先es；网页搜索只用google；本机rg未装(搜索静默返回空!)→用grep

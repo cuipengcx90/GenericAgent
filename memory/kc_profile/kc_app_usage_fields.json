@@ -1,0 +1,119 @@
+{
+ "schema": "kc_app_usage_fields/v1",
+ "generated_by": "tools/kc_app_usage.py --emit-profile",
+ "generated_at": "2026-09-27 00:51:41",
+ "source_dict": {
+  "db": "/Users/cuip/projects/GenericAgent/temp/kc_snapshots/2026-09-25/knowledgeC.db",
+  "cutoff_local": "2026-09-25 22:30:53"
+ },
+ "sql": {
+  "app_usage": "select ZSTARTDATE t, ZENDDATE e, ZVALUESTRING app from ZOBJECT where ZSTREAMNAME='/app/usage' order by ZSTARTDATE;",
+  "notification_usage": "select o.ZSTARTDATE t, s.Z_DKNOTIFICATIONUSAGEMETADATAKEY__BUNDLEID b, s.Z_DKNOTIFICATIONUSAGEMETADATAKEY__IDENTIFIER i from ZOBJECT o left join ZSTRUCTUREDMETADATA s on s.Z_PK=o.ZSTRUCTUREDMETADATA where o.ZSTREAMNAME='/notification/usage' order by o.ZSTARTDATE;",
+  "backlit": "select ZSTARTDATE t, ZENDDATE e, ZVALUEINTEGER v from ZOBJECT where ZSTREAMNAME='/display/isBacklit' order by ZSTARTDATE;",
+  "cutoff": "select max(ZCREATIONDATE) from ZOBJECT;"
+ },
+ "fields": [
+  {
+   "name": "fg_hours_by_day",
+   "value": {
+    "2026-08-28": "UNKNOWN",
+    "2026-08-29": "UNKNOWN",
+    "2026-08-30": "UNKNOWN",
+    "2026-08-31": "UNKNOWN",
+    "2026-09-01": 4.539,
+    "2026-09-02": 6.487,
+    "2026-09-03": 10.712,
+    "2026-09-04": 11.709,
+    "2026-09-05": 3.584,
+    "2026-09-06": 4.039,
+    "2026-09-07": 8.364,
+    "2026-09-08": 7.672,
+    "2026-09-09": 9.088,
+    "2026-09-10": 7.532,
+    "2026-09-11": 6.07,
+    "2026-09-12": 4.94,
+    "2026-09-13": 1.23,
+    "2026-09-14": 7.323,
+    "2026-09-15": 9.958,
+    "2026-09-16": 8.381,
+    "2026-09-17": 7.319,
+    "2026-09-18": 7.578,
+    "2026-09-19": 0.527,
+    "2026-09-20": 7.101,
+    "2026-09-21": 6.026,
+    "2026-09-22": 7.6,
+    "2026-09-23": 5.447,
+    "2026-09-24": 5.565,
+    "2026-09-25": 7.732
+   },
+   "unit": "小时",
+   "source": "/app/usage ZENDDATE-ZSTARTDATE，per app 先并集再按本地日切分",
+   "note": "UNKNOWN=该日该流无行，与 0 不同"
+  },
+  {
+   "name": "fg_hours_by_app_total",
+   "value": {
+    "com.mitchellh.ghostty": 92.942,
+    "com.google.Chrome": 27.769,
+    "com.electron.lark": 16.684,
+    "com.tencent.xinWeChat": 6.86,
+    "md.obsidian": 4.758,
+    "io.github.clash-verge-rev.clash-verge-rev": 2.557,
+    "com.alibaba.DingTalkMac": 2.291,
+    "com.apple.systempreferences": 1.86,
+    "com.jetbrains.intellij": 1.433,
+    "com.jinghaoshe.qspace.pro": 1.433
+   },
+   "unit": "小时",
+   "source": "/app/usage ZVALUESTRING 分组",
+   "note": "仅 Top10"
+  },
+  {
+   "name": "notif_by_bundle",
+   "value": {
+    "com.electron.lark": 2932,
+    "com.apple.Terminal": 2560,
+    "com.google.Chrome": 165,
+    "com.Snipaste": 24,
+    "com.apple.BTMNotificationAgent": 13,
+    "_SYSTEM_CENTER_:com.apple.SoftwareUpdateNotification": 5,
+    "com.apple.controlcenter.notifications.low-battery": 5,
+    "_SYSTEM_CENTER_:com.apple.diskspaced": 2
+   },
+   "unit": "次(投递)",
+   "source": "/notification/usage ⨝ ZSTRUCTUREDMETADATA.BUNDLEID",
+   "note": "raw 口径"
+  },
+  {
+   "name": "notif_per_fg_hour",
+   "value": 34.27,
+   "unit": "次/前台小时",
+   "source": "notif_raw_total / fg_hours_total",
+   "note": "分母是前台时长上界，故为下界密度"
+  },
+  {
+   "name": "fg_off_overlap_hours",
+   "value": 0.981,
+   "unit": "小时",
+   "source": "/app/usage ∩ /display/isBacklit(v=0)",
+   "note": "越大说明前台信号越不可信"
+  }
+ ],
+ "window": {
+  "first_day": "2026-08-28",
+  "last_day": "2026-09-25",
+  "days_total": 29,
+  "days_with_app": 25,
+  "days_without_app": 4,
+  "days_without_notif": 3,
+  "fg_hours_total": 166.521,
+  "notif_raw_total": 5706,
+  "notif_dedup_total": 5704,
+  "apps": 43,
+  "notif_bundles": 8,
+  "off_hours": 262.736,
+  "off_intervals": 709,
+  "anomaly_intervals": 148,
+  "anomaly_off_overlap_h": 0.981
+ }
+}
