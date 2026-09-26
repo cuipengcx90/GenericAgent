@@ -47,12 +47,31 @@
 - 复发确认(2026-09-21 11:01 与 11:12 连续两次调度)：仍止于 `/api/user/sign` 的 `SSLEOFError`。当日复测：Clash 组『宝可梦』8/8 节点对目标站 `delay` 测试全失败(`Timeout` / `An error occurred in the delay test`)，**同一批节点 google/generate_204 正常**(308/90/42/188/43/258ms，仅 2 个节点自身超时)；`r.jina.ai` 旁证返回 `422 AssertionFailureError: page.goto: Timeout 15000ms exceeded`。→ 再次独立确认**站点侧不可达**，非节点/配置问题；两次调度均未推送、未耗额度、未写 `birdie_seen_items.json`。
 - 复发确认(2026-09-23 11:00 调度)：同症状 `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 止于 `/api/user/sign`。当日三步复测：①`google/generate_204` = **204（0.89s）** 出口正常 ②Clash `GLOBAL/delay?url=<目标站>` = `Timeout`（同日 GLOBAL 对 google 也 Timeout ⇒ 该 API 的组选择不可单独作证，①已足够）③`r.jina.ai` 旁证 = **422 `page.goto: Timeout 15000ms exceeded`**，而同一调用抓 `example.com` = 200 ⇒ 再次独立确认**站点侧不可达**。本轮零推送、零额度消耗、`birdie_seen_items.json` mtime 仍停 2026-08-07。★附加判据：`socket.create_connection` 能连上 443 只说明连到了 **Clash TUN 假 IP(198.18.0.110)**，**不构成站点可达证据**（勿被"TCP OK"误导）。
 - 复发确认(2026-09-25 11:00 调度)：同症状 `SSLEOFError(8, UNEXPECTED_EOF_WHILE_READING)` 止于 `/api/user/sign`（`tools/bg_task.py` 启动 11:01:06、日志末写 11:01:12、`exit=1`、耗时 6s）。当日四步复测：①本机直连与 `-x http://127.0.0.1:7897` 的 `google/generate_204` 均 **204（1.15s / 1.01s）**；②Clash **逐节点 8/8** 对目标站全 `Timeout`，而**同一批 8 个节点 google 全部正常**（96/99/92/90/123/103/152/103ms）；③`r.jina.ai` 抓目标站 = **422 `AssertionFailureError: TimeoutError: navigating to ... waiting until "networkidle"`（19.5s）**，同一调用抓 `example.com` = **200（0.97s）**；④DNS 仍解析为 fake-ip `198.18.0.110` ⇒ 再次独立确认**站点侧不可达**。本轮零推送（脚本未跑到通知分支）、零额度消耗、`birdie_seen_items.json` sha1/mtime **完全未变**（`066c0695928cd83340c2673d3e4671cbaa89bac6` / `2026-08-07 11:00:50`，29 条）。
-- ★**失败起点订正（2026-09-25，推翻本节旧记）**：旧记「自 2026-09-13 起每日失败、09-10 为最后一次真正跑通」**有误**。按 `sche_tasks/done/` 内全部 58 份 birdie 报告**逐份核 exit 码**：**2026-08-07 是最后一次真正跑通**（exit=0、当日「今日无新增命中」），**08-08 起每一份均为签到阶段失败**（含被关键词粗筛误判为成功的 08-13「⚠️ 采集失败，未推送」与 08-20「因 BirdieSearch 签到请求 SSL EOF 失败而中断」）⇒ **截至 2026-09-25 已连续 49 天静默失败**（08-08→09-25；其间仅 09-19 无报告）。唯一独立佐证 = 去重库 mtime 停在 **2026-08-07 11:00:50**（脚本只有跑到写库才会更新它），与报告序列一致。★教训：统计「连续失败天数」**必须逐份核 exit 码**——关键词粗筛会把「stdout 中**没有**『今日无新增命中』」这类**否定句**误判为成功。此类长期静默已远超人工介入阈值，应做**连续同因失败告警**而非继续静默重试。
+- ★**失败起点订正（2026-09-25，推翻本节旧记）**：旧记「自 2026-09-13 起每日失败、09-10 为最后一次真正跑通」**有误**。按 `sche_tasks/done/` 内全部 59 份 birdie 报告**逐份核 exit 码**（2026-09-27 R442 复核订正：59 份 = 成功 7 天 08-01..08-07 + 失败 52 份 / 48 个日期 08-08→09-25，区间 49 天仅 09-19 无报告）：**2026-08-07 是最后一次真正跑通**（exit=0、当日「今日无新增命中」），**08-08 起每一份均为签到阶段失败**（含被关键词粗筛误判为成功的 08-13「⚠️ 采集失败，未推送」与 08-20「因 BirdieSearch 签到请求 SSL EOF 失败而中断」）⇒ **截至 2026-09-25 已连续 49 天静默失败**（08-08→09-25；其间仅 09-19 无报告）。唯一独立佐证 = 去重库 mtime 停在 **2026-08-07 11:00:50**（脚本只有跑到写库才会更新它），与报告序列一致。★教训：统计「连续失败天数」**必须逐份核 exit 码**——关键词粗筛会把「stdout 中**没有**『今日无新增命中』」这类**否定句**误判为成功。此类长期静默已远超人工介入阈值，应做**连续同因失败告警**而非继续静默重试。
 
 ## 扩源候选（来自本机访问证据，非已验证站点）
 只读工具 `tools/domain_gap.py` 列的「本机高频访问、语料零提及」域名里 B 节是网盘搜索 / 资源站（2026-09-27 快照：13 域 / 358 次，如 `meow.tg` 22、`kebaiwan.net` 21、`www.fwfly.com` 21、`itjc8.com` 20、`www.itkenet.com` 20），可作**加源候选**参考。
 - 清单落点：`memory/domain_gap/COLLECTION_CANDIDATES.md`（B 节）；重算＝`python3 tools/domain_gap.py scan`。
-- ★加源前必做：先按本 SOP 验证该站是否有可用的签名/接口与查询额度——清单只说明「本机访问过」，不构成站点可用性或额度的证据；且当前主链路已连续 49 天静默失败（见上节），**先修复现有链路再加源**。
+- ★加源前必做：先按本 SOP 验证该站是否有可用的签名/接口与查询额度——清单只说明「本机访问过」，不构成站点可用性或额度的证据；且当前主链路已确认**站点侧死亡、已建议退役**（见文末裁决）⇒ **加源须另起新链路，勿在死链路上加源**。
 
 ## 已知噪音(勿误判为故障)
 脚本 stderr 中出现的 numpy/sklearn 版本警告，来自 `llmcore`/`mykey.py` 导入链的后台线程噪音，与本任务无关，`exit_code=0` 即代表脚本本身执行成功。
+
+## ★裁决：退役（2026-09-27 R442，只出裁决不执行，退役动作待用户批准）
+
+**判定**：故障 100% 在站点侧（IP 层全球不可达），我方**无缺陷可修** ⇒ **建议退役本监控（停用定时任务）**，不要再花力气改客户端。
+
+证据（全部只读，落 `temp/birdie_triage/evidence.md`，原始探针输出同目录）：
+- 站点侧（第三方网络，绕开本机代理）：`check-host.net` 多国节点 **HTTP 6/6 全超时、TCP 443 4/4 全超时、ICMP ping 4/4 全 TIMEOUT**（节点跨 AU/BG/CA/HK/SI/US/IR/PL/RU/UA/CH/ES/HU/ID）⇒ 不是 TLS/签名/关键词问题，是**服务器已下线**。DoH 仍解析 `103.189.141.216`（TTL 38400，域名未弃）；archive.org 末次 200 快照 = 2026-05-13；crt.sh 末次证书 not_before = 2026-07-07。
+- 我方：失败点固定 `birdie_monitor/birdie_client.py:73`（`POST /api/user/sign`，timeout=15），`git log` 显示该文件自 `b36a80c`(2026-08-05) **零改动** ⇒ 非代码回归。
+- 复现：受控重跑一次 `rc=1` / 15.2s / `ProxyError: handshake operation timed out`；去重库 `birdie_seen_items.json` 的 sha1 与 mtime **前后完全一致**（零副作用）。
+- 产出：`sche_tasks/done/` 内 **59** 份报告中成功仅 **7 天**（2026-08-01~08-07），**2026-08-08→09-25 连续 49 天零有效产出**（52 份失败报告 / 48 个日期，区间内仅 09-19 无报告）。
+- 死亡窗口锁定 **2026-08-07 ~ 2026-08-08**（我方末次成功 → 首份失败）。
+
+**执行条件**：退役动作（把 `sche_tasks/birdie_daily_monitor.json` 的 `enabled` 置 false，或按已归档任务的惯例移入 `sche_tasks/disabled/`）**须用户批准**，提案见 `temp/pending_decisions/DECISIONS_R442_birdie_retire.md`；未批准前保持现状。
+
+**保留资产与复活路径**：`birdie_monitor/`（client/daily/cookies 引用）、59 份历史报告、本 SOP 全部保留 ⇒ 站点复活后恢复=把配置 `enabled` 置回 true（或从 `disabled/` 移回），**无需改代码**。
+复活探活（一条命令，能建连即视为可能复活，再走上文三步定性）：
+`curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x http://127.0.0.1:7897 https://www.birdiesearch.com/api/user/sign`（返回非 `000` 即可能复活）。
+
+**★通用教训（新增判据）**：任何监控任务**连续 ≥3 天同因失败必须一次性提醒用户**（含「站点侧不可达」这类非本机故障）；本任务连续 49 天静默失败才被发现，属**告警缺失**而非故障本身。判读时禁关键词粗筛，必须逐份核 exit 码（否定句会把失败判成成功）。

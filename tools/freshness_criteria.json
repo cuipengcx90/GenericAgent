@@ -10,7 +10,7 @@
       "payloads": [{"glob": "birdie_monitor/birdie_seen_items.json", "max_silence_days": 3, "required": true}],
       "scans": [{"globs": ["temp/bg_task/logs/birdie_*.log", "temp/birdie_*.log"], "window_days": 3,
                  "patterns": ["SSLError", "Max retries exceeded", "exit: 1", "签到失败"]}],
-      "note": "2026-08-07 起连续 49 天静默失败：任务照跑、报告照写、产物不动（TODO#9 起因）"
+      "note": "2026-08-07 起连续 49 天静默失败：任务照跑、报告照写、产物不动。R442(2026-09-27) 已裁决=**退役**（站点侧 IP 层全球不可达，我方无缺陷可修）；退役动作待批（temp/pending_decisions/DECISIONS_R442_birdie_retire.md:D1），未批准前本目标仍按 ALERT 计。"
     },
     {
       "id": "haisou_daily_monitor", "kind": "sche", "label": "haisou.cc 网盘监控", "cadence": "daily 11:15",
