@@ -1,3 +1,4 @@
+| R462 | ✅正文 | kc 迟写回填「稳定期」实测（第19批 C4） | 15541B R462_kc迟写回填稳定期实测.md | 新增只读工具 tools/kc_backfill_stability.py(746行/39504B/selftest 33/33 含 NC1–NC21)；三快照 24 可评估日 23 日三点逐字相同、唯一非零 09-01 EVICTION_HEAD(2.573h)、changing_real=[]⇒EVICTION_ONLY；订正旧 L1「0.90→5.84→11.78h」实为截断面；口径说明 memory/kc_profile/BACKFILL_STABILITY.md |
 | R461 | ✅正文 | T0 两套定义差异门禁（第19批 C5） | 9291B R461_T0两套定义差异门禁.md | 保护面6299条×备份面348成员仅交295(4.68%)；新增 tools/t0_surface_diff.py 只读门禁(selftest 17/17含6负控)+注册表分桶；需登记55已分桶；台账 DECISIONS_R461_t0_surface.md |
 # 自主报告归档清单（抢救重建）
 
