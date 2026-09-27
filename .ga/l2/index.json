@@ -1,0 +1,67 @@
+{
+  "generated_at": "2026-09-27T22:36:48+08:00",
+  "tasks": {
+    "00-bootstrap-guidelines": {
+      "id": "00-bootstrap-guidelines",
+      "name": "00-bootstrap-guidelines",
+      "title": "Bootstrap Guidelines",
+      "description": "Fill in project development guidelines for AI agents",
+      "status": "in_progress",
+      "dev_type": "docs",
+      "scope": null,
+      "package": null,
+      "priority": "P1",
+      "creator": "崔朋",
+      "assignee": "崔朋",
+      "createdAt": "2026-06-03",
+      "completedAt": null,
+      "branch": "task/00-bootstrap-guidelines",
+      "base_branch": "main",
+      "worktree_path": null,
+      "commit": null,
+      "pr_url": null,
+      "subtasks": [],
+      "children": [],
+      "parent": null,
+      "relatedFiles": [
+        ".trellis/spec/backend/"
+      ],
+      "notes": "First-time setup task created by trellis init (backend project)",
+      "meta": {}
+    },
+    "06-04-genericagent-trellis-local-fusion-bridge": {
+      "id": "genericagent-trellis-local-fusion-bridge",
+      "name": "genericagent-trellis-local-fusion-bridge",
+      "title": "genericagent trellis local fusion bridge",
+      "description": "",
+      "status": "completed",
+      "dev_type": null,
+      "scope": null,
+      "package": null,
+      "priority": "P2",
+      "creator": "崔朋",
+      "assignee": "崔朋",
+      "createdAt": "2026-06-04",
+      "completedAt": "2026-06-04",
+      "branch": null,
+      "base_branch": "main",
+      "worktree_path": null,
+      "commit": null,
+      "pr_url": null,
+      "subtasks": [],
+      "children": [],
+      "parent": null,
+      "relatedFiles": [
+        "plugins/trellis_bridge.py",
+        ".trellis/scripts/get_context.py",
+        "memory/trellis_integration_sop.md"
+      ],
+      "notes": "",
+      "meta": {},
+      "_archived_at": "2026-06"
+    }
+  },
+  "deps": {},
+  "ready": [],
+  "waiting": []
+}
