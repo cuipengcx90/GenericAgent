@@ -152,6 +152,7 @@ function getLikeCount(post) {
 - 附带结论：`connect.linux.do` 的 CF 卡死（见 `linuxdo_trust_level_sop`）与本次 429 是两类不同故障，不要混淆。
 - ★2026-09-26 实测（另一类障碍，勿与 429 混淆）：日报帖位于**需登录**的分类 ⇒ 匿名通道（jina / 无 cookies 的 curl）拿不到 `/t/<id>.json`；分类页 cat78「最新 30 条」与作者 `user_actions.json?filter=4`（建帖列表 09-26 实测止于 2026-06-10）**都定位不到当日日报帖**。唯一可靠入口仍是**同源** `search.json?q=人工智能技术日报 order:latest`。
 - ★同条实测：CF 挑战只拦「无登录态」的请求通道；**只要浏览器里已有一个 linux.do 的普通 tab**（哪怕它当前停在挑战页），在该 tab 上同源 fetch `search.json` / `/t/<id>.json` 直接 200 ⇒ **无需**起独立临时 Chrome 注 cookies（下面的「独立临时 Chrome」通道只在完全没有 linux.do tab 时才用）。
+- ★★2026-09-27 实测（**登录态会整体失效**，务必开工先验，勿当 CF/429 反复重试）：当日 Chrome 里 linux.do 已**登出** ⇒ 站头渲染出「登录」入口、同源 `search.json?q=...` 返回 **HTTP 403 JSON** `{"errors":["您需要登录才能执行此操作。"],"error_type":"not_logged_in"}`、`/t/<id>.json` 匿名 404。**与 CF 的判别口径=看响应体**：CF 拦截返 `Just a moment...` HTML，未登录返 Discourse 的 `not_logged_in` JSON ⇒ 见到该 JSON **立即停手**，不要再换通道/重试（本次实测在 CF 误判上白烧 20+ 轮）。登录态快检=`/search.json` 能否 200；cookie 侧 Default profile 应有 `_t`（只有 `_forum_session`/`cf_clearance`/`__cfuvid`/`g_state` = 匿名）。此时**唯一出路=用户本人登录**：/login 仅提供「邮箱或用户名＋密码」「邮件一次性登录码」「Google/GitHub/Discord/Apple OAuth」「通行密钥」，**无免密 SSO**；2026-09-27 实测 10 个 Chrome profile 的 cookie 库**全无 `_t`**（含 `connect.linux.do auth.session-token` 也救不了）⇒ 直接写「未登录无法读取当日帖」的 done 报告 + 请用户登录后再跑，别继续烧轮次。
 
 ### 正文=纯附件时的取 PDF
 - 主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
