@@ -51,7 +51,19 @@ R434 的两条 kc 万级流都是「采完才发现此前零消费者」的例�
     python3 tools/source_consumer_census.py --json temp/source_census/<date>.json
     python3 tools/source_consumer_census.py --no-profiles        # 只判 kc 面（跳过 Chrome 拷贝）
     python3 tools/source_consumer_census.py --readonly-proof     # 附源侧指纹前后一致自证
-    python3 tools/source_consumer_census.py --selftest           # 纯函数自测（含 6 类负控）
+    python3 tools/source_consumer_census.py --verify-json <json> # 只读复核已归档结论（不重新采集）
+    python3 tools/source_consumer_census.py --selftest           # 纯函数自测（含 11 类负控）
+
+零消费者流的处置（TODO#167）
+---------------------------
+「有料但零消费者」若只报出来、无人决策，就会以「清单每次照旧」的形式无限存续。故本器要求每条
+零消费者 kc 流在 `ZERO_CONSUMER_DISPOSITION` 里**显式二选一登记**（`DEPRECATED` 弃用+复活判据 /
+`DEFERRED` 保留·暂不消费+立项判据），登记内容含 `evidence`（行数/取值多样性/时间跨度/样本量），
+人类可读版落在 `memory/kc_profile/ZERO_CONSUMER_DISPOSITION.md`。三条闸门判据（`guard_disposition`）：
+
+1. `ZERO_CONSUMER_UNDISPOSED` —— 有料零消费者但没登记（新流逃逸）；
+2. `CLAIM_WITHOUT_EVIDENCE` —— 声称 CONSUMED/DYNAMIC_CONSUMED 但消费者列表为空（伪改）；
+3. `DISPOSITION_STALE` —— 登记项与现况不符（源消失，或已被真消费者接管）。
 """
 
 from __future__ import annotations
@@ -91,6 +103,37 @@ KNOWN_CONSUMED = {
     "kc:/display/isBacklit": "tools/sleep_source_crosscheck.py",
     "chrome:Default": "tools/chrome_history_consume.py",
     "chrome:Profile 3": "tools/chrome_profiles_consume.py",
+}
+
+# 零消费者流的**显式处置登记**（TODO#167 / L167）。为什么要有它：
+# 本器能算出「有料但零消费者」，但**算不出「该不该管」**——是漏了消费者，还是这条流本就不值得消费？
+# 不登记 ⇒ 清单每次出现同样两行、无人决策，等于「采了不管」悄悄存续。故要求：每条零消费者 kc 流
+# 必须在此二选一登记（DEPRECATED=弃用+复活判据 / DEFERRED=保留·暂不消费+立项判据），未登记即违规。
+ZERO_CONSUMER_DISPOSITION = {
+    "/discoverability/signals": {
+        "status": "DEPRECATED",
+        "why": "6 行全为同一 value（com.apple.spotlight.invoked）、末条 2025-04-14（距快照 529 天）"
+               "＝该流在本机已停写；行数与取值多样性都不足以支撑任何结论（R371/R392 已记）。",
+        "evidence": {
+            "rows": 6, "distinct_values": 1, "value_field": "ZVALUESTRING",
+            "span_local": "2024-12-27 08:55:27 → 2025-04-14 22:03:51",
+            "last_seen_days_before_snapshot": 529,
+        },
+        "revive": "重现 ≥1 行新事件（last_seen 距当次快照 < 90 天）或 distinct_values ≥ 2 ⇒ 撤销本登记、重评消费者",
+        "decided": "2026-09-27",
+    },
+    "/app/mediaUsage": {
+        "status": "DEFERRED",
+        "why": "7 行 / 13 天 / 3 个 app（com.alibaba.DingTalkMac×3、wxplayer×3、com.apple.helpviewer×1），"
+               "单条时长 ≤ 20 s ⇒ 量级不足以支撑派生指标（媒体播放时长/媒体 app 画像），显式保留通道、暂不建消费者。",
+        "evidence": {
+            "rows": 7, "distinct_values": 3, "value_field": "ZVALUESTRING",
+            "span_local": "2026-09-10 17:53:28 → 2026-09-22 18:41:23",
+            "duration_s": {"max": 36.0, "min": 0.0, "n": 7},
+        },
+        "revive": "单日行数 ≥ 50 或 30 天行数 ≥ 200 ⇒ 立项消费者（届时把 status 改 CONSUMED_PLANNED 并附指标）",
+        "decided": "2026-09-27",
+    },
 }
 
 KC_SCOPE = ["/app/usage", "/notification/usage", "/display/isBacklit"]
@@ -246,6 +289,62 @@ def zero_consumer(rows):
     hard = [r for r in rows if r["has_data"] and r["verdict"] in ("NONE", "REF_ONLY")]
     soft = [r for r in rows if r["has_data"] and r["verdict"] in ("COLLECTOR_ONLY", "GUARD_ONLY")]
     return hard, soft
+
+
+def guard_disposition(rows, disposition=None):
+    """零消费者流的**处置闸门**（纯函数，只读）。三条判据，任一非空即违规：
+
+    1. `ZERO_CONSUMER_UNDISPOSED`：有料但零消费者的 kc 流必须显式登记（DEPRECATED / DEFERRED）
+       —— 防「采了不管」以「清单照旧」的形式无限存续；
+    2. `CLAIM_WITHOUT_EVIDENCE`：声称 CONSUMED / DYNAMIC_CONSUMED 却拿不出任何消费者
+       —— 防把 REF_ONLY 手改成 CONSUMED 充数（TODO#167 的指定负控靶子）；
+    3. `DISPOSITION_STALE`：登记项与当次现况不符（源名不存在，或该流已被真消费者接管）
+       —— 防登记表过期变成新的僵尸。
+    """
+    disposition = ZERO_CONSUMER_DISPOSITION if disposition is None else disposition
+    bad = []
+    hard, soft = zero_consumer(rows)
+    for r in list(hard) + list(soft):
+        if not str(r["id"]).startswith("kc:"):
+            continue
+        if str(r["id"])[3:] not in disposition:
+            bad.append(f"ZERO_CONSUMER_UNDISPOSED {r['id']}: 有料但零消费者，且未在 ZERO_CONSUMER_DISPOSITION 登记")
+    for r in rows:
+        if r.get("verdict") in ("CONSUMED", "DYNAMIC_CONSUMED"):
+            if not (r.get("consumers") or r.get("dynamic_consumers")):
+                bad.append(f"CLAIM_WITHOUT_EVIDENCE {r['id']}: 判为 {r['verdict']} 但消费者列表为空")
+    live = {str(r["id"])[3:]: r for r in rows if str(r["id"]).startswith("kc:")}
+    for name, disp in disposition.items():
+        r = live.get(name)
+        if r is None:
+            bad.append(f"DISPOSITION_STALE kc:{name}: 登记项({disp['status']})在本次源清单里不存在")
+        elif r.get("verdict") in ("CONSUMED", "DYNAMIC_CONSUMED"):
+            bad.append(f"DISPOSITION_STALE kc:{name}: 登记为 {disp['status']} 但现已 {r['verdict']} ⇒ 须撤销登记")
+    return bad
+
+
+def rows_from_payload(payload):
+    """从落盘 JSON 还原判定行（供 --verify-json 复核已归档结论，字段缺失即 fail-closed）。"""
+    rows = []
+    for s in payload.get("sources", []):
+        if "id" not in s or "verdict" not in s or "has_data" not in s:
+            raise ValueError(f"payload 缺字段（id/verdict/has_data）: {s!r}")
+        rows.append(s)
+    return rows
+
+
+def verify_json_file(path, known=None):
+    """复核一份落盘的 census JSON：跑 guard_disposition + guard_known_consumed。返回 (rc, 打印行)。"""
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows = rows_from_payload(payload)
+    L = [f"[verify-json] {path}（sources={len(rows)} 条，生成于 {payload.get('generated_at')}）"]
+    bad = guard_disposition(rows) + guard_known_consumed(rows, known=known)
+    if bad:
+        for b in bad:
+            L.append(f"  VIOLATION {b}")
+    else:
+        L.append("  无违规（未登记零消费者 / 无证据声称 / 登记过期 三类均为 0）")
+    return (2 if bad else 0), L
 
 
 # --------------------------------------------------------------------------- #
@@ -420,11 +519,17 @@ def main(argv=None):
     ap.add_argument("--no-profiles", action="store_true", help="跳过 Chrome 面（不拷贝任何 profile）")
     ap.add_argument("--json", default=None, help="落 JSON 报告（唯一写入点之一）")
     ap.add_argument("--readonly-proof", action="store_true", help="打印源侧指纹前后一致")
+    ap.add_argument("--verify-json", default=None,
+                    help="只读复核一份已落盘的 census JSON（跑处置闸门+负控，不重新采集）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
 
     if args.selftest:
         return selftest()
+    if args.verify_json:
+        rc, lines = verify_json_file(args.verify_json)
+        print("\n".join(lines))
+        return rc
 
     before = None
     rows, db = build_rows(args.chrome_root, Path(args.kc_root), Path(args.work_root),
@@ -445,6 +550,17 @@ def main(argv=None):
         print("\n[负控] 已知已消费源判为未消费（必须修）：")
         for b in bad:
             print("  -", b)
+    disp_bad = guard_disposition(rows)
+    print("\n[处置闸门] 零消费者流（TODO#167）登记面 kc 侧 %d 条：%s"
+          % (len(ZERO_CONSUMER_DISPOSITION),
+             ", ".join(f"{k}={v['status']}" for k, v in ZERO_CONSUMER_DISPOSITION.items())))
+    if disp_bad:
+        print("[处置闸门] 违规（必须修）：")
+        for b in disp_bad:
+            print("  -", b)
+    else:
+        print("[处置闸门] 无违规（未登记零消费者 / 无证据声称 / 登记过期 三类均为 0）")
+    bad = bad + disp_bad
     if args.readonly_proof:
         after = source_fingerprints(rows)
         same = before == after
@@ -465,6 +581,8 @@ def main(argv=None):
             "zero_consumer": [r["id"] for r in hard],
             "weak_consumer": [r["id"] for r in soft],
             "known_consumed_violations": bad,
+            "disposition_violations": disp_bad,
+            "zero_consumer_disposition": {k: v["status"] for k, v in ZERO_CONSUMER_DISPOSITION.items()},
         }
         out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n[json] {out}")
@@ -608,6 +726,61 @@ def selftest():
     chk("NC9 token+动态两路并存", j["verdict"] == "CONSUMED"
         and j["consumers"] == ["tools/chrome_history_consume.py"]
         and j["dynamic_consumers"] == ["tools/chrome_profiles_consume.py"])
+
+    # --- 处置闸门（TODO#167）：合成行 helper（只喂闸门需要的字段，防 KeyError）
+    def _row(sid, has_data=True, verdict="REF_ONLY", consumers=None, dynamic=None):
+        return {"id": sid, "has_data": has_data, "verdict": verdict,
+                "consumers": consumers or [], "dynamic_consumers": dynamic or [],
+                "collectors": [], "guards": [], "mem_hits": 0, "report_hits": 0}
+
+    live = [_row("kc:/app/mediaUsage"), _row("kc:/discoverability/signals"),
+            _row("kc:/app/usage", verdict="CONSUMED", consumers=["tools/kc_app_usage.py"])]
+    chk("T14 现役登记表覆盖现役两条零消费者流（正例：0 违规）", guard_disposition(live) == [])
+    chk("T15 登记表结构完备（status/why/evidence/revive/decided 五键齐全）",
+        all(set(v) >= {"status", "why", "evidence", "revive", "decided"}
+            for v in ZERO_CONSUMER_DISPOSITION.values())
+        and {v["status"] for v in ZERO_CONSUMER_DISPOSITION.values()} <= {"DEPRECATED", "DEFERRED"})
+
+    # --- 负控 NC11（TODO#167 指定靶子）：把 REF_ONLY 手改成 CONSUMED 而源侧无消费者 ⇒ 必报
+    forged = [_row("kc:/app/mediaUsage", verdict="CONSUMED"), _row("kc:/discoverability/signals")]
+    b11 = [x for x in guard_disposition(forged) if x.startswith("CLAIM_WITHOUT_EVIDENCE")]
+    chk("NC11 REF_ONLY 伪改 CONSUMED（消费者为空）必报", len(b11) == 1 and "kc:/app/mediaUsage" in b11[0])
+
+    # --- 负控 NC12：登记项在本次源清单里不存在（源被删/改名）⇒ 必报 DISPOSITION_STALE
+    b12 = [x for x in guard_disposition([_row("kc:/app/mediaUsage")]) if x.startswith("DISPOSITION_STALE")]
+    chk("NC12 登记项源侧消失必报", len(b12) == 1 and "signals" in b12[0])
+
+    # --- 负控 NC13：有料零消费者但未登记（新增流逃逸）⇒ 必报 ZERO_CONSUMER_UNDISPOSED
+    b13 = [x for x in guard_disposition(live + [_row("kc:/brand/new_stream")])
+           if x.startswith("ZERO_CONSUMER_UNDISPOSED")]
+    chk("NC13 未登记的零消费者流必报", len(b13) == 1 and "new_stream" in b13[0])
+
+    # --- 负控 NC14：登记表过期——该流已被真消费者接管，仍挂着 DEPRECATED ⇒ 必报
+    b14 = [x for x in guard_disposition(live + [_row("kc:/discoverability/signals", verdict="CONSUMED",
+                                                    consumers=["tools/x.py"])])
+           if x.startswith("DISPOSITION_STALE")]
+    chk("NC14 已被真消费者接管的登记项必报过期", any("signals" in x for x in b14))
+
+    # --- T16/T17：--verify-json 复核入口（落盘 JSON 的字段级 fail-closed）
+    with tempfile.TemporaryDirectory() as td:
+        ok_payload = {"generated_at": "2026-09-27T00:00:00",
+                      "sources": [{"id": "kc:/app/mediaUsage", "has_data": True, "verdict": "REF_ONLY",
+                                   "consumers": []},
+                                  {"id": "kc:/discoverability/signals", "has_data": True, "verdict": "REF_ONLY",
+                                   "consumers": []},
+                                  {"id": "kc:/display/isBacklit", "has_data": True, "verdict": "CONSUMED",
+                                   "consumers": ["tools/sleep_source_crosscheck.py"]}]}
+        p1 = Path(td, "ok.json")
+        p1.write_text(json.dumps(ok_payload, ensure_ascii=False), encoding="utf-8")
+        rc1, _ = verify_json_file(p1, known={"kc:/display/isBacklit": "tools/sleep_source_crosscheck.py"})
+        chk("T16 --verify-json 干净 payload rc=0", rc1 == 0)
+        bad_payload = json.loads(json.dumps(ok_payload))
+        bad_payload["sources"][0]["verdict"] = "CONSUMED"        # 伪改，consumers 仍为空
+        p2 = Path(td, "bad.json")
+        p2.write_text(json.dumps(bad_payload, ensure_ascii=False), encoding="utf-8")
+        rc2, lines2 = verify_json_file(p2, known={"kc:/display/isBacklit": "tools/sleep_source_crosscheck.py"})
+        chk("NC15 --verify-json 抓到伪改 payload 且 rc=2",
+            rc2 == 2 and any("CLAIM_WITHOUT_EVIDENCE" in x for x in lines2))
 
     print(f"\nselftest: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1
