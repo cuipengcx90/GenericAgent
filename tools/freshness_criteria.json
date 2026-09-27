@@ -1,5 +1,5 @@
 {
-  "_doc": "定时任务/launchd/外部通道「产物级」新鲜度判据表（单一来源）。被 tools/task_freshness.py 读取。字段：cadence 节奏；max_run_gap_days=L3 运行缺席阈值（最近运行证据年龄上限）；payloads[].max_silence_days=L1 产物静默上限；payloads[].soft=true 表示只记 INFO 不判硬问题；scans[].patterns=L2 静默降级签名（扫最新日志/证据文件尾部）；severity=soft 表示该目标的问题不进硬问题清单。",
+  "_doc": "定时任务/launchd/外部通道「产物级」新鲜度判据表（单一来源）。被 tools/task_freshness.py 读取。字段：cadence 节奏；max_run_gap_days=L3 运行缺席阈值（最近运行证据年龄上限）；payloads[].max_silence_days=L1 产物静默上限；payloads[].soft=true 表示只记 INFO 不判硬问题；scans[].patterns=L2 静默降级签名（扫最新日志/证据文件尾部）；severity=soft 表示该目标的问题不进硬问题清单；content[].glob/max_content_stale_days/min_files=L1b 内容级判据（家族内文件内容指纹零变化/停滞超阈值即报，内核复用 tools/content_change_detector.py）；content[].soft|ack 为真时命中降为 INFO（ack 须填「为何静止」理由）。",
   "_calibrated": "2026-09-25 首次标定（全部路径经实测 stat/glob 命中，非凭印象）",
   "_counts": "sche 22（enabled 17 / disabled 5）、launchd plist 15、外部通道 8",
   "targets": [
@@ -52,6 +52,8 @@
       "run_evidence": ["sche_tasks/done/*_sqlite_snapshot.md"],
       "payloads": [{"glob": "temp/sqlite_snapshots/snapshot_*.json", "max_silence_days": 8, "required": true,
                     "note": "实测历史间隔 2-7d（09-12→09-19 最大 7d），故阈值取 8d"}],
+      "content": [{"glob": "temp/sqlite_snapshots/snapshot_*.json", "max_content_stale_days": 8, "min_files": 3,
+                   "note": "内容级判据（R457 内核接线，R464）：110 份快照内容指纹 distinct=1、距上次实质变化 108.6d ⇒ 受监控 DB 静止（不是任务故障，是源无变化）；未登记即 ALERT。若结论为「有意保持静止」，填 ack='理由' 降为 INFO"}],
       "scans": []
     },
     {

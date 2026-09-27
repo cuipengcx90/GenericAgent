@@ -9,6 +9,9 @@
 
 判据（三层，逐条目标各出一行）：
   L1 产物新鲜度：payload glob 的最新 mtime 距今天数 > max_silence_days ⇒ STALE；无文件 ⇒ MISSING
+  L1b 产出内容变化：content 段登记的家族内文件内容指纹「零变化/停滞」超阈值 ⇒ ALERT/WARN
+       （补齐 L1 的 mtime 盲区「任务跑了、文件也在写，但内容没变」；判据内核复用
+        tools/content_change_detector.py，只对显式登记 content 段的目标生效）
   L2 静默降级签名：扫最新日志/证据文件尾部（默认 200KB）命中 degraded_patterns ⇒ DEGRADED
   L3 运行缺席：最近一次运行证据（done 报告/日志）距今 > max_run_gap_days ⇒ NO_RUN
 附加：launchd 目标额外查 launchctl list（未加载 ⇒ NOT_LOADED；上次退出码非 0 ⇒ 记 note）。
@@ -41,6 +44,10 @@ LEDGER_DEFAULT = os.path.join(GA, "temp", "task_freshness", "ledger.jsonl")
 
 # 判定严重度顺序（大 = 更严重）；同一行取最严重
 LEVEL_ORDER = {"OK": 0, "INFO": 1, "WARN": 2, "ALERT": 3}
+
+# ---- L1b 内容级判据默认值（判据内核在 tools/content_change_detector.py，本文件只做接线）----
+DEFAULT_CONTENT_MIN_FILES = 3     # 单文件/双文件族无法判「内容零变化」，默认至少 3 份
+DEFAULT_CONTENT_MAX_FILES = 500   # 只取最新 N 份（大目录不全扫，窗口贴近当下）
 
 
 def now_ts():
@@ -233,6 +240,55 @@ def check_target(t, root, ref=None, ld=None):
                                       % (row["file"], fmt_age(a), size)})
         res["payloads"].append(row)
 
+    # ---- L1b 内容级产出变化（补齐 L1 的 mtime 盲区：任务跑了、文件也在写，但内容没变）----
+    # 判据内核复用 tools/content_change_detector.py（指纹/归一化/分类零重写）；
+    # 本段只做「命中即 bump 等级」。未登记 content 段的目标行为逐字不变。
+    res["contents"] = []
+    cspecs = t.get("content") or []
+    if isinstance(cspecs, dict):
+        cspecs = [cspecs]
+    if cspecs:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import content_change_detector as _ccd
+        for cs in cspecs:
+            globs = list(cs.get("globs") or []) or ([cs["glob"]] if cs.get("glob") else [])
+            lim = cs.get("max_content_stale_days", _ccd.DEFAULT_ALERT_DAYS)
+            # ack=「已知静止源」显式登记（等价 R449 零消费者处置的登记思路）：
+            # 命中降为 INFO 并带出理由；未登记的静止仍按 ALERT/WARN 报出（默认不静默）。
+            ack = cs.get("ack") or ""
+            soft = bool(cs.get("soft")) or bool(ack)
+            for pat in globs:
+                info = _ccd.scan_family(root, pat, lim,
+                                        cs.get("min_files", DEFAULT_CONTENT_MIN_FILES),
+                                        cs.get("max_files", DEFAULT_CONTENT_MAX_FILES),
+                                        cs.get("hash_cap", _ccd.DEFAULT_HASH_CAP),
+                                        cs.get("normalize", True))
+                info["soft"] = soft
+                info["ack"] = ack
+                res["contents"].append(info)
+                klass, sd = info["class"], info.get("stale_days") or 0.0
+                desc = "%s（n=%d distinct=%d 距上次实质变化 %.2fd）" % (pat, info["n"], info["distinct"], sd)
+                if ack:
+                    tag = "（已登记静止：%s）" % ack
+                elif soft:
+                    tag = "（软判据）"
+                else:
+                    tag = ""
+                if klass == "ALL_IDENTICAL" and sd > lim:
+                    lvl = "INFO" if soft else "ALERT"
+                    bump(lvl, "L1b 产出内容零变化：%s%s" % (desc, tag))
+                elif klass == "CONTENT_STALE" and sd > lim:
+                    lvl = "INFO" if soft else "WARN"
+                    bump(lvl, "L1b 产出内容停滞：%s%s" % (desc, tag))
+                elif klass in ("MISSING", "NO_HISTORY"):
+                    # 样本不足（单文件族）⇒ 明确「不可用」，不假绿也不告警
+                    res["checks"].append({"level": "INFO",
+                                          "text": "L1b 内容判据不可用（%s，需 ≥%s 份）：%s"
+                                                  % (klass, cs.get("min_files", DEFAULT_CONTENT_MIN_FILES), pat)})
+                else:
+                    res["checks"].append({"level": "OK", "text": "L1b 产出内容在变：%s" % desc})
+
     # ---- L2 静默降级签名 ----
     sig_hits = []
     for sc in t.get("scans") or []:
@@ -320,7 +376,8 @@ def run(criteria, root, only=None, as_json=False, ledger=LEDGER_DEFAULT, write_l
               "hard_issue_ids": [r["id"] for r in hard], "targets": rows, "channels": channels,
               "corpus": {"targets": len(rows), "channels": len(channels),
                          "payload_files_seen": sum(p.get("matched", 0) for r in rows for p in r.get("payloads", [])),
-                         "log_files_scanned": len({h["file"] for r in rows for h in r.get("signatures", [])})}}
+                         "log_files_scanned": len({h["file"] for r in rows for h in r.get("signatures", [])}),
+                         "content_families": sum(len(r.get("contents", [])) for r in rows)}}
 
     prev = None
     if write_ledger and ledger:
@@ -444,6 +501,13 @@ def selftest(tmp=None):
     touch("output/tech_trends_2026-09-25.md", 0.36, "# ok\n")
     touch("temp/bg_task/logs/trr_ok.log", 0.36, "done, 12 items\n")
     touch("sche_tasks/done/2026-09-25_1040_github_trending.md", 0.36, "# done\n")
+    # fixture D：L1b 内容级判据 —— 4 份内容逐字相同的「跑而不产出」族（+ 单文件族负控）
+    for i, age in enumerate((30, 20, 10, 1), start=1):
+        touch("temp/contentfam/snap_%02d.json" % i, age, '{"v":1}\n')
+    touch("temp/oneshot/only_01.json", 0.5, '{"v":1}\n')
+    touch("sche_tasks/done/2026-09-27_0800_content_heartbeat.md", 0.30, "# done\n")
+    touch("sche_tasks/done/2026-09-27_0800_content_acked.md", 0.30, "# done\n")
+    touch("sche_tasks/done/2026-09-27_0800_content_oneshot.md", 0.30, "# done\n")
 
     criteria = {"_source": "selftest-fixture", "targets": [
         {"id": "birdie_daily_monitor", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
@@ -461,6 +525,26 @@ def selftest(tmp=None):
          "payloads": [{"glob": "output/tech_trends_*.md", "max_silence_days": 2}],
          "scans": [{"globs": ["temp/bg_task/logs/trr_*.log"], "window_days": 3,
                     "patterns": ["SSLError", "Traceback"]}]},
+        # fixture D：L1b 内容级判据（跑而不产出）
+        {"id": "content_heartbeat", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_content_heartbeat.md"],
+         "payloads": [{"glob": "temp/contentfam/snap_*.json", "max_silence_days": 8}],
+         "content": [{"glob": "temp/contentfam/snap_*.json", "max_content_stale_days": 8, "min_files": 3}],
+         "scans": []},
+        # 同上族但显式登记「已知静止」（ack）⇒ 命中须降为 INFO 且不进硬问题
+        {"id": "content_acked", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_content_acked.md"],
+         # 注：刻意不登记 payloads —— 本夹具只测 L1b；若登记，族内 30d 旧文件会先撞 L1 的 mtime 判据
+         # （这正是 R457 指出的 mtime 盲区镜像：ack 只对「内容静止」生效，不对「产物过期」生效）
+         "content": [{"glob": "temp/contentfam/snap_*.json", "max_content_stale_days": 8, "min_files": 3,
+                      "ack": "受监控对象自 2026-05-19 起静止（selftest 夹具）"}],
+         "scans": []},
+        # 单文件族：样本不足 ⇒ 不可用（不假绿也不告警）
+        {"id": "content_oneshot", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_content_oneshot.md"],
+         "payloads": [{"glob": "temp/oneshot/only_*.json", "max_silence_days": 8}],
+         "content": [{"glob": "temp/oneshot/only_*.json", "max_content_stale_days": 8, "min_files": 3}],
+         "scans": []},
     ], "channels": [
         {"id": "www.birdiesearch.com", "via": "birdie_daily_monitor",
          "success_artifact": ["birdie_monitor/birdie_seen_items.json"],
@@ -508,10 +592,40 @@ def selftest(tmp=None):
            rows3["haisou_daily_monitor"]["verdict"])
     # 语料自证：确认夹具被真读到
     # 夹具固定语料：3 个 payload 文件（birdie/haisou seen_items + tech_trends 产物）
-    # + 2 个带签名的日志（birdie_0925.log / haisou_20260925_1115.log）；精确计数=证明真读到语料
-    expect("⑦ 语料自证：payload=3 且日志=2（精确计数）",
-           res["corpus"]["payload_files_seen"] == 3 and res["corpus"]["log_files_scanned"] == 2,
+    # + 4 个内容族夹具（temp/contentfam/snap_*.json，经 content_heartbeat 的 payloads 计入）
+    # + 1 个单文件族（temp/oneshot/only_*.json）+ 2 个带签名的日志（birdie_0925.log / haisou_20260925_1115.log）
+    expect("⑦ 语料自证：payload=8 且日志=2 且内容族=3（精确计数）",
+           res["corpus"]["payload_files_seen"] == 8 and res["corpus"]["log_files_scanned"] == 2
+           and res["corpus"]["content_families"] == 3,
            str(res["corpus"]))
+    # ⑧–⑫ L1b 内容级判据（跑而不产出不得判健康）——本段五条即 R457 候选的接线负控
+    hb = rows["content_heartbeat"]
+    expect("⑧ 内容零变化（4 份逐字相同，离线 30d）→ content_heartbeat ALERT",
+           hb["verdict"] == "ALERT" and hb["contents"][0]["class"] == "ALL_IDENTICAL"
+           and hb["contents"][0]["distinct"] == 1,
+           "%s / class=%s distinct=%s" % (hb["verdict"], hb["contents"][0]["class"],
+                                          hb["contents"][0]["distinct"]))
+    ack = rows["content_acked"]
+    expect("⑨ 已登记静止（ack）→ 同样命中但降为 INFO，且不进硬问题",
+           ack["verdict"] == "INFO" and ack["id"] not in res["hard_issue_ids"],
+           "%s / hard=%s" % (ack["verdict"], ack["id"] in res["hard_issue_ids"]))
+    one = rows["content_oneshot"]
+    expect("⑩ 单文件族（样本不足）→ 判「不可用」，既不假绿也不告警",
+           one["verdict"] == "OK" and one["contents"][0]["class"] == "NO_HISTORY",
+           "%s / class=%s" % (one["verdict"], one["contents"][0]["class"]))
+    # 负控：真改内容 ⇒ 必须转绿（证明判定随输入变，不是硬编码结论）
+    touch("temp/contentfam/snap_01.json", 0.1, '{"v":2,"changed":"yes"}\n')
+    res4 = run(criteria, base, as_json=True, write_ledger=False, return_result=True)
+    rows4 = {r["id"]: r for r in res4["targets"]}
+    hb4 = rows4["content_heartbeat"]
+    expect("⑪ 负控：改写族内一份内容 → content_heartbeat 转绿（distinct=2）",
+           hb4["verdict"] == "OK" and hb4["contents"][0]["distinct"] == 2,
+           "%s / distinct=%s class=%s" % (hb4["verdict"], hb4["contents"][0]["distinct"],
+                                          hb4["contents"][0]["class"]))
+    # 负控：未登记 content 段的目标（birdie）行为不得受本改动影响
+    expect("⑫ 负控：未登记 content 段的目标 contents 为空（默认行为逐字不变）",
+           rows["birdie_daily_monitor"]["contents"] == [],
+           str(rows["birdie_daily_monitor"]["contents"][:1]))
 
     ok = True
     for name, good, detail in checks:
