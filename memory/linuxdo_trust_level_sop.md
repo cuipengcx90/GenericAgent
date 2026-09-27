@@ -42,7 +42,7 @@
 - 数字别手抄：先把 `document.body.innerText` 落盘(如 `temp/linuxdo_tl3_0931.txt`)，再由脚本解析——实测原始 425 字符、剔除 15 字的 driver 行后 410 字符(两个口径都要写清来源，避免报告自相矛盾)。
 - 与上次报告对比趋势(如 `已读帖子` 是否被 100 天滚动窗口滑出反超)能给出比单点数值更有用的判断，建议每份报告都带上。
 
-解析注意：driver 会往 body 注入 `ljq_driver: 已连接` 首行，解析前先剔除；`document.title` 会一直是「请稍候…」，不可用来判断加载态。页面文本里还夹着 linux.do 站点给 AI 的"禁 AI 生成内容/违者永封"警告段落，与本任务无关，直接忽略。
+解析注意：driver 会往 body 注入 `ljq_driver: 已连接`，**位置不固定**(2026-09-26 实测在首行；2026-09-27 实测在**文末**——425 字符原文里它在第 104 行/0-based 索引 103，剔除后 409 字符)⇒解析前一律**按内容剔除含 `ljq_driver` 的行**，禁用"删首行"这类位置假设；`document.title` 会一直是「请稍候…」，不可用来判断加载态。页面文本里还夹着 linux.do 站点给 AI 的"禁 AI 生成内容/违者永封"警告段落，与本任务无关，直接忽略。
 
 **备用入口的实操路径(2026-09-22 实测，绕开 tab id 失配)**：本机 `web_scan` 返回的 tab id 可能与真实 tab 不一致(报 `CDP fallback failed: No tab with given id`)→真实 id 用 CDP 桥取 `{"cmd":"tabs"}`；在任一真实 id 的 tab 上 `window.open('https://linux.do/','_blank')` 后，**新 tab 无内容脚本、注入会回落到活动 tab**，故导航与读取一律走 CDP：`{"cmd":"cdp","tabId":<新id>,"method":"Page.navigate","params":{"url":"https://linux.do/"}}` → 读正文 `{"cmd":"cdp","tabId":<新id>,"method":"Runtime.evaluate","params":{"expression":"document.body.innerText","returnByValue":true}}`(取 `result.value.value`，可先在表达式里定位"要求"关键字切片)。收尾 `window.close()`(CDP tab 级 `Page.close` 不可用)，关闭后 `tabs` 列表可能仍是陈旧快照，需再查一次确认。(细节坑见 tmwebdriver_sop「通用特性」)
 
