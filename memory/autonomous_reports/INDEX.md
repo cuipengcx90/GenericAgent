@@ -6,6 +6,7 @@
 - 正文来源: memory/L4_raw_sessions/*.zip (GA L4 会话归档)；抽取= tools/autonomous_reports_archive.py
 - 说明: 报告正文仅在会话日志中被引用过才可能恢复；⚠️仅索引 = 编号/主题可考、正文已随 temp 灭失
 
+| R459 | ✅正文 | 推送「送达凭据」单一源 | 12331B R459_推送送达凭据单一源.md | 第19批 C3：新增只读单一源 tools/notify_receipt.py(833 行/41542B/sha256 前16=2533484f148676e6;families/judge/scan + --selftest 34/34 含 NC1–NC21 负控),四族+兜底共 5 剖面统一三态 PUSHED/NOT_PUSHED/UNDETERMINABLE;真跑 6043 份 done 报告=PUSHED 5913/UNDETERMINABLE 119/NOT_PUSHED 11(全为 haisou 08-08→09-25 站点期失败,与 R442 独立一致);★新陷阱=报告自述「未触发推送」实为模型误读代码路径(notify 必被调用)⇒判据改「代码路径 > LLM 自述」并挂 claim_conflict 留痕(收窄后 5→2);★修散文引文护栏(零计数/机制/反事实句不计证据)+剔除「未额外」假冲突;JSON 落 temp/notify_receipt/scan_2026-09-28.json(4346380B);接线待批
 | R | 状态 | 主题 | 证据 | 结论摘要 |
 |---|---|---|---|---|
 | R0 | ⚠️仅索引 | - | *.md |  |
