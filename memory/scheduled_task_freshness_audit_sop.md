@@ -9,6 +9,7 @@
 3. 失败件 `*.failed.txt` 二分类：**同日另有成功件 = 质量重试丢弃稿（非故障）**；**孤儿（fail 无同日成功）= 真漏发**。
 4. 归档覆盖率判据用 `build_output_archive.parse_name`，别用文件名猜。
 5. **快照/diff 类任务专用判据**（2026-09-23 实测补充）：这类任务"无变化"是正常态，不能只看最近一次 diff 就判健康 —— 要 **全量相邻两两对比** 回答"它这辈子触发过告警吗"，并 **同时查被监控目标的 mtime** 区分「真不变」与「探针读空/读错」。两者都指向"目标已冻结"时，结论是**监控目标已死的容量问题**（非静默失败：任务在跑、报告在产、逻辑正确），应建议退役/换活跃目标，不要报故障。
+6. **前置条件层（L0，R475 实测补充）**：把「能不能跑」与「有没有产出」**分开判** —— 前置不成立时任务必不会产出，而 run 级/mtime 证据可能照样新鲜。`tools/preflight_check.py`（只读内核，登记面单一源 = 判据表 `tools/freshness_criteria.json` 的 `preflight` 段，6 目标/10 探针，`--selftest 34/34`）：`http_endpoint`（站外可达）/`chrome_tabs`（有无已登录目标站点的标签）/`cookie_present`（cookie 存在性，**只判存在绝不读值**）/`credential_entry`（凭证登记表命中）/`path_exists`（脚本/清单齐备）。`tools/task_freshness.py` 已接该层：前置 FAIL ⇒ 目标 verdict 升 **ALERT**（只加严），OK/WARN 只带 `preflight` 段、不改既有 verdict；`--no-preflight` 可关。**铁律「前置可用 ≠ 产出正常」**（实测 `linuxdo_ai_daily_summary` 前置探针 PASS 而任务仍 ALERT＝连续两日阻塞未归档）⇒ 两层结论分别陈述，勿互相替代。
 
 ## 实测结论（2026-09-22 基线，供日后对比）
 - 归档覆盖率 **401/433 = 92.6%**；32 跳过 = 31 份 `*.failed.txt` + 1 份 `*_filtered_test.txt`，均设计内。
