@@ -1559,8 +1559,14 @@ def _tree_index(root) -> dict:
 
 
 def verify_all(roots=None, today=None, live=None, source='all', proof: bool = True,
-               sources=None) -> dict:
-    """全源留存断档探测。只读：不写任何文件、不补采、不删。"""
+               sources=None, coverage_ledger=None) -> dict:
+    """全源留存断档探测。只读：不写任何文件、不补采、不删。
+
+    coverage_ledger != None 时额外做「缺口日的**数据级**覆盖复核」（R495）：
+    判据层（日期目录×必需文件）看到的是「目录缺口」；覆盖层回答的是
+    这些缺口日的**数据**是否已在某份更晚快照的产物里（→ 非数据丢失）。
+    不带该参数时输出与旧版逐字相同（rc 亦不变）。
+    """
     names = list(sources) if sources else (list(SOURCES) if source == 'all' else [source])
     roots = roots or {}
     before = {n: _tree_index(roots.get(n) or SOURCES[n]['root']) for n in names} if proof else {}
@@ -1578,8 +1584,32 @@ def verify_all(roots=None, today=None, live=None, source='all', proof: bool = Tr
     counts = {}
     for v in res.values():
         counts[v['verdict']] = counts.get(v['verdict'], 0) + 1
-    out = {'schema': 'ga.rolling_source_verify/v1', 'today': (today or datetime.date.today().isoformat())[:10],
+    cov_out = None
+    if coverage_ledger:
+        try:
+            import rolling_source_coverage as rsc       # 惰性：rsc 顶层 import rss，此处防循环
+        except Exception as exc:                        # 账本不可用 ⇒ 只登记不判、不改 rc
+            cov_out = {'ledger': str(coverage_ledger), 'error': 'import failed: %s' % exc}
+        else:
+            claims = rsc.latest_claims(coverage_ledger)
+            cov_out = {'ledger': str(coverage_ledger), 'sources': {}}
+            for n, v in res.items():
+                days, by = {}, {}
+                for d in v['missing_days']:
+                    st = (claims.get((n, d)) or {}).get('status') or 'NO_CLAIM'
+                    days[d] = st
+                    by[st] = by.get(st, 0) + 1
+                v['coverage'] = {'by_status': by, 'days': days}
+                cov_out['sources'][n] = by
+            lost = sum(by.get('UNCOVERED', 0) + by.get('NO_CLAIM', 0)
+                       for by in cov_out['sources'].values())
+            cov_out['n_data_loss'] = lost
+            cov_out['verdict'] = 'NO_DATA_LOSS' if not lost else 'DATA_LOSS_OR_UNKNOWN'
+    out = {'schema': 'ga.rolling_source_verify/v1',
+           'today': (today or datetime.date.today().isoformat())[:10],
            'sources': res, 'counts': counts, 'readonly_selfproof': proof_out}
+    if cov_out is not None:                             # 只在显式给账本时加键：不带 flag 输出逐字不变
+        out['coverage'] = cov_out
     bad = [n for n, v in res.items() if v['verdict'].startswith('ALERT') or v['verdict'] == 'UNKNOWN']
     out['rc'] = 0 if not bad else 1
     return out
@@ -1587,7 +1617,8 @@ def verify_all(roots=None, today=None, live=None, source='all', proof: bool = Tr
 
 def cmd_verify(args) -> int:
     out = verify_all(today=getattr(args, 'today', None), source=getattr(args, 'source', 'all'),
-                     proof=not getattr(args, 'no_proof', False))
+                     proof=not getattr(args, 'no_proof', False),
+                     coverage_ledger=getattr(args, 'coverage_ledger', None))
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=2))
         return out['rc']
@@ -1615,12 +1646,31 @@ def cmd_verify(args) -> int:
             print('   ★空壳日目录（有目录缺必需文件 %s，不计已采）: %s' % (v['required'], v['shell_days']))
         if v['pending_today']:
             print('   · 今天尚未采（当天仍可采，未计为缺口丢失）')
+        if v.get('coverage') and v['missing_days']:
+            cv = v['coverage']
+            n_cov = cv['by_status'].get('COVERED', 0)
+            tag = ('  ★缺口日数据实际在更晚快照里（非数据丢失）'
+                   if n_cov == len(v['missing_days']) else '')
+            print('     ↳ 覆盖复核（账本）: %s%s'
+                  % (' '.join('%s=%d' % kv for kv in sorted(cv['by_status'].items())), tag))
+            for d in sorted(cv['days']):
+                if cv['days'][d] != 'COVERED':
+                    print('        · %s ⇒ %s' % (d, cv['days'][d]))
     if out['readonly_selfproof']:
         p = out['readonly_selfproof']
         print('─ 只读自证: %s（快照树文件 %d）%s'
               % (p['verdict'], p['files'], '' if p['verdict'] == 'unchanged'
                  else '  ★变化源=%s' % p['changed_sources']))
     print('─ 汇总: %s   rc=%d' % (', '.join('%s=%d' % kv for kv in sorted(out['counts'].items())), out['rc']))
+    if out.get('coverage'):
+        c = out['coverage']
+        if c.get('error'):
+            print('─ 覆盖复核: 跳过（%s）' % c['error'])
+        else:
+            print('─ 覆盖复核（账本 %s）: verdict=%s  数据级不可补 %d 天  [%s]'
+                  % (c['ledger'], c['verdict'], c['n_data_loss'],
+                     '; '.join('%s{%s}' % (n, ' '.join('%s=%d' % kv for kv in sorted(b.items())))
+                               for n, b in c['sources'].items() if b)))
     if out['rc']:
         bad = [n for n, v in out['sources'].items() if v['verdict'].startswith('ALERT')]
         print('[ALERT] %d 个源存在留存断档: %s（只报不采：补采请显式跑 `snapshot`）'
@@ -2087,6 +2137,8 @@ def main() -> int:
     s.add_argument('--json', action='store_true')
     s.add_argument('--no-proof', action='store_true', help='跳过快照树只读自证（默认做）')
     s.set_defaults(func=cmd_verify)
+    s.add_argument('--coverage-ledger', default=None, metavar='PATH',
+                   help='额外做缺口日的**数据级**覆盖复核（读 R495 覆盖账本；不带则输出与旧版逐字相同）')
     s = sub.add_parser('selftest'); s.set_defaults(func=lambda a: selftest())
     a = ap.parse_args()
     return a.func(a)
