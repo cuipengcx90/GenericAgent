@@ -230,6 +230,14 @@ def scan(root, criteria_path, families, alert_days, min_files, max_files, cap,
             groups.append(("payload", [p.get("glob") for p in t.get("payloads", []) if p.get("glob")]))
         if families in ("evidence", "both"):
             groups.append(("evidence", [g for g in t.get("run_evidence", []) if g]))
+        state = str(t.get("state") or "").strip().lower()
+        disabled = bool(t.get("disabled"))
+        if disabled:
+            exempt_reason = "disabled"
+        elif state in EXEMPT_STATES:
+            exempt_reason = state
+        else:
+            exempt_reason = None
         for gname, pats in groups:
             for pat in pats:
                 info = scan_family(root, pat, alert_days, min_files, max_files, cap,
@@ -237,8 +245,32 @@ def scan(root, criteria_path, families, alert_days, min_files, max_files, cap,
                 info["target"] = tid
                 info["kind"] = t.get("kind", "?")
                 info["group"] = gname
+                # 生命周期口径：已退役/按需触发的任务「内容不再变化」是预期，不是产出塌陷。
+                # 本器仍照常测量（class 不改），只标 exempt 并从告警面排除（--strict-exempt 可关）。
+                info["state"] = state
+                info["disabled"] = disabled
+                info["exempt"] = bool(exempt_reason)
+                info["exempt_reason"] = exempt_reason
                 rows.append(info)
     return rows, crit
+
+
+def done_family_key(basename):
+    """从 done 报告文件名推出**族键**（= 任务名）。
+
+    真实命名 = `<YYYY-MM-DD>_<HHMM>_<task>.md`（如 `2026-05-12_1845_wechat_signals.md`）。
+    ★2026-09-28 修（R470）：旧实现用 `(.+)_([A-Za-z0-9_]+).md$` 取**最后一个下划线段**，
+      把 `..._trendradar_evening.md` 截成 `evening`、`..._supply_chain_digest.md` 截成 `digest`
+      ⇒ 族键与判据表 target id 对不上，登记面对账**假报未登记**（实测 19 族里 5 族是截断假象，
+      其中 digest/signals/sqlcipher/13h/reset 正是 R457 标记的 5 个「停滞族」）。
+      现改为剥掉日期(±时间)前缀后取整段任务名；非该命名格式（老文件/夹具）回落旧规则，
+      保证既有自测夹具与历史文件名仍可解析。
+    """
+    m = re.match(r"\d{4}-\d{2}-\d{2}(?:_\d{4})?_(?P<tid>[A-Za-z0-9_\-]+)\.md$", basename)
+    if m:
+        return m.group("tid")
+    m = re.match(r"(.+)_([A-Za-z0-9_]+)\.md$", basename)
+    return m.group(2) if m else None
 
 
 def discover_done(root, alert_days, min_files, max_files, cap, normalize,
@@ -252,13 +284,12 @@ def discover_done(root, alert_days, min_files, max_files, cap, normalize,
       那类由 R411（task_freshness）L1/L3 覆盖。本函数只做「登记面 × 实际产出面」对账。
     """
     import collections
-    import re as _re
     registered = registered or set()
     groups = collections.Counter()
     for p in globmod.glob(os.path.join(root, "sche_tasks/done/*.md")):
-        m = _re.match(r"(.+)_([A-Za-z0-9_]+)\.md$", os.path.basename(p))
-        if m:
-            groups[m.group(2)] += 1
+        tid = done_family_key(os.path.basename(p))
+        if tid:
+            groups[tid] += 1
     rows = []
     for tid, n in sorted(groups.items()):
         if n < min_files:
@@ -284,18 +315,42 @@ def rerun_cmd(row, root, criteria, families, alert_days):
                row.get("target", "?")))
 
 
+# ---------------------------------------------------------------- 生命周期豁免
+# 与 tools/task_freshness.py 的 state=legacy/on_demand 同一口径：
+# 已退役 / 仅按需触发的任务，其产物「内容不再变化」是**预期状态**，不是产出塌陷。
+# 本器仍照常测量（class 一字不改，可审计），只把这类族标 exempt 并从告警/rc 中排除；
+# --strict-exempt 可关掉豁免（负控与人工复核通路）。
+EXEMPT_STATES = ("legacy", "on_demand")
+
+
+def is_exempt(row, strict_exempt=False):
+    """该族是否因生命周期（disabled/legacy/on_demand）而豁免内容级告警。"""
+    if strict_exempt:
+        return False
+    return bool(row.get("exempt"))
+
+
+def hard_rows(rows, strict_exempt=False):
+    """内容级硬告警族（停滞含全同）——豁免族不计入。"""
+    return [r for r in rows if r["class"] in ("CONTENT_STALE", "ALL_IDENTICAL")
+            and not is_exempt(r, strict_exempt)]
+
+
 # ---------------------------------------------------------------- 渲染
 
 CLASS_ICON = {"OK": "🟢", "CONTENT_STALE": "🔴", "ALL_IDENTICAL": "🟠",
               "NO_HISTORY": "⚪", "MISSING": "❓"}
 
 
-def render(rows, alert_days, normalize, top=60, show_all=False, discover_rows=None):
+def render(rows, alert_days, normalize, top=60, show_all=False, discover_rows=None,
+           strict_exempt=False):
     lines = []
     lines.append("== 定时任务内容级产出变化检测（只读）==")
     lines.append("口径：alert_days=%.1f 归一化=%s  " % (alert_days, "on" if normalize else "off")
                  + "stale_days=距今最近一次实质内容变化天数（越大=越久没产出变化）")
-    stale = [r for r in rows if r["class"] in ("CONTENT_STALE", "ALL_IDENTICAL")]
+    exh = [r for r in rows if is_exempt(r, strict_exempt)]
+    stale = [r for r in rows if r["class"] in ("CONTENT_STALE", "ALL_IDENTICAL")
+             and not is_exempt(r, strict_exempt)]
     for r in sorted(stale, key=lambda x: -(x["stale_days"] or 0)):
         lines.append("%s %-9s %-26s n=%-5d distinct=%-5d stale=%7.2fd since=%s rank=%s/%s%s"
                      % (CLASS_ICON[r["class"]], r["class"], r["target"] + "/" + r["group"],
@@ -305,6 +360,14 @@ def render(rows, alert_days, normalize, top=60, show_all=False, discover_rows=No
                         "  [truncated %d/%d]" % (r["n"], r["matched_total"]) if r["truncated"] else ""))
         lines.append("      pattern: %s" % r["pattern"])
         lines.append("      newest : %s" % (r["files"][-1] if r["files"] else "-"))
+    if exh:
+        lines.append("-- 生命周期豁免（state=legacy/on_demand 或 disabled ⇒ 内容停滞属预期，不计入告警，仅留痕）: %d 族"
+                     % len(exh))
+        for r in sorted(exh, key=lambda x: -(x["stale_days"] or 0)):
+            lines.append("   ⏸️ %-9s %-28s group=%-8s n=%-5d distinct=%-5d stale=%7.2fd reason=%s"
+                         % (r["class"], r["target"][:28], r["group"], r["n"], r["distinct"],
+                            r["stale_days"] or 0, r.get("exempt_reason") or "?"))
+        lines.append("      ★口径：豁免只影响告警面与 rc，class 照实测量；--strict-exempt 可关掉豁免。")
     if show_all:
         withnum = [r for r in rows if r["stale_days"] is not None]
         withnum.sort(key=lambda x: -x["stale_days"])
@@ -314,8 +377,8 @@ def render(rows, alert_days, normalize, top=60, show_all=False, discover_rows=No
                          % (r["stale_days"], r["target"][:30], r["group"], r["n"],
                             r["distinct"], r["class"], r["pattern"]))
     okn = sum(1 for r in rows if r["class"] == "OK")
-    lines.append("-- 汇总: 族总数=%d  OK=%d  内容停滞(含全同)=%d  无历史=%d  缺失=%d"
-                 % (len(rows), okn, len(stale),
+    lines.append("-- 汇总: 族总数=%d  OK=%d  内容停滞(含全同，已剔豁免)=%d  生命周期豁免=%d  无历史=%d  缺失=%d"
+                 % (len(rows), okn, len(stale), len(exh),
                     sum(1 for r in rows if r["class"] == "NO_HISTORY"),
                     sum(1 for r in rows if r["class"] == "MISSING")))
     if discover_rows:
@@ -343,7 +406,7 @@ def _write(path, text):
 
 
 def selftest(verbose=True):
-    """沙箱自测：14 项断言，含 5 类负控。返回 (passed, total, log)。"""
+    """沙箱自测：44 项断言，含 9 类负控。返回 (passed, total, log)。"""
     log = []
     passed = total = 0
 
@@ -451,6 +514,23 @@ def selftest(verbose=True):
                                                      registered={"alpha"}, ledger_recs=[])}
         check("NC16 篡改后 alpha 不再 ALL_IDENTICAL(负控)",
               dr2["alpha"]["class"] in ("OK", "CONTENT_STALE"), True)
+        # NC23 族键：真实命名 <日期>_<HHMM>_<task>.md 必须取**整段任务名**
+        check("NC23 真实命名取整段任务名",
+              done_family_key("2026-05-12_1845_wechat_signals.md"), "wechat_signals")
+        check("NC23b 多下划线不被截成末段",
+              done_family_key("2026-05-12_1845_trendradar_evening.md"), "trendradar_evening")
+        check("NC23c 无日期前缀(老文件/外域夹具)回落末段",
+              done_family_key("20260900_alpha.md"), "alpha")
+        check("NC23d 非 .md 不认(负控)", done_family_key("2026-05-12_1845_x.txt"), None)
+        # NC24 负控：真实命名族在 discover_done 里不得被拆成末段键（旧实现症状）
+        for i in range(3):
+            _write(os.path.join(tmp, "sche_tasks", "done",
+                                "2026-07-0%d_0900_trendradar_evening.md" % (i + 1)), "rev %d\n" % i)
+        dr4 = {r["target"]: r for r in discover_done(tmp, 7.0, 2, 0, DEFAULT_HASH_CAP, True,
+                                                     registered={"trendradar_evening"}, ledger_recs=[])}
+        check("NC24 真实命名族键=整段任务名", "trendradar_evening" in dr4, True)
+        check("NC24b 未被截成末段 evening(负控)", "evening" in dr4, False)
+        check("NC24c 该族按新键判已登记", dr4["trendradar_evening"]["registered"], True)
         # NC17-19 只读自证的并发追加定性（活跃日志族）
         check("NC17 live 且只增⇒并发追加(非违例)",
               classify_recheck(True, 100, 130), "CONCURRENT_APPEND")
@@ -466,6 +546,55 @@ def selftest(verbose=True):
         _write(os.path.join(tmp, "fA", "c.txt"), "z\n")
         fam_plain = scan_family(tmp, "fA/*.txt", 7.0, 2, 0, DEFAULT_HASH_CAP, True)
         check("NC20b 非日志族 live=False", fam_plain["live"], False)
+        # NC21/NC22 生命周期豁免（与 task_freshness 的 state=legacy/on_demand 同口径）
+        # fG：3 份内容全同且都老于 alert ⇒ 确定性 ALL_IDENTICAL（作豁免告警面样本）
+        for i in range(3):
+            _write(os.path.join(tmp, "fG", "g%d.txt" % i), "g-same\n")
+            os.utime(os.path.join(tmp, "fG", "g%d.txt" % i), (base + i * 86400,) * 2)
+        crit = {"targets": [
+            {"id": "legacyA", "kind": "test", "state": "legacy",
+             "payloads": [{"glob": os.path.join(tmp, "fG/*.txt")}]},
+            {"id": "ondemandB", "kind": "test", "state": "on_demand",
+             "payloads": [{"glob": os.path.join(tmp, "fE/*.txt")}]},
+            {"id": "disabledC", "kind": "test", "disabled": True,
+             "payloads": [{"glob": os.path.join(tmp, "fE/*.txt")}]},
+            {"id": "activeD", "kind": "test",
+             "payloads": [{"glob": os.path.join(tmp, "fE/*.txt")}]},
+        ]}
+        cpath = os.path.join(tmp, "crit.json")
+        _write(cpath, json.dumps(crit))
+        rows, _c = scan(tmp, cpath, "payload", 0.5, 2, 0, DEFAULT_HASH_CAP, True)
+        byid = {r["target"]: r for r in rows}
+        check("NC21a 豁免族 class 照实测量(=ALL_IDENTICAL，不掩盖)",
+              byid["legacyA"]["class"], "ALL_IDENTICAL")
+        check("NC21b exempt=True reason=legacy",
+              (byid["legacyA"]["exempt"], byid["legacyA"]["exempt_reason"]), (True, "legacy"))
+        check("NC21c on_demand 亦豁免",
+              (byid["ondemandB"]["exempt"], byid["ondemandB"]["exempt_reason"]), (True, "on_demand"))
+        check("NC21d disabled 亦豁免",
+              (byid["disabledC"]["exempt"], byid["disabledC"]["exempt_reason"]), (True, "disabled"))
+        check("NC21e 非豁免族 exempt=False", byid["activeD"]["exempt"], False)
+        check("NC21f hard_rows 剔除全部豁免族(仅余 activeD)",
+              sorted(r["target"] for r in hard_rows(rows)), ["activeD"])
+        _EXH_HDR = "-- 生命周期豁免（state="
+        _txt = render(rows, 0.5, True)
+        check("NC21g render 含生命周期豁免留痕区", _EXH_HDR in _txt, True)
+        check("NC21h render 汇总标注已剔豁免", "已剔豁免" in _txt, True)
+        check("NC21i render 豁免区点名 legacyA", _EXH_HDR in _txt and "legacyA" in _txt, True)
+        # 负控 NC22：--strict-exempt 关掉豁免 ⇒ 豁免族重新变回硬告警（豁免可被证伪）
+        check("NC22a strict 下 is_exempt=False(负控)", is_exempt(byid["legacyA"], True), False)
+        check("NC22b strict 下 hard_rows 含全部豁免族(负控)",
+              sorted(r["target"] for r in hard_rows(rows, True)),
+              ["activeD", "disabledC", "legacyA", "ondemandB"])
+        check("NC22c strict 下 render 无豁免留痕区(负控)",
+              _EXH_HDR in render(rows, 0.5, True, strict_exempt=True), False)
+        # NC22d 负控：去掉 state 字段 ⇒ 豁免消失（证明豁免来自 state 而非族名/路径）
+        crit2 = {"targets": [{"id": "legacyA", "kind": "test",
+                              "payloads": [{"glob": os.path.join(tmp, "fG/*.txt")}]}]}
+        cpath2 = os.path.join(tmp, "crit2.json")
+        _write(cpath2, json.dumps(crit2))
+        rows2, _ = scan(tmp, cpath2, "payload", 0.5, 2, 0, DEFAULT_HASH_CAP, True)
+        check("NC22d 去 state⇒不再豁免(负控)", rows2[0]["exempt"], False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -534,6 +663,8 @@ def main(argv=None):
     ap.add_argument("--discover-done", action="store_true",
                     help="反向发现：扫 sche_tasks/done 里的任务族，标注是否已登记（登记面空洞）")
     ap.add_argument("--show-all", action="store_true", help="打印全部有历史可比的族（不止告警）")
+    ap.add_argument("--strict-exempt", action="store_true",
+                    help="关掉生命周期豁免：state=legacy/on_demand 与 disabled 族照常计为告警（负控/复核用）")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args(argv)
 
@@ -567,7 +698,7 @@ def main(argv=None):
         r["rerun"] = rerun_cmd(r, args.root, args.criteria, args.families, args.alert_days)
 
     print(render(rows, args.alert_days, normalize, show_all=args.show_all,
-                 discover_rows=discover_rows))
+                 discover_rows=discover_rows, strict_exempt=args.strict_exempt))
 
     if args.json:
         payload = {
@@ -576,6 +707,15 @@ def main(argv=None):
             "families": args.families, "root": os.path.abspath(args.root),
             "criteria": os.path.abspath(args.criteria),
             "criteria_targets": len(crit.get("targets", [])),
+            "strict_exempt": bool(args.strict_exempt),
+            "exempt_rows": [{"target": r["target"], "group": r["group"],
+                             "class": r["class"], "state": r.get("state") or "",
+                             "exempt_reason": r.get("exempt_reason"),
+                             "stale_days": r.get("stale_days")}
+                            for r in rows if is_exempt(r, args.strict_exempt)],
+            "hard_rows": [{"target": r["target"], "group": r["group"],
+                           "class": r["class"], "stale_days": r.get("stale_days")}
+                          for r in hard_rows(rows, args.strict_exempt)],
             "rows": [{k: v for k, v in r.items() if k != "digests"} for r in rows],
         }
         if discover_rows is not None:

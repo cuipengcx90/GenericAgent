@@ -14,6 +14,10 @@
         tools/content_change_detector.py，只对显式登记 content 段的目标生效）
   L2 静默降级签名：扫最新日志/证据文件尾部（默认 200KB）命中 degraded_patterns ⇒ DEGRADED
   L3 运行缺席：最近一次运行证据（done 报告/日志）距今 > max_run_gap_days ⇒ NO_RUN
+  L4 退役/人工家族（state=legacy|on_demand，R470）：任务定义已删除/归档（legacy）或仅人工触发
+       （on_demand）⇒ 缺产出判 LEGACY / ON_DEMAND（静默，不计硬问题）；legacy 族在
+       revive_within_days（默认 3d）窗口内**又长出新产出** = 登记已过期 ⇒ WARN（负控可证伪：
+       新产物退回窗口外即回 LEGACY；改判据表 state 即整体回退）。
 附加：launchd 目标额外查 launchctl list（未加载 ⇒ NOT_LOADED；上次退出码非 0 ⇒ 记 note）。
 
 零副作用：只 stat / 读尾部；不 touch、不删、不改任何被检测文件（唯一写入是 --ledger 台账）。
@@ -48,6 +52,11 @@ LEVEL_ORDER = {"OK": 0, "INFO": 1, "WARN": 2, "ALERT": 3}
 # ---- L1b 内容级判据默认值（判据内核在 tools/content_change_detector.py，本文件只做接线）----
 DEFAULT_CONTENT_MIN_FILES = 3     # 单文件/双文件族无法判「内容零变化」，默认至少 3 份
 DEFAULT_CONTENT_MAX_FILES = 500   # 只取最新 N 份（大目录不全扫，窗口贴近当下）
+
+# ---- L4 退役/人工家族（state=legacy|on_demand）----
+# legacy：任务定义已删除/归档 ⇒ 缺产出属预期（静默）；但窗口内又长出新产出 = 登记过期 ⇒ WARN
+# on_demand：仅人工触发（试用重置等）⇒ 无产出与新产出都属预期（静默，只留证据）
+DEFAULT_REVIVE_WITHIN_DAYS = 3.0
 
 
 def now_ts():
@@ -187,6 +196,36 @@ def check_target(t, root, ref=None, ld=None):
     if t.get("disabled"):
         res["verdict"] = "DISABLED"
         res["checks"].append({"level": "INFO", "text": "按设计停用/归档（enabled=false），不参与新鲜度判定"})
+        return res
+
+    # ---- L4 退役/人工家族（state=legacy|on_demand；R470）----
+    # 与 disabled 的区别：任务 json 可能已被删除（legacy），此处按**产出面**判定，不依赖调度条目存在。
+    st = str(t.get("state") or "").strip().lower()
+    if st in ("legacy", "on_demand"):
+        res["state"] = st
+        lp, lm, ln = newest_match(t.get("run_evidence") or [], root)
+        if lp is None:
+            a = None
+            ev = "无产出（glob 未命中）"
+        else:
+            a = age_days(lm, ref)
+            ev = "最近产出 %s（%s，%s）" % (fmt_ts(lm), fmt_age(a),
+                                          os.path.relpath(lp, root) if lp.startswith(root) else lp)
+            res["evidence"] = {"file": os.path.relpath(lp, root) if lp.startswith(root) else lp,
+                               "mtime": fmt_ts(lm), "age_days": round(a, 2), "matched": ln}
+        if st == "legacy":
+            revive = float(t.get("revive_within_days") or DEFAULT_REVIVE_WITHIN_DAYS)
+            if a is not None and a <= revive:
+                bump("WARN", "L4 登记过期：判据表标为 legacy 的族在 %.1f 天窗口内仍产出（%s）"
+                             "⇒ 该族已复活，请复核 state" % (revive, ev))
+            else:
+                res["verdict"] = "LEGACY"
+                res["checks"].append({"level": "INFO", "text":
+                                      "L4 已退役/归档族：%s；缺产出属预期（静默，不计硬问题）" % ev})
+        else:
+            res["verdict"] = "ON_DEMAND"
+            res["checks"].append({"level": "INFO", "text":
+                                  "L4 人工触发族：%s；无固定节奏，不参与新鲜度判定" % ev})
         return res
 
     # ---- L3 运行缺席 ----
@@ -508,6 +547,13 @@ def selftest(tmp=None):
     touch("sche_tasks/done/2026-09-27_0800_content_heartbeat.md", 0.30, "# done\n")
     touch("sche_tasks/done/2026-09-27_0800_content_acked.md", 0.30, "# done\n")
     touch("sche_tasks/done/2026-09-27_0800_content_oneshot.md", 0.30, "# done\n")
+    # fixture E：L4 退役/人工家族（R470）
+    #  E1 legacy 静默：标 legacy、产出停在 120 天前 ⇒ 判 LEGACY（静默）
+    #  E2 legacy 复活（负控）：标 legacy 但窗口内（1 天前）又产出 ⇒ 必升 WARN「登记过期」
+    #  E3 on_demand：人工触发族，产出停在 90 天前 ⇒ 判 ON_DEMAND（静默）
+    touch("sche_tasks/done/2026-05-31_0900_legacy_quiet.md", 120.0, "# done\n")
+    touch("sche_tasks/done/2026-09-27_0900_legacy_revived.md", 1.0, "# done\n")
+    touch("sche_tasks/done/2026-06-30_0900_ondemand_manual.md", 90.0, "# done\n")
 
     criteria = {"_source": "selftest-fixture", "targets": [
         {"id": "birdie_daily_monitor", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
@@ -545,6 +591,15 @@ def selftest(tmp=None):
          "payloads": [{"glob": "temp/oneshot/only_*.json", "max_silence_days": 8}],
          "content": [{"glob": "temp/oneshot/only_*.json", "max_content_stale_days": 8, "min_files": 3}],
          "scans": []},
+        # fixture E：L4 退役/人工家族（R470）—— state=legacy 走「登记过期」护栏；on_demand 恒静默
+        {"id": "legacy_quiet", "kind": "sche", "cadence": "legacy", "state": "legacy", "severity": "soft",
+         "note": "已退役任务（判据表登记，产出面静默）",
+         "run_evidence": ["sche_tasks/done/*_legacy_quiet.md"]},
+        {"id": "legacy_revived", "kind": "sche", "cadence": "legacy", "state": "legacy", "severity": "soft",
+         "revive_within_days": 3,
+         "run_evidence": ["sche_tasks/done/*_legacy_revived.md"]},
+        {"id": "ondemand_manual", "kind": "sche", "cadence": "on-demand", "state": "on_demand", "severity": "soft",
+         "run_evidence": ["sche_tasks/done/*_ondemand_manual.md"]},
     ], "channels": [
         {"id": "www.birdiesearch.com", "via": "birdie_daily_monitor",
          "success_artifact": ["birdie_monitor/birdie_seen_items.json"],
@@ -626,6 +681,23 @@ def selftest(tmp=None):
     expect("⑫ 负控：未登记 content 段的目标 contents 为空（默认行为逐字不变）",
            rows["birdie_daily_monitor"]["contents"] == [],
            str(rows["birdie_daily_monitor"]["contents"][:1]))
+    # ⑬–⑯ L4 退役/人工家族语义（R470）—— ⑭⑯ 为负控
+    expect("⑬ legacy 族（产出停在 120d）→ 判 LEGACY，不进硬问题",
+           rows["legacy_quiet"]["verdict"] == "LEGACY"
+           and "legacy_quiet" not in res["hard_issue_ids"],
+           "%s / hard=%s" % (rows["legacy_quiet"]["verdict"],
+                             "legacy_quiet" in res["hard_issue_ids"]))
+    expect("⑭ 负控：legacy 族在 3d 窗口内又产出 → 必升 WARN「登记过期」（判定随输入变）",
+           rows["legacy_revived"]["verdict"] == "WARN"
+           and "登记过期" in (rows["legacy_revived"]["checks"][-1]["text"] if rows["legacy_revived"]["checks"] else ""),
+           "%s / %s" % (rows["legacy_revived"]["verdict"],
+                        (rows["legacy_revived"]["checks"][-1]["text"] if rows["legacy_revived"]["checks"] else "")[:40]))
+    expect("⑮ on_demand 族（产出停在 90d）→ 判 ON_DEMAND（无固定节奏，静默）",
+           rows["ondemand_manual"]["verdict"] == "ON_DEMAND",
+           rows["ondemand_manual"]["verdict"])
+    expect("⑯ 负控：未登记 state 的目标逐字不变（无 state 键、verdict 仍 OK）",
+           "state" not in rows["github_trending"] and rows["github_trending"]["verdict"] == "OK",
+           "%s / state=%s" % (rows["github_trending"]["verdict"], rows["github_trending"].get("state")))
 
     ok = True
     for name, good, detail in checks:
