@@ -400,6 +400,42 @@ def family_scan(task_id, tokens, done_dir):
     return files, hits
 
 
+def provenance_check(case, base=None):
+    """★出处机检：用例的 onset 必须能在权威文件里被逐字指认（防 onset 手写漂移）。
+
+    用例可声明 `provenance` = {authority, case_token, onset_token}：
+      authority   —— 权威文件（仓内相对路径或绝对路径）
+      case_token  —— 该案在被引文件中的标识串（如 R467 的 case id `birdie_0808_0925`）
+      onset_token —— onset 日期字面（如 `2026-08-08`）
+
+    三态：
+      PROVENANCE_OK     两 token 都在权威文件里逐字命中
+      PROVENANCE_FAIL   声明了但对不上（文件不存在/不可读/字段缺/token 查无）
+      PROVENANCE_ABSENT 未声明 ⇒ 只登记不计数（`replay` 汇总报 provenance_undeclared）
+    ★FAIL 计 problem（声明即承诺）；ABSENT 不计 problem（历史用例兼容），但汇总必须显式。
+    """
+    pv = case.get("provenance")
+    if not pv:
+        return {"status": "PROVENANCE_ABSENT", "detail": "未声明 provenance（onset 无出处）"}
+    miss = [k for k in ("authority", "case_token", "onset_token") if not (pv or {}).get(k)]
+    if miss:
+        return {"status": "PROVENANCE_FAIL", "detail": "provenance 缺字段 %s" % ",".join(miss)}
+    path = pv["authority"]
+    p = path if os.path.isabs(path) else os.path.join(base or GA, path)
+    if not os.path.exists(p):
+        return {"status": "PROVENANCE_FAIL", "detail": "权威文件不存在: %s" % path}
+    try:
+        txt = open(p, encoding="utf-8", errors="replace").read()
+    except OSError as e:                                     # noqa: BLE001 — fail-closed
+        return {"status": "PROVENANCE_FAIL", "detail": "权威文件不可读: %s" % type(e).__name__}
+    bad = [k for k in ("case_token", "onset_token") if pv[k] not in txt]
+    if bad:
+        return {"status": "PROVENANCE_FAIL",
+                "detail": "%s 中查无 %s ⇒ onset 出处不成立" % (path, ",".join(bad))}
+    return {"status": "PROVENANCE_OK",
+            "detail": "%s 命中 %s + %s" % (path, pv["case_token"], pv["onset_token"])}
+
+
 def _days(a, b):
     import datetime
     da = datetime.date(*[int(x) for x in a.split("-")])
@@ -407,7 +443,7 @@ def _days(a, b):
     return (da - db).days
 
 
-def replay(cases, done_dir=DEFAULT_DONE, live=True, registry=None):
+def replay(cases, done_dir=DEFAULT_DONE, live=True, registry=None, base=None):
     rows = []
     by_id = {t.get("id"): t for t in (registry or {}).get("targets", [])}
     for c in cases.get("cases", []):
@@ -433,6 +469,14 @@ def replay(cases, done_dir=DEFAULT_DONE, live=True, registry=None):
             rows.append(row)
             continue
         # evidence 型：族内扫描 recorded token ⇒ 首次命中日 vs onset
+        # evidence 型：★先机检 onset 出处（声明即承诺；FAIL 短路，防「onset 手写漂移」）
+        pv = provenance_check(c, base=base)
+        row["provenance"] = pv
+        if pv["status"] == "PROVENANCE_FAIL":
+            row["status"] = "PROVENANCE_FAIL"
+            row["note"] = pv["detail"]
+            rows.append(row)
+            continue
         files, hits = family_scan(c.get("target"), c.get("recorded_tokens") or [], done_dir)
         grace = int(c.get("grace_days", 1))
         if not files:
@@ -460,6 +504,10 @@ def replay(cases, done_dir=DEFAULT_DONE, live=True, registry=None):
             row["note"] = "迟至 %d 天（grace=%d）" % (delay, grace)
         if live and c.get("live_spec") is not None:
             row["live"] = run_probe(c["live_spec"])
+            lv = row["live"]["verdict"]
+            proxy_alert = row["status"] in ("FIRE_ON_TIME", "FIRE_EARLY", "FIRE_LATE")
+            # 代理信号(历史报告仍记故障) vs 实测信号(探针当下 PASS/FAIL) 是否同向
+            row["live_agrees"] = None if lv == "UNVERIFIABLE" else (proxy_alert == (lv == "FAIL"))
         rows.append(row)
     covered = [r for r in rows if r["status"] in ("FIRE_ON_TIME", "FIRE_EARLY", "NC_OK", "COVERAGE_OK")]
     bad = [r for r in rows if r not in covered]
@@ -469,6 +517,8 @@ def replay(cases, done_dir=DEFAULT_DONE, live=True, registry=None):
     return {"schema": "ga.preflight_replay/v1", "ts": fmt_ts(), "done_dir": done_dir,
             "cases": len(rows), "covered": len(covered), "problem": len(bad),
             "problem_status": pstat,
+            "provenance_undeclared": len([r for r in rows
+                                          if (r.get("provenance") or {}).get("status") == "PROVENANCE_ABSENT"]),
             "problem_ids": [r["id"] for r in bad], "rows": rows}
 
 
@@ -554,6 +604,14 @@ def check_cases(cases):
                 errs.append("%s 缺 recorded_tokens" % cid)
             elif not c.get("target"):
                 errs.append("%s 缺 target" % cid)
+            pv = c.get("provenance")
+            if pv is not None:
+                if not isinstance(pv, dict):
+                    errs.append("%s provenance 必须是对象" % cid)
+                else:
+                    for k in ("authority", "case_token", "onset_token"):
+                        if not pv.get(k):
+                            errs.append("%s provenance 缺 %s" % (cid, k))
     return errs
 
 
@@ -604,11 +662,17 @@ def print_replay(rep):
         print("%-28s %-14s onset=%s first_hit=%s delay=%s token=%r"
               % (r["id"], r["status"], r.get("onset"), r.get("first_hit"),
                  r.get("delay_days"), r.get("token")))
+        if r.get("provenance"):
+            print("%-28s   provenance=%s %s" % ("", r["provenance"]["status"],
+                                                r["provenance"].get("detail", "")))
         if r.get("live"):
             print("%-28s   live=%s %s" % ("", r["live"]["verdict"], r["live"]["detail"]))
+            if r.get("live_agrees") is not None:
+                print("%-28s   live_agrees=%s（代理信号 vs 实测探针）" % ("", r["live_agrees"]))
     print("-" * 100)
     print("用例 %d：覆盖 %d / 问题 %d %s"
           % (rep["cases"], rep["covered"], rep["problem"], rep["problem_ids"]))
+    print("出处未声明 %d（不计问题，仅登记）" % rep.get("provenance_undeclared", 0))
 
 
 # ------------------------------------------------------------ selftest
@@ -780,6 +844,53 @@ def selftest():
         covered_targets = {c.get("target") for c in cs["cases"] if c.get("type") == "evidence"}
         ck("NC33 回测覆盖的 target 全部已在册（防回测与登记脱钩）",
            covered_targets <= {t["id"] for t in reg["targets"]}, str(sorted(covered_targets)))
+
+        # --- 出处机检（onset 必须能被权威文件逐字指认）---
+        auth = os.path.join(base, "authority.md")
+        with open(auth, "w", encoding="utf-8") as f:
+            f.write("case birdie_0808_0925 onset 2026-08-08（权威片段）\n")
+        pv = provenance_check({"id": "p_ok", "onset": "2026-08-08",
+                               "provenance": {"authority": auth, "case_token": "birdie_0808_0925",
+                                              "onset_token": "2026-08-08"}}, base=base)
+        ck("NC35 出处：两 token 均在权威文件逐字命中⇒PROVENANCE_OK",
+           pv["status"] == "PROVENANCE_OK", str(pv))
+        pv = provenance_check({"id": "p_bad", "onset": "2026-08-09",
+                               "provenance": {"authority": auth, "case_token": "birdie_0808_0925",
+                                              "onset_token": "2026-08-09"}}, base=base)
+        ck("NC36 出处：onset token 查无⇒PROVENANCE_FAIL（fail-closed 不放过）",
+           pv["status"] == "PROVENANCE_FAIL" and "查无" in pv["detail"], str(pv))
+        pv = provenance_check({"id": "p_miss", "onset": "2026-08-08",
+                               "provenance": {"authority": auth, "case_token": "birdie_0808_0925"}}, base=base)
+        ck("NC37 出处：provenance 缺字段⇒PROVENANCE_FAIL",
+           pv["status"] == "PROVENANCE_FAIL" and "缺字段" in pv["detail"], str(pv))
+        mini = {"cases": [
+            {"id": "m_fail", "type": "evidence", "target": "t1", "onset": "2026-08-08",
+             "recorded_tokens": ["X"],
+             "provenance": {"authority": auth, "case_token": "birdie_0808_0925",
+                            "onset_token": "2026-99-99"}},
+            {"id": "m_absent", "type": "evidence", "target": "t1", "onset": "2026-08-08",
+             "recorded_tokens": ["X"]},
+        ]}
+        rep2 = replay(mini, done_dir=done, live=False, registry={"targets": []}, base=base)
+        by2 = {r["id"]: r for r in rep2["rows"]}
+        ck("NC38 出处：FAIL 计入 problem 且不再去扫语料（声明即承诺）",
+           by2["m_fail"]["status"] == "PROVENANCE_FAIL" and "first_hit" not in by2["m_fail"]
+           and rep2["problem_status"].get("PROVENANCE_FAIL") == 1,
+           json.dumps(rep2["problem_status"]))
+        # ★ABSENT=历史用例兼容：不计问题，但汇总必须显式（否则「没声明」被当「已核过」）
+        #  (m_absent 无语料 ⇒ 因 NO_DATA 进 problem 属另一码事；此处只锁它没被判成出处问题)
+        ck("NC39 出处：未声明⇒只登记 provenance_undeclared=1 且该案不判出处 FAIL",
+           rep2["provenance_undeclared"] == 1
+           and by2["m_absent"]["provenance"]["status"] == "PROVENANCE_ABSENT"
+           and by2["m_absent"]["status"] == "NO_DATA"
+           and rep2["problem_status"].get("PROVENANCE_FAIL") == 1,
+           json.dumps({"undeclared": rep2["provenance_undeclared"],
+                       "absent_status": by2["m_absent"]["status"],
+                       "problems": rep2["problem_status"]}))
+        errs = check_cases({"cases": [{"id": "c", "type": "evidence", "target": "t",
+                                       "onset": "2026-08-08", "provenance": "not-an-object"}]})
+        ck("NC40 cases：provenance 非对象⇒报错（形状 fail-closed）",
+           any("必须是对象" in e for e in errs), str(errs))
 
         # --- 只读自证 ---
         pr = proof(DEFAULT_REGISTRY, DEFAULT_CASES)
