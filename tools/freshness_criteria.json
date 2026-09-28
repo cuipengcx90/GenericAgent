@@ -2,6 +2,154 @@
   "_doc": "定时任务/launchd/外部通道「产物级」新鲜度判据表（单一来源）。被 tools/task_freshness.py 读取。字段：cadence 节奏；max_run_gap_days=L3 运行缺席阈值（最近运行证据年龄上限）；payloads[].max_silence_days=L1 产物静默上限；payloads[].soft=true 表示只记 INFO 不判硬问题；scans[].patterns=L2 静默降级签名（扫最新日志/证据文件尾部）；severity=soft 表示该目标的问题不进硬问题清单；content[].glob/max_content_stale_days/min_files=L1b 内容级判据（家族内文件内容指纹零变化/停滞超阈值即报，内核复用 tools/content_change_detector.py）；content[].soft|ack 为真时命中降为 INFO（ack 须填「为何静止」理由）；state=legacy|on_demand=L4 退役/人工家族（任务定义已删除或归档 / 仅人工触发），按产出面判定而不依赖调度条目存在：缺产出判 LEGACY / ON_DEMAND（静默，不进硬问题清单）；legacy 族在 revive_within_days（默认 3d）窗口内又长出新产出=登记已过期⇒WARN。",
   "_calibrated": "2026-09-25 首次标定（全部路径经实测 stat/glob 命中，非凭印象）；2026-09-28 二次标定（R470：补 L4 legacy/on_demand 家族 8 条，run_evidence glob 逐条实测命中；navicat_trial_reset 由 disabled 改判 on_demand；wechat_weekly 按 CCD --discover-done 的登记面对账补齐）",
   "_counts": "sche 29（enabled 17 / disabled 4 / on_demand 1 / legacy 7）、launchd plist 15、外部通道 8；目标合计 44",
+  "preflight": {
+    "schema": "ga.preflight_targets/v1",
+    "note": "定时任务「前置条件可用性」探针登记面（L0 层，只读）。任一 FAIL ⇒ ALERT；全 PASS 只记 INFO，不得判健康。层外边界写在每个 target 的 limits 字段。",
+    "targets": [
+      {
+        "id": "x_ai_intel_daily",
+        "label": "X(Twitter) AI 情报采集（浏览器实体标签）",
+        "probes": [
+          {
+            "kind": "chrome_tabs",
+            "params": {
+              "match": "x.com",
+              "min_count": 1,
+              "timeout_s": 20
+            }
+          },
+          {
+            "kind": "cookie_present",
+            "params": {
+              "names": [
+                "auth_token"
+              ],
+              "domain": ".x.com"
+            }
+          },
+          {
+            "kind": "credential_entry",
+            "params": {
+              "entry_id": "bc_x_auth_token"
+            }
+          }
+        ],
+        "limits": "只覆盖「有无 x.com 标签 / 登录 cookie 是否存在 / 凭证在册」；CDP 标签 id 失效形态（报告写作 CDP_TABID）在标签仍存在时发生，本层不可见",
+        "history": "2026-08-18 起零有效产出；cookie 在库中存在 ⇒ 本层全 PASS 也不能判健康（负控用例 nc_all_pass_no_health）"
+      },
+      {
+        "id": "birdie_daily_monitor",
+        "label": "birdiesearch 网盘资源监控",
+        "probes": [
+          {
+            "kind": "http_endpoint",
+            "params": {
+              "url": "https://birdiesearch.com/api/user/sign",
+              "method": "POST",
+              "timeout_s": 8,
+              "expect_status": [
+                200,
+                400,
+                401,
+                403,
+                404,
+                405,
+                422
+              ]
+            }
+          }
+        ],
+        "limits": "探针只断言「签到端点在答」；站点返回 5xx 网关错误或传输层失败一律判 FAIL。R442 已裁决站点侧 IP 层不可达（退役待批）",
+        "history": "2026-08-08 起 502/ProxyError 连续失败；首败当天报告即有 502 Bad Gateway 证据"
+      },
+      {
+        "id": "haisou_daily_monitor",
+        "label": "haisou.cc 网盘资源监控",
+        "probes": [
+          {
+            "kind": "http_endpoint",
+            "params": {
+              "url": "https://haisou.cc/",
+              "method": "GET",
+              "timeout_s": 8,
+              "expect_status": [
+                200,
+                301,
+                302,
+                403
+              ]
+            }
+          },
+          {
+            "kind": "credential_entry",
+            "params": {
+              "entry_id": "gc_haisou_session"
+            }
+          }
+        ],
+        "limits": "只判站点可达与会员会话名在册；额度耗尽（第 1 次命中后即 403，SOP 实测）与判断逻辑误放行属任务内部面，不在本层",
+        "history": "2026-09-25 起步骤 1 首页抓取 SSLEOFError，任务仍 rc=0 落 done 报告（静默降级）"
+      },
+      {
+        "id": "linuxdo_ai_daily_summary",
+        "label": "linux.do 人工智能技术日报归档",
+        "probes": [
+          {
+            "kind": "cookie_present",
+            "params": {
+              "names": [
+                "_t"
+              ],
+              "domain": "linux.do"
+            }
+          },
+          {
+            "kind": "credential_entry",
+            "params": {
+              "entry_id": "bc_linuxdo_t"
+            }
+          }
+        ],
+        "limits": "只判 Discourse 登录令牌 _t 是否存在（多 profile 扫描）；CF 挑战页与 429 限流属运行时面；connect.linux.do 的 auth.session-token 是独立会话，不可与本探针互推",
+        "history": "2026-09-27 起登录态整体失效（search.json 403 not_logged_in），当日报告记载 10 个 profile 全无 _t"
+      },
+      {
+        "id": "linuxdo_trust_level_check",
+        "label": "linux.do TL3 等级每日检查",
+        "probes": [
+          {
+            "kind": "cookie_present",
+            "params": {
+              "names": [
+                "_t"
+              ],
+              "domain": "linux.do"
+            }
+          }
+        ],
+        "limits": "同 linuxdo_ai_daily_summary；等级门槛判定属页面解析面",
+        "history": "与日报共用同一登录态，登录态丢失同样会使检查退化"
+      },
+      {
+        "id": "weekly_inspection",
+        "label": "opserver SLS 周巡检（三层防线脚本）",
+        "probes": [
+          {
+            "kind": "path_exists",
+            "params": {
+              "paths": [
+                "memory/gen_report_skeleton.py",
+                "memory/weekly_inspection_verify.py",
+                "memory/verify_then_notify.py"
+              ]
+            }
+          }
+        ],
+        "limits": "只判三层防线脚本在盘（R469 实测 prompt 里写成 ../memory/... 锚定，cwd 一变即硬失败）；脚本内部逻辑与 SLS 连通性不在本层",
+        "history": "R469 sche_tasks prompt 静态体检 3 条 FAIL 全为 ../ 锚定项"
+      }
+    ]
+  },
   "targets": [
     {
       "id": "birdie_daily_monitor", "kind": "sche", "label": "BirdieSearch 网盘监控日报", "cadence": "daily 11:00",

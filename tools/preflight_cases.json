@@ -1,0 +1,59 @@
+{
+ "schema": "ga.preflight_cases/v1",
+ "note": "前置探针层回测用例：evidence 型按「族内扫描 recorded_tokens 的首次命中日 vs onset」判早/准/迟；negative_control 型验证「全 PASS 不得判健康」；coverage 型做在册性对账。语料=sche_tasks/done/*_<target>.md（★必须族内限定：报告正文会回述别族故障）。",
+ "cases": [
+  {
+   "id": "birdie_0808_502",
+   "type": "evidence",
+   "target": "birdie_daily_monitor",
+   "onset": "2026-08-08",
+   "recorded_tokens": ["502 Bad Gateway"],
+   "grace_days": 1,
+   "live_spec": {"kind": "http_endpoint", "params": {"url": "https://birdiesearch.com/api/user/sign", "method": "POST", "timeout_s": 8, "expect_status": [200, 400, 401, 403, 404, 405, 422]}},
+   "note": "R442 裁决的死亡窗口起点 08-07→08-08；首败报告当天即含 502 证据"
+  },
+  {
+   "id": "x_ai_0818_no_session",
+   "type": "evidence",
+   "target": "x_ai_intel_daily",
+   "onset": "2026-08-18",
+   "recorded_tokens": ["No active X browser tab"],
+   "grace_days": 1,
+   "live_spec": {"kind": "chrome_tabs", "params": {"match": "x.com", "min_count": 1, "timeout_s": 20}},
+   "note": "本层首个适用日=08-19（08-18 那例是 CDP_TABID 标签 id 失效，属层外形态）；08-17 16:38 已有同签名报告 ⇒ 判 FIRE_EARLY"
+  },
+  {
+   "id": "haisou_0925_ssleof",
+   "type": "evidence",
+   "target": "haisou_daily_monitor",
+   "onset": "2026-09-25",
+   "recorded_tokens": ["SSLEOFError"],
+   "grace_days": 1,
+   "live_spec": {"kind": "http_endpoint", "params": {"url": "https://haisou.cc/", "method": "GET", "timeout_s": 8, "expect_status": [200, 301, 302, 403]}},
+   "note": "09-25 首例步骤 1 首页抓取失败（SSLEOFError），任务仍 rc=0 落 done 报告"
+  },
+  {
+   "id": "linuxdo_0927_not_logged_in",
+   "type": "evidence",
+   "target": "linuxdo_ai_daily_summary",
+   "onset": "2026-09-27",
+   "recorded_tokens": ["not_logged_in"],
+   "grace_days": 1,
+   "live_spec": {"kind": "cookie_present", "params": {"names": ["_t"], "domain": "linux.do"}},
+   "note": "09-27 报告记载 10 个 profile 全无 _t；该报告同时给出 cookie 状态本身（与本层判据同源）"
+  },
+  {
+   "id": "nc_all_pass_no_health",
+   "type": "negative_control",
+   "target": "x_ai_intel_daily",
+   "probes": [{"kind": "path_exists", "params": {"paths": ["tools/preflight_check.py"]}}],
+   "note": "★codex 复核点：全 PASS 不得判健康 —— x.com 登录 cookie 存在而任务零产出（08-17 起），故聚合必须 OK+health=False 而非「健康」"
+  },
+  {
+   "id": "cov_linuxdo_trust_level",
+   "type": "coverage",
+   "target": "linuxdo_trust_level_check",
+   "note": "在册性对账：该目标已登记探针 ⇒ COVERAGE_OK；若被移除登记则必须显式报 COVERAGE_GAP（不得静默降级）"
+  }
+ ]
+}

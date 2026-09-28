@@ -180,8 +180,12 @@ def plist_meta(label):
             "args": " ".join(map(str, (d.get("ProgramArguments") or [d.get("Program", "")])))}
 
 
-def check_target(t, root, ref=None, ld=None):
-    """对一个判据目标求判定。返回 dict。"""
+def check_target(t, root, ref=None, ld=None, pf=None):
+    """对一个判据目标求判定。返回 dict。
+
+    pf=L0 前置条件可用性（R475，来自判据表 preflight 段与 preflight_check.l0_map）；
+    仅对显式登记的目标传入（未登记=None ⇒ 本层完全不参与，既有判定逐字不变）。
+    """
     ref = ref or now_ts()
     res = {"id": t["id"], "kind": t.get("kind", "sche"), "label": t.get("label", t["id"]),
            "cadence": t.get("cadence", ""), "notes": t.get("note", ""),
@@ -197,6 +201,24 @@ def check_target(t, root, ref=None, ld=None):
         res["verdict"] = "DISABLED"
         res["checks"].append({"level": "INFO", "text": "按设计停用/归档（enabled=false），不参与新鲜度判定"})
         return res
+
+    # ---- L0 前置条件可用性（R475）----
+    # 语义：前置不成立 ⇒ 任务必不会产出（run 级证据可能照样新鲜，mtime 层看不见）。
+    # 只加严：FAIL⇒ALERT；WARN/OK 只留 INFO，不改既有 verdict。
+    if pf is not None:
+        res["preflight"] = pf
+        pv = pf.get("verdict")
+        if pv == "ALERT":
+            bad = [p for p in (pf.get("probes") or []) if p.get("verdict") == "FAIL"]
+            bump("ALERT", "L0 前置条件不成立（fail-closed）：%s" % "；".join(
+                "%s「%s」" % (p.get("kind"), (p.get("detail") or "")[:90]) for p in bad)[:400])
+        elif pv == "WARN":
+            unk = [p for p in (pf.get("probes") or []) if p.get("verdict") == "UNVERIFIABLE"]
+            res["checks"].append({"level": "INFO", "text":
+                "L0 前置条件存在无法判定项 %d/%d（未知≠成立，不计硬问题）" % (len(unk), len(pf.get("probes") or []))})
+        else:
+            res["checks"].append({"level": "INFO", "text":
+                "L0 前置条件可用（%d 项探针全通过）" % len(pf.get("probes") or [])})
 
     # ---- L4 退役/人工家族（state=legacy|on_demand；R470）----
     # 与 disabled 的区别：任务 json 可能已被删除（legacy），此处按**产出面**判定，不依赖调度条目存在。
@@ -396,14 +418,25 @@ def check_channel(c, root, ref=None):
 
 
 def run(criteria, root, only=None, as_json=False, ledger=LEDGER_DEFAULT, write_ledger=True,
-        do_diff=False, ref=None, return_result=False):
+        do_diff=False, ref=None, return_result=False, preflight=True, preflight_live=True):
     ref = ref or now_ts()
     ld = launchd_state()
+    # ---- L0 前置条件：登记面=判据表 `preflight` 段（单一来源，勿另存一份）----
+    pf_map, pf_err = {}, ""
+    if preflight and criteria.get("preflight"):
+        try:
+            _here = os.path.dirname(os.path.abspath(__file__))
+            if _here not in sys.path:
+                sys.path.insert(0, _here)
+            import preflight_check as _pc                    # noqa: PLC0415
+            pf_map = _pc.l0_map(criteria["preflight"], only=set(only) if only else None, live=preflight_live)
+        except Exception as e:                               # noqa: BLE001
+            pf_err = "%s: %s" % (type(e).__name__, e)        # 失败不静默：记进 result（不改判定）
     targets = criteria["targets"]
     if only:
         want = set(only)
         targets = [t for t in targets if t["id"] in want]
-    rows = [check_target(t, root, ref, ld) for t in targets]
+    rows = [check_target(t, root, ref, ld, pf=pf_map.get(t["id"])) for t in targets]
     channels = [check_channel(c, root, ref) for c in criteria.get("channels", [])]
 
     hard = [r for r in rows if r["severity"] != "soft" and r["verdict"] in ("ALERT", "WARN")]
@@ -413,6 +446,8 @@ def run(criteria, root, only=None, as_json=False, ledger=LEDGER_DEFAULT, write_l
     result = {"schema": "ga.task_freshness/v1", "ts": fmt_ts(ref), "root": root,
               "criteria_source": criteria.get("_source", ""), "counts": counts,
               "hard_issue_ids": [r["id"] for r in hard], "targets": rows, "channels": channels,
+              "preflight": {"enabled": bool(preflight and criteria.get("preflight")),
+                            "registered": len(pf_map), "error": pf_err},
               "corpus": {"targets": len(rows), "channels": len(channels),
                          "payload_files_seen": sum(p.get("matched", 0) for r in rows for p in r.get("payloads", [])),
                          "log_files_scanned": len({h["file"] for r in rows for h in r.get("signatures", [])}),
@@ -699,6 +734,31 @@ def selftest(tmp=None):
            "state" not in rows["github_trending"] and rows["github_trending"]["verdict"] == "OK",
            "%s / state=%s" % (rows["github_trending"]["verdict"], rows["github_trending"].get("state")))
 
+    # ⑰–⑲ L0 前置条件层（R475）——⑰ 是负控（前置可用不得报警）；⑱⑲ 证明判定随输入与开关变
+    pf_path = os.path.join(base, "output", "tech_trends_2026-09-25.md")
+    criteria["preflight"] = {"targets": [{"id": "github_trending", "label": "selftest 前置夹具",
+                                          "probes": [{"kind": "path_exists", "params": {"paths": [pf_path]}}]}]}
+    res5 = run(criteria, base, as_json=True, write_ledger=False, return_result=True)
+    gt = {r["id"]: r for r in res5["targets"]}["github_trending"]
+    expect("⑰ 负控：L0 前置可用 → 不改变判定（github_trending 仍 OK，preflight 段带出）",
+           gt["verdict"] == "OK" and gt["preflight"]["verdict"] == "OK"
+           and res5["preflight"]["registered"] == 1 and gt["id"] not in res5["hard_issue_ids"],
+           "%s / pf=%s / hard=%s" % (gt["verdict"], gt.get("preflight"), gt["id"] in res5["hard_issue_ids"]))
+    # 探针指到不存在的路径 ⇒ 前置不成立必升 ALERT（产物 mtime 全新鲜也拦得住）
+    criteria["preflight"]["targets"][0]["probes"][0]["params"]["paths"] = [os.path.join(base, "missing_never.txt")]
+    res6 = run(criteria, base, as_json=True, write_ledger=False, return_result=True)
+    gt6 = {r["id"]: r for r in res6["targets"]}["github_trending"]
+    expect("⑱ 负控：L0 前置不成立（路径缺失）→ 必升 ALERT 且进硬问题",
+           gt6["verdict"] == "ALERT" and gt6["id"] in res6["hard_issue_ids"]
+           and gt6["preflight"]["verdict"] == "ALERT",
+           "%s / hard=%s" % (gt6["verdict"], gt6["id"] in res6["hard_issue_ids"]))
+    # 关掉 L0 ⇒ 必须回到 OK（证明是开关生效，不是硬编码结论）
+    res7 = run(criteria, base, as_json=True, write_ledger=False, return_result=True, preflight=False)
+    gt7 = {r["id"]: r for r in res7["targets"]}["github_trending"]
+    expect("⑲ 负控：--no-preflight ⇒ 同一夹具回 OK 且 preflight 段缺席（开关生效）",
+           gt7["verdict"] == "OK" and "preflight" not in gt7 and res7["preflight"]["registered"] == 0,
+           "%s / %s" % (gt7["verdict"], res7["preflight"]))
+
     ok = True
     for name, good, detail in checks:
         ok &= good
@@ -719,6 +779,8 @@ def main():
     ap.add_argument("--only", default="")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-root", default="")
+    ap.add_argument("--no-preflight", action="store_true",
+                    help="关闭 L0 前置条件层（前置不成立也可判 OK；默认开启）")
     a = ap.parse_args()
     if a.selftest:
         return selftest(a.selftest_root or None)
@@ -729,7 +791,8 @@ def main():
     criteria["_source"] = os.path.relpath(a.criteria, a.root)
     only = [s for s in a.only.split(",") if s]
     return run(criteria, a.root, only=only, as_json=a.json,
-               ledger=a.ledger, write_ledger=not a.no_ledger, do_diff=a.diff)
+               ledger=a.ledger, write_ledger=not a.no_ledger, do_diff=a.diff,
+               preflight=not a.no_preflight)
 
 
 if __name__ == "__main__":
