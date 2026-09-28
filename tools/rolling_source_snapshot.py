@@ -37,7 +37,9 @@
 from __future__ import annotations
 
 import argparse
+import bz2
 import datetime
+import gzip
 import hashlib
 import json
 import os
@@ -138,8 +140,10 @@ SOURCES = {
 # 已知滚动源但**未实现**采集（只登记，不装定时；评审建议：别单独立项）
 NOTES = {
     'pmset': 'R420 已实现采集（见源 pmset / wifilog）；本工具只做「源接入 + 解析」，**未接定时**（待批）',
-    'wifi-rotated': '★边界：/var/log/wifi.log.N.bz2（N=0..10，各 ~100–370KB）**未纳入采集**；'
-                    '只采当前 wifi.log（newsyslog 每日 00:30 轮转）⇒ 更早窗口的「睡眠内网络活动」对账不可得',
+    'wifi-rotated': '★边界：/var/log/wifi.log.N.bz2（N=0..10，各 ~100–370KB）**未纳入每日采集**；'
+                    '只采当前 wifi.log（newsyslog 每日 00:30 轮转）。R504 起**抢救面已补**：'
+                    'tools/rolling_source_coverage.py salvage 可按行抽归档里的某一天（归档跨度**非**固定 1 天），'
+                    '`live_oldest` 亦改为按各归档首行时间戳实测最老可抽日（不再恒等 today-1）',
     'pmset-store': '★边界：/var/log/powermanagement/StoreData（8B 索引）随目录整体拷贝；'
                    '`pmset -g log` 是**活性视图**（按 ASL 索引滚动读，实测回溯仅到 2026-09-19），它本身不落盘',
 }
@@ -1431,6 +1435,100 @@ def _live_oldest_pmset(src: dict) -> dict:
             'method': 'filename', 'n_dated_files': len(days)}
 
 
+# ---------------------------------------------------------------- wifi 轮转归档（R504）
+# 背景：newsyslog 每日 00:30 轮转 wifi.log，但**保留多份压缩归档**（实测 .0/.1/.2 在盘，
+#      跨度**非**固定 1 天：.1 一份就覆盖 09-26+09-27）。R483/R495 曾据此判 wifilog 缺口
+#      「永久丢失」=**假**（源侧仍可抽）⇒ ①`live_oldest` 改为按归档首行时间戳实测；
+#      ②抢救采数（tools/rolling_source_coverage.py salvage）可按行抽某一天。
+WIFI_ROTATE_RE = re.compile(r'^wifi\.log(?:\.\d+)?(?:\.bz2|\.gz)?$')
+
+
+def wifi_source_files(src: dict = None, src_dir=None) -> list:
+    """列 wifi 日志源侧文件（当前 wifi.log + newsyslog 轮转归档），按 mtime 新→旧。只读。"""
+    src = src or {}
+    base = src_dir or src.get('src_dir')
+    if base is None:
+        base = Path(src.get('src_file') or '/var/log/wifi.log').parent
+    d = Path(base)
+    if not d.exists():
+        return []
+    out = []
+    try:
+        entries = sorted(d.iterdir())
+    except OSError:
+        return []
+    for p in entries:
+        try:
+            if not p.is_file() or not WIFI_ROTATE_RE.match(p.name):
+                continue
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({'path': p, 'name': p.name, 'mtime': st.st_mtime, 'bytes': st.st_size,
+                    'compressed': p.name.endswith(('.bz2', '.gz'))})
+    return sorted(out, key=lambda r: r['mtime'], reverse=True)
+
+
+def wifi_read_lines(rec: dict) -> list:
+    """读一个源侧文件的行（.bz2/.gz 走 stdlib 解压；不写任何东西）。"""
+    p = Path(rec['path'])
+    if p.name.endswith('.bz2'):
+        with bz2.open(p, 'rt', encoding='utf-8', errors='replace') as f:
+            return f.read().splitlines()
+    if p.name.endswith('.gz'):
+        with gzip.open(p, 'rt', encoding='utf-8', errors='replace') as f:
+            return f.read().splitlines()
+    return p.read_text(encoding='utf-8', errors='replace').splitlines()
+
+
+def wifi_year_for(lines: list, mtime_ts: float) -> int:
+    """归档行时间戳**不含年份**⇒ 取文件 mtime 年；若首行日期晚于 mtime 日则回退一年（跨年归档）。"""
+    mdt = datetime.datetime.fromtimestamp(mtime_ts)
+    y = mdt.year
+    for ln in lines[:200]:
+        ts = _ts_from_line(ln, y)
+        if ts:
+            try:
+                if datetime.date.fromisoformat(ts[:10]) > mdt.date():
+                    return y - 1
+            except ValueError:
+                pass
+            return y
+    return y
+
+
+def _live_oldest_wifi(src: dict) -> dict:
+    """轮转归档型源：最老仍可抽的一天 = 各归档**首行时间戳**的最小值（只读）。
+
+    fail-closed：读不到任何时间戳 ⇒ 回退 today（保守=把缺口当已滚出，宁可早报不可晚报）。
+    """
+    files = wifi_source_files(src)
+    today = datetime.date.today().isoformat()
+    if not files:
+        return {'date': today, 'rc': 1, 'method': 'rotation-fallback',
+                'error': 'no-source-file', 'n_files': 0}
+    days, n_read, n_err = [], 0, 0
+    for f in files:
+        try:
+            lines = wifi_read_lines(f)[:200]
+            n_read += 1
+        except Exception:  # noqa: BLE001
+            n_err += 1
+            continue
+        y = wifi_year_for(lines, f['mtime'])
+        for ln in lines:
+            ts = _ts_from_line(ln, y)
+            if ts:
+                days.append(ts[:10])
+                break
+    if not days:
+        return {'date': today, 'rc': 1, 'method': 'rotation-fallback',
+                'error': 'no-timestamp', 'n_files': len(files), 'n_read': n_read}
+    return {'date': min(days), 'rc': 0, 'method': 'rotation-archive-first-ts',
+            'n_files': len(files), 'n_read': n_read, 'n_errors': n_err,
+            'newest_archive': files[0]['name']}
+
+
 def live_oldest(name: str, src: dict = None) -> dict:
     """源侧「最老仍可采的一天」。live 源是活库⇒只读打开，不落任何写。"""
     src = src or SOURCES[name]
@@ -1441,8 +1539,7 @@ def live_oldest(name: str, src: dict = None) -> dict:
     if name == 'pmset':
         return _live_oldest_pmset(src)
     if name == 'wifilog':
-        return {'date': datetime.date.today().isoformat(), 'rc': 0, 'method': 'rotation-1d',
-                'error': None}
+        return _live_oldest_wifi(src)
     return {'date': None, 'rc': 2, 'method': 'unregistered', 'error': 'no retention spec'}
 
 

@@ -41,6 +41,7 @@ claim 仅追加账本；salvage 仅写 `<root>/<day>/salvaged.json`。
 """
 from __future__ import annotations
 
+import bz2
 import datetime
 import hashlib
 import json
@@ -58,6 +59,7 @@ import rolling_source_snapshot as rss  # noqa: E402  复用源登记面/审计�
 RULE_VERSION = 'coverage-rule/v1'
 SCHEMA = 'ga.rolling_source_coverage/v1'
 LEDGER_DEFAULT = Path(rss.GA) / 'temp' / 'source_retention' / 'coverage.jsonl'
+SALVAGE_LEDGER_DEFAULT = Path(rss.GA) / 'temp' / 'source_retention' / 'salvage.jsonl'
 DATE_RE = rss.DATE_RE
 SOURCES = rss.SOURCES
 
@@ -400,6 +402,43 @@ def ledger_append(recs, path=None) -> dict:
     return {'path': str(p), 'appended': len(new), 'skipped': len(recs) - len(new)}
 
 
+def _salvage_id(r: dict) -> str:
+    """抢救台账幂等键：同 (source,day,status,产物指纹) 视为同一事件。"""
+    key = json.dumps({'s': r.get('source'), 'd': r.get('day'), 'st': r.get('status'),
+                      'sha': (r.get('output') or {}).get('sha256_16') or r.get('rows')},
+                     ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(key.encode('utf-8')).hexdigest()[:16]
+
+
+def salvage_ledger_append(recs, path=None) -> dict:
+    """抢救台账 append-only（幂等）：记录每次真落盘的抢救（含 EMPTY/NO_SOURCE 留痕）。"""
+    p = Path(path or SALVAGE_LEDGER_DEFAULT)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    existing = set()
+    if p.exists():
+        for ln in p.read_text(encoding='utf-8').splitlines():
+            try:
+                existing.add(json.loads(ln).get('ledger_id'))
+            except Exception:
+                continue
+    new = []
+    for r in recs:
+        lid = _salvage_id(r)
+        if lid in existing:
+            continue
+        rec = dict(r)
+        rec['ledger_id'] = lid
+        rec['ts'] = datetime.datetime.now().isoformat(timespec='seconds')
+        rec['schema'] = SCHEMA
+        new.append(rec)
+        existing.add(lid)
+    if new:
+        with open(p, 'a', encoding='utf-8') as fh:
+            for r in new:
+                fh.write(json.dumps(r, ensure_ascii=False) + '\n')
+    return {'path': str(p), 'appended': len(new), 'skipped': len(recs) - len(new)}
+
+
 # ---------------------------------------------------------------- 子命令
 def build_claims(source='all', today=None, roots=None, live=None) -> dict:
     """对每个源的 missing 日（recoverable + lost）逐日跑数据级探针。"""
@@ -503,7 +542,80 @@ SALVAGE_SQL = {
 }
 
 
-def salvage_one(source: str, day: str, root=None, today=None, apply: bool = False) -> dict:
+# ------------------------------------------------------- wifilog 归档抢救（R504）
+WIFI_ARTIFACT = 'wifi.log'
+
+
+def salvage_wifilog(day: str, root=None, src_dir=None, apply: bool = False) -> dict:
+    """从 newsyslog 归档（含 .bz2）里把属于 `day` 的**行**抽成 `<root>/<day>/wifi.log`。
+
+    与库源补采的差别（写进产物）：
+      * 这是**派生抽取**：只保留「带时间戳且日期==day」的行，非源文件全量拷贝；
+      * 归档跨度**非**固定 1 天（R504 实测一份归档可覆盖 2 天）⇒ 逐文件全量扫、按文件序合并；
+      * 零行 ⇒ EMPTY 且**不落任何文件**（真丢失就承认丢失，绝不造假行）；
+      * `events.json` 由**生产解析器** rss.parse_wifi_text 产出（单一源解析口径），标 salvaged=True
+        并记来源归档 sha256（可追溯）；同日 pmset 快照缺失时窗口如实记 None。
+    """
+    r = Path(root if root is not None else SOURCES['wifilog']['root'])
+    dest_dir = r / day
+    dest = dest_dir / WIFI_ARTIFACT
+    rec = {'schema': 'ga.rolling_source_salvage/v1', 'source': 'wifilog', 'day': day,
+           'ts': datetime.datetime.now().isoformat(timespec='seconds'),
+           'kind': 'derived-extract',
+           'note': '派生抽取：仅保留「带时间戳且日期==day」的行；非源文件全量拷贝',
+           'rows': 0, 'dest': str(dest)}
+    files = rss.wifi_source_files(src_dir=src_dir)
+    if not files:
+        return dict(rec, status='NO_SOURCE', error='missing-source',
+                    src_dir=str(src_dir) if src_dir else 'default')
+    kept, used, errs = [], [], []
+    for f in files:
+        try:
+            lines = rss.wifi_read_lines(f)
+        except Exception as e:  # noqa: BLE001
+            errs.append({'file': f['name'], 'error': str(e)[:120]})
+            continue
+        year = rss.wifi_year_for(lines, f['mtime'])
+        sel = [ln for ln in lines if (rss._ts_from_line(ln, year) or '')[:10] == day]
+        if sel:
+            used.append({'file': f['name'], 'rows': len(sel), 'bytes': f.get('bytes'),
+                         'sha256_16': _sha_head(Path(f['path']), 16)})
+            kept.extend(sel)
+    rec.update({'archives_scanned': len(files), 'archives_used': used})
+    if errs:
+        rec['errors'] = errs
+    if not kept:
+        return dict(rec, status='EMPTY',
+                    note=rec['note'] + '；源侧（含轮转归档）该日零行=真丢失')
+    content = '\n'.join(kept) + '\n'
+    rec['rows'] = len(kept)
+    rec['lines_sha256_16'] = hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]
+    if not apply:
+        return dict(rec, status='PLAN')
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest.write_text(content, encoding='utf-8')
+    rec['bytes'] = dest.stat().st_size
+    try:
+        windows = rss._pm_windows_for(day)
+    except Exception:  # noqa: BLE001
+        windows = None
+    got = rss.parse_wifi_text(kept, int(day[:4]), windows)
+    ev = {'tool': 'tools/rolling_source_snapshot.py', 'source': 'wifilog', 'file': str(dest),
+          'method': '归档抽行 → rss.parse_wifi_text（单一源解析口径）', 'salvaged': True,
+          'provenance': {'kind': rec['kind'], 'archives': used, 'rows': rec['rows'],
+                         'lines_sha256_16': rec['lines_sha256_16']},
+          'result': got}
+    (dest_dir / 'events.json').write_text(json.dumps(ev, ensure_ascii=False, indent=2),
+                                          encoding='utf-8')
+    rec['events'] = {'n_lines': got['n_lines'], 'n_timestamped': got['n_timestamped'],
+                     'dhcp_lines': got['dhcp_lines'], 'n_windows_used': got['n_windows_used'],
+                     'verdict': got['verdict']}
+    rec['status'] = 'SALVAGED'
+    return rec
+
+
+def salvage_one(source: str, day: str, root=None, today=None, apply: bool = False,
+                src_dir=None) -> dict:
     """一次性抢救采数：把**源里仍能读到的**该日行抽成 `<root>/<day>/salvaged.json`。
 
     边界（写进产物）：这是**派生抽取**，不是源库全量拷贝；不含该源未登记的列/流；
@@ -559,27 +671,41 @@ def salvage_one(source: str, day: str, root=None, today=None, apply: bool = Fals
         else:
             rec['status'] = 'PLAN'
         return rec
+    if source == 'wifilog':
+        return salvage_wifilog(day, root=root, src_dir=src_dir, apply=apply)
     return dict(rec, status='UNSUPPORTED',
-                error='wifilog 单日轮转，源侧无历史可抽（只能靠每日采）')
+                error='未登记抽取规则（源侧无可抽历史）')
 
 
 def cmd_salvage(args) -> int:
     claims = build_claims(source=args.source, today=getattr(args, 'today', None))
+    root = getattr(args, 'root', None)
+    src_dir = getattr(args, 'src_dir', None)
+    apply = getattr(args, 'apply', False)
     plans = []
     for n, blk in claims['sources'].items():
         for pr in blk['probes']:
             if pr['status'] == 'UNCOVERED':
-                plans.append(salvage_one(n, pr['day'], today=claims['today'],
-                                         apply=getattr(args, 'apply', False)))
+                plans.append(salvage_one(n, pr['day'], root=root, today=claims['today'],
+                                         apply=apply, src_dir=src_dir))
     print('■ 一次性抢救采数（%s；今天=%s）'
-          % ('apply' if getattr(args, 'apply', False) else 'dry-run', claims['today']))
+          % ('apply' if apply else 'dry-run', claims['today']))
     if not plans:
         print('─ 无「无覆盖」缺口日：无需抢救（覆盖日的数据已在更晚快照里）')
         return 0
     for p in plans:
         print('─ %-8s %s  %-10s rows=%s %s' % (p['source'], p['day'], p['status'],
                                                p.get('rows'), p.get('note', '')))
-    return 0
+    if apply:
+        led = salvage_ledger_append([p for p in plans if p['status'] != 'PLAN'])
+        print('─ 抢救台账 %s（新增 %d / 跳过 %d）'
+              % (led['path'], led['appended'], led['skipped']))
+    n_bad = [p for p in plans if p['status'] not in ('SALVAGED',)]
+    print('─ 摘要: 抢救成功 %d / 未成功 %d（%s）'
+          % (len(plans) - len(n_bad), len(n_bad),
+             '、'.join(sorted({p['status'] for p in plans}))))
+    # 有缺口但一行都抽不到 = 真丢失，rc=1 让调用方看得见；纯 dry-run 恒 rc=0
+    return 1 if (apply and n_bad) else 0
 
 
 def cmd_probe(args) -> int:
@@ -793,6 +919,53 @@ def selftest() -> int:
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
+        print('■ salvage(wifilog)：从 newsyslog 归档抢救缺失日（含 .bz2 解压）')
+        wd = Path(tempfile.mkdtemp(prefix='rsc_wifilog_'))
+        try:
+            src = wd / 'var_log'
+            src.mkdir(parents=True)
+            wlines = ['Sat Sep 26 00:35:15.909 [airport] event A',
+                      'Sat Sep 26 23:59:00.000 [airport] DHCP inform',
+                      'Sun Sep 27 00:01:12.345 [airport] DHCP ack',
+                      'Sun Sep 27 08:00:00.000 [airport] event C']
+            with bz2.open(src / 'wifi.log.0.bz2', 'wt', encoding='utf-8') as f:
+                f.write('\n'.join(wlines) + '\n')
+            wroot = wd / 'root'
+            rec = salvage_one('wifilog', '2026-09-26', root=wroot, src_dir=src, apply=True)
+            dst = wroot / '2026-09-26' / 'wifi.log'
+            expect('归档中该日 2 行 ⇒ SALVAGED 且产物只含该日行',
+                   rec['status'] == 'SALVAGED' and rec['rows'] == 2 and dst.exists()
+                   and all('Sep 26' in x for x in dst.read_text(encoding='utf-8').splitlines()),
+                   str({k: rec.get(k) for k in ('status', 'rows')}))
+            ev = json.loads((wroot / '2026-09-26' / 'events.json').read_text(encoding='utf-8'))
+            expect('events.json 标 salvaged=True 且 provenance 记归档 sha/行数',
+                   ev.get('salvaged') is True and bool(ev['provenance']['archives'])
+                   and ev['provenance']['rows'] == 2 and ev['result']['n_timestamped'] == 2,
+                   str(ev.get('provenance')))
+            rec2 = salvage_one('wifilog', '2026-09-27', root=wroot, src_dir=src, apply=True)
+            d2 = wroot / '2026-09-27' / 'wifi.log'
+            expect('同一归档跨两天 ⇒ 各归各日（不串行）',
+                   rec2['status'] == 'SALVAGED' and rec2['rows'] == 2
+                   and all('Sep 27' in x for x in d2.read_text(encoding='utf-8').splitlines()),
+                   str(rec2.get('rows')))
+            print('■ 负控：源侧该日零行 ⇒ EMPTY 且不落盘（不造假行）')
+            rec3 = salvage_one('wifilog', '2026-09-20', root=wroot, src_dir=src, apply=True)
+            expect('零行 ⇒ EMPTY 且目录不存在',
+                   rec3['status'] == 'EMPTY' and not (wroot / '2026-09-20').exists(), str(rec3))
+            print('■ 负控：源侧无归档 ⇒ NO_SOURCE')
+            empty = wd / 'empty_src'
+            empty.mkdir()
+            rec4 = salvage_one('wifilog', '2026-09-26', root=wroot, src_dir=empty, apply=True)
+            expect('无归档 ⇒ NO_SOURCE 且零落盘',
+                   rec4['status'] == 'NO_SOURCE' and (rec4.get('rows') or 0) == 0, str(rec4))
+            print('■ 负控：dry-run 不改盘（PLAN）')
+            r5 = wd / 'dry'
+            rec5 = salvage_one('wifilog', '2026-09-27', root=r5, src_dir=src, apply=False)
+            expect('apply=False ⇒ PLAN 且无产物',
+                   rec5['status'] == 'PLAN' and not (r5 / '2026-09-27').exists(), str(rec5))
+        finally:
+            shutil.rmtree(wd, ignore_errors=True)
+
         print('■ content_window 与 ledger 读取健壮性')
         r = _fixture(base / 'w3', ['2026-09-29'], chrome_db_days=['2026-09-01', '2026-09-29'])
         w = content_window('chrome', root=r, today='2026-09-29')
@@ -851,6 +1024,8 @@ def main(argv=None) -> int:
     p = sub.add_parser('salvage', help='一次性抢救采数（默认 dry-run，--apply 落盘）')
     p.add_argument('--source', default='all', choices=['all'] + list(SOURCES))
     p.add_argument('--today', default=None)
+    p.add_argument('--root', default=None, help='快照根（默认取源登记面 root）')
+    p.add_argument('--src-dir', default=None, help='源侧目录（wifilog 归档所在，默认 /var/log）')
     p.add_argument('--apply', action='store_true')
     p.set_defaults(func=cmd_salvage)
 
