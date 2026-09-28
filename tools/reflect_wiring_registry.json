@@ -1,0 +1,156 @@
+{
+  "schema": "ga.reflect_wiring_registry/v1",
+  "note": "未接线反射脚本的处置登记（登记面单一源）。status ∈ example_template/pending_approval/manual_on_demand/retired；evidence 须逐字命中。",
+  "entries": [
+    {
+      "id": "reflect_scripts/01_system_monitor.py",
+      "status": "example_template",
+      "reason": "官方示例场景（01-06 示例场景库之一），示例配置与阈值随文件分发；未挂任何定时条目，属「示例模板」非漏接线",
+      "evidence": [
+        {
+          "path": "reflect_scripts/01_system_monitor.py",
+          "token": "启动：python agentmain.py --reflect reflect_scripts/01_system_monitor.py"
+        },
+        {
+          "path": "docs/reflect_best_practices.md",
+          "token": "01_system_monitor.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/02_email_handler.py",
+      "status": "example_template",
+      "reason": "官方示例场景（需自填 IMAP 占位符），未挂定时条目；按 R002 判定为「失效-未配置」而非漏接线",
+      "evidence": [
+        {
+          "path": "reflect_scripts/02_email_handler.py",
+          "token": "启动：python agentmain.py --reflect reflect_scripts/02_email_handler.py"
+        },
+        {
+          "path": "docs/reflect_best_practices.md",
+          "token": "02_email_handler.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/03_daily_report.py",
+      "status": "example_template",
+      "reason": "官方示例场景；功能与既有定时报告重叠（R040 判为低频/可清理），不作为漏接线处理",
+      "evidence": [
+        {
+          "path": "reflect_scripts/03_daily_report.py",
+          "token": "启动：python agentmain.py --reflect reflect_scripts/03_daily_report.py"
+        },
+        {
+          "path": "docs/reflect_best_practices.md",
+          "token": "03_daily_report.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/04_github_monitor.py",
+      "status": "example_template",
+      "reason": "官方示例场景（GitHub token 为占位符），未挂定时条目，属示例模板",
+      "evidence": [
+        {
+          "path": "reflect_scripts/04_github_monitor.py",
+          "token": "启动：python agentmain.py --reflect reflect_scripts/04_github_monitor.py"
+        },
+        {
+          "path": "docs/reflect_best_practices.md",
+          "token": "04_github_monitor.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/05_folder_watcher.py",
+      "status": "example_template",
+      "reason": "官方示例场景；R012 已定性「从未被启动，非库缺陷」，R476 起若需按需手动起用反射器版",
+      "evidence": [
+        {
+          "path": "reflect_scripts/05_folder_watcher.py",
+          "token": "启动：python agentmain.py --reflect reflect_scripts/05_folder_watcher.py"
+        },
+        {
+          "path": "memory/autonomous_reports/R012_watchdog_verification.md",
+          "token": "05_folder_watcher.py从未被启动"
+        }
+      ]
+    },
+    {
+      "id": "reflect/agent_team_worker.py",
+      "status": "manual_on_demand",
+      "reason": "Goal Hive 协议里的 worker 角色，由人工/Goal Master 在协作会话中显式拉起（一次一个进程），不设常驻定时",
+      "evidence": [
+        {
+          "path": "memory/goal_hive_sop.md",
+          "token": "启动 worker："
+        },
+        {
+          "path": "memory/checklist_helper.py",
+          "token": "reflect/agent_team_worker.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect/checklist_master.py",
+      "status": "manual_on_demand",
+      "reason": "Goal Hive 的 hive master 角色，由协作 SOP 按时间预算人工拉起（checklist_helper 以子进程方式启动），无常驻定时",
+      "evidence": [
+        {
+          "path": "memory/checklist_helper.py",
+          "token": "reflect/checklist_master.py"
+        },
+        {
+          "path": "memory/goal_hive_sop.md",
+          "token": "Hive master，workers都是与你不同的独立进程"
+        }
+      ]
+    },
+    {
+      "id": "reflect/goal_mode.py",
+      "status": "manual_on_demand",
+      "reason": "Goal Mode 自驱循环：须由人工先写好 state json 并用环境变量 GOAL_STATE 指定路径后手动启动，语义上不挂常驻定时",
+      "evidence": [
+        {
+          "path": "reflect/goal_mode.py",
+          "token": "启动: set GOAL_STATE="
+        },
+        {
+          "path": "memory/goal_mode_sop.md",
+          "token": "start /b python agentmain.py --reflect reflect/goal_mode.py"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/08_kc_snapshot.py",
+      "status": "pending_approval",
+      "reason": "「反射器版 · 待批准接入」：脚本与产物已就绪，R415 实测 LaunchAgents/sche_tasks 命中数 0，注册方式属用户决策（待批 DECISIONS_R430 D6）",
+      "evidence": [
+        {
+          "path": "reflect_scripts/08_kc_snapshot.py",
+          "token": "本文件的存在不等于"
+        },
+        {
+          "path": "memory/autonomous_reports/R415_时间衰减源每日快照.md",
+          "token": "在 LaunchAgents / `sche_tasks` 命中数实测均为 **0**"
+        }
+      ]
+    },
+    {
+      "id": "reflect_scripts/09_task_freshness.py",
+      "status": "pending_approval",
+      "reason": "巡检反射器已就绪但无任何 launchd 条目（R479 实测），补调度是 D2 待批项，未批准前不新增定时",
+      "evidence": [
+        {
+          "path": "reflect_scripts/09_task_freshness.py",
+          "token": "巡检只做「发现+报告」"
+        },
+        {
+          "path": "memory/autonomous_reports/R479_巡检告警生命周期台账.md",
+          "token": "没有任何 launchd 定时条目"
+        }
+      ]
+    }
+  ]
+}
