@@ -51,8 +51,54 @@ def _last_ledger(ledger):
         return None
 
 
+def _keys_of_record(rec):
+    """台账「比较键」：新格式记录 = 跨轮稳定事件 ID；旧格式记录 = 硬问题 id（回落）。
+
+    区分依据=记录里有无 `issues` 键（新格式即便零告警也带该键）——因此「新格式 + 空事件集合」
+    表示「确实没有告警」，不得回落成 id 空间，否则会把自己与 id 空间比出全量假差集。
+    """
+    if not isinstance(rec, dict):
+        return set(), 'none'
+    if 'issues' in rec:
+        # R480：键**只**从 issues 派生（issues 只收硬目标 ALERT/WARN）。顶层 event_ids 是汇总字段，
+        # 修正前曾并入非硬目标事件 ⇒ 若取用会与「只统计硬目标」的本次结果不对称，制造幻影「已恢复」。
+        ks = set()
+        for iss in rec.get('issues') or []:
+            ks |= set(iss.get('event_ids') or [])
+            for e in iss.get('events') or []:
+                if e.get('event_id'):
+                    ks.add(e['event_id'])
+        return ks, 'event'
+    return set(rec.get('hard_issue_ids') or []), 'id'
+
+
+def _keys_of_result(res):
+    """本次运行输出的比较键（与台账同口径）：优先事件 ID，工具核未挂上时回落硬问题 id。"""
+    ev = set()
+    for r in res.get('targets', []):
+        if r.get('verdict') not in ('ALERT', 'WARN'):
+            continue
+        ev |= set(r.get('event_ids') or [])
+        for e in r.get('event_details') or []:
+            if e.get('event_id'):
+                ev.add(e['event_id'])
+    if ev:
+        return ev, 'event'
+    return set(res.get('hard_issue_ids') or []), 'id'
+
+
+def _label_map(res):
+    """事件 ID → 「target·face」可读标签（渲染通知用；查不到的原样回落到硬问题 id 分支）。"""
+    m = {}
+    for r in res.get('targets', []):
+        for e in r.get('event_details') or []:
+            if e.get('event_id'):
+                m[e['event_id']] = '%s·%s' % (e.get('target', ''), e.get('face', ''))
+    return m
+
+
 def evaluate(ledger=LEDGER, root=GA, timeout=600):
-    """跑一次工具，返回 (result_dict, new_hard_ids, cleared_hard_ids)。"""
+    """跑一次工具，返回 (result_dict, new_keys, cleared_keys)。"""
     before = _last_ledger(ledger)
     p = subprocess.run([sys.executable, str(TOOL), '--root', str(root),
                         '--ledger', str(ledger), '--json'],
@@ -61,12 +107,15 @@ def evaluate(ledger=LEDGER, root=GA, timeout=600):
     if not out:
         raise RuntimeError('task_freshness 无输出（rc=%s）: %s' % (p.returncode, (p.stderr or '')[-400:]))
     res = json.loads(out)
-    now = set(res.get('hard_issue_ids') or [])
-    prev = set((before or {}).get('hard_issue_ids') or [])
+    now, now_mode = _keys_of_result(res)
+    prev, prev_mode = _keys_of_record(before)
     first_run = before is None
-    newi = sorted(now - prev) if not first_run else []
-    clri = sorted(prev - now) if not first_run else []
-    return res, newi, clri
+    res['_key_mode'] = now_mode
+    # 键空间切换（旧 id 台账 → 新事件台账）当轮不判差集：两个空间不可比，报了必是假警报
+    res['_key_mode_transition'] = bool(not first_run and prev_mode != now_mode)
+    if first_run or res['_key_mode_transition']:
+        return res, [], []
+    return res, sorted(now - prev), sorted(prev - now)
 
 
 def _detail(res, ids, limit=4):
@@ -93,8 +142,16 @@ def check_state(res, newi, clri):
     ts = res.get('ts') or datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
     parts = ['🔔 任务产物新鲜度巡检 %s' % ts, '']
     if newi:
-        parts.append('新增硬问题 %d 项：' % len(newi))
-        parts.append(_detail(res, newi))
+        labels = _label_map(res)
+        ev = [k for k in newi if k in labels]
+        ids = [k for k in newi if k not in labels]
+        if ev:                                  # 事件 ID 空间（R480）：同一件事跨轮同 ID
+            parts.append('新增告警事件 %d 项：' % len(ev))
+            parts.append('\n'.join('- %s [%s]' % (labels[k], k) for k in ev[:4])
+                         + ('\n- …另有 %d 项' % (len(ev) - 4) if len(ev) > 4 else ''))
+        if ids:                                 # 旧格式回落（硬问题 id）与事件空间混报时兜底
+            parts.append('新增硬问题 %d 项：' % len(ids))
+            parts.append(_detail(res, ids))
     if clri:
         parts.append('')
         parts.append('已恢复 %d 项：%s' % (len(clri), '、'.join(clri)))
@@ -146,20 +203,63 @@ def selftest():
     checks.append(('④ 语料自证：本次硬问题集合与真实环境一致（>0 或 0 均可，但须可解释）',
                    isinstance(hard_now, list) and len(res2.get('targets', [])) > 20,
                    'hard=%s targets=%d' % (hard_now, len(res2.get('targets', [])))))
-    # 负控：伪造 prev（把当前硬问题当基线）⇒ 必须算出「已恢复」而不是「新增」
-    prev_line = {'ts': 'x', 'hard_issue_ids': hard_now, 'counts': {}, 'issues': [], 'channels': []}
+    # ---- R480：差集键规范化（合成记录，不跑工具）----
+    k_new, m_new = _keys_of_record({'ts': 'x', 'event_ids': ['ev-a', 'ev-b'],
+                                    'issues': [{'id': 't1', 'event_ids': ['ev-b'],
+                                                'events': [{'event_id': 'ev-c'}]}],
+                                    'hard_issue_ids': ['t1']})
+    checks.append(('⑤ 键空间：新格式台账按键 = issues 派生的事件 ID（不取顶层汇总、不混硬问题 id）',
+                   m_new == 'event' and k_new == {'ev-b', 'ev-c'},
+                   '%s %s' % (m_new, sorted(k_new))))
+    # 负控：顶层汇总混入非硬目标/历史遗留事件 ⇒ 必须忽略，否则跨轮会报幻影「已恢复」
+    k_ph, m_ph = _keys_of_record({'ts': 'x', 'event_ids': ['ev-top-ghost', 'ev-b'],
+                                  'issues': [{'id': 't1', 'event_ids': ['ev-b'], 'events': []}]})
+    checks.append(('⑤b 负控：顶层 event_ids 的幻影事件被忽略（键只认 issues 派生）',
+                   m_ph == 'event' and k_ph == {'ev-b'}, '%s %s' % (m_ph, sorted(k_ph))))
+    k_old, m_old = _keys_of_record({'ts': 'x', 'hard_issue_ids': ['t1', 'ghost']})
+    checks.append(('⑥ 键空间：旧格式台账回落硬问题 id（兼容 R479 前存量台账）',
+                   m_old == 'id' and k_old == {'t1', 'ghost'}, '%s %s' % (m_old, sorted(k_old))))
+    # 负控：伪造旧格式 prev（只有 id，无 issues 键）⇒ 键空间切换当轮静默，不得报「全量新增」
+    prev_line = {'ts': 'x', 'hard_issue_ids': hard_now + ['__ghost_issue__'],
+                 'counts': {}, 'channels': []}
     with open(led, 'w', encoding='utf-8') as f:
         f.write(json.dumps(prev_line, ensure_ascii=False) + '\n')
     res3, newi3, clri3 = evaluate(ledger=led)
-    checks.append(('⑤ 负控：基线=当前集合 ⇒ clri 为空、newi 为空（单调幂等）',
-                   newi3 == [] and clri3 == [], 'new=%s clr=%s' % (newi3, clri3)))
-    # 负控：基线中塞一个假 id ⇒ 必须报「已恢复」
-    prev_line['hard_issue_ids'] = hard_now + ['__ghost_issue__']
+    checks.append(('⑥b 负控：旧 id 台账 → 新事件台账 ⇒ 当轮静默 + 标记 transition（防一次假全量）',
+                   newi3 == [] and clri3 == [] and res3.get('_key_mode_transition') is True,
+                   'new=%s clr=%s trans=%s' % (newi3, clri3, res3.get('_key_mode_transition'))))
+
+    # ---- R480：差集键 = 跨轮稳定事件 ID（新格式台账），旧格式回落硬问题 id ----
+    def _ev_ids(res):
+        out = []
+        for r in res.get('targets', []):
+            if r.get('verdict') in ('ALERT', 'WARN'):
+                for e in r.get('event_ids') or []:
+                    if e not in out:
+                        out.append(e)
+        return out
+
+    ev_now = _ev_ids(res2)
+    new_line = {'ts': 'x2', 'counts': {}, 'hard_issue_ids': hard_now, 'event_ids': ev_now,
+                'issues': [{'id': i, 'event_ids': [e for e in ev_now if e.startswith('ev-')],
+                            'events': [], 'first': ''} for i in hard_now],
+                'channels': []}
     with open(led, 'w', encoding='utf-8') as f:
-        f.write(json.dumps(prev_line, ensure_ascii=False) + '\n')
-    res4, newi4, clri4 = evaluate(ledger=led)
-    checks.append(('⑥ 负控：基线含幽灵 id ⇒ 必须报「已恢复 __ghost_issue__」',
-                   clri4 == ['__ghost_issue__'], 'new=%s clr=%s' % (newi4, clri4)))
+        f.write(json.dumps(new_line, ensure_ascii=False) + '\n')
+    res5, newi5, clri5 = evaluate(ledger=led)
+    checks.append(('⑦ 新格式台账（事件 ID 键）⇒ 同一轮幂等静默，且键空间标记为 event',
+                   newi5 == [] and clri5 == [] and res5.get('_key_mode') == 'event',
+                   'new=%s clr=%s mode=%s' % (newi5, clri5, res5.get('_key_mode'))))
+
+    # 负控：新格式但事件集合为空（保留 issues 键）⇒ 必须判「全部已恢复」，不得回落成 id 空间
+    empty_line = dict(new_line, event_ids=[],
+                      issues=[{'id': i, 'event_ids': [], 'events': [], 'first': ''} for i in hard_now])
+    with open(led, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(empty_line, ensure_ascii=False) + '\n')
+    res6, newi6, clri6 = evaluate(ledger=led)
+    checks.append(('⑧ 负控：新格式空事件集合 ⇒ 判「上一轮无告警、本轮全新增」，不得回落 id 空间',
+                   set(newi6) == set(ev_now) and clri6 == [] and all(k.startswith('ev-') for k in newi6),
+                   'new=%s clr=%s' % (newi6, clri6)))
 
     ok = True
     for name, cond, detail in checks:

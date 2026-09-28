@@ -1,0 +1,263 @@
+{
+  "version": 1,
+  "name": "task_freshness 巡检判据回归集",
+  "generated_by": "tools/freshness_regression.py 真跑 detector_replay.replay_case（R480 生成，数值为实测非手写）",
+  "baseline_source": "R467（16 格 HIT8/LAYER_BLIND5/DISABLED_EXCUSED2/NO_DATA1）+ R480 第二正控；同一内核同一时点",
+  "layers": [
+    "run_presence",
+    "log_signature",
+    "artifact_signature",
+    "content_change"
+  ],
+  "cases": [
+    {
+      "id": "birdie_0808_0925",
+      "task": "birdie_daily_monitor",
+      "gt_start": "2026-08-08",
+      "gt_end": "2026-09-25",
+      "gt_source": "memory/autonomous_reports/R442_birdie链路裁决.md + tools/freshness_criteria.json note（『最后成功 2026-08-07；连续 49 天零有效产出』，59 份 done 报告=成功 7/失败 52）",
+      "window_start": "2026-08-08",
+      "window_end": "2026-09-25",
+      "run_evidence": [
+        "sche_tasks/done/*_birdie_daily_monitor.md"
+      ],
+      "log_globs": [
+        "temp/bg_task/logs/birdie_*.log",
+        "temp/birdie_*.log"
+      ],
+      "patterns": [
+        "SSLError",
+        "Max retries exceeded",
+        "exit: 1",
+        "签到失败",
+        "执行失败",
+        "JSONDecodeError",
+        "Traceback"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": false,
+      "expect": "alert"
+    },
+    {
+      "id": "haisou_0925",
+      "task": "haisou_daily_monitor",
+      "gt_start": "2026-09-25",
+      "gt_end": "2026-09-25",
+      "gt_source": "tools/freshness_criteria.json note（『2026-09-25 首例静默降级：步骤1 首页抓取失败但 SYNC_RC=0』）",
+      "window_start": "2026-09-20",
+      "window_end": "2026-09-27",
+      "run_evidence": [
+        "sche_tasks/done/*_haisou_daily_monitor.md"
+      ],
+      "log_globs": [
+        "temp/haisou_*.log",
+        "temp/bg_task/logs/haisou*.log"
+      ],
+      "patterns": [
+        "抓取失败",
+        "抓取到 0 个课程",
+        "SSLEOFError",
+        "触发限流"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": false,
+      "expect": "alert"
+    },
+    {
+      "id": "x_ai_0818_0927",
+      "task": "x_ai_intel_daily",
+      "gt_start": "2026-08-18",
+      "gt_end": "2026-09-27",
+      "gt_source": "memory/x_ai_intel_daily_sop（末次成功 2026-08-17；done 报告 39 份中 37 份含 RuntimeError/未登录）",
+      "window_start": "2026-08-18",
+      "window_end": "2026-09-27",
+      "run_evidence": [
+        "sche_tasks/done/*_x_ai_intel_daily.md"
+      ],
+      "log_globs": [
+        "temp/bg_task/logs/x_ai_intel_*.log"
+      ],
+      "patterns": [
+        "No active X browser tab",
+        "RuntimeError",
+        "CDP fallback failed"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": false,
+      "expect": "alert"
+    },
+    {
+      "id": "wechat_13h_0704_0927",
+      "task": "wechat_cc_daily_13h",
+      "gt_start": "2026-07-04",
+      "gt_end": "2026-09-27",
+      "gt_source": "done 报告止于 2026-07-03（6 份 06-28..07-03）+ sche_tasks/wechat_cc_daily_13h.json enabled=false；tools/freshness_criteria.json 该目标 cadence=disabled",
+      "window_start": "2026-07-04",
+      "window_end": "2026-09-27",
+      "run_evidence": [
+        "sche_tasks/done/*_wechat_cc_daily_13h.md"
+      ],
+      "log_globs": [],
+      "patterns": [
+        "失败"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": true,
+      "expect": "alert"
+    },
+    {
+      "id": "birdie_healthy_0801_0807",
+      "task": "birdie_daily_monitor",
+      "gt_start": "2026-08-01",
+      "gt_end": "2026-08-07",
+      "gt_source": "R442：08-01..08-07 为成功 7 天（最后成功 08-07）；本用例是**正向对照**，期望零报警",
+      "window_start": "2026-08-01",
+      "window_end": "2026-08-07",
+      "run_evidence": [
+        "sche_tasks/done/*_birdie_daily_monitor.md"
+      ],
+      "log_globs": [
+        "temp/bg_task/logs/birdie_*.log",
+        "temp/birdie_*.log"
+      ],
+      "patterns": [
+        "SSLError",
+        "Max retries exceeded",
+        "exit: 1",
+        "签到失败",
+        "执行失败",
+        "JSONDecodeError",
+        "Traceback"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": false,
+      "expect": "no_alert"
+    },
+    {
+      "id": "haisou_healthy_0920_0924",
+      "task": "haisou_daily_monitor",
+      "gt_start": "2026-09-20",
+      "gt_end": "2026-09-24",
+      "gt_source": "memory/haisou_monitor_sop（09-25 为首例抓取失败）⇒ 09-20..09-24 为正常窗口",
+      "window_start": "2026-09-20",
+      "window_end": "2026-09-24",
+      "run_evidence": [
+        "sche_tasks/done/*_haisou_daily_monitor.md"
+      ],
+      "log_globs": [
+        "temp/haisou_*.log",
+        "temp/bg_task/logs/haisou*.log"
+      ],
+      "patterns": [
+        "抓取失败",
+        "抓取到 0 个课程",
+        "SSLEOFError",
+        "触发限流"
+      ],
+      "max_run_gap_days": 2,
+      "sig_window_days": 3,
+      "content_stale_days": 8,
+      "cadence_disabled": false,
+      "expect": "no_alert"
+    }
+  ],
+  "baseline": {
+    "birdie_0808_0925": {
+      "expect": "alert",
+      "verdicts": {
+        "run_presence": "MISS",
+        "log_signature": "HIT",
+        "artifact_signature": "HIT",
+        "content_change": "MISS"
+      },
+      "hit_layers": [
+        "log_signature",
+        "artifact_signature"
+      ],
+      "delay_min_days": 0
+    },
+    "haisou_0925": {
+      "expect": "alert",
+      "verdicts": {
+        "run_presence": "MISS",
+        "log_signature": "HIT",
+        "artifact_signature": "HIT",
+        "content_change": "MISS"
+      },
+      "hit_layers": [
+        "log_signature",
+        "artifact_signature"
+      ],
+      "delay_min_days": 0
+    },
+    "x_ai_0818_0927": {
+      "expect": "alert",
+      "verdicts": {
+        "run_presence": "HIT",
+        "log_signature": "MISS",
+        "artifact_signature": "HIT",
+        "content_change": "MISS"
+      },
+      "hit_layers": [
+        "run_presence",
+        "artifact_signature"
+      ],
+      "delay_min_days": 0
+    },
+    "wechat_13h_0704_0927": {
+      "expect": "alert",
+      "verdicts": {
+        "run_presence": "HIT",
+        "log_signature": "MISS",
+        "artifact_signature": "HIT",
+        "content_change": "MISS"
+      },
+      "hit_layers": [
+        "run_presence",
+        "artifact_signature"
+      ],
+      "delay_min_days": 0
+    },
+    "birdie_healthy_0801_0807": {
+      "expect": "no_alert",
+      "verdicts": {
+        "run_presence": "MISS",
+        "log_signature": "MISS",
+        "artifact_signature": "MISS",
+        "content_change": "MISS"
+      },
+      "hit_layers": [],
+      "delay_min_days": null
+    },
+    "haisou_healthy_0920_0924": {
+      "expect": "no_alert",
+      "verdicts": {
+        "run_presence": "MISS",
+        "log_signature": "MISS",
+        "artifact_signature": "MISS",
+        "content_change": "MISS"
+      },
+      "hit_layers": [],
+      "delay_min_days": null
+    }
+  },
+  "rejected_positive_candidates": [
+    {
+      "id": "x_ai_healthy_0801_0817",
+      "task": "x_ai_intel_daily",
+      "window": "2026-08-01..2026-08-17",
+      "reason": "artifact_signature 在 2026-08-17 命中：该窗口内 x_ai 仅 1 份 done 产物（2026-08-17_1638_x_ai_intel_daily.md），且其正文含 RuntimeException: No active X browser tab ... ⇒ 该窗口在产物层就不是绿的，不能当正控（误报会掩盖真退化）",
+      "evidence": "sche_tasks/done/2026-08-17_1638_x_ai_intel_daily.md；detector_replay artifact_signature verdict=HIT first_hit=2026-08-17"
+    }
+  ]
+}

@@ -46,6 +46,33 @@ GA = os.path.dirname(HERE)
 DEFAULT_CRITERIA = os.path.join(HERE, "freshness_criteria.json")
 LEDGER_DEFAULT = os.path.join(GA, "temp", "task_freshness", "ledger.jsonl")
 
+# ---- 稳定事件 ID（R480：告警面收口；内核在 tools/alert_event_id.py）----
+# 语义：同一 (scope, target, 判据层) 的告警在任何一轮里都是同一个 ID
+#       ⇒ 跨轮「同一件事」可去重、可计复发（缺席后再现 = 新 episode）。
+# 加法式接线：只往 checks/台账补 layer 与 event_id(s)，不改任何 level/verdict/推送行为。
+try:
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import alert_event_id as _aeid
+except Exception:                                    # 极端环境下降级为「有检查行、无 ID」
+    _aeid = None
+
+# 判据层前缀 → canonical face（与 alert_event_id.ALIASES 同源口径）
+LAYER_FACE = {"L0": "preflight", "L1": "artifact", "L1b": "content",
+              "L2": "log", "L3": "run", "L4": "lifecycle"}
+
+
+def _face_of_text(text):
+    """检查行文本以 L0/L1/L1b/L2/L3/L4 打头 ⇒ 返回 canonical face；否则 None。
+
+    注意先长后短（L1b 必须早于 L1），否则 L1b 行会被判成 artifact。
+    """
+    for lv in ("L1b", "L0", "L1", "L2", "L3", "L4"):
+        if text.startswith(lv + " "):
+            return LAYER_FACE[lv]
+    return None
+
+
 # 判定严重度顺序（大 = 更严重）；同一行取最严重
 LEVEL_ORDER = {"OK": 0, "INFO": 1, "WARN": 2, "ALERT": 3}
 
@@ -192,8 +219,28 @@ def check_target(t, root, ref=None, ld=None, pf=None):
            "max_run_gap_days": t.get("max_run_gap_days"),
            "checks": [], "verdict": "OK", "severity": t.get("severity", "hard")}
 
-    def bump(level, text):
-        res["checks"].append({"level": level, "text": text})
+    def bump(level, text, layer=None):
+        # layer 可为 canonical face（run/log/…）或 L-前缀（L1/L1b/…）；不传则从 text 前缀推断。
+        # 推断不到（如 launchd 状态行）由调用方显式传 run ⇒ 仍无 ID 的行保持原样（加法式）。
+        face = None
+        if layer:
+            face = LAYER_FACE.get(layer, layer)
+        else:
+            face = _face_of_text(text)
+        chk = {"level": level, "text": text}
+        if face:
+            chk["layer"] = face
+            if _aeid is not None:
+                eid = _aeid.event_id(t.get("id", ""), face)
+                chk["event_id"] = eid
+                ids = res.setdefault("event_ids", [])
+                if eid not in ids:
+                    ids.append(eid)
+                det = res.setdefault("event_details", [])
+                d = {"target": t.get("id", ""), "face": face, "event_id": eid}
+                if d not in det:
+                    det.append(d)
+        res["checks"].append(chk)
         if LEVEL_ORDER[level] > LEVEL_ORDER[res["verdict"]]:
             res["verdict"] = level
 
@@ -381,13 +428,13 @@ def check_target(t, root, ref=None, ld=None, pf=None):
         res["launchd"] = {"label": label, "plist": meta, "launchctl": st}
         if label:
             if meta is None:
-                bump("ALERT", "launchd plist 不存在：~/Library/LaunchAgents/%s.plist" % label)
+                bump("ALERT", "launchd plist 不存在：~/Library/LaunchAgents/%s.plist" % label, layer="run")
             elif st is None:
-                bump("ALERT", "launchd 未加载：plist 存在但 launchctl list 无 %s（僵尸任务）" % label)
+                bump("ALERT", "launchd 未加载：plist 存在但 launchctl list 无 %s（僵尸任务）" % label, layer="run")
             else:
                 info = "launchctl: pid=%s last_exit=%s" % (st["pid"] or "-", st["exit"])
                 if st["exit"] not in (0, None):
-                    bump("WARN", "launchd 上次退出码非 0（%s）: %s" % (st["exit"], info))
+                    bump("WARN", "launchd 上次退出码非 0（%s）: %s" % (st["exit"], info), layer="run")
                 else:
                     res["checks"].append({"level": "OK", "text": info})
     return res
@@ -457,12 +504,21 @@ def run(criteria, root, only=None, as_json=False, ledger=LEDGER_DEFAULT, write_l
     if write_ledger and ledger:
         prev = _ledger_prev(ledger)
         os.makedirs(os.path.dirname(ledger), exist_ok=True)
+        issues_out = [{"id": r["id"], "verdict": r["verdict"],
+                       "event_ids": list(r.get("event_ids", [])),
+                       "events": list(r.get("event_details", [])),
+                       "first": (r["checks"][0]["text"][:160] if r["checks"] else "")}
+                      for r in rows if r["verdict"] in ("ALERT", "WARN")]
+        # ★顶层 event_ids = 本轮告警面（只并硬目标 ALERT/WARN），与 issues_out 同口径。
+        # 不得并入 OK/INFO/ON_DEMAND/DISABLED 行的事件 ID：读取端（反射器差集、R480 消费器）
+        # 只统计硬目标，两端口径不一致会制造「幻影已恢复」（R480 实测 x_ai_intel_daily 的 L2 INFO 行）。
+        all_ev = sorted({e for r in rows if r["verdict"] in ("ALERT", "WARN")
+                         for e in r.get("event_ids", [])})
         with open(ledger, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": result["ts"], "counts": counts,
                                 "hard_issue_ids": result["hard_issue_ids"],
-                                "issues": [{"id": r["id"], "verdict": r["verdict"],
-                                            "first": (r["checks"][0]["text"][:160] if r["checks"] else "")}
-                                           for r in rows if r["verdict"] in ("ALERT", "WARN")],
+                                "event_ids": all_ev,
+                                "issues": issues_out,
                                 "channels": [{"id": c["id"], "last_success": (c["last_success"] or {}).get("mtime"),
                                               "age_days": c["success_age_days"], "failure_mode": c["failure_mode"]}
                                              for c in channels]}, ensure_ascii=False) + "\n")
@@ -758,6 +814,19 @@ def selftest(tmp=None):
     expect("⑲ 负控：--no-preflight ⇒ 同一夹具回 OK 且 preflight 段缺席（开关生效）",
            gt7["verdict"] == "OK" and "preflight" not in gt7 and res7["preflight"]["registered"] == 0,
            "%s / %s" % (gt7["verdict"], res7["preflight"]))
+
+    # ⑳ 台账顶层 event_ids 口径（R480）：只并硬目标 ⇒ 与读取端（反射器差集/消费器）一致
+    led_path = os.path.join(base, "ledger_scope_selftest.jsonl")
+    if os.path.exists(led_path):
+        os.remove(led_path)
+    res8 = run(criteria, base, as_json=True, ledger=led_path, write_ledger=True, return_result=True)
+    with open(led_path, encoding="utf-8") as _lf:
+        _rec = json.loads(_lf.read().strip().splitlines()[-1])
+    _hard = {e for r in res8["targets"] if r["verdict"] in ("ALERT", "WARN") for e in r.get("event_ids", [])}
+    _nonhard = {e for r in res8["targets"] if r["verdict"] not in ("ALERT", "WARN") for e in r.get("event_ids", [])}
+    expect("⑳ 负控：台账顶层 event_ids 只并硬目标事件（非硬目标事件不得混入）",
+           set(_rec["event_ids"]) == _hard and not (set(_rec["event_ids"]) & _nonhard),
+           "top=%d hard=%d nonhard=%d" % (len(_rec["event_ids"]), len(_hard), len(_nonhard)))
 
     ok = True
     for name, good, detail in checks:
