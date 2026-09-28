@@ -14,6 +14,23 @@
     仅报告引用 = 只在 memory/autonomous_reports/*.md 里出现
     无引用    = 仓内 tracked 文件零命中（第二证据见 --evidence）
     检索用 `git -c core.quotepath=false grep -l -F -- <name>`（约 0.1s/次；禁用 grep -r，temp/ 5.8G 会超时）
+[2b] 入口面（R421 扩面，2026-09-29）：「有引用」≠「有可复跑入口」。逐 tools/*.py 静态判定
+     tier ∈ {SELFTEST(--selftest 字面量) / SUBCOMMAND(add_subparsers) / FLAGS(add_argument>0) /
+             MANUAL_ARGV(手搓 sys.argv/getopt) / NONE(无任何参数面)}。
+     `rerunnable = tier ∈ {SELFTEST, SUBCOMMAND}`（口径来自 TODO L201 正文「--selftest/子命令」）。
+     「无可复跑入口」清单 = 上述 rerunnable=False 的工具，**每条必带证据**：
+       ①入口侧证据 = 命中的 token 及其行号（`tools/x.py:NN: '--selftest'`），无则记 `none`
+       ②引用侧证据 = 消费面命中路径（code/cfg/other，最多 5 条）；`ghost_refs` = 命中路径在盘上
+         不存在者（负控：自称引用必须可回源，见 T9）
+     引用判定必须 **token 边界**匹配（负控 T8：`x_helper.py` 不得算作 `x.py` 的引用）。
+     `TOOL_ENTRY_DISPOSITION` 登记表（memory/tool_surface/TOOL_ENTRY_DISPOSITION.json）对每条
+     无入口工具显式登记 status ∈ {ACTIVE 现状保留 / DEFER 已排期补入口 / RETIRE 退役候选}，
+     证据格式 `"<repo 相对路径> | <token>"` 且须回源命中（三判据 guard_entry_disposition）：
+       1. `TOOL_ENTRY_UNDISPOSED` —— 无可复跑入口且未登记（新工具逃逸）；
+       2. `CLAIM_WITHOUT_EVIDENCE` —— 登记项证据为空 / 文件不存在 / token 未命中（伪改）；
+       3. `DISPOSITION_STALE` —— 登记项与现况不符（工具已删，或已获得可复跑入口）。
+     RETIRE 属政策面，本器只登记不判决（退役提案须人批）。
+
 [3] 热度信号（4 个，逐项给原始证据，不做加权）：
     W 接线（被 plist/sche_tasks/reflect_scripts/代码引用）
     D durable 记忆引用（L1/L2/SOP）
@@ -243,6 +260,272 @@ def tools_axis(plists=None):
     return rows
 
 
+# ---------------------------------------------------------------- 入口面（R421 扩面 · R501）
+ENTRY_TIER_SELFTEST = "SELFTEST"
+ENTRY_TIER_SUBCOMMAND = "SUBCOMMAND"
+ENTRY_TIER_FLAGS = "FLAGS"
+ENTRY_TIER_MANUAL = "MANUAL_ARGV"
+ENTRY_TIER_NONE = "NONE"
+# 「可复跑入口」口径 = --selftest 或子命令面（TODO L201 正文括号内定义）
+RERUNNABLE_TIERS = (ENTRY_TIER_SELFTEST, ENTRY_TIER_SUBCOMMAND)
+ENTRY_DISPOSITION_PATH = ROOT / "memory" / "tool_surface" / "TOOL_ENTRY_DISPOSITION.json"
+DISPOSITION_STATUSES = ("ACTIVE", "DEFER", "RETIRE")
+ENTRY_TOKENS = ("--selftest", "add_subparsers", "add_argument(")
+
+
+def registered_selftest(src):
+    """「--selftest 真被注册」判据（纯函数）。
+
+    v1 的 `"--selftest"` 子串判定会把**只在 docstring / 帮助文本里提到**该字的工具
+    误判成 SELFTEST（实测 detector_replay.py:32 就在 docstring 里，真入口是 positional
+    子命令 ⇒ 误判方向=把无自测面的工具说成有，属**乐观误报**，比漏报更危险）。
+    v2 口径：该字面量所在行（或其后 2 行，覆盖多行 add_argument 调用）里必须出现
+    `add_argument(`，或该行本身就是 argv 判定（`in sys.argv`）；亦接受 `add_parser("selftest")`。
+    """
+    lines = src.splitlines()
+    for i, l in enumerate(lines):
+        if ('"--selftest"' not in l) and ("'--selftest'" not in l):
+            continue
+        if "add_argument(" in l or "sys.argv" in l or "argv" in l:
+            return True
+        if any("add_argument(" in w for w in lines[i + 1:i + 3]):
+            return True
+    return re.search(r"""add_parser\(\s*["']selftest["']""", src) is not None
+
+
+def argparse_choice_cmds(src):
+    """argparse positional 的命令面：{arg名: [命令名…]}（纯函数）。
+
+    v1 只认 add_subparsers，漏掉「positional + choices」这种写法（实测 detector_replay.py
+    用 add_argument("cmd", nargs="?", choices=[replay, check, selftest, cases, proof])）。
+    """
+    out = {}
+    for m in re.finditer(r"add_argument\(\s*[\"']([A-Za-z_]\w*)[\"']", src):
+        seg = src[m.start():m.start() + 400]
+        cm = re.search(r"choices\s*=\s*[\[(]([^\])]*)[\])]", seg)
+        if not cm:
+            continue
+        cmds = re.findall(r"[\"']([A-Za-z][\w-]*)[\"']", cm.group(1))
+        if cmds:
+            out[m.group(1)] = cmds
+    return out
+
+
+def manual_dispatch_cmds(src):
+    """手写 argv 分派的命令名集合（纯函数）。
+
+    形如 `cmd = argv[0]` / `a = sys.argv[1] ...` 后的 `cmd == "snapshot"` 或
+    `a in ("probe", "all")`。只统计「由 argv 赋值出来的变量」，避免把
+    `layer == "run_presence"` 这类普通比较算成命令面。
+    """
+    vars_ = set(re.findall(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*sys\.argv\[", src))
+    vars_ |= set(re.findall(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*argv\[", src))
+    vars_ |= set(re.findall(r"(?m)^\s*([A-Za-z_]\w*)\s*=\s*[\w.]+\(\s*argv\[", src))
+    cmds = set()
+    for v in vars_:
+        for m in re.finditer(re.escape(v) + r"\s*==\s*[\"']([A-Za-z][\w-]*)[\"']", src):
+            cmds.add(m.group(1))
+        for m in re.finditer(re.escape(v) + r"\s+in\s*\(([^)]*)\)", src):
+            cmds |= set(re.findall(r"[\"']([A-Za-z][\w-]*)[\"']", m.group(1)))
+    return cmds
+
+
+def detect_entry(src):
+    """静态判定一个工具的「可复跑入口」（纯函数，供 selftest 喂合成文本做负控）。
+
+    返回 dict(tier, has_selftest, has_subparsers, n_add_argument, has_argv, cmds, lines)，
+    lines = token -> 首个命中行号（用于清单里的 `tools/x.py:NN: <token>` 证据）。
+    """
+    has_selftest = registered_selftest(src)
+    has_subparsers = "add_subparsers" in src
+    n_addarg = len(re.findall(r"add_argument\(", src))
+    has_argv = (re.search(r"\bsys\.argv\b", src) is not None
+                or re.search(r"\bgetopt\b", src) is not None)
+    cmds = set(manual_dispatch_cmds(src))
+    for _arg, cs in argparse_choice_cmds(src).items():
+        cmds |= set(cs)
+    lines = {}
+    for token in ENTRY_TOKENS:
+        for i, l in enumerate(src.splitlines(), 1):
+            if token in l:
+                lines[token] = i
+                break
+    if has_selftest:
+        tier = ENTRY_TIER_SELFTEST
+    elif has_subparsers or len(cmds) >= 2:
+        tier = ENTRY_TIER_SUBCOMMAND
+    elif n_addarg > 0:
+        tier = ENTRY_TIER_FLAGS
+    elif has_argv:
+        tier = ENTRY_TIER_MANUAL
+    else:
+        tier = ENTRY_TIER_NONE
+    return {"tier": tier, "has_selftest": has_selftest, "has_subparsers": has_subparsers,
+            "n_add_argument": n_addarg, "has_argv": has_argv,
+            "cmds": sorted(cmds), "lines": lines}
+
+
+def is_rerunnable(entry):
+    """可复跑入口判据（纯函数）。"""
+    return entry.get("tier") in RERUNNABLE_TIERS
+
+
+def ref_match(text, token):
+    """引用必须是 token 边界匹配（纯函数）。
+
+    负控 T8：`..._helper.py` 不得算作 `x.py` 的引用 —— R421 的子串匹配有该风险。
+    """
+    # 注意：前缀只排除 [A-Za-z0-9_.-]，**不**排除 `/` —— `tools/x.py` 必须算作 x.py 的
+    # 引用（R421 的口径）；真正要防的是后缀粘连（`x.py.bak` / `x_helper.py`）。
+    return re.search(r"(?<![A-Za-z0-9_.\-])" + re.escape(token) + r"(?![A-Za-z0-9_.\-])",
+                     text) is not None
+
+
+def ghost_refs(hits):
+    """仓内相对路径型命中必须真实存在（虚拟 `~/...` 路径跳过）。纯函数。"""
+    out = []
+    for h in hits:
+        if h.startswith("~/"):
+            continue
+        if not (ROOT / h).exists():
+            out.append(h)
+    return sorted(set(out))
+
+
+def entry_evidence_lines(tool, entry):
+    """入口侧证据：`tools/x.py:NN: <token>`；一个 token 都没有 ⇒ ['tools/x.py: none']。
+
+    另附一行子命令面（`commands=[...]`，来自 argparse choices 或手写 argv 分派），
+    使 SUBCOMMAND 档也自带可核证据（判据 v2 新增）。
+    """
+    rel = f"tools/{tool}"
+    ev = [f"{rel}:{ln}: {tok}" for tok, ln in sorted(entry["lines"].items(), key=lambda kv: kv[1])]
+    if entry.get("cmds"):
+        ev.append(f"{rel}: commands=[{', '.join(entry['cmds'])}]")
+    return ev or [f"{rel}: none"]
+
+
+def evidence_hit(spec):
+    """登记表证据回源校验：格式 `<repo 相对路径> | <token>`，须文件存在且 token 命中。
+
+    返回 (ok, why)。纯函数（只读文件）。
+    """
+    if " | " not in spec:
+        return False, "格式应为 '<repo 相对路径> | <token>'"
+    path, token = spec.split(" | ", 1)
+    p = ROOT / path
+    if not p.exists():
+        return False, f"文件不存在 {path}"
+    try:
+        src = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return False, f"不可读 {path}: {e}"
+    if token not in src:
+        return False, f"token 未在 {path} 命中"
+    return True, ""
+
+
+def load_entry_disposition(path=None):
+    """读登记表；文件不存在返回 {}（闸门会把全部无入口工具报 UNDISPOSED）。"""
+    p = Path(path) if path else ENTRY_DISPOSITION_PATH
+    if not p.exists():
+        return {}
+    with open(p, encoding="utf-8") as f:
+        doc = json.load(f)
+    return doc.get("entries", doc)
+
+
+def guard_entry_disposition(rows, registry=None):
+    """三判据闸门（与 R449 guard_disposition 同款语义）。返回违规字符串列表。纯函数。"""
+    reg = load_entry_disposition() if registry is None else registry
+    bad = []
+    by_tool = {r["tool"]: r for r in rows}
+    for r in rows:
+        if r["rerunnable"]:
+            continue
+        if r["tool"] not in reg:
+            bad.append(f"TOOL_ENTRY_UNDISPOSED {r['tool']}: tier={r['entry_tier']} "
+                       f"且未在 TOOL_ENTRY_DISPOSITION 登记")
+    for tool in sorted(reg):
+        disp = reg[tool] or {}
+        st = disp.get("status")
+        if st not in DISPOSITION_STATUSES:
+            bad.append(f"CLAIM_WITHOUT_EVIDENCE {tool}: status={st!r} 不在 {list(DISPOSITION_STATUSES)}")
+            continue
+        ev = disp.get("evidence") or []
+        if not ev:
+            bad.append(f"CLAIM_WITHOUT_EVIDENCE {tool}: 登记为 {st} 但 evidence 为空")
+        for spec in ev:
+            ok, why = evidence_hit(spec)
+            if not ok:
+                bad.append(f"CLAIM_WITHOUT_EVIDENCE {tool}: 证据不可回源 ({spec}) — {why}")
+        r = by_tool.get(tool)
+        if r is None:
+            bad.append(f"DISPOSITION_STALE {tool}: 登记项不在本次 tools/*.py 清单里")
+        elif r["rerunnable"]:
+            bad.append(f"DISPOSITION_STALE {tool}: 登记为 {st} 但现已获得可复跑入口"
+                       f"(tier={r['entry_tier']}) ⇒ 须撤销登记")
+    return bad
+
+
+def entries_axis(tools_rows=None):
+    """入口面清单：逐 tools/*.py 合并「消费面 + 可复跑入口 + 证据」。"""
+    rows = tools_axis() if tools_rows is None else tools_rows
+    out = []
+    for r in rows:
+        p = ROOT / "tools" / r["tool"]
+        try:
+            src = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            src = ""
+        e = detect_entry(src)
+        refs = list(r.get("code", [])) + list(r.get("cfg", [])) + list(r.get("other", []))
+        out.append({"tool": r["tool"], "face": r["face"], "tracked": r.get("tracked", 1),
+                    "entry_tier": e["tier"], "rerunnable": is_rerunnable(e),
+                    "entry_evidence": entry_evidence_lines(r["tool"], e),
+                    "ref_evidence": refs[:5], "n_refs": len(refs),
+                    "durable": r.get("durable", []), "reports": r.get("reports", []),
+                    "ghost_refs": ghost_refs(refs)})
+    return out
+
+
+def entries_report(rows, gate, baseline_tools=None):
+    """生成 markdown 清单（含证据），供报告引用。纯函数。"""
+    no_entry = [r for r in rows if not r["rerunnable"]]
+    tier_count = {}
+    for r in rows:
+        tier_count[r["entry_tier"]] = tier_count.get(r["entry_tier"], 0) + 1
+    lines = ["# tools/*.py 「可复跑入口」清单（只读，自动生成）", "",
+             f"判据：rerunnable = tier ∈ {{SELFTEST, SUBCOMMAND}}（TODO L201 口径）；"
+             f"生成时间 {time.strftime('%Y-%m-%d %H:%M:%S')}；工具数 {len(rows)}。",
+             f"tier 分布：{json.dumps(tier_count, ensure_ascii=False, sort_keys=True)}；"
+             f"无可复跑入口 {len(no_entry)} 个。", "",
+             "## 无可复跑入口（每条附证据）", ""]
+    for r in sorted(no_entry, key=lambda x: (-x.get("n_refs", 0), x["tool"])):
+        base = ""
+        if baseline_tools is not None:
+            base = " 新增(R421后)" if r["tool"] not in baseline_tools else " R421在册"
+        lines.append(f"- `{r['tool']}` tier={r['entry_tier']} face={r['face']} "
+                     f"refs={r.get('n_refs', 0)}{base} ghost={r.get('ghost_refs', [])}")
+        lines.append(f"    - 入口证据：{'；'.join(r.get('entry_evidence') or ['none'])}")
+        lines.append(f"    - 引用证据：{'；'.join(r.get('ref_evidence') or []) or 'none'}")
+        mem = list(r.get("durable") or [])[:5]
+        rep = list(r.get("reports") or [])[:5]
+        if mem:
+            lines.append(f"    - 记忆引用证据（memory/ 非报告）：{'；'.join(mem)}")
+        if rep:
+            lines.append(f"    - 报告引用证据（memory/autonomous_reports）：{'；'.join(rep)}")
+        if not mem and not rep:
+            lines.append("    - 记忆/报告引用证据：none（无任何引用 ⇒ 见处置登记）")
+    lines += ["", "## 闸门（guard_entry_disposition）", ""]
+    if gate:
+        for g in gate:
+            lines.append(f"- {g}")
+    else:
+        lines.append("- 违规 0")
+    return "\n".join(lines) + "\n"
+
+
 # ---------------------------------------------------------------- temp 轴
 def scan_dir(p: Path, cap_files=TEMP_WALK_CAP_FILES, cap_sec=TEMP_WALK_CAP_SEC):
     t0 = time.time()
@@ -466,16 +749,110 @@ def md_table(rows, cols):
     return "\n".join(out)
 
 
+def load_baseline_tools(path):
+    """读 R421 快照 tools_census.csv 的第一列（工具名集合）；路径不存在返回 None。"""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    names = set()
+    with open(p, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i == 0 or not line.strip():
+                continue
+            names.add(line.split(",")[0].strip().strip('"'))
+    return names
+
+
+def entries_main(a):
+    """入口面真跑：清单 + 处置登记闸门；唯一写入点 = out 目录。返回 rc（违规 ⇒ 1）。"""
+    out = ROOT / a.out
+    out.mkdir(parents=True, exist_ok=True)
+    rows = entries_axis()
+    gate = guard_entry_disposition(rows)
+    baseline = load_baseline_tools(a.baseline_tools_csv)
+    no_entry = [r for r in rows if not r["rerunnable"]]
+    tier_count, face_count = {}, {}
+    for r in rows:
+        tier_count[r["entry_tier"]] = tier_count.get(r["entry_tier"], 0) + 1
+    for r in no_entry:
+        face_count[r["face"]] = face_count.get(r["face"], 0) + 1
+    doc = {"generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "tools_total": len(rows), "no_rerunnable_entry": len(no_entry),
+           "tier_count": tier_count, "no_entry_face_count": face_count,
+           "no_entry": [{"tool": r["tool"], "face": r["face"], "tier": r["entry_tier"],
+                         "entry_evidence": r["entry_evidence"],
+                         "ref_evidence": r["ref_evidence"], "n_refs": r["n_refs"],
+                         "durable_refs": list(r.get("durable") or [])[:5],
+                         "report_refs": list(r.get("reports") or [])[:5],
+                         "ghost_refs": r["ghost_refs"]} for r in no_entry],
+           "gate": gate, "gate_rc": 1 if gate else 0,
+           "baseline": str(a.baseline_tools_csv) if baseline is not None else None,
+           "baseline_count": len(baseline) if baseline is not None else None,
+           "new_since_baseline": (sorted(r["tool"] for r in rows
+                                          if r["tool"] not in baseline)
+                                  if baseline is not None else None)}
+    with open(out / "entries.json", "w", encoding="utf-8") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    with open(out / "entries.md", "w", encoding="utf-8") as f:
+        f.write(entries_report(rows, gate, baseline))
+    print(f"[entries] tools={len(rows)} tiers={json.dumps(tier_count, ensure_ascii=False, sort_keys=True)}")
+    print(f"[entries] 无可复跑入口={len(no_entry)} "
+          f"faces={json.dumps(face_count, ensure_ascii=False, sort_keys=True)}")
+    if baseline is not None:
+        print(f"[entries] R421 快照在册={len(baseline)} / 其后新增={len(doc['new_since_baseline'])}")
+    print(f"[entries] 闸门违规={len(gate)} rc={doc['gate_rc']}")
+    for g in gate[:20]:
+        print("  -", g)
+    print(f"[out] {out}/entries.md")
+    print(f"[out] {out}/entries.json")
+    return doc["gate_rc"]
+
+
+def verify_entries_json(path):
+    """复算已归档 entries JSON 的闸门（只读）；装配面变化 ⇒ 从归档清单重建并重判。"""
+    p = Path(path)
+    if not p.exists():
+        print(f"[verify] 文件不存在 {p}")
+        return 2
+    with open(p, encoding="utf-8") as f:
+        doc = json.load(f)
+    rows = [{"tool": r["tool"], "face": r.get("face", ""), "rerunnable": False,
+             "entry_tier": r.get("tier", "NONE")} for r in doc.get("no_entry", [])]
+    gate = guard_entry_disposition(rows)
+    stored = doc.get("gate") or []
+    print(f"[verify] 归档 {p}")
+    print(f"[verify] 归档时 tools={doc.get('tools_total')} 无入口={doc.get('no_rerunnable_entry')} "
+          f"违规={len(stored)}；复算违规={len(gate)}")
+    added = [g for g in gate if g not in stored]
+    gone = [g for g in stored if g not in gate]
+    print(f"[verify] 新增违规={len(added)} 已消除={len(gone)}")
+    for g in (added[:10] + gone[:5]):
+        print("  -", g)
+    return 1 if gate else 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="资产使用热度 × T0 备份 × tools 消费面 三向对账（只读）")
     ap.add_argument("--out", default="temp/usage_census", help="输出目录（唯一写入点）")
     ap.add_argument("--manifest", default=None, help="指定 T0 manifest（默认取最新）")
     ap.add_argument("--json", action="store_true", help="打印 JSON 摘要")
     ap.add_argument("--selftest", action="store_true", help="纯函数自测（含负控）")
+    ap.add_argument("--entries", action="store_true",
+                    help="入口面：无可复跑入口清单 + 处置登记闸门（写 out 目录）")
+    ap.add_argument("--verify-entries-json", default=None,
+                    help="复算已归档 entries JSON 的闸门（只读）")
+    ap.add_argument("--baseline-tools-csv", default=None,
+                    help="R421 快照 tools_census.csv（标记其后新增工具）")
     a = ap.parse_args(argv)
 
     if a.selftest:
         return selftest()
+    if a.verify_entries_json:
+        return verify_entries_json(a.verify_entries_json)
+    if a.entries:
+        return entries_main(a)
 
     t0 = load_t0_module()
     man_path = find_manifest(a.manifest)
@@ -653,14 +1030,125 @@ def selftest():
     arcs = {f["arc"] for f in man["files"]}
     eq(sorted(disk - arcs), ["tools/b.py"], "T5 新增识别")
 
+    # T6 入口分档（纯函数合成文本；含负控）
+    src_selftest = 'ap = argparse.ArgumentParser()\nap.add_argument("--selftest", action="store_true")\n'
+    src_sub = 'sub = p.add_subparsers(dest="cmd")\n'
+    src_flags = 'ap.add_argument("--out", default="x")\n'
+    src_manual = 'opts = sys.argv[1:]\n'
+    src_none = 'print("hello")\n'
+    eq(detect_entry(src_selftest)["tier"], ENTRY_TIER_SELFTEST, "T6a --selftest ⇒ SELFTEST")
+    eq(detect_entry(src_sub)["tier"], ENTRY_TIER_SUBCOMMAND, "T6b 子命令 ⇒ SUBCOMMAND")
+    eq(detect_entry(src_flags)["tier"], ENTRY_TIER_FLAGS, "T6c 仅参数 ⇒ FLAGS")
+    eq(detect_entry(src_manual)["tier"], ENTRY_TIER_MANUAL, "T6d 手搓 argv ⇒ MANUAL_ARGV")
+    eq(detect_entry(src_none)["tier"], ENTRY_TIER_NONE, "T6e 无参数面 ⇒ NONE")
+    eq(detect_entry('print("see --selftest in docs")\n')["tier"], ENTRY_TIER_NONE,
+       "T6f 负控 非引号包裹的 --selftest 不算入口")
+    eq(detect_entry(src_selftest)["lines"]["--selftest"], 2, "T6g 证据行号=2")
+    # v2 判据负控：**docstring 里提到 "--selftest" 不算注册**（实测 detector_replay.py 旧判据翻车处）
+    src_doc = 'def f():\n    """用法: python3 x.py "--selftest" """\n    pass\n'
+    eq(detect_entry(src_doc)["tier"], ENTRY_TIER_NONE, "T6h 负控 docstring 提 --selftest ⇒ 不算入口")
+    eq(registered_selftest(src_doc), False, "T6h2 registered_selftest 同为 False")
+    src_argvst = 'if "--selftest" in sys.argv:\n    run()\n'
+    eq(detect_entry(src_argvst)["tier"], ENTRY_TIER_SELFTEST, "T6i argv 判定 --selftest ⇒ SELFTEST")
+    # 手写 argv 分派：两个命令 ⇒ SUBCOMMAND（实盘 detector_replay/alert_lifecycle 即此形态）
+    src_disp = 'a = sys.argv[1] if len(sys.argv) > 1 else "all"\nif a == "scan":\n    pass\n' \
+               'if a == "report":\n    pass\n'
+    de = detect_entry(src_disp)
+    eq(de["tier"], ENTRY_TIER_SUBCOMMAND, "T6j 手写 argv 双命令 ⇒ SUBCOMMAND")
+    eq(de["cmds"], ["report", "scan"], "T6j2 命令面已抽取")
+    src_disp1 = 'a = sys.argv[1]\nif a == "scan":\n    pass\n'
+    eq(detect_entry(src_disp1)["tier"], ENTRY_TIER_MANUAL, "T6k 负控 单命令不升 SUBCOMMAND")
+    src_choice = 'ap.add_argument("cmd", nargs="?", choices=["replay", "check", "selftest"])\n'
+    eq(detect_entry(src_choice)["tier"], ENTRY_TIER_SUBCOMMAND, "T6l argparse choices ⇒ SUBCOMMAND")
+    eq("commands=[" in "".join(entry_evidence_lines("x.py", detect_entry(src_choice))), True,
+       "T6m 证据含 commands 行")
+
+    # T7 可复跑判据（口径=TODO L201：--selftest / 子命令）
+    eq(is_rerunnable(detect_entry(src_selftest)), True, "T7a SELFTEST 可复跑")
+    eq(is_rerunnable(detect_entry(src_sub)), True, "T7b SUBCOMMAND 可复跑")
+    eq(is_rerunnable(detect_entry(src_flags)), False, "T7c 负控 FLAGS 不算可复跑入口")
+    eq(is_rerunnable(detect_entry(src_manual)), False, "T7d 负控 MANUAL 不算")
+    eq(is_rerunnable(detect_entry(src_none)), False, "T7e 负控 NONE 不算")
+
+    # T8 引用边界（负控=伪造/近似引用不得算引用）
+    eq(ref_match("tools/usage_census.py", "usage_census.py"), True, "T8a 路径限定名命中")
+    eq(ref_match("restore_ga_desktop_bridge_helper.py", "restore_ga_desktop_bridge.py"), False,
+       "T8b 负控 _helper 后缀不算引用")
+    eq(ref_match("x.py.bak", "x.py"), False, "T8c 负控 .bak 后缀不算引用")
+    eq(ref_match("a/x.pyy", "x.py"), False, "T8d 负控 长后缀不算引用")
+
+    # T9 ghost 命中（负控：仓内不存在的路径必须被标出）
+    eq(ghost_refs(["tools/usage_census.py"]), [], "T9a 真路径非 ghost")
+    eq(ghost_refs(["tools/__no_such_tool__.py"]), ["tools/__no_such_tool__.py"],
+       "T9b 负控 不存在路径 ⇒ ghost")
+    eq(ghost_refs(["~/Library/LaunchAgents/x.plist"]), [], "T9c 虚拟路径跳过")
+
+    # T10 证据回源（负控：token 不命中/文件不存在 ⇒ 拒）
+    ok, _ = evidence_hit("tools/usage_census.py | --selftest")
+    eq(ok, True, "T10a 真证据命中")
+    # 负控 token 用拼接构造（写死字面量会落在本文件源码里 ⇒ 恒命中=自败）
+    badtok = "NOTOKEN_" + "0000"
+    ok2, why2 = evidence_hit("tools/usage_census.py | " + badtok)
+    eq(ok2, False, "T10b 负控 token 未命中 ⇒ 拒")
+    ok3, _ = evidence_hit("tools/__no_such_tool__.py | x")
+    eq(ok3, False, "T10c 负控 文件不存在 ⇒ 拒")
+    eq(evidence_hit("no-separator")[0], False, "T10d 负控 格式非法 ⇒ 拒")
+
+    # T11 闸门三判据 + 负控（合成 rows/registry，不触真登记表）
+    rows_syn = [
+        {"tool": "no_entry_tool.py", "face": "接线", "rerunnable": False,
+         "entry_tier": ENTRY_TIER_FLAGS},
+        {"tool": "ok_tool.py", "face": "接线", "rerunnable": True,
+         "entry_tier": ENTRY_TIER_SELFTEST},
+    ]
+    g1 = guard_entry_disposition(rows_syn, {})
+    eq(any(x.startswith("TOOL_ENTRY_UNDISPOSED") for x in g1), True, "T11a 未登记 ⇒ UNDISPOSED")
+    g2 = guard_entry_disposition(rows_syn, {"no_entry_tool.py": {"status": "ACTIVE", "evidence": []}})
+    eq(any("CLAIM_WITHOUT_EVIDENCE" in x for x in g2), True, "T11b 负控 空证据 ⇒ CLAIM_WITHOUT_EVIDENCE")
+    g3 = guard_entry_disposition(
+        rows_syn, {"no_entry_tool.py": {"status": "ACTIVE",
+                                        "evidence": ["tools/usage_census.py | " + ("NOTOKEN_" + "0000")]}})
+    eq(any("CLAIM_WITHOUT_EVIDENCE" in x for x in g3), True, "T11c 负控 证据不可回源 ⇒ 拒")
+    g4 = guard_entry_disposition(rows_syn, {"__ghost_tool__.py": {"status": "ACTIVE",
+                                                                  "evidence": ["tools/usage_census.py | --selftest"]}})
+    eq(any(x.startswith("DISPOSITION_STALE") for x in g4), True, "T11d 负控 登记项不存在 ⇒ STALE")
+    g5 = guard_entry_disposition(
+        rows_syn, {"ok_tool.py": {"status": "ACTIVE",
+                                  "evidence": ["tools/usage_census.py | --selftest"]}})
+    eq(any(x.startswith("DISPOSITION_STALE") for x in g5), True,
+       "T11e 负控 已获得入口仍登记 ⇒ STALE")
+    eq(guard_entry_disposition(
+        rows_syn, {"no_entry_tool.py": {"status": "DEFER",
+                                        "evidence": ["tools/usage_census.py | --selftest"]}}), [],
+       "T11f 正例 合法登记 ⇒ 零违规")
+    g7 = guard_entry_disposition(rows_syn, {"no_entry_tool.py": {"status": "NOPE",
+                                                                 "evidence": ["tools/usage_census.py | --selftest"]}})
+    eq(any("status=" in x for x in g7), True, "T11g 负控 非法 status ⇒ 违规")
+
+    # T12 清单渲染含证据（防"清单无证据"回归）
+    import io                                   # noqa: PLC0415
+    md = entries_report(rows_syn, [], None)
+    eq("入口证据：" in md and "引用证据：" in md, True, "T12a 清单每条带两类证据")
+    eq(md.count("- `no_entry_tool.py`"), 1, "T12b 只列无可复跑入口者")
+    rows_mem = [dict(rows_syn[0], durable=["memory/kc_profile/profile.py"], reports=[],
+                     entry_evidence=["tools/x.py: none"])]
+    md2 = entries_report(rows_mem, [], None)
+    eq("记忆引用证据（memory/ 非报告）：memory/kc_profile/profile.py" in md2, True,
+       "T12c 记忆引用证据行落地（face=仅记忆引用 也有证据）")
+    eq("记忆/报告引用证据：none（无任何引用 ⇒ 见处置登记）" in
+       entries_report([dict(rows_syn[0], durable=[], reports=[], entry_evidence=["tools/x.py: none"])],
+                      [], None), True, "T12d 零引用时显式标 none")
+
     eq(len(fails), 0, "ALL")
     if fails:
         print("SELFTEST FAILED:")
         for x in fails:
             print("  -", x)
         return 1
-    print("SELFTEST 5/5 groups PASS (T1 分类 5 例含 1 负控 / T2 路径 3 例 / T3 分档 3 例含 1 负控 "
-          "/ T4 覆盖 4 例含 1 负控 / T5 delta 1 例)")
+    print("SELFTEST 12/12 groups PASS (T1 分类 5 例含 1 负控 / T2 路径 3 例 / T3 分档 3 例含 1 负控 "
+          "/ T4 覆盖 4 例含 1 负控 / T5 delta 1 例 / T6 入口分档 7 例含 1 负控 / T7 可复跑 5 例含 2 负控 "
+          "/ T8 引用边界 4 例含 3 负控 / T9 ghost 3 例含 1 负控 / T10 证据回源 4 例含 3 负控 "
+          "/ T11 闸门 7 例含 5 负控 / T12 清单渲染 2 例)")
     return 0
 
 
