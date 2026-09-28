@@ -12,6 +12,10 @@
   L1b 产出内容变化：content 段登记的家族内文件内容指纹「零变化/停滞」超阈值 ⇒ ALERT/WARN
        （补齐 L1 的 mtime 盲区「任务跑了、文件也在写，但内容没变」；判据内核复用
         tools/content_change_detector.py，只对显式登记 content 段的目标生效）
+  L1c 留存断档层（R483, kind=retention）：时间衰减源（Chrome History ~90d、kc /app/usage ~25d、
+       pmset 日目录 ~15d、wifi.log 每日轮转）一旦漏采，当天不补就可能永久滚出源窗口 ⇒ 按
+       「日期目录 × 必需文件」审计留存面（不用 mtime）。判据内核复用 tools/rolling_source_snapshot.py
+       的 verify（缺口/连续缺/空壳/永久丢失/今天待采），只对显式登记 kind=retention 的目标生效。
   L2 静默降级签名：扫最新日志/证据文件尾部（默认 200KB）命中 degraded_patterns ⇒ DEGRADED
   L3 运行缺席：最近一次运行证据（done 报告/日志）距今 > max_run_gap_days ⇒ NO_RUN
   L4 退役/人工家族（state=legacy|on_demand，R470）：任务定义已删除/归档（legacy）或仅人工触发
@@ -58,7 +62,7 @@ except Exception:                                    # 极端环境下降级为�
     _aeid = None
 
 # 判据层前缀 → canonical face（与 alert_event_id.ALIASES 同源口径）
-LAYER_FACE = {"L0": "preflight", "L1": "artifact", "L1b": "content",
+LAYER_FACE = {"L0": "preflight", "L1": "artifact", "L1b": "content", "L1c": "artifact",
               "L2": "log", "L3": "run", "L4": "lifecycle"}
 
 
@@ -67,7 +71,7 @@ def _face_of_text(text):
 
     注意先长后短（L1b 必须早于 L1），否则 L1b 行会被判成 artifact。
     """
-    for lv in ("L1b", "L0", "L1", "L2", "L3", "L4"):
+    for lv in ("L1b", "L1c", "L0", "L1", "L2", "L3", "L4"):
         if text.startswith(lv + " "):
             return LAYER_FACE[lv]
     return None
@@ -248,6 +252,69 @@ def check_target(t, root, ref=None, ld=None, pf=None):
         res["verdict"] = "DISABLED"
         res["checks"].append({"level": "INFO", "text": "按设计停用/归档（enabled=false），不参与新鲜度判定"})
         return res
+
+    # ---- L1c 留存断档层（R483, kind=retention）----
+    # 与 L1（多久没写）/L1b（写了但没变）正交：本层问的是「该采的日子有没有采到、还来不来得及补」。
+    # 时间衰减源有硬留存窗口（Chrome ~90d / kc ~25d / pmset ~15d / wifi.log 1d）⇒ 漏采当天不补
+    # 就可能永久丢失（R481 C4 现场实测 kc 3 天、chrome 2 天、pmset 1 天、wifilog 1 天）。
+    # 判据内核复用 tools/rolling_source_snapshot.py verify（日期目录 × 必需文件，零 mtime）；
+    # 未登记 kind=retention 的目标在此处行为逐字不变（无新键、无新 check）。
+    if t.get("kind") == "retention":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import rolling_source_snapshot as _rss
+        srcs = list(t.get("sources") or [])
+        roots = {k: (v if os.path.isabs(v) else os.path.join(GA, v))
+                 for k, v in dict(t.get("roots") or {}).items()}
+        ld = t.get("live_dates") or {}
+        if ld:                       # 夹具/离线：显式给出源侧「最老仍可采日」
+            live = {n: {"date": ld[n], "rc": 0, "method": "declared"} for n in srcs if n in ld}
+        elif t.get("live_probe", True):
+            live = None              # 走真实只读探针（只读打开活库，不写）
+        else:                        # 显式关探针 ⇒ fail-closed（不假装窗口无限）
+            live = {n: {"date": None, "rc": 2, "method": "probe-disabled"} for n in srcs}
+        try:
+            today = datetime.date.fromtimestamp(ref).isoformat()
+        except Exception:
+            today = None
+        try:
+            out = _rss.verify_all(roots=roots, today=today, live=live, proof=False,
+                                  sources=srcs or None)
+        except Exception as e:       # 探头坏掉 ⇒ fail-closed，不静默
+            bump("ALERT", "L1c 留存探针不可用（%s: %s）" % (type(e).__name__, e))
+            return res
+        res["retention"] = {"today": out["today"], "counts": out["counts"], "sources": {}}
+        if not out.get("sources"):
+            bump("ALERT", "L1c 留存探针空面（未扫到任何登记的源）")
+            return res
+        for name, v in out["sources"].items():
+            missing_non_today = [d for d in v["missing_days"] if d != out["today"]]
+            res["retention"]["sources"][name] = {
+                "verdict": v["verdict"], "n_present": v["n_present"], "n_missing": v["n_missing"],
+                "missing_days": missing_non_today, "missing_lost": v["missing_lost"],
+                "pending_today": bool(v.get("pending_today")),
+                "missing_recoverable": v["missing_recoverable"],
+                "oldest_available": v["oldest_available"], "retention_days": v.get("retention_days"),
+                "days_left": v["days_left"], "shell_days": v["shell_days"]}
+            extra = []
+            if v["shell_days"]:
+                extra.append("空壳日目录 %d 天（%s）" % (len(v["shell_days"]), v["shell_days"][:3]))
+            if v["missing_recoverable"]:
+                extra.append("仍可补采 %d 天（最早 %s，留存≈%s 天，剩 %s 天）"
+                             % (len(v["missing_recoverable"]), v["missing_recoverable"][0],
+                                v.get("retention_days"), v["days_left"]))
+            if v["missing_lost"]:
+                extra.append("★永久丢失 %d 天（%s）" % (len(v["missing_lost"]), v["missing_lost"][:3]))
+            if v["pending_today"]:
+                extra.append("今天尚未采（当天仍可采）")
+            desc = "%s 已采 %d 天，缺口 %d 天%s" % (name, v["n_present"], v["n_missing"],
+                                                   ("；" + "；".join(extra)) if extra else "")
+            if v["missing_lost"] or missing_non_today or v["verdict"] == "UNKNOWN":
+                bump("ALERT", "L1c 留存断档：%s" % desc)
+            elif v["pending_today"]:
+                bump("INFO", "L1c 留存待采：%s" % desc)
+            else:
+                res["checks"].append({"level": "OK", "text": "L1c 留存完备：%s" % desc})
 
     # ---- L0 前置条件可用性（R475）----
     # 语义：前置不成立 ⇒ 任务必不会产出（run 级证据可能照样新鲜，mtime 层看不见）。
@@ -697,6 +764,29 @@ def selftest(tmp=None):
          "scan_globs": ["temp/bg_task/logs/birdie_*.log"], "failure_patterns": ["SSLError"]},
     ]}
 
+    # fixture F：L1c 留存断档层（R483）—— 三个同构 chrome 快照根，只有留存面不同
+    _t0 = datetime.date.today()
+    def retdir(sub, offsets):
+        """建 base/retention/<sub>/<YYYY-MM-DD>/History（chrome 必需文件）。"""
+        for off in offsets:
+            d = os.path.join(base, "retention", sub,
+                             (_t0 - datetime.timedelta(days=off)).isoformat())
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "History"), "w", encoding="utf-8").write("x")
+        return os.path.join(base, "retention", sub)
+    r_gap = retdir("gap", [5, 4, 1])            # 缺 3、2 天（非今天）+ 今天未采 ⇒ ALERT
+    r_pend = retdir("pending", [4, 3, 2, 1])    # 只缺今天 ⇒ INFO（当天仍可采）
+    r_lost = retdir("lost", [8, 3])             # 源侧最老仍可采=4 天前 ⇒ 7/6/5 天前不可补
+    criteria["targets"] += [
+        {"id": "retention_gap", "kind": "retention", "label": "留存断档（selftest 夹具）",
+         "sources": ["chrome"], "roots": {"chrome": r_gap}},
+        {"id": "retention_pending", "kind": "retention", "label": "只缺今天（selftest 夹具）",
+         "sources": ["chrome"], "roots": {"chrome": r_pend}},
+        {"id": "retention_lost", "kind": "retention", "label": "永久丢失（selftest 夹具）",
+         "sources": ["chrome"], "roots": {"chrome": r_lost},
+         "live_dates": {"chrome": (_t0 - datetime.timedelta(days=4)).isoformat()}},
+    ]
+
     checks = []
     def expect(name, cond, detail=""):
         checks.append((name, bool(cond), detail))
@@ -827,6 +917,35 @@ def selftest(tmp=None):
     expect("⑳ 负控：台账顶层 event_ids 只并硬目标事件（非硬目标事件不得混入）",
            set(_rec["event_ids"]) == _hard and not (set(_rec["event_ids"]) & _nonhard),
            "top=%d hard=%d nonhard=%d" % (len(_rec["event_ids"]), len(_hard), len(_nonhard)))
+
+    # ㉑–㉕ L1c 留存断档层（R483）—— ㉒㉔㉕ 为负控
+    rg = rows["retention_gap"]
+    _cg = rg["retention"]["sources"]["chrome"]
+    expect("㉑ 留存缺口（非今天缺 2 天）→ ALERT 且进硬问题，缺口天数带出",
+           rg["verdict"] == "ALERT" and rg["id"] in res["hard_issue_ids"]
+           and _cg["n_missing"] >= 1 and _cg["missing_lost"] == []
+           and any("留存断档" in c["text"] for c in rg["checks"]),
+           "%s / %s" % (rg["verdict"], _cg))
+    rp = rows["retention_pending"]
+    expect("㉒ 负控：只缺今天（当天仍可采）→ INFO，不进硬问题",
+           rp["verdict"] == "INFO" and rp["id"] not in res["hard_issue_ids"]
+           and rp["retention"]["sources"]["chrome"]["verdict"] == "WARN_PENDING_TODAY",
+           "%s / %s" % (rp["verdict"], rp["retention"]["sources"]["chrome"]["verdict"]))
+    _cl = rows["retention_lost"]["retention"]["sources"]["chrome"]
+    expect("㉓ 已滚出源窗口的缺口 → ALERT 且 missing_lost 非空（不可补）",
+           rows["retention_lost"]["verdict"] == "ALERT" and len(_cl["missing_lost"]) == 3
+           and _cl["oldest_available"] == (_t0 - datetime.timedelta(days=4)).isoformat(),
+           "%s / lost=%s oldest=%s" % (rows["retention_lost"]["verdict"],
+                                       _cl["missing_lost"], _cl["oldest_available"]))
+    expect("㉔ 负控：未登记 kind=retention 的目标无 retention 键（既有目标行为逐字不变）",
+           "retention" not in rows["github_trending"] and rows["github_trending"]["verdict"] == "OK",
+           str(rows["github_trending"].get("retention")))
+    retdir("gap", [3, 2])                       # 补齐缺口 ⇒ 只剩今天未采
+    res9 = run(criteria, base, as_json=True, write_ledger=False, return_result=True)
+    rg9 = {r["id"]: r for r in res9["targets"]}["retention_gap"]
+    expect("㉕ 负控：补上缺口目录 → retention_gap 转 INFO（判定随输入变，非硬编码结论）",
+           rg9["verdict"] == "INFO" and rg9["id"] not in res9["hard_issue_ids"],
+           "%s / %s" % (rg9["verdict"], rg9["retention"]["sources"]["chrome"]["missing_days"]))
 
     ok = True
     for name, good, detail in checks:

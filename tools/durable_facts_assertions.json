@@ -236,7 +236,7 @@
    "id": "R477-A17",
    "cls": "COUNT",
    "check": "count_consistency",
-   "status": "ACTIVE",
+   "status": "CLOSED",
    "params": {
     "file": "memory/global_mem_insight.txt",
     "count_line_regex": "targets 37→(\\d+)",
@@ -247,7 +247,24 @@
      "path": "targets"
     }
    },
-   "note": "R470 行「判据表 7 条登记 targets 37→44」的终值须等于判据表 targets 数组长度（claim 在 L1 出现两次 ⇒ claim_take=first）。"
+   "note": "R470 行「判据表 7 条登记 targets 37→44」的终值须等于判据表 targets 数组长度（claim 在 L1 出现两次 ⇒ claim_take=first）。★R483 起判据表 targets=45（新增 kind=retention）⇒本断言转 CLOSED（该 L1 行为 R470 时点快照），改由 R483-A18 守当前值。"
+  },
+  {
+   "id": "R483-A18",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "targets 44→(\\d+)",
+    "claim_take": "first",
+    "count_source": {
+     "kind": "json_len",
+     "file": "tools/freshness_criteria.json",
+     "path": "targets"
+    }
+   },
+   "note": "R483 行「判据表 targets 44→45（新增 kind=retention=rolling_source_retention）」的终值须等于判据表 targets 数组长度。"
   }
  ]
 }

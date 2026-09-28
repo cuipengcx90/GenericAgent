@@ -10,6 +10,7 @@
   snapshot  逐源采一份「当天」快照，打印 路径 / 字节 / sha256，并写 manifest.json
   window    对快照副本（file:...?mode=ro）跑「窗口长度」SQL，给出 行数 / 最老 / 最新 / 跨度天
   list      列出全源快照资产（按日期），供「不可再生程度 × 当前覆盖」对账
+  verify    逐源对账「日期目录 × 必需文件」，给出缺口/永久丢失/距过期剩余天数（R483）
   selftest  合成夹具 + 负控自证（见 --selftest，禁止只跑正例）
 
 设计约束
@@ -22,6 +23,9 @@
     「原样拷 db + 侧车（-wal/-shm/-journal）」并如实记 method，副本一律跑 quick_check。
   - **幂等**：当天已有快照（且 manifest 末次 revision 日期==今天）时直接跳过，`--force` 重采。
   - **不删任何东西**：无 prune 子命令，删除历史快照不可逆。
+  - **verify 只判不采**：只报缺口，不自动补采（补采=写盘，须显式 `snapshot`）。判据只用
+    「日期目录名 + 目录内必需文件」这类确定性证据，**不用 mtime**——mtime 只反映最近一次写
+    的时刻，看不见「中间少了一天」。
 
 用法
   python3 tools/rolling_source_snapshot.py snapshot               # 全源采今天
@@ -138,6 +142,19 @@ NOTES = {
                     '只采当前 wifi.log（newsyslog 每日 00:30 轮转）⇒ 更早窗口的「睡眠内网络活动」对账不可得',
     'pmset-store': '★边界：/var/log/powermanagement/StoreData（8B 索引）随目录整体拷贝；'
                    '`pmset -g log` 是**活性视图**（按 ASL 索引滚动读，实测回溯仅到 2026-09-19），它本身不落盘',
+}
+
+# ---------------------------------------------------------------- 留存窗登记（R483）
+# verify 用的「过期即不可再生」天数。判「永久丢失」取**保守下界**（宁可早报不可晚报）。
+RETENTION = {
+    'chrome': {'retention_days': 90, 'conservative_days': 90, 'required': ['History'],
+               'evidence': 'R415/R423：Chrome 只保留最近 ~90 天 visits（`window --source chrome` 的 SQL 可复算）'},
+    'kc': {'retention_days': 25, 'conservative_days': 23, 'required': ['knowledgeC.db'],
+           'evidence': 'R434/R436：kc `/app/usage` 流按 ~23–25 天滚动删除（判丢失取保守下界 23）'},
+    'pmset': {'retention_days': 15, 'conservative_days': 15, 'required': ['events.json'],
+              'evidence': 'R420：/var/log/powermanagement 窗口由文件轮转决定，实测 15 天'},
+    'wifilog': {'retention_days': 1, 'conservative_days': 1, 'required': ['wifi.log'],
+                'evidence': 'newsyslog 每日 00:30 轮转，且 wifi.log.N.bz2 历史未纳入采集 ⇒ 仅当天一份可采'},
 }
 
 METHOD = 'rolling_source_snapshot/v1'
@@ -1365,6 +1382,252 @@ def cmd_window(args) -> int:
     return 0
 
 
+
+# =============================================================== 留存断档探测（R483）
+# 为什么存在：本工具的源都按时间窗**滚动删除**，每过一天永久丢一天；而三个采集器**均未接定时**
+# （待批）。「漏采一天」无法从产物 mtime 看出（mtime 只显示最近一次写的时刻），必须按**日期目录**
+# 逐日对账。本层只读、只判、不补采（补采=写盘，须显式 `snapshot`）。
+DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _as_date(s):
+    try:
+        return datetime.date.fromisoformat(str(s)[:10])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _live_oldest_sql(db, sql, timeout: int = 20) -> dict:
+    """只读打开源库取「最老仍可采的一天」。失败一律 rc≠0（fail-closed，不许静默当 0）。"""
+    p = Path(db)
+    if not p.exists():
+        return {'date': None, 'rc': 2, 'method': 'sqlite-ro', 'error': 'missing-source'}
+    try:
+        con = _ro_conn(p)
+    except Exception as e:  # noqa: BLE001
+        return {'date': None, 'rc': 2, 'method': 'sqlite-ro', 'error': str(e)[:160]}
+    try:
+        row = con.execute(sql).fetchone()
+    except Exception as e:  # noqa: BLE001
+        return {'date': None, 'rc': 2, 'method': 'sqlite-ro', 'error': str(e)[:160]}
+    finally:
+        con.close()
+    oldest = row[1] if row and len(row) > 1 else None
+    return {'date': (str(oldest)[:10] if oldest else None), 'rc': 0 if oldest else 2,
+            'method': 'sqlite-ro'}
+
+
+def _live_oldest_pmset(src: dict) -> dict:
+    """目录型源：窗口由**文件名日期**决定（不含 mtime）。"""
+    d = Path(src['src_dir'])
+    if not d.exists():
+        return {'date': None, 'rc': 2, 'method': 'filename', 'error': 'missing-source'}
+    days = []
+    for p in _dir_source_files(src):
+        m = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', p.name)
+        if m:
+            days.append('%s-%s-%s' % m.groups())
+    return {'date': min(days) if days else None, 'rc': 0 if days else 2,
+            'method': 'filename', 'n_dated_files': len(days)}
+
+
+def live_oldest(name: str, src: dict = None) -> dict:
+    """源侧「最老仍可采的一天」。live 源是活库⇒只读打开，不落任何写。"""
+    src = src or SOURCES[name]
+    if name == 'chrome':
+        return _live_oldest_sql(src['db'], src['window'][0][1])
+    if name == 'kc':
+        return _live_oldest_sql(src['db'], src['window'][0][1])
+    if name == 'pmset':
+        return _live_oldest_pmset(src)
+    if name == 'wifilog':
+        return {'date': datetime.date.today().isoformat(), 'rc': 0, 'method': 'rotation-1d',
+                'error': None}
+    return {'date': None, 'rc': 2, 'method': 'unregistered', 'error': 'no retention spec'}
+
+
+def audit_source(name: str, root=None, src: dict = None, today=None, live=None,
+                 retention_days: int = None) -> dict:
+    """单源对账：present=目录齐必需文件；missing=span 内缺日；lost=已过期不可补。"""
+    src = src or SOURCES[name]
+    rroot = Path(root if root is not None else src['root'])
+    spec = RETENTION.get(name, {})
+    required = list(spec.get('required') or [src['artifact']])
+    t = _as_date(today) or datetime.date.today()
+    present, shells, sizes = [], [], {}
+    if rroot.exists():
+        for d in sorted(rroot.iterdir()):
+            if not (d.is_dir() and DATE_RE.match(d.name)):
+                continue
+            art = d / required[0]
+            if art.exists():
+                present.append(d.name)
+                sizes[d.name] = art.stat().st_size
+            else:
+                shells.append(d.name)
+    lo = live if isinstance(live, dict) else live_oldest(name, src)
+    oldest_avail = _as_date(lo.get('date'))
+    # span：从「最早一份快照」到「今天」；没有快照就退化为仍可采窗口
+    if present:
+        span_start = _as_date(present[0])
+    elif oldest_avail:
+        span_start = oldest_avail
+    else:
+        span_start = None
+    missing, lost, recoverable, pending_today = [], [], [], False
+    if span_start:
+        cur, tod = span_start, t
+        while cur <= tod:
+            d = cur.isoformat()
+            if d not in present:
+                missing.append(d)
+                if oldest_avail and cur < oldest_avail:
+                    lost.append(d)          # 已滚出源窗口 ⇒ 不可补
+                elif cur == tod:
+                    pending_today = True    # 今天还没采（当天仍可采）
+                else:
+                    recoverable.append(d)
+            cur += datetime.timedelta(days=1)
+    days_left = None
+    days_left_src = None
+    oldest_effective = oldest_avail
+    if recoverable:
+        # 两路口径取更保守者（更晚的窗口起点 ⇒ 更少剩余天数）：
+        #  (a) 探针实测窗口起点；(b) 声明留存窗（retention_days / conservative_days）。
+        # 只用 (a) 会假乐观：kc 探针实测起点 2024-12-27 与声明≈25 天严重矛盾（636 天）。
+        cd = spec.get('conservative_days') or spec.get('retention_days')
+        cands = []
+        if oldest_avail:
+            cands.append(('probe', oldest_avail))
+        if cd:
+            cands.append(('declared', t - datetime.timedelta(days=cd)))
+        if cands:
+            src_name, start = max(cands, key=lambda kv: kv[1])
+            days_left = max(0, (_as_date(recoverable[0]) - start).days)
+            # 标注口径：'probe'=探针实测且未受声明窗收紧；'declared'=只有声明窗可用
+            # （探针失败，或源未提供探针）；'probe+declared'=两者都有但声明窗更紧 ⇒ 已收紧。
+            if len(cands) == 2:
+                days_left_src = 'probe+declared' if src_name == 'declared' else 'probe'
+            else:
+                days_left_src = src_name
+            oldest_effective = start
+        elif not oldest_avail:
+            # 探针失败且源未声明留存 ⇒ 无从估：保持 None（下游按「未知」处理，不假绿）
+            days_left = None
+            days_left_src = None
+    if not present and not oldest_avail:
+        verdict = 'UNKNOWN'                 # 既无快照又探不到窗口 ⇒ fail-closed
+    elif lost:
+        verdict = 'ALERT_PERMANENT_LOSS'
+    elif recoverable:
+        verdict = 'ALERT_GAP'
+    elif pending_today:
+        verdict = 'WARN_PENDING_TODAY'
+    else:
+        verdict = 'OK'
+    return {'source': name, 'title': src.get('title'), 'root': str(rroot),
+            'required': required, 'today': t.isoformat(),
+            'present_days': present, 'n_present': len(present), 'latest': present[-1] if present else None,
+            'shell_days': shells, 'day_bytes': sizes,
+            'oldest_available': (oldest_avail.isoformat() if oldest_avail else None),
+            'oldest_probe': {k: v for k, v in lo.items() if k != 'date'},
+            'retention_days': retention_days if retention_days is not None
+                              else spec.get('retention_days'),
+            'retention_evidence': spec.get('evidence'),
+            'missing_days': missing, 'n_missing': len(missing),
+            'missing_lost': lost, 'missing_recoverable': recoverable,
+            'pending_today': pending_today, 'days_left': days_left,
+            'days_left_src': days_left_src,
+            'oldest_effective': (oldest_effective.isoformat() if oldest_effective else None),
+            'verdict': verdict}
+
+
+def _tree_index(root) -> dict:
+    """快照树指纹（用于只读自证：跑前后必须逐字相同）。"""
+    rroot = Path(root)
+    idx = {}
+    if not rroot.exists():
+        return idx
+    for d in sorted(rroot.iterdir()):
+        if not (d.is_dir() and DATE_RE.match(d.name)):
+            continue
+        for p in sorted(d.iterdir()):
+            if p.is_file():
+                st = p.stat()
+                idx['%s/%s' % (d.name, p.name)] = {'size': st.st_size, 'sha256': sha256_file(p)}
+    return idx
+
+
+def verify_all(roots=None, today=None, live=None, source='all', proof: bool = True,
+               sources=None) -> dict:
+    """全源留存断档探测。只读：不写任何文件、不补采、不删。"""
+    names = list(sources) if sources else (list(SOURCES) if source == 'all' else [source])
+    roots = roots or {}
+    before = {n: _tree_index(roots.get(n) or SOURCES[n]['root']) for n in names} if proof else {}
+    res = {}
+    for n in names:
+        res[n] = audit_source(n, root=roots.get(n), today=today,
+                             live=(live or {}).get(n) if live else None)
+    proof_out = None
+    if proof:
+        after = {n: _tree_index(roots.get(n) or SOURCES[n]['root']) for n in names}
+        same = before == after
+        proof_out = {'verdict': 'unchanged' if same else 'CHANGED',
+                     'files': sum(len(v) for v in after.values()),
+                     'changed_sources': [n for n in names if before.get(n) != after.get(n)]}
+    counts = {}
+    for v in res.values():
+        counts[v['verdict']] = counts.get(v['verdict'], 0) + 1
+    out = {'schema': 'ga.rolling_source_verify/v1', 'today': (today or datetime.date.today().isoformat())[:10],
+           'sources': res, 'counts': counts, 'readonly_selfproof': proof_out}
+    bad = [n for n, v in res.items() if v['verdict'].startswith('ALERT') or v['verdict'] == 'UNKNOWN']
+    out['rc'] = 0 if not bad else 1
+    return out
+
+
+def cmd_verify(args) -> int:
+    out = verify_all(today=getattr(args, 'today', None), source=getattr(args, 'source', 'all'),
+                     proof=not getattr(args, 'no_proof', False))
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return out['rc']
+    print('■ 留存断档探测（只读；判据=日期目录 × 必需文件，不用 mtime）  今天=%s' % out['today'])
+    for n, v in out['sources'].items():
+        print('─ %-8s %s' % (n, v['title']))
+        print('   根=%s  已采=%d 天 %s' % (v['root'], v['n_present'], v['present_days'] or '（无）'))
+        print('   最老仍可采=%s（探针=%s）  留存≈%s 天  %s'
+              % (v['oldest_available'], v['oldest_probe'].get('method'),
+                 v.get('retention_days'), v['verdict']))
+        if v['missing_days']:
+            print('   缺口 %d 天: %s' % (v['n_missing'], v['missing_days']))
+            if v['missing_recoverable']:
+                est = {'probe': '',
+                       'declared': '（探针不可用，按声明留存估）',
+                       'probe+declared': '（探针窗超出声明留存，已按声明留存收紧）'}.get(
+                          v.get('days_left_src'), '')
+                print('     ↳ 仍可补采 %d 天（最早 %s，按留存≈%s 天算还剩 %s 天）%s'
+                      % (len(v['missing_recoverable']), v['missing_recoverable'][0],
+                         v.get('retention_days'), v['days_left'], est))
+            if v['missing_lost']:
+                print('     ↳ ★永久丢失 %d 天（已滚出源窗口，不可补）: %s'
+                      % (len(v['missing_lost']), v['missing_lost']))
+        if v['shell_days']:
+            print('   ★空壳日目录（有目录缺必需文件 %s，不计已采）: %s' % (v['required'], v['shell_days']))
+        if v['pending_today']:
+            print('   · 今天尚未采（当天仍可采，未计为缺口丢失）')
+    if out['readonly_selfproof']:
+        p = out['readonly_selfproof']
+        print('─ 只读自证: %s（快照树文件 %d）%s'
+              % (p['verdict'], p['files'], '' if p['verdict'] == 'unchanged'
+                 else '  ★变化源=%s' % p['changed_sources']))
+    print('─ 汇总: %s   rc=%d' % (', '.join('%s=%d' % kv for kv in sorted(out['counts'].items())), out['rc']))
+    if out['rc']:
+        bad = [n for n, v in out['sources'].items() if v['verdict'].startswith('ALERT')]
+        print('[ALERT] %d 个源存在留存断档: %s（只报不采：补采请显式跑 `snapshot`）'
+              % (len(bad), bad))
+    return out['rc']
+
+
 # ---------------------------------------------------------------- selftest
 def _mk_fixture_db(p: Path, n_rows: int = 500, days_back: int = 30) -> None:
     con = sqlite3.connect(str(p))
@@ -1620,6 +1883,148 @@ def selftest() -> int:
     ok('T17 负控-端到端总量不符 ⇒ rc≠0 且报 TOTAL_MISMATCH', e17b['rc'] != 0
        and any(v['kind'] == 'TOTAL_MISMATCH' for v in e17b['reconcile']['violations']))
 
+    # ===================== R483：留存断档探测（verify）负控/正例 =====================
+    vroot = work / 'vroot'
+
+    def mkday(root, d, name='knowledgeC.db', content=None):
+        p = root / d
+        p.mkdir(parents=True, exist_ok=True)
+        (p / name).write_bytes((content or d).encode())
+        (p / 'manifest.json').write_text('{"tool":"rolling_source_snapshot/v1"}', encoding='utf-8')
+
+    for d in ('2026-01-01', '2026-01-02', '2026-01-03'):
+        mkday(vroot, d)
+
+    # T18 正例：三天齐（含今天）⇒ OK、零缺口
+    a18 = audit_source('kc', root=vroot, today='2026-01-03', live={'date': '2026-01-01', 'rc': 0})
+    ok('T18 正例-快照齐含今天 ⇒ OK 零缺口',
+       a18['verdict'] == 'OK' and a18['n_missing'] == 0 and a18['n_present'] == 3 and not a18['pending_today'],
+       '%s present=%s' % (a18['verdict'], a18['n_present']))
+
+    # T19 负控：今天未采 ⇒ WARN_PENDING_TODAY（当天仍可采，不算丢失）
+    a19 = audit_source('kc', root=vroot, today='2026-01-04', live={'date': '2026-01-01', 'rc': 0})
+    ok('T19 负控-今天未采必报(WARN_PENDING_TODAY)',
+       a19['verdict'] == 'WARN_PENDING_TODAY' and a19['pending_today'] and a19['missing_recoverable'] == [],
+       '%s missing=%s' % (a19['verdict'], a19['missing_days']))
+
+    # T20 负控：中间缺一天（仍可补）⇒ ALERT_GAP 且 days_left 正确
+    vmiss = work / 'vmiss'
+    for d in ('2026-01-01', '2026-01-03'):
+        mkday(vmiss, d)
+    a20 = audit_source('kc', root=vmiss, today='2026-01-03', live={'date': '2026-01-01', 'rc': 0})
+    ok('T20 负控-缺一天必报(ALERT_GAP)+剩余天数正确',
+       a20['verdict'] == 'ALERT_GAP' and a20['missing_recoverable'] == ['2026-01-02']
+       and a20['days_left'] == 1 and a20['n_missing'] == 1,
+       '%s missing=%s days_left=%s' % (a20['verdict'], a20['missing_days'], a20['days_left']))
+
+    # T21 负控：连续两天未采 ⇒ 必报且缺口计数=2
+    vtwo = work / 'vtwo'
+    mkday(vtwo, '2026-01-01')
+    a21 = audit_source('kc', root=vtwo, today='2026-01-03', live={'date': '2026-01-01', 'rc': 0})
+    ok('T21 负控-连续两天未采必报(缺 01-02/01-03)',
+       a21['verdict'] == 'ALERT_GAP' and a21['missing_recoverable'] == ['2026-01-02']
+       and a21['pending_today'] and a21['n_missing'] == 2,
+       '%s missing=%s' % (a21['verdict'], a21['missing_days']))
+
+    # T22 负控：已滚出源窗口 ⇒ 永久丢失
+    a22 = audit_source('kc', root=vroot, today='2026-01-06', live={'date': '2026-01-05', 'rc': 0})
+    ok('T22 负控-滚出窗口必报永久丢失(ALERT_PERMANENT_LOSS)',
+       a22['verdict'] == 'ALERT_PERMANENT_LOSS' and a22['missing_lost'] == ['2026-01-04']
+       and a22['missing_recoverable'] == ['2026-01-05'] and a22['pending_today'],
+       '%s lost=%s' % (a22['verdict'], a22['missing_lost']))
+
+    # T23 负控：空壳日目录（有目录缺必需文件）不算已采
+    vshell = work / 'vshell'
+    mkday(vshell, '2026-01-01')
+    (vshell / '2026-01-02').mkdir(parents=True, exist_ok=True)      # 只建目录，不写 knowledgeC.db
+    a23 = audit_source('kc', root=vshell, today='2026-01-02', live={'date': '2026-01-01', 'rc': 0})
+    ok('T23 负控-空壳目录不算已采(计缺口)',
+       a23['shell_days'] == ['2026-01-02'] and a23['n_present'] == 1
+       and a23['verdict'] in ('ALERT_GAP', 'WARN_PENDING_TODAY') and a23['n_missing'] == 1,
+       '%s shell=%s missing=%s' % (a23['verdict'], a23['shell_days'], a23['missing_days']))
+
+    # T24 负控：源窗口探不到且无快照 ⇒ UNKNOWN（fail-closed，不许静默 OK）
+    a24 = audit_source('kc', root=work / 'nope', today='2026-01-03',
+                       live={'date': None, 'rc': 2, 'method': 'sqlite-ro', 'error': 'x'})
+    ok('T24 负控-无快照且探针失败 ⇒ UNKNOWN 且算不良',
+       a24['verdict'] == 'UNKNOWN' and a24['n_present'] == 0,
+       a24['verdict'])
+
+    # T25 正例-只读自证：verify_all 跑完快照树指纹逐字不变；负控-改内容必报 CHANGED
+    v26 = work / 'v26'
+    for d in ('2026-01-01', '2026-01-02'):
+        mkday(v26, d)
+    va = verify_all(roots={'kc': v26}, today='2026-01-02', live={'kc': {'date': '2026-01-01', 'rc': 0}},
+                    source='kc')
+    ok('T25 正例-只读自证 unchanged 且 rc=0',
+       va['readonly_selfproof']['verdict'] == 'unchanged' and va['rc'] == 0
+       and va['sources']['kc']['verdict'] == 'OK', str(va['counts']))
+    idx_a = _tree_index(v26)
+    (v26 / '2026-01-02' / 'knowledgeC.db').write_bytes(b'mutated-after-index')
+    idx_b = _tree_index(v26)
+    ok('T25b 负控-指纹能抓到内容变化(自证机制不会假绿)',
+       idx_a != idx_b and idx_a['2026-01-02/knowledgeC.db']['sha256']
+       != idx_b['2026-01-02/knowledgeC.db']['sha256'],
+       'keys=%s' % len(idx_a))
+
+    # T26 正例-真树复算一致性：present_days 与独立 ls 逐字一致（fixture 上做口径自证）
+    indep = sorted([d.name for d in v26.iterdir() if d.is_dir() and DATE_RE.match(d.name)
+                    and (d / 'knowledgeC.db').exists()])
+    a26 = audit_source('kc', root=v26, today='2026-01-02', live={'date': '2026-01-01', 'rc': 0})
+    ok('T26 正例-已采日集合与独立 ls 复算逐字一致',
+       a26['present_days'] == indep and a26['latest'] == '2026-01-02', str(a26['present_days']))
+
+    # T27 负控-多种判定共存：三源分别 OK / ALERT_GAP / UNKNOWN ⇒ rc=1
+    vr0, vr1 = work / 'vr0', work / 'vr1'
+    for d in ('2026-01-01', '2026-01-02', '2026-01-03'):
+        mkday(vr0, d, name='History')      # chrome 必需文件=History（负控：文件名错会被判空壳）
+    mkday(vr1, '2026-01-01'); mkday(vr1, '2026-01-03')
+    vc = verify_all(roots={'chrome': vr0, 'kc': vr1, 'pmset': work / 'none'},
+                    today='2026-01-03', proof=False, sources=['chrome', 'kc', 'pmset'],
+                    live={'chrome': {'date': '2026-01-01', 'rc': 0}, 'kc': {'date': '2026-01-01', 'rc': 0},
+                          'pmset': {'date': None, 'rc': 2}})
+    ok('T27 负控-任一源断档/未知 ⇒ rc=1 且计数分列',
+       vc['rc'] == 1 and vc['counts'].get('OK') == 1 and vc['counts'].get('ALERT_GAP') == 1
+       and vc['counts'].get('UNKNOWN') == 1, str(vc['counts']))
+
+    # T28 正例-JSON 结构键齐（给下游 task_freshness / 反射器消费）
+    need = {'schema', 'today', 'sources', 'counts', 'readonly_selfproof', 'rc'}
+    ok('T28 正例-verify JSON 顶层键齐', need <= set(va.keys()), str(sorted(va)))
+
+    # T29 负控：探针失败（源库被占用）⇒ days_left 不得为 None 静默通过，须用保守留存估并标注来源
+    a29 = audit_source('kc', root=vmiss, today='2026-01-03',
+                       live={'date': None, 'rc': 2, 'method': 'sqlite-ro', 'error': 'database is locked'})
+    ok('T29 负控-探针失败时剩余天数须保守估+标注(不许 None)',
+       a29['verdict'] == 'ALERT_GAP' and a29['days_left'] is not None
+       and a29['days_left_src'] == 'declared' and a29['oldest_available'] is None,
+       '%s days_left=%s src=%s' % (a29['verdict'], a29['days_left'], a29['days_left_src']))
+    a20b = audit_source('kc', root=vmiss, today='2026-01-03', live={'date': '2026-01-01', 'rc': 0})
+    ok('T29b 正例-探针可用时来源标 probe(估不冒充实测)',
+       a20b['days_left_src'] == 'probe' and a20b['days_left'] == 1,
+       'days_left=%s src=%s' % (a20b['days_left'], a20b['days_left_src']))
+
+    # T30 负控：探针实测窗远超声明留存（kc 实况 2024-12-27 vs ≈25 天）⇒ 剩余天数须被声明窗收紧
+    a30 = audit_source('kc', root=vmiss, today='2026-01-03', live={'date': '2024-12-27', 'rc': 0})
+    ok('T30 负控-探针窗超出声明留存须收紧(不许 636 天式假乐观)',
+       a30['days_left'] == 22 and a30['days_left_src'] == 'probe+declared'
+       and a30['oldest_effective'] == '2025-12-11',
+       'days_left=%s src=%s eff=%s' % (a30['days_left'], a30['days_left_src'], a30['oldest_effective']))
+
+    # T31 负控（反事实）：若去掉声明窗收紧，同一探针必给 636 天式假乐观 ⇒ 锁住修复不被回退
+    # 注：留存窗取自模块级 RETENTION（不是 SOURCES）⇒ 负控须改 RETENTION
+    _saved = RETENTION['kc'].get('conservative_days')
+    _saved_r = RETENTION['kc'].get('retention_days')
+    RETENTION['kc']['conservative_days'] = None
+    RETENTION['kc']['retention_days'] = None
+    try:
+        a31 = audit_source('kc', root=vmiss, today='2026-01-03', live={'date': '2024-12-27', 'rc': 0})
+    finally:
+        RETENTION['kc']['conservative_days'] = _saved
+        RETENTION['kc']['retention_days'] = _saved_r
+    ok('T31 负控-去声明窗即复现假乐观(证明该收紧确实起作用)',
+       a31['days_left'] == 371 and a31['days_left_src'] == 'probe',
+       'days_left=%s src=%s' % (a31['days_left'], a31['days_left_src']))
+
     shutil.rmtree(work, ignore_errors=True)
     bad_n = [n for n, c, _ in cases if not c]
     print('---\nselftest: %d/%d PASS%s' % (len(cases) - len(bad_n), len(cases), '' if not bad_n else '  失败: %s' % bad_n))
@@ -1676,6 +2081,12 @@ def main() -> int:
     s.add_argument('--all-days', action='store_true'); s.add_argument('--json', action='store_true')
     s.set_defaults(func=cmd_window)
     s = sub.add_parser('list'); s.add_argument('--json', action='store_true'); s.set_defaults(func=cmd_list)
+    s = sub.add_parser('verify', help='留存断档探测：日期目录 × 必需文件对账（只报不采；R483）')
+    s.add_argument('--source', default='all', choices=['all'] + list(SOURCES))
+    s.add_argument('--today', help='以该日期为「今天」（默认系统日期；供复算/夹具）')
+    s.add_argument('--json', action='store_true')
+    s.add_argument('--no-proof', action='store_true', help='跳过快照树只读自证（默认做）')
+    s.set_defaults(func=cmd_verify)
     s = sub.add_parser('selftest'); s.set_defaults(func=lambda a: selftest())
     a = ap.parse_args()
     return a.func(a)
