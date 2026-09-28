@@ -1,0 +1,99 @@
+{
+ "_doc": {
+  "purpose": "tools/*.py 中「无可复跑入口」(tier ∉ {SELFTEST,SUBMCOMMAND}) 的逐条处置登记；由 tools/usage_census.py --entries 的闸门 guard_entry_disposition 消费。",
+  "status_semantics": {
+   "ACTIVE": "形态合理且存在真实消费路径（库/被 import/launchd plist 驱动/SOP 记录的 flag 调用），保留现态，无需补入口",
+   "DEFER": "当前无真实消费者或待接线，已登记待办，暂保留",
+   "RETIRE": "建议退役（无消费者且无预期用途）"
+  },
+  "evidence_format": "'<repo 相对路径> | <token>'，须文件存在且 token 逐字命中（不支持 ~ 路径）",
+  "generated": "2026-09-29 03:42:11",
+  "note": "R501 首次建立；12 条与 temp/r501_entries/entries.json 的 no_entry 逐条对应"
+ },
+ "entries": {
+  "audio_asr_batch.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/asr_sop.md | audio_asr_batch.py"
+   ],
+   "note": "asr_sop 记录的 flag 调用式（--assets/--outdir/--model），批量转写主力；缺 --selftest，回归靠 SOP 夹具，暂不纳 CI"
+  },
+  "audio_asset_inventory.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/asr_sop.md | audio_asset_inventory.py"
+   ],
+   "note": "asr_sop 记录：盘点/去重/音轨判定入口；计数口径曾有两义（unique vs unique_incl_not_media）已在工具内订正"
+  },
+  "audio_vad_scan.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/asr_sop.md | audio_vad_scan.py"
+   ],
+   "note": "asr_sop 记录：silero VAD 预筛（≈257× 实时）；face=仅记忆引用（无仓内代码引用）"
+  },
+  "build_output_archive.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/output_archive_sop.md | build_output_archive.py"
+   ],
+   "note": "由仓外 launchd com.cuip.archive-rebuild.plist 驱动（监听 output 重建 + 8899 服务）；本仓无调用点"
+  },
+  "cache_reclaim.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/autonomous_reports/R368_磁盘「可再生空间」回收工具化_cache_reclaim.md | cache_reclaim.py"
+   ],
+   "note": "人工按需（默认 dry-run，--apply 需显式确认）；无自动消费者，R429 reclaim_candidates 仅复用其 ITEMS 口径不调用"
+  },
+  "kc_snapshot_guard.py": {
+   "status": "DEFER",
+   "evidence": [
+    "memory/global_mem_insight.txt | kc_snapshot_guard.py"
+   ],
+   "note": "守卫已落地但未接线（LaunchAgents/sche_tasks 命中 0，L1 明记『未接线待批』）⇒ 待接线决策；接线后本条应撤销"
+  },
+  "lan_ip.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "sche_tasks/run_tech_trends.py | lan_ip"
+   ],
+   "note": "库形态（无 CLI 属设计）：sche_tasks/run_tech_trends.py:11 与 run_trendradar_digest.py:56 均 from tools.lan_ip import archive_url"
+  },
+  "log_compress.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/autonomous_reports/R349_draft_fix-compress-deadref.md | log_compress.py"
+   ],
+   "note": "消费链=memory/autonomous_operation_sop/helper.py:29 → temp/compress_log.py（shim）→ runpy tools/log_compress.py；helper 直指 tools/ 的根治仍待批"
+  },
+  "memory_assert_audit.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "tools/report_assert_audit.py | memory_assert_audit"
+   ],
+   "note": "库形态：被 tools/report_assert_audit.py import 复用常量表/basename 索引；报告 R378 记录 --negctl 用法"
+  },
+  "report_assert_audit.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/autonomous_reports/R380_报告路径断言机械审计.md | report_assert_audit.py"
+   ],
+   "note": "只读审计工具，命令行用法记在 R380 报告（--top/--json/--negctl）；人工按需跑"
+  },
+  "restore_ga_desktop_bridge.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/autonomous_reports/R421_使用热度×T0备份×tools消费面三向对账.md | restore_ga_desktop_bridge.py"
+   ],
+   "note": "由仓外 launchd com.genericagent.desktop-bridge-repair.plist 驱动；R419 曾误判为 dead，R421 以 plist 证据推翻"
+  },
+  "trendradar_keyword_ab.py": {
+   "status": "ACTIVE",
+   "evidence": [
+    "memory/trendradar_sop.md | trendradar_keyword_ab.py"
+   ],
+   "note": "trendradar_sop 记录的只读离线复算入口（--days/--end/--pair-mode/--json）；face=仅记忆引用"
+  }
+ }
+}
