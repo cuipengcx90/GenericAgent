@@ -27,6 +27,19 @@
 - `roi_history.json` **非 git 跟踪**（`git ls-files` 空，`git status` 亦不报）⇒ 收尾**无需提交**；快照总数 **90**（`task_volume_v1` 89 个、含 `avg_lines_per_task` 仅 1 个=2026-05-03 的 115.7）。
 - 结论口径：本任务**无推送要求**，正常日只写快照 + 报告。
 
+## 口径 v3（2026-09-29 R497 标定，未接线，待批）
+
+**三条铁律**（全量口径只作旁证，判读一律用业务型）：
+1. **心跳判定走单一源**：`tools/roi_task_class.json`（30 类任务；规则 = `per_active_day ≥ 1.0 ∧ median_lines ≤ 25`，规则违例 0；heartbeat = `folder_watcher`/`price_alert`/`bridge_autonomous`/`sqlite_snapshot`）。**禁止再散落文件名硬编码**。
+2. **双口径并行**：全量 / 业务型 / 心跳型三行 + 心跳占比列；跨期比较只用业务型；同时给**去重任务种类数**（执行次数会被同日多跑灌水）。
+3. **阈值须过「可触发性闸门」**：每条规则在历史评估窗内须 ≥1 次触发且 ≤33% 触发天数，否则视为死阈值（v2 的 `biz_drop>25` 仅 1/127、`bpd<4` 仅 2/127 即在 2026-06-05 后沉默）。
+
+**v3 阈值（`tools/roi_thresholds_v3.json`，四条全 gate PASS）**：R1 `bpd < 4.0`（业务型执行量稀疏）/ R2 `lines7 < 26.6`（单任务均产出过低）/ R3 `biz_drop > 34.4`（业务层 7 日均 vs 30 日均）/ R4 `ratio > 5.85`（灌水比 = 执行次数 / 去重种类）；R5 `unclass7 > 0`（出现未登记任务名，fail-closed）。
+
+**回测硬证据（127 天评估窗）**：`wow_all < -30` 触发 **20/127** 且末次连续至 **2026-09-28** —— 该触发在 09-21/22 心跳归档后已成**结构假象**（同期业务型 **+11.4%**）；v2 旧历史值 `V2a/V2b` 现场实测为 4/127 与 2/127（旧会话笔记的 `1/127` 口径不同，未采信）。
+
+**只读工具（勿重造）**：`tools/roi_task_class.py`（`audit` / `selftest` 23/23）、`tools/roi_calibration.py`（`scan` / `calibrate` / `backtest` / `proof`，`proof files=203 changed=[]`）。生产端接线（`roi_monitor.py` 消费 v3）仍**待批准**：见 `temp/pending_decisions/DECISIONS_R497_roi_calibration.md`（D1 接线 / D2 定时复算 / D3 心跳集合扩面复核）。
+
 ## 报告写法（避免重复踩坑）
 - dashboard 同时给**全量 / 业务型 / 心跳型**三行；趋势表附**心跳占比**列；跨期比较只用业务型。
 - 告警段必须显式写"字段缺失/阈值口径"这类**沉默盲区**，不能只抄脚本的 `alerts=[]`。

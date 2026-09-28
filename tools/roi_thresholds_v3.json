@@ -1,0 +1,115 @@
+{
+ "schema": "roi_thresholds_v3",
+ "generated_at": "2026-09-29T02:16:39",
+ "calibrated_on": {
+  "done_dir": "/Users/cuip/projects/GenericAgent/sche_tasks/done",
+  "n_days_total": 157,
+  "warmup_days": 30,
+  "eval_days": 127,
+  "window": [
+   "2026-05-23",
+   "2026-09-28"
+  ],
+  "registry_sha16": "d4b4124744285953"
+ },
+ "constants": {
+  "quantile_grid": [
+   0.02,
+   0.05,
+   0.1,
+   0.15,
+   0.2,
+   0.25,
+   0.3
+  ],
+  "min_fire_rate": 0.01,
+  "fire_cap": 0.33
+ },
+ "rules": [
+  {
+   "id": "R1",
+   "metric": "bpd",
+   "op": "lt",
+   "threshold": 4.0,
+   "kind": "calibrated",
+   "rule": "bpd < 4.0",
+   "desc": "业务型任务执行量稀疏(7日均)",
+   "quantile": 0.02,
+   "fires": 2,
+   "fire_rate": 0.0157,
+   "fire_dates": [
+    "2026-06-04",
+    "2026-06-05"
+   ],
+   "gate": "PASS"
+  },
+  {
+   "id": "R2",
+   "metric": "lines7",
+   "op": "lt",
+   "threshold": 26.6,
+   "kind": "calibrated",
+   "rule": "lines7 < 26.6",
+   "desc": "业务型单任务平均产出过低(7日均行数)",
+   "quantile": 0.02,
+   "fires": 3,
+   "fire_rate": 0.0236,
+   "fire_dates": [
+    "2026-07-10",
+    "2026-07-12",
+    "2026-08-07"
+   ],
+   "gate": "PASS"
+  },
+  {
+   "id": "R3",
+   "metric": "biz_drop",
+   "op": "gt",
+   "threshold": 34.4,
+   "kind": "calibrated",
+   "rule": "biz_drop > 34.4",
+   "desc": "业务层 7日均 vs 30日均 下滑幅度",
+   "quantile": 0.02,
+   "fires": 2,
+   "fire_rate": 0.0157,
+   "fire_dates": [
+    "2026-06-04",
+    "2026-06-05"
+   ],
+   "gate": "PASS"
+  },
+  {
+   "id": "R4",
+   "metric": "ratio",
+   "op": "gt",
+   "threshold": 5.85,
+   "kind": "calibrated",
+   "rule": "ratio > 5.8",
+   "desc": "业务型灌水比(执行次数/去重种类数)",
+   "quantile": 0.02,
+   "fires": 3,
+   "fire_rate": 0.0236,
+   "fire_dates": [
+    "2026-06-21",
+    "2026-06-25",
+    "2026-09-18"
+   ],
+   "gate": "PASS"
+  },
+  {
+   "id": "R5",
+   "metric": "unclass7",
+   "op": "gt",
+   "threshold": 0,
+   "kind": "fail_closed",
+   "rule": "unclass7 > 0",
+   "desc": "出现未登记任务名(fail-closed)",
+   "fires": 0,
+   "fire_rate": 0.0,
+   "fire_dates": [],
+   "gate": "n/a(fail-closed)"
+  }
+ ],
+ "gate_ok": true,
+ "problems": []
+}
