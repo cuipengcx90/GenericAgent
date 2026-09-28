@@ -51,3 +51,8 @@ max_delay_hours（可选，默认6）：超过schedule多少小时后不再触�
 - **症状**：`git add memory/xxx.md sche_tasks/done/2026-09-23_1830_yyy.md && git commit -m '...'` 整条**什么都不做**——`git add` 因路径被忽略而 **rc=1**（stderr：`The following paths are ignored by one of your .gitignore files: sche_tasks/done`），`&&` 短路 ⇒ commit 从不执行；而 `git commit -q` 静默更让人误以为已提交。
 - **判据**：`git status --porcelain <记忆文件>` 仍显示 `M ` （首列 M=已暂存未提交）或 `git log --oneline -1` 没变 ⇒ 提交没发生。
 - **正确姿势**：**只 add 记忆文件**（报告不入 git 是既有约定）；如需强制可 `git add -f`（一般不必）。收尾核验固定看 `git log --oneline -1` 的哈希，别只看有无报错。
+## 🔎 任务 prompt 静态体检（R469）
+- 任何 `sche_tasks/*.json` 新增/修改 prompt 后，先跑 `python3 tools/sche_tasks_lint.py`（只读，无参数=全量）做五查：cwd 依赖、路径锚定、flag、超时、通道。
+- 判读：`FAIL`=显式 `../` 锚定（在 cwd=repo 根时必失败，实测 3 例：weekly_report_reminder / linuxdo_ai_daily_summary / weekly_inspection）；`WARN`=裸相对名等跨仓歧义；`OK/SKIP` 无需处理。
+- 用法：`--only <id>[,<id>]`（未知 id 直接 rc=2）、`--json <path>`、`--sandbox` 复现 cwd 漂移、`--selftest`。
+- 与 R375 的关系：R375 记录的两类 cwd 吃态事故（PATH_MISSING / CWD_DRIFT）本器已可复现，修法仍待批（见 pending_decisions）。
