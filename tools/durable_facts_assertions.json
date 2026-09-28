@@ -1,0 +1,97 @@
+{
+ "_doc": "耐久记忆事实断言注册表 —— 由 tools/durable_facts_lint.py 消费（只读）。原则：只登记「会被当成事实读」的断言，每条都必须机器可判。status=ACTIVE 表示该断言现在应成立（其 CONTRADICTED 计入 rc）；status=CLOSED 表示已知缺口（已被别的批次登记/属他会话文件，rc 默认不计入，见 main --strict）。",
+ "_limitations": "claim_body_conflict 类需要「一行一事实」的语料；L1/L2 与报告多为『一行一主题、含多 artifact』的超长行，实测该口径在 mega-line 上会产生假冲突（同一行既写 已闭环 又写 待批 是合法叙述），故本表不为真实 mega-line 语料登记该类，仅在 --selftest 夹具中验证其判定力。",
+ "assertions": [
+  {
+   "id": "R468-A1",
+   "cls": "SOP_VS_IMPL",
+   "check": "index_insert_side",
+   "status": "ACTIVE",
+   "params": {
+    "sop_file": "memory/autonomous_operation_sop/task_planning.md",
+    "sop_claim_regex": "`INDEX\\.md` 按编号[^。]{0,70}",
+    "target_file": "memory/autonomous_reports/INDEX.md",
+    "row_regex": "\\|\\s*R(\\d+)\\s*\\|"
+   },
+   "note": "R468 旗舰事实锚：SOP 第 47 行的 ④ 句曾写「INDEX.md 按编号升序⇒新行追加文件末尾」，实测 INDEX.md 首行=最新编号（顶部插）。本断言即该句的机器判据：订正前 CONTRADICTED，订正后 MATCH；若日后实践改回末尾追加，本断言会重新变红。"
+  },
+  {
+   "id": "R468-A2",
+   "cls": "SOP_VS_IMPL",
+   "check": "index_insert_side",
+   "status": "ACTIVE",
+   "params": {
+    "sop_file": "memory/autonomous_operation_sop/task_planning.md",
+    "sop_claim_regex": "`history\\.md` 按编号\\*\\*降序\\*\\*⇒新行插\\*\\*顶部\\*\\*",
+    "target_file": "memory/autonomous_reports/history.md",
+    "row_regex": "^R(\\d+) \\|"
+   },
+   "note": "正控（同句里成立的那半）：history.md 断言=顶部、实测=顶部 ⇒ MATCH。若本器在真实语料上只会报红，这条会先暴露。"
+  },
+  {
+   "id": "R468-A3",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/autonomous_reports/history.md",
+    "count_line_regex": "行数\\s*(\\d+)",
+    "row_regex": "^R\\d+ \\|"
+   },
+   "note": "已知缺口（不代改）：history.md 首段计数行写「行数 397」（2026-09-26 口径），实际 ^R 行数已 432 ⇒ 陈旧 35。该行由收尾归档方按批改写，属他会话文件，本批只登记+报告，不动手。"
+  },
+  {
+   "id": "R468-A4",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/autonomous_reports/INDEX.md",
+    "count_line_regex": "索引可见\\s*(\\d+)\\s*个编号",
+    "row_regex": "\\|\\s*R\\d+\\s*\\|"
+   },
+   "note": "同族缺口：INDEX.md 头部写「索引可见 398 个编号」，实测表行数远大于该值（同一索引的两套计数口径未同步）。同样只登记。"
+  },
+  {
+   "id": "R468-A5",
+   "cls": "REF_EXISTS",
+   "check": "path_tokens_exist",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/wechat_signals_sop.md",
+    "token_regex": "wechat_[a-z_0-9]+\\.json",
+    "expect": "NO_ABSENT"
+   },
+   "note": "已知缺口（待批 R418 D3）：wechat_signals_sop.md 引 5 个 sche_tasks/wechat_*.json，实测 4 无 1 有（wechat_cc_daily_13h.json 在盘）。本批不修（属既有待批台账），登记以保证「文件补齐/引用被删」两个方向都有机器证据。"
+  },
+  {
+   "id": "R468-A6",
+   "cls": "CITED_FILE_TRUTH",
+   "check": "file_truth",
+   "status": "ACTIVE",
+   "params": {
+    "token": "monitored_groups.json",
+    "search_roots": [
+     "temp"
+    ],
+    "expect": "NONE"
+   },
+   "note": "R418 的「他根相对路径」歧义样本：该名全盘查无（曾在报告中以 temp 相对路径形式出现）。断言=全盘查无；若日后真身出现，本断言转红，提示复核那条引用的落点。"
+  },
+  {
+   "id": "R468-A7",
+   "cls": "CITED_FILE_TRUTH",
+   "check": "file_truth",
+   "status": "ACTIVE",
+   "params": {
+    "token": "profile.py",
+    "search_roots": [
+     "memory",
+     "temp"
+    ],
+    "expect_under": "memory/"
+   },
+   "note": "同名多份（归属类）：kc 作息画像脚本在 memory/kc_profile/ 有耐久副本、temp/ 侧为工作副本。断言=「可在 memory/ 下解析」，其余同名只作提示——这正是 R404 所说的『全盘无同名』类断言会过期，故口径改为「归属在哪」。"
+  }
+ ]
+}
