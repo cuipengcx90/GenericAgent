@@ -36,6 +36,7 @@
 现象：`connect.linux.do` 顶层导航必定停在 CF managed challenge(title「请稍候…」，hidden `cf-turnstile-response` 恒为空)。
 根因：Chrome cookies 里 `cf_clearance` 的 `partitionKey.topLevelSite = https://linux.do`(CHIPS 分区 cookie)，**仅当顶层站点是 linux.do 时才携带**；顶层导航到 connect.linux.do 不携带 → 必然重新挑战。同浏览器访问 `https://linux.do/` 正常放行。
 已验证无效：等待6~15s / 连续重载 / `Page.reload(ignoreCache)` / `Page.bringToFront` 前台化 / curl 带 `cf_clearance`+`auth.session-token` 直连(403，JA3 指纹不符) / 从 linux.do 页跨域 fetch(被 CORS 挡)。
+**⚠️ 可达性会波动：connect 并非恒被卡死(2026-09-28 实测)**：本次 `window.open('https://connect.linux.do/','_blank')` 新 tab **首读即得完整正文**(`readyState=complete`，含「信任级别 3 的要求」「未达到」；原始 651 B、剔除 driver 行后 340 字符)，未出现 CF 挑战 ⇒ 处置顺序仍是「**先试 connect，失败才回落首页等级卡**」，两条入口互为兜底；报告里要写清本次实际走的是哪条。
 **备用入口(推荐)**：直接读 **linux.do 首页的「要求」等级卡**，一步拿到全部 TL3 明细，格式与 connect 页一致：
 `✓ 访问天数 81/50 / ✓ 浏览话题 582/500 / ○ 已读帖子 13407/20000 / ○ 回复 8/10 / ✓ 送出赞 84/30 / ✓ 获赞 39/20 / ✓ 获赞天数 9/7 / ✓ 点赞用户 39/5 / ✓ 被举报帖子 0/5 / ✓ 发起举报 0/5 / ✓ 被禁言 0/0 / ✓ 被封禁 0/0`，卡片头部汇总「✓N 已达标 / X% 完成度 / LvX → LvX+1 / ○M 待完成」。
 **⚠️ 达标判定必须按页面标记，禁用数值机械比较(2026-09-25 实测)**：等级卡每项首字符是 `✓`(达标)或 `○`(待完成)，文本结构固定为「标记/名称/当前值/`/`/门槛值」四元组——用正则 `([✓○])\n([^\n]+?)\n(\d+)\n/\n(\d+)\n` 一次抽全 12 条，**mark 才是判据**。若按「当前值 < 门槛值」机械判会误报：「被举报帖子 0/5」「发起举报 0/5」「被禁言/被封禁 0/0」属**越少越好**的上限类指标，页面标 ✓ 却会全被算成未达标。检查脚本应输出「✓项数/○项数」，并与头部「✓N 已达标 / M% 完成度 / ○M 待完成」对账自洽。
