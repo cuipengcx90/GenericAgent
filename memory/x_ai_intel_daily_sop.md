@@ -17,6 +17,13 @@ d=TMWebDriver(); print(d.is_remote, len(d.get_all_sessions()), d.find_session("x
    `osascript -e 'tell application "Google Chrome" to get URL of tabs of windows'`
    ★**实测坑（2026-09-25）**：若唯一标签是 `chrome-extension://…/onetab.html`（OneTab 2.21 等扩展页），Chrome 会显示"有窗口有标签"，但**扩展页不注入内容脚本 ⇒ 驱动会话恒为 0**——用户把标签收进 OneTab 就等价于"没有浏览器标签"。
 
+## 第四形态：标签在册但该标签 JS 通道死（2026-09-28 现场实测）
+- 现象：`get_all_sessions()` 里有 x.com，`set_session("x.com")` **成功**，但 `execute_js` 报 `CDP fallback failed: No tab with given id <id>`；同批其它标签可能正常（实测 7 标签 = 2 OK / 5 FAIL）⇒ **故障按标签粒度**，非驱动整体掉线。
+- 判据：`web_scan`/`get_all_sessions` 给的 id 与 AppleScript 枚举的「标签确实存在」是**两件事**（前者=扩展会话表，本次其 id 与 CDP 真值不符亦照列）；两者不可互证「通道可用」。唯一判据是**实跑一次 JS**：
+  `python3 -c "import sys;sys.path.insert(0,'.');from TMWebDriver import TMWebDriver;d=TMWebDriver();print(d.execute_js('return document.title', session_id='<x.com 标签 id>'))"`
+- ★「激活标签」不能修：实测 `set active tab index` + `activate` + 等 4s 后仍 FAIL（该标签 title 亦仍为空=未渲染）⇒ 别把「切到前台」当修复手段。
+- 处置：仍属外部前置 ⇒ 报阻塞、等用户重开标签（或手动在该标签加载一次 x.com），**不改脚本**。
+
 ## 恢复与处置
 - 恢复（需用户动作，代理不得代开标签）：打开并登录 `https://x.com/home` 且**不要收进 OneTab** → 下次调度自动恢复。
 - 长期不用则建议归档为 disabled（避免每天一条必然失败记录），归档需批准。
