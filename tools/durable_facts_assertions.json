@@ -92,6 +92,162 @@
     "expect_under": "memory/"
    },
    "note": "同名多份（归属类）：kc 作息画像脚本在 memory/kc_profile/ 有耐久副本、temp/ 侧为工作副本。断言=「可在 memory/ 下解析」，其余同名只作提示——这正是 R404 所说的『全盘无同名』类断言会过期，故口径改为「归属在哪」。"
+  },
+  {
+   "id": "R477-A8",
+   "cls": "COUNT",
+   "check": "expr_sum",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "claim_regex": "注册面=LaunchAgents 29\\+sche_tasks 25=54"
+   },
+   "note": "R477 订正锚（L1）：原句写「LaunchAgents 29+sche_tasks 25+reflect_scripts 14=54」被本器判 CONTRADICTED（29+25+14=68≠54）；按 todo_claim_audit.py 源码口径「注册面=plist+sche_tasks，reflect 另列」订正为 29+25=54 ⇒ MATCH。若日后有人再把旁项并进算式，本断言立刻转红。"
+  },
+  {
+   "id": "R477-A9",
+   "cls": "COUNT",
+   "check": "expr_sum",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem.txt",
+    "claim_regex": "29\\+25 = \\*\\*54\\*\\*"
+   },
+   "note": "同一处缺陷的 L2 副本（global_mem.txt 第 574 行原写 reflect_scripts 14 计入合计）⇒ 同批订正，本断言锁新算式。"
+  },
+  {
+   "id": "R477-A10",
+   "cls": "COUNT",
+   "check": "expr_sum",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem.txt",
+    "claim_regex": "22\\+3\\+0=25"
+   },
+   "note": "注册面分项算式（sche_tasks 启用22+禁用3+空0=25）自洽性；任一目录项数变化而记忆未更新即转红。"
+  },
+  {
+   "id": "R477-A11",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/autonomous_reports/INDEX.md",
+    "count_line_regex": "索引可见\\s*(\\d+)\\s*个编号",
+    "count_source": {
+     "kind": "rows_diff",
+     "a": {
+      "file": "memory/autonomous_reports/INDEX.md",
+      "row_regex": "\\|\\s*R\\d+\\s*\\|"
+     },
+     "b": {
+      "file": "memory/autonomous_reports/history.txt",
+      "row_regex": "^R\\d+ \\|"
+     }
+    }
+   },
+   "note": "R468-A4 的量化升级：INDEX.md 头部计数行是 2026-09-25 生成时点的快照（398），与磁盘实测的「表行−history 行」差已不一致。属他会话（归档方）文件，本批只登记+报告不改文；status=CLOSED ⇒ 默认不因此红。"
+  },
+  {
+   "id": "R477-A12",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "INDEX多(\\d+)编号",
+    "count_source": {
+     "kind": "rows_diff",
+     "a": {
+      "file": "memory/autonomous_reports/INDEX.md",
+      "row_regex": "\\|\\s*R\\d+\\s*\\|"
+     },
+     "b": {
+      "file": "memory/autonomous_reports/history.txt",
+      "row_regex": "^R\\d+ \\|"
+     }
+    }
+   },
+   "note": "L1 原写「INDEX多33编号」，2026-09-28 实测为 37（同批已订正为 37 并标注日期）。本断言=订正值的机器复核（当日 MATCH）；随归档推进该值会变大 ⇒ 快照型，登记 CLOSED 以免长期刷红。"
+  },
+  {
+   "id": "R477-A13",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "2026-09-28 实测 (\\d+)\\)实测接线",
+    "count_source": {
+     "kind": "glob",
+     "pattern": "tools/*.py"
+    }
+   },
+   "note": "L1 的 R421 行原写「40 个 tools/*.py」为快照值，同批补注「R421 快照;2026-09-28 实测 68」。本断言复核 68（快照型：新增工具后需重新盖章，故 CLOSED）。"
+  },
+  {
+   "id": "R477-A14",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "CLOSED",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "2026-09-28 实测 md (\\d+)\\)",
+    "count_source": {
+     "kind": "glob",
+     "pattern": "memory/autonomous_reports/*.md"
+    }
+   },
+   "note": "R418 的「报告归档面盘上 173 vs tracked 155」为 2026-09-26 时点；同批补注 2026-09-28 实测 md=230。快照型 ⇒ CLOSED。"
+  },
+  {
+   "id": "R477-A15",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "t0_baseline\\.sha256 (\\d+)条",
+    "count_source": {
+     "kind": "file_lines",
+     "file": "temp/t0_baseline.sha256",
+     "nonempty": true
+    }
+   },
+   "note": "T0 保护面条数（R461 行写 6299）必须等于基线文件非空行数；基线重建而记忆未更新即转红（文件缺失则 UNVERIFIABLE，不当 0）。"
+  },
+  {
+   "id": "R477-A16",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "(\\d+)条entries",
+    "count_source": {
+     "kind": "json_len",
+     "file": "memory/credential_surface/credentials.json",
+     "path": "entries"
+    }
+   },
+   "note": "凭证声明面条数（25）与 credentials.json 的 entries 长度必须一致；新增凭证条目而 L1 未同步即转红。"
+  },
+  {
+   "id": "R477-A17",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "targets 37→(\\d+)",
+    "claim_take": "first",
+    "count_source": {
+     "kind": "json_len",
+     "file": "tools/freshness_criteria.json",
+     "path": "targets"
+    }
+   },
+   "note": "R470 行「判据表 7 条登记 targets 37→44」的终值须等于判据表 targets 数组长度（claim 在 L1 出现两次 ⇒ claim_take=first）。"
   }
  ]
 }

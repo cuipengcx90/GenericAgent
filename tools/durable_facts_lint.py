@@ -37,6 +37,7 @@
   同 token 集下旧式逐 token 全仓 walk 需 239.01s ⇒ 索引化后 **1356×**（判定逐字一致）。
 """
 import argparse
+import glob
 import hashlib
 import io
 import json
@@ -333,21 +334,166 @@ def chk_claim_body_conflict(p):
     return "MATCH", res, "artifact %s 无自相矛盾" % (arts[:3])
 
 
+def _abs(p):
+    """注册表路径：`~` 展开；其余按 REPO 相对解析"""
+    if p.startswith("~"):
+        return os.path.expanduser(p)
+    return os.path.join(REPO, p)
+
+
+def _count_source(spec):
+    """按规格求「实测计数」-> (int|None, evidence, reason)
+
+    kind=rows       : file 内 row_regex 命中的行数（可跨文件：声明在 A、数据在 B）
+    kind=file_lines : file 的行数（nonempty=true 时只数非空行）
+    kind=glob       : pattern 命中文件数（相对 REPO；`~` 开头按用户目录）
+    kind=json_len   : file 的 JSON 在 dotted path 处的长度（dict/list/str）
+
+    kind=glob_multi : patterns 列表各自 glob 后求和（每项目录必须存在，任一缺失即 fail-closed）
+    kind=rows_diff  : a/b 两处 row_regex 命中行数之差（如 INDEX 表行 − history 编号行）
+
+    fail-closed：源缺失 / JSON 坏 / path 不可达 ⇒ (None, …, reason)，
+    由调用方判 UNVERIFIABLE —— 绝不静默当成 0（「源没了」与「计数变 0」是两回事）。
+    """
+    kind = spec.get("kind")
+    if kind in ("rows", "file_lines", "json_len"):
+        txt = read_text(_abs(spec["file"]))
+        if txt is None:
+            return None, {}, "计数源文件不存在: %s" % spec["file"]
+        if kind == "rows":
+            n = len(re.findall(spec["row_regex"], txt, re.M))
+            return n, {"kind": "rows", "source": spec["file"]}, ""
+        if kind == "file_lines":
+            lines = txt.split("\n")
+            if lines and lines[-1] == "":
+                lines = lines[:-1]
+            n = len([l for l in lines if l.strip()]) if spec.get("nonempty") else len(lines)
+            return n, {"kind": "file_lines", "source": spec["file"],
+                       "nonempty": bool(spec.get("nonempty"))}, ""
+        try:
+            cur = json.loads(txt)
+        except ValueError as e:
+            return None, {}, "计数源 JSON 解析失败: %s (%s)" % (spec["file"], e)
+        for k in str(spec["path"]).split("."):
+            if isinstance(cur, dict):
+                if k not in cur:
+                    return None, {}, "计数源 path 不可达: %s" % spec["path"]
+                cur = cur[k]
+            elif isinstance(cur, list):
+                try:
+                    cur = cur[int(k)]
+                except (ValueError, IndexError):
+                    return None, {}, "计数源 path 越界: %s" % spec["path"]
+            else:
+                return None, {}, "计数源 path 不可达: %s" % spec["path"]
+        try:
+            n = len(cur)
+        except TypeError:
+            return None, {}, "计数源 path 处不可取长度: %s" % spec["path"]
+        return n, {"kind": "json_len", "source": spec["file"], "path": spec["path"]}, ""
+
+    if kind == "glob_multi":
+        ev = {"kind": "glob_multi", "per": {}}
+        total = 0
+        for p0 in spec.get("patterns", []):
+            n0, _e0, why0 = _count_source({"kind": "glob", "pattern": p0})
+            if n0 is None:
+                return None, {}, "glob_multi 子项失败: %s（pattern=%s）" % (why0, p0)
+            ev["per"][p0] = n0
+            total += n0
+        if not spec.get("patterns"):
+            return None, {}, "glob_multi 未给 patterns"
+        return total, ev, ""
+
+    if kind == "rows_diff":
+        a = _count_source(dict(spec["a"], kind="rows"))
+        b = _count_source(dict(spec["b"], kind="rows"))
+        if a[0] is None:
+            return None, {}, "rows_diff 左项失败: %s" % a[2]
+        if b[0] is None:
+            return None, {}, "rows_diff 右项失败: %s" % b[2]
+        return a[0] - b[0], {"kind": "rows_diff", "a_rows": a[0], "b_rows": b[0],
+                             "a": spec["a"]["file"], "b": spec["b"]["file"]}, ""
+
+    if kind == "glob":
+        pat = spec["pattern"]
+        pat = os.path.expanduser(pat) if pat.startswith("~") else os.path.join(REPO, pat)
+        base = pat.split("*")[0]
+        if base.endswith("/"):
+            base = base.rstrip("/")
+        else:
+            base = os.path.dirname(base)
+        if "*" not in pat:
+            return None, {}, "glob 规格无通配符（拒绝把固定路径当计数）: %s" % pat
+        if not os.path.isdir(base):
+            return None, {}, "计数源目录不存在: %s" % base
+        hits = glob.glob(pat)
+        return len(hits), {"kind": "glob", "pattern": pat,
+                           "samples": [os.path.basename(x) for x in sorted(hits)[:3]]}, ""
+
+    return None, {}, "未知 count_source.kind: %s" % kind
+
+
 def chk_count_consistency(p):
-    """『行数 N』声明 与 实际行数 是否自洽"""
+    """『N 个/行/条』声明 与 实测计数 是否自洽
+
+    声明侧：file + count_line_regex（claim_group 默认 1；claim_take=first|last，默认 first）
+    实测侧：① legacy `row_regex`（同文件行数）或 ② `count_source` 规格（跨文件/glob/JSON/非空行）
+    """
     res = {"detail": [], "evidence": {}}
-    txt = read_text(os.path.join(REPO, p["file"]))
+    txt = read_text(_abs(p["file"]))
     if txt is None:
         return "UNVERIFIABLE", res, "源文件不存在: %s" % p["file"]
-    m = re.search(p["count_line_regex"], txt, re.M)
-    if not m:
+    hits = list(re.finditer(p["count_line_regex"], txt, re.M))
+    if not hits:
         return "UNVERIFIABLE", res, "未匹配到计数行: %s" % p["count_line_regex"]
-    declared = int(m.group(1))
-    actual = len(re.findall(p["row_regex"], txt, re.M))
-    res["evidence"] = {"declared": declared, "actual": actual}
-    res["detail"].append("[计数] 声明 %d / 实测 %d" % (declared, actual))
+    if p.get("claim_take", "first") == "last":
+        hits = hits[-1:]
+    m = hits[0]
+    g = int(p.get("claim_group", 1))
+    try:
+        declared = int(m.group(g))
+    except (IndexError, ValueError):
+        return "UNVERIFIABLE", res, "计数行第 %d 捕获组非数字: %s" % (g, p["count_line_regex"])
+    ev = {"declared": declared, "claim_text": m.group(0)[:120]}
+    if "count_source" in p:
+        actual, sev, why = _count_source(p["count_source"])
+        if actual is None:
+            res["evidence"] = ev
+            return "UNVERIFIABLE", res, why
+        ev.update(sev)
+    else:
+        actual = len(re.findall(p["row_regex"], txt, re.M))
+        ev["kind"] = "rows(same-file)"
+    res["evidence"] = ev
+    res["detail"].append("[计数] 声明 %d / 实测 %d（%s）" % (declared, actual, ev.get("kind", "")))
     return ("MATCH", res, "计数自洽") if declared == actual else \
-           ("CONTRADICTED", res, "计数行声明 %d 但实测 %d 行" % (declared, actual))
+           ("CONTRADICTED", res, "计数行声明 %d 但实测 %d" % (declared, actual))
+
+
+def chk_expr_sum(p):
+    """『A+B+C=D』类分量算式的自洽性：最后一个数字=总和，其余求和
+
+    用途：注册面/统计行的分量算式（如 LaunchAgents 29+sche_tasks 25=54）；
+    可选 + 段（如 +reflect_scripts 14）会被一并计入 ⇒ 用于暴露「把不该加的项并进算式」。
+    fail-closed：未匹配 / 数字少于 3 个 ⇒ UNVERIFIABLE
+    """
+    res = {"detail": [], "evidence": {}}
+    txt = read_text(_abs(p["file"]))
+    if txt is None:
+        return "UNVERIFIABLE", res, "源文件不存在: %s" % p["file"]
+    m = re.search(p["claim_regex"], txt, re.M)
+    if not m:
+        return "UNVERIFIABLE", res, "未匹配到算式: %s" % p["claim_regex"]
+    nums = [int(x) for x in re.findall(r"\d+", m.group(0))]
+    if len(nums) < 3:
+        return "UNVERIFIABLE", res, "算式中数字少于 3 个: %s" % m.group(0)[:80]
+    total, parts = nums[-1], nums[:-1]
+    res["evidence"] = {"claim_text": m.group(0)[:120], "parts": parts, "declared_total": total,
+                       "actual_total": sum(parts)}
+    res["detail"].append("[算式] %s = %d / 声明 %d" % ("+".join(map(str, parts)), sum(parts), total))
+    return ("MATCH", res, "算式自洽") if sum(parts) == total else \
+           ("CONTRADICTED", res, "算式的分量和 %d 但声明合计 %d" % (sum(parts), total))
 
 
 CHECKS = {
@@ -356,6 +502,7 @@ CHECKS = {
     "file_truth": chk_file_truth,
     "claim_body_conflict": chk_claim_body_conflict,
     "count_consistency": chk_count_consistency,
+    "expr_sum": chk_expr_sum,
 }
 
 # ---------------------------------------------------------------- 运行
@@ -604,6 +751,126 @@ def selftest():
         REPO = old_repo
         _BASE_INDEX = old_idx
         shutil.rmtree(d, ignore_errors=True)
+
+    # ---- 计数类断言扩面（R476）：count_source 四形态 / 算式自洽 / fail-closed
+    d2 = tempfile.mkdtemp(prefix="dfl_count_")
+    old_repo2 = REPO
+    try:
+        os.makedirs(os.path.join(d2, "tools"), exist_ok=True)
+        os.makedirs(os.path.join(d2, "docs"), exist_ok=True)
+        for i in (1, 2, 3):
+            io.open(os.path.join(d2, "tools", "t%d.py" % i), "w", encoding="utf-8").write("x=%d\n" % i)
+        W = lambda rel, s: io.open(os.path.join(d2, rel), "w", encoding="utf-8").write(s)
+        W("docs/tools_claim.md", "工具面 3 个 tools/*.py（复核）\n")
+        W("docs/tools_claim_last.md", "工具面 3 个\n历史复核: 工具面 4 个\n")
+        W("docs/rows_claim.md", "采集: 共 2 行\n")
+        W("docs/rows_claim_bad.md", "采集: 共 3 行\n")
+        W("docs/rows.txt", "| R1 |\n| R2 |\n")
+        W("docs/json_claim.md", "条目: 5 条\n")
+        W("docs/json_claim_bad.md", "条目: 4 条\n")
+        W("docs/tgt.json", json.dumps({"entries": [1, 2, 3, 4, 5]}))
+        W("docs/fl_claim.md", "非空: 3 行\n")
+        W("docs/lines.txt", "a\n\nb\nc\n")
+        W("docs/expr_bad.md", "算式 LaunchAgents 29+sche_tasks 25+reflect_scripts 14=54\n")
+        W("docs/expr_ok.md", "算式 LaunchAgents 29+sche_tasks 25=54\n")
+        REPO = d2
+        glob_src = {"kind": "glob", "pattern": "tools/*.py"}
+        reg2 = {"assertions": [
+            {"id": "NC14", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/tools_claim.md", "count_line_regex": r"工具面\s*(\d+)",
+                "count_source": glob_src}},
+            {"id": "NC15", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/tools_claim.md", "count_line_regex": r"工具面\s*(\d+)",
+                "count_source": {"kind": "glob", "pattern": "tools/*.md"}}},
+            {"id": "NC16", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/tools_claim.md", "count_line_regex": r"工具面\s*(\d+)",
+                "count_source": {"kind": "glob", "pattern": "nodir/*.py"}}},
+            {"id": "NC17", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/rows_claim.md", "count_line_regex": r"共\s*(\d+)\s*行",
+                "count_source": {"kind": "rows", "file": "docs/rows.txt",
+                                 "row_regex": r"^\|\s*R\d+\s*\|"}}},
+            {"id": "NC18", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/rows_claim_bad.md", "count_line_regex": r"共\s*(\d+)\s*行",
+                "count_source": {"kind": "rows", "file": "docs/rows.txt",
+                                 "row_regex": r"^\|\s*R\d+\s*\|"}}},
+            {"id": "NC19", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/json_claim.md", "count_line_regex": r"条目:\s*(\d+)",
+                "count_source": {"kind": "json_len", "file": "docs/tgt.json", "path": "entries"}}},
+            {"id": "NC20", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/json_claim_bad.md", "count_line_regex": r"条目:\s*(\d+)",
+                "count_source": {"kind": "json_len", "file": "docs/tgt.json", "path": "entries"}}},
+            {"id": "NC21", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/fl_claim.md", "count_line_regex": r"非空:\s*(\d+)",
+                "count_source": {"kind": "file_lines", "file": "docs/lines.txt", "nonempty": True}}},
+            {"id": "NC22", "cls": "COUNT", "check": "expr_sum", "params": {
+                "file": "docs/expr_bad.md",
+                "claim_regex": r"算式 LaunchAgents \d+\+sche_tasks \d+(?:\+reflect_scripts \d+)?=\d+"}},
+            {"id": "NC23", "cls": "COUNT", "check": "expr_sum", "params": {
+                "file": "docs/expr_ok.md",
+                "claim_regex": r"算式 LaunchAgents \d+\+sche_tasks \d+(?:\+reflect_scripts \d+)?=\d+"}},
+            {"id": "NC24", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/tools_claim_last.md", "count_line_regex": r"工具面\s*(\d+)",
+                "count_source": glob_src, "claim_take": "last"}},
+            {"id": "NC25", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/tools_claim.md", "count_line_regex": r"工具面\s*(\d+)",
+                "count_source": {"kind": "rows", "file": "docs/nope.txt", "row_regex": r"."}}},
+        ]}
+        r2 = {r["id"]: r["verdict"] for r in run_registry(reg2, corpus_files(os.path.join(d2, "docs")))}
+        check("NC14 glob 计数一致须 MATCH", r2["NC14"] == "MATCH", r2["NC14"])
+        check("NC15 glob 实测 0 与声明不符须 CONTRADICTED（0 是实测值不是缺失）",
+              r2["NC15"] == "CONTRADICTED", r2["NC15"])
+        check("NC16 计数源目录不存在须 UNVERIFIABLE（不得当 0）", r2["NC16"] == "UNVERIFIABLE", r2["NC16"])
+        check("NC17 跨文件 rows 计数一致须 MATCH", r2["NC17"] == "MATCH", r2["NC17"])
+        check("NC18 跨文件 rows 声明被篡改须 CONTRADICTED", r2["NC18"] == "CONTRADICTED", r2["NC18"])
+        check("NC19 json_len 一致须 MATCH", r2["NC19"] == "MATCH", r2["NC19"])
+        check("NC20 json_len 声明被篡改须 CONTRADICTED", r2["NC20"] == "CONTRADICTED", r2["NC20"])
+        check("NC21 file_lines nonempty=true 只数非空行须 MATCH", r2["NC21"] == "MATCH", r2["NC21"])
+        check("NC22 算式把不该加的项并进算式须 CONTRADICTED", r2["NC22"] == "CONTRADICTED", r2["NC22"])
+        check("NC23 加法算式自洽须 MATCH", r2["NC23"] == "MATCH", r2["NC23"])
+        check("NC24 claim_take=last 生效（取末次声明）", r2["NC24"] == "CONTRADICTED", r2["NC24"])
+        check("NC25 计数源文件缺失须 UNVERIFIABLE", r2["NC25"] == "UNVERIFIABLE", r2["NC25"])
+        # NC26：真正把算式改对 ⇒ 同一断言必须转 MATCH（证明 CONTRADICTED 可被订正消除）
+        W("docs/expr_bad.md", "算式 LaunchAgents 29+sche_tasks 25=54\n")
+        r3 = {r["id"]: r["verdict"] for r in run_registry(
+            {"assertions": [reg2["assertions"][8]]}, corpus_files(os.path.join(d2, "docs")))}
+        check("NC26 订正后同一算式断言转 MATCH", r3["NC22"] == "MATCH", r3["NC22"])
+        # NC27–NC30：glob_multi / rows_diff
+        W("docs/multi_claim.md", "三组合计 5\n")
+        W("docs/multi_claim_bad.md", "三组合计 4\n")
+        os.makedirs(os.path.join(d2, "docs", "b"), exist_ok=True)
+        io.open(os.path.join(d2, "docs", "b", "x1.txt"), "w", encoding="utf-8").write("1\n")
+        io.open(os.path.join(d2, "docs", "b", "x2.txt"), "w", encoding="utf-8").write("2\n")
+        W("docs/a_rows.txt", "| R1 |\n| R2 |\n| R3 |\n| R4 |\n")
+        W("docs/b_rows.txt", "R1 |\nR2 |\n")
+        W("docs/diff_claim.md", "两处相差 2\n")
+        W("docs/diff_claim_bad.md", "两处相差 3\n")
+        diff_src = {"kind": "rows_diff",
+                    "a": {"file": "docs/a_rows.txt", "row_regex": r"^\|\s*R\d+\s*\|"},
+                    "b": {"file": "docs/b_rows.txt", "row_regex": r"^R\d+ \|"}}
+        reg3 = {"assertions": [
+            {"id": "NC27", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/multi_claim.md", "count_line_regex": r"三组合计\s*(\d+)",
+                "count_source": {"kind": "glob_multi",
+                                 "patterns": ["tools/*.py", "docs/b/*.txt"]}}},
+            {"id": "NC28", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/multi_claim.md", "count_line_regex": r"三组合计\s*(\d+)",
+                "count_source": {"kind": "glob_multi",
+                                 "patterns": ["tools/*.py", "nodir/*.txt"]}}},
+            {"id": "NC29", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/diff_claim.md", "count_line_regex": r"相差\s*(\d+)",
+                "count_source": diff_src}},
+            {"id": "NC30", "cls": "COUNT", "check": "count_consistency", "params": {
+                "file": "docs/diff_claim_bad.md", "count_line_regex": r"相差\s*(\d+)",
+                "count_source": diff_src}},
+        ]}
+        r4 = {r["id"]: r["verdict"] for r in run_registry(reg3, corpus_files(os.path.join(d2, "docs")))}
+        check("NC27 glob_multi 多目录求和一致须 MATCH", r4["NC27"] == "MATCH", r4["NC27"])
+        check("NC28 glob_multi 子项目录缺失须 UNVERIFIABLE", r4["NC28"] == "UNVERIFIABLE", r4["NC28"])
+        check("NC29 rows_diff 行数差一致须 MATCH", r4["NC29"] == "MATCH", r4["NC29"])
+        check("NC30 rows_diff 声明被篡改须 CONTRADICTED", r4["NC30"] == "CONTRADICTED", r4["NC30"])
+    finally:
+        REPO = old_repo2
+        shutil.rmtree(d2, ignore_errors=True)
 
     print("\nselftest: %d passed, %d failed" % (ok, len(fail)))
     if fail:
