@@ -259,6 +259,24 @@ def prompt_lines(prompt: str):
     return prompt.split("\n")
 
 
+FLAG_RE = re.compile(r"(?<![\w-])(--?[A-Za-z][A-Za-z0-9\-]*)")
+
+# 子句切分（仅用于 flag 归属）：中英标点 + 连续空白
+CLAUSE_SEP_RE = re.compile(r"[，。；、（）()【】\[\]{}：:!！?？\"“”'‘’|]+|\s{2,}")
+
+
+def split_clauses(ln: str):
+    """把一行切成子句（保留原序，不跨标点）⇒ flag 只归同子句内且在其前的脚本。"""
+    out, start = [], 0
+    for m in CLAUSE_SEP_RE.finditer(ln):
+        if m.start() > start:
+            out.append(ln[start:m.start()])
+        start = m.end()
+    if start < len(ln):
+        out.append(ln[start:])
+    return out
+
+
 # ---------------------------------------------------------------- 体检
 
 def _add(findings, check, code, severity, detail, task=None):
@@ -377,20 +395,27 @@ def lint_task(tid, data, root, home, idx, proof):
     for raw, path in resolved_scripts.items():
         proof.note(path)
 
-    # flag 归属：按行就近（同一行的 脚本 token + flag 视为一对）
+    # flag 归属：按「子句」就近（同子句内、且位于 flag 之前的脚本引用才算归属）
+    # 反例（实测）：同一行里既有 `python3 ../temp/get_week_range.py` 又有散文句
+    # 「后续 git log 的 --since/--until」⇒ 按整行归属会把 git 的 flag 算到
+    # 脚本头上 = 假 FLAG_UNKNOWN。
+    flags_by_script = {}
     orphans = []
     for ln in prompt_lines(prompt):
-        flags = re.findall(r"(?<![\w-])(--?[A-Za-z][A-Za-z0-9\-]*)", ln)
-        if not flags:
-            continue
-        hit = None
-        for raw, path in resolved_scripts.items():
-            if raw in ln or os.path.basename(path) in ln:
-                hit = path
-                break
-        if hit is None:
-            orphans += flags
-            continue
+        for cl in split_clauses(ln):
+            for m in FLAG_RE.finditer(cl):
+                f, pos = m.group(1), m.start()
+                hit, best = None, -1
+                for raw, path in resolved_scripts.items():
+                    for tok in (raw, os.path.basename(path)):
+                        p = cl.find(tok)
+                        if 0 <= p < pos and p > best:
+                            best, hit = p, path
+                if hit is None:
+                    orphans.append(f)
+                else:
+                    flags_by_script.setdefault(hit, set()).add(f)
+    for hit, flags in flags_by_script.items():
         defined, has_argparse = argparse_flags(hit)
         if defined is None:
             _add(F, "flag", "FLAG_UNCHECKED", "INFO", "脚本不可读：%s" % hit, tid)
@@ -398,14 +423,14 @@ def lint_task(tid, data, root, home, idx, proof):
         if not has_argparse:
             _add(F, "flag", "FLAG_UNCHECKED", "INFO",
                  "%s 未使用 argparse，%s 无法静态核验" %
-                 (os.path.relpath(hit, root), "/".join(sorted(set(flags)))), tid)
+                 (os.path.relpath(hit, root), "/".join(sorted(flags))), tid)
             continue
-        unknown = [f for f in sorted(set(flags)) if f not in defined]
-        for f in unknown:
-            _add(F, "flag", "FLAG_UNKNOWN", "FAIL",
-                 "%s 的 argparse 无此 flag：%s（已定义：%s）" %
-                 (os.path.relpath(hit, root), f,
-                  ",".join(sorted(defined)) or "<none>"), tid)
+        for f in sorted(flags):
+            if f not in defined:
+                _add(F, "flag", "FLAG_UNKNOWN", "FAIL",
+                     "%s 的 argparse 无此 flag：%s（已定义：%s）" %
+                     (os.path.relpath(hit, root), f,
+                      ",".join(sorted(defined)) or "<none>"), tid)
     if orphans:
         _add(F, "flag", "FLAG_UNATTRIBUTED", "INFO",
              "未归属到仓库脚本的 flag（可能属外部 CLI，如 lark-cli）：%s" %
@@ -618,6 +643,13 @@ def run_selftest():
     # NC19 ./ 锚定 + 无 GA_ROOT ⇒ CWD_DRIFT（R375 另一形态：repo/temp 下落点漂移）
     T(NC + "19_dot_anchor", "运行 python3 ./temp/good.py --alpha", ["CWD_DRIFT"],
       ["PATH_MISSING"])
+    # NC23 跨子句引用：同一行里脚本归前句、--since/--until 属后句的 git 散文引用
+    #      ⇒ 不得把后句 flag 判成前脚本的 FLAG_UNKNOWN（真实样本：weekly_report_reminder）
+    T(NC + "23_cross_clause", "运行 python3 %s/temp/good.py --alpha，后续 git log 的 --since/--until 原样使用" % root,
+      ["FLAG_UNATTRIBUTED"], ["FLAG_UNKNOWN"])
+    # NC24 flag 出现在脚本之前（同一子句）：归属要求「脚本须在 flag 之前」⇒ 同样不得判 FLAG_UNKNOWN
+    T(NC + "24_flag_before_script", "git log --since=2026-09-01 之后运行 python3 %s/temp/good.py --alpha" % root,
+      ["FLAG_UNATTRIBUTED"], ["FLAG_UNKNOWN"])
 
     os.makedirs(tasks, exist_ok=True)
     for tid, d, _, _ in cases:
