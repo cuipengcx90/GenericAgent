@@ -1,0 +1,116 @@
+{
+  "note": "memory 非 .md 资产耐久性登记面（R507 / TODO L208）。判据与口径见 memory/asset_durability/DURABILITY_POLICY.md；消费证据分级 PATH>GLOB>BASE。",
+  "generated_by": "tools/memory_asset_durability.py",
+  "entries": [
+    {
+      "path": "memory/L4_raw_sessions/2026-04.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/2026-05.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/2026-06.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/2026-07.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/2026-08.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/2026-09.zip",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:3",
+        "tools/report_body_recover.py:14"
+      ],
+      "evidence_tokens": [
+        "memory/L4_raw_sessions/"
+      ],
+      "rationale": "L4 会话归档，被 tools/l4_search.py（流式只读检索）按目录 glob 消费、tools/report_body_recover.py 按份名消费；单份最大数十 MiB 不入 git，靠 T0 保护面 + T0 归档双覆盖恢复（本器实测 t0_baseline=True ∧ t0_archive=True）。"
+    },
+    {
+      "path": "memory/global_mem.txt",
+      "status": "PENDING_APPROVAL",
+      "evidence": [
+        "tools/backup_restore_drill.py:22",
+        "tools/backup_restore_drill.py:15"
+      ],
+      "rationale": "L2 单文件层唯一副本（无 git 历史）；被 T0 备份/恢复演练固定集合消费。R418 D1「L2 入库 or 私有备份」待批；实测 T0 保护面与归档均覆盖（True/True）。"
+    },
+    {
+      "path": "memory/history.txt",
+      "status": "PENDING_APPROVAL",
+      "evidence": [
+        "memory/global_mem.txt:617",
+        "tools/report_number_gate.py:90"
+      ],
+      "rationale": "编号权威链路的 memory 侧历史（R503 口径：口径以 memory 为准），被 tools/report_number_gate.py 经 os.path.join(mem,'history.txt') 消费。仅 231 B ⇒ 建议 git add -f 入库（待批）。"
+    },
+    {
+      "path": "memory/file_access_stats.json",
+      "status": "DEFER",
+      "evidence": [
+        "ga.py:160"
+      ],
+      "rationale": "GA 运行期访问统计（ga.py 读写），可再生但历史计数不可回填；实测不在 T0 保护面（t0_baseline=False）而归档含其名（t0_archive=True）⇒ 两套 T0 口径不一致（R461），是否纳入保护面待定。"
+    },
+    {
+      "path": "memory/L4_raw_sessions/all_histories.txt",
+      "status": "DECLARED_LOCAL_ONLY",
+      "evidence": [
+        "tools/l4_search.py:19",
+        "memory/L4_raw_sessions/compress_session.py:149"
+      ],
+      "evidence_tokens": [
+        "all_histories.txt"
+      ],
+      "rationale": "由 memory/L4_raw_sessions/compress_session.py 生成/维护的会话历史汇总（10.6 MiB），可重建；l4_search.py grep-file 可直接消费该文件。证据档位为 BASE（裸名），本器判 INFO，此处登记以固化口径。"
+    }
+  ]
+}
