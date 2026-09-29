@@ -1,0 +1,55 @@
+{
+  "_doc": "调度注册面四源对账器（tools/schedule_registry_audit.py）的 ④ 象限处置登记表：四源（sche_tasks 声明 × disabled 归档 × LaunchAgents 实装 × reflect 在册）皆未认领的产物家族必须在此登记处置，否则 disposition 子命令报 UNDISPOSED。status ∈ {LEGACY=退役遗留（与判据表 state=legacy 同义）, DEFERRED=真无人认领·处置待批}。evidence 格式 `<repo 相对路径> | <token>`，须文件存在且 token 逐字命中（不可回源即 CLAIM_WITHOUT_EVIDENCE）。登记项若家族消失或已被四源认领 ⇒ DISPOSITION_STALE（须撤登记）。",
+  "_updated": "2026-09-29 (R530 / 第26批 L220 交付)",
+  "entries": {
+    "wechat_daily_sqlcipher": {
+      "status": "LEGACY",
+      "evidence": [
+        "tools/freshness_criteria.json | \"id\": \"wechat_daily_sqlcipher\""
+      ],
+      "note": "四源皆无登记但产物持续落地=退役任务遗留；与 tools/freshness_criteria.json 中 state=legacy 的同一家族登记一致（R470 口径），内容停滞属预期、不计硬告警。"
+    },
+    "supply_chain_digest": {
+      "status": "LEGACY",
+      "evidence": [
+        "tools/freshness_criteria.json | \"id\": \"supply_chain_digest\""
+      ],
+      "note": "四源皆无登记但产物持续落地=退役任务遗留；与 tools/freshness_criteria.json 中 state=legacy 的同一家族登记一致（R470 口径），内容停滞属预期、不计硬告警。"
+    },
+    "wechat_signals": {
+      "status": "LEGACY",
+      "evidence": [
+        "tools/freshness_criteria.json | \"id\": \"wechat_signals\""
+      ],
+      "note": "四源皆无登记但产物持续落地=退役任务遗留；与 tools/freshness_criteria.json 中 state=legacy 的同一家族登记一致（R470 口径），内容停滞属预期、不计硬告警。"
+    },
+    "wechat_weekly": {
+      "status": "LEGACY",
+      "evidence": [
+        "tools/freshness_criteria.json | \"id\": \"wechat_weekly\""
+      ],
+      "note": "四源皆无登记但产物持续落地=退役任务遗留；与 tools/freshness_criteria.json 中 state=legacy 的同一家族登记一致（R470 口径），内容停滞属预期、不计硬告警。"
+    },
+    "quangneng_monitor": {
+      "status": "DEFERRED",
+      "evidence": [
+        "memory/autonomous_reports/R520_调度注册面四源对账器.md | quangneng_monitor"
+      ],
+      "note": "四源皆无登记、判据表也查无（真无人认领）；处置（补 legacy 登记 / 明确退役并停产物）待批，见 R520 报告与 R530 报告提案。"
+    },
+    "wechat_cc_daily_18h": {
+      "status": "DEFERRED",
+      "evidence": [
+        "memory/autonomous_reports/R520_调度注册面四源对账器.md | wechat_cc_daily_18h"
+      ],
+      "note": "四源皆无登记、判据表也查无（真无人认领）；处置（补 legacy 登记 / 明确退役并停产物）待批，见 R520 报告与 R530 报告提案。"
+    },
+    "wechat_daily_sqlcipher_output": {
+      "status": "DEFERRED",
+      "evidence": [
+        "memory/autonomous_reports/R520_调度注册面四源对账器.md | wechat_daily_sqlcipher_output"
+      ],
+      "note": "四源皆无登记、判据表也查无（真无人认领）；处置（补 legacy 登记 / 明确退役并停产物）待批，见 R520 报告与 R530 报告提案。"
+    }
+  }
+}

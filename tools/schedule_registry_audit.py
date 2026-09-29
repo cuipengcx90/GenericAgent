@@ -22,14 +22,32 @@ TODO L214（第25批 C7「调度注册面 ④ 象限对账器」的收窄实现�
 ④ 为唯一告警面：rc=1。另给「近名登记」提示（token 交集但非同名）——提示级，不参与判决
 （沿用 R448 教训：近名信号 8/8 假误报，只可作提示）。
 
-子命令（位置参数，非 --flag）：
-  scan [--json PATH]  扫描并打印 ④ 清单（含语料计数自证）
-  proof               只读自证：扫描前后语料 sha256 逐项一致
-  crosscheck          与 R488 reflect_wiring_check 的 launchd 接线集独立交叉核验（逐集相等）
-  selftest            夹具 + 10 组用例（含负控）
+④ 处置登记（R530 / TODO L220）：④ 只回答「四源不认识它」，不回答「该怎么办」。本器把处置
+做成**声明面 + 三判据闸门**（同 R449/R499 的登记面范式）：
 
-rc: 0=无 ④  1=存在 ④（登记面空洞；不等于链路故障，需人读产物新旧）  2=输入无效（缺产物面 /
-    全部登记源为空 / 源不可读 / crosscheck 依赖缺失）
+  memory/schedule_registry/FAMILY_DISPOSITION.json  entries: 家族名 → {status, evidence[], note}
+    status   LEGACY   退役遗留族（与 R457/R470 判据表的 legacy 豁免同源）
+             DEFERRED 真无人认领，处置待批（本器只登记不代为停用/删除）
+    evidence ['<repo 相对路径> | <token>']，须文件存在且 token 逐字命中（回源校验）
+
+三判据（fail-closed）：
+  UNDISPOSED              ④ 家族未登记处置
+  CLAIM_WITHOUT_EVIDENCE  status 不在枚举 / evidence 为空 / 证据不可回源
+  DISPOSITION_STALE       登记项已不在产物家族里，或该家族现已被四源认领（须撤销登记）
+
+覆盖口径：covered = (四源在册族) ∪ (④ 中已登记族)，覆盖 31/31 + 未认领 0 才算干净。
+另把被判据表统计出的**两器口径差**（本器分母=全部 done 族；R457/R470 内容级判据分母=
+判据表可见族）接进判定面，含 R520 指出的 3 条 fresh=False 族。
+
+子命令（位置参数，非 --flag）：
+  scan [--json PATH]   扫描并打印 ④ 清单（含语料计数自证）
+  disposition [--json] 扫描 + 处置闸门（覆盖表/口径差/违规清单），rc 0=干净 1=有违规 2=输入无效
+  proof                只读自证：扫描前后语料（含登记面 JSON）sha256 逐项一致
+  crosscheck           与 R488 reflect_wiring_check 的 launchd 接线集独立交叉核验（逐集相等）
+  selftest             夹具 + 用例（含负控）
+
+rc（scan）: 0=无 ④  1=存在 ④（登记面空洞；不等于链路故障，需人读产物新旧）  2=输入无效
+rc（disposition）: 0=无违规  1=有违规（未登记/证据不可回源/登记陈旧）  2=输入无效
 
 只读保证：本器不写任何调度文件、不调用 launchctl、不 import 被审计脚本；仅 glob/读文本 + 可选
 写 --json 产物到调用者指定路径。
@@ -56,6 +74,9 @@ DECL_ARCHIVED_GLOB = "sche_tasks/disabled/*.json"
 REFLECT_GLOBS = ("reflect_scripts/*.py", "reflect/*.py")
 CRITERIA_REL = "tools/freshness_criteria.json"
 R488_REL = "tools/reflect_wiring_check.py"
+DISPOSITION_REL = "memory/schedule_registry/FAMILY_DISPOSITION.json"
+DISPOSITION_STATUSES = ("LEGACY", "DEFERRED")
+GUARD_CODES = ("UNDISPOSED", "CLAIM_WITHOUT_EVIDENCE", "DISPOSITION_STALE")
 DEFAULT_LAUNCHAGENTS = ("~/Library/LaunchAgents",)
 
 SCHEMA = "ga.schedule_registry_audit/v1"
@@ -142,6 +163,9 @@ def collect_files(root: Path, la_dirs) -> list:
     crit = root / CRITERIA_REL
     if crit.is_file():
         out.append(crit)
+    disp = root / DISPOSITION_REL
+    if disp.is_file():
+        out.append(disp)
     return sorted(set(out))
 
 
@@ -267,10 +291,152 @@ def freshness_ids(root: Path) -> set:
     return found
 
 
+# --------------------------------------------------------------------------- disposition
+
+
+def load_family_disposition(path=None, root: Path = None) -> dict:
+    """读 ④ 处置登记表；文件不存在/不可解析返回 {}（闸门届时把全部 ④ 报 UNDISPOSED）。
+
+    纯读，不写盘、不建目录。
+    """
+    p = Path(path) if path else ((root or GA_ROOT) / DISPOSITION_REL)
+    if not p.is_file():
+        return {}
+    try:
+        doc = json.loads(_read_text(p))
+    except Exception:
+        return {}
+    ent = doc.get("entries", doc)
+    return ent if isinstance(ent, dict) else {}
+
+
+def evidence_hit(spec, root: Path = None):
+    """登记表证据回源：`<repo 相对路径> | <token>` 须文件存在且 token 逐字命中。
+
+    返回 (ok, why)。语义与 R499 usage_census.evidence_hit 同款；此处**不复用其实现**：那个
+    函数绑死模块级 ROOT=GA 根，而本器需要在沙盒夹具 root 下跑同一判据（--root/夹具），故内联。
+    """
+    base = Path(root) if root else GA_ROOT
+    if " | " not in spec:
+        return False, "格式应为 '<repo 相对路径> | <token>'"
+    rel, token = spec.split(" | ", 1)
+    p = Path(rel)
+    if not p.is_absolute():
+        p = base / rel
+    if not p.is_file():
+        return False, f"文件不存在 {rel}"
+    if token not in _read_text(p):
+        return False, f"token 未在 {rel} 命中"
+    return True, ""
+
+
+def coverage_block(rows, disp) -> dict:
+    """覆盖口径：covered = 四源在册族 ∪ ④ 中已登记处置的族。"""
+    fams = {r["family"] for r in rows}
+    unreg = sorted(r["family"] for r in rows if r["status"] == UNREGISTERED)
+    four = sorted(fams - set(unreg))
+    disposed = sorted(f for f in unreg if f in disp)
+    unclaimed = sorted(f for f in unreg if f not in disp)
+    covered = sorted(set(four) | set(disposed))
+    return {
+        "families": len(fams),
+        "registered_four_source": len(four),
+        "unregistered": len(unreg),
+        "disposed": len(disposed),
+        "covered": len(covered),
+        "covered_pct": round(100.0 * len(covered) / len(fams), 1) if fams else 0.0,
+        "unclaimed": unclaimed,
+        "disposed_families": disposed,
+    }
+
+
+def ccd_family_ids(path):
+    """从 `content_change_detector --discover-done --json` 产物里取 CCD 侧家族集（target 字段）。
+
+    纯读；口径不符/不可解析时返回 (set(), 原因)，由调用方记 ccd_error，不当假绿。
+    """
+    try:
+        doc = json.loads(_read_text(Path(path)))
+    except Exception as e:
+        return set(), f"CCD JSON 不可读或不可解析: {e}"
+    d = doc.get("discover")
+    rows = d.get("rows") if isinstance(d, dict) else None
+    if rows is None:
+        rows = doc.get("rows")
+    if not isinstance(rows, list):
+        return set(), "CCD JSON 缺 discover.rows/rows 数组（口径不符）"
+    ids = {r.get("target") for r in rows if isinstance(r, dict) and r.get("target")}
+    if not ids:
+        return set(), "CCD JSON 行内无 target 字段（口径不符）"
+    return ids, None
+
+
+def freshness_gap(root: Path, families, ccd_json=None) -> dict:
+    """两器口径差：本器分母=全部 done 族；R457/R470 内容级判据分母=判据表可见族。
+
+    gap_families 即「任何在册判据都看不见的产物家族」——R520 增量信息的机械表达（代理口径）。
+    传入 ccd_json（content_change_detector --discover-done --json 的产物）时追加**实测**口径：
+    ccd_gap_families = 本器分母 − CCD 侧真实家族集 ⇒ 精确差集，不再依赖判据表代理。
+    """
+    crit = freshness_ids(root)
+    vis = sorted(f for f in families if f in crit)
+    gap = sorted(f for f in families if f not in crit)
+    out = {
+        "criteria_ids": len(crit),
+        "visible_families": vis,
+        "gap_families": gap,
+        "gap_count": len(gap),
+        "note": "本器分母=全部 done 族；判据表侧分母=visible_families ⇒ 差值即两器口径差（R520 代理口径）",
+    }
+    if ccd_json:
+        ids, err = ccd_family_ids(ccd_json)
+        if err:
+            out["ccd_error"] = err
+            out["ccd_json"] = str(ccd_json)
+        else:
+            out["ccd_json"] = str(ccd_json)
+            out["ccd_families"] = len(ids)
+            out["ccd_visible_families"] = sorted(f for f in families if f in ids)
+            out["ccd_gap_families"] = sorted(f for f in families if f not in ids)
+            out["ccd_gap_count"] = len(out["ccd_gap_families"])
+            out["ccd_note"] = ("CCD 侧分母=实测 ccd_families（--discover-done 的 target 集）；"
+                               "ccd_gap_families 即两套在册内容级监控同时漏掉的族（R520）")
+    return out
+
+
+def guard_disposition(rows, disp, root: Path = None) -> list:
+    """三判据闸门（同 R499 guard_entry_disposition 语义）。返回违规字符串列表。纯函数。"""
+    bad = []
+    fams = {r["family"] for r in rows}
+    status_by = {r["family"]: r["status"] for r in rows}
+    for f in sorted(fams):
+        if status_by[f] == UNREGISTERED and f not in disp:
+            bad.append(f"UNDISPOSED {f}: ④（四源皆无登记）且未在 FAMILY_DISPOSITION 登记处置")
+    for f in sorted(disp):
+        d = disp[f] or {}
+        st = d.get("status")
+        if st not in DISPOSITION_STATUSES:
+            bad.append(f"CLAIM_WITHOUT_EVIDENCE {f}: status={st!r} 不在 {list(DISPOSITION_STATUSES)}")
+            continue
+        ev = d.get("evidence") or []
+        if not ev:
+            bad.append(f"CLAIM_WITHOUT_EVIDENCE {f}: 登记为 {st} 但 evidence 为空")
+        for spec in ev:
+            ok, why = evidence_hit(spec, root)
+            if not ok:
+                bad.append(f"CLAIM_WITHOUT_EVIDENCE {f}: 证据不可回源 ({spec}) — {why}")
+        if f not in fams:
+            bad.append(f"DISPOSITION_STALE {f}: 登记项不在本次产物家族清单里")
+        elif status_by[f] != UNREGISTERED:
+            bad.append(f"DISPOSITION_STALE {f}: 登记为 {st} 但该家族现已被四源认领"
+                       f"（{status_by[f]}）⇒ 须撤销登记")
+    return bad
+
+
 # --------------------------------------------------------------------------- scan
 
 
-def scan(root: Path, la_dirs) -> dict:
+def scan(root: Path, la_dirs, disposition_path=None, ccd_json=None) -> dict:
     fams = collect_products(root)
     idx = collect_registry(root, la_dirs)
     if not fams:
@@ -287,6 +453,7 @@ def scan(root: Path, la_dirs) -> dict:
     registered_names |= {p["label"] for p in idx["launchd"] if p["label"]}
     registered_names |= {Path(p["path"]).stem for p in idx["reflect"]}
     fresh = freshness_ids(root)
+    disp = load_family_disposition(disposition_path, root)
     token_df = {}
     for rn in registered_names:
         for t in _tokens(rn):
@@ -324,6 +491,7 @@ def scan(root: Path, la_dirs) -> dict:
             },
             "hints": _hints(fam, registered_names, token_df),
             "in_freshness_criteria": fam in fresh,
+            "disposition": disp.get(fam),
             "sample_files": [f.name for f in d["files"][-3:]],
         })
     unreg = sorted([r for r in rows if r["status"] == UNREGISTERED],
@@ -331,6 +499,8 @@ def scan(root: Path, la_dirs) -> dict:
     dist = {}
     for r in rows:
         dist[r["status"]] = dist.get(r["status"], 0) + 1
+    cov = coverage_block(rows, disp)
+    fgap = freshness_gap(root, [r["family"] for r in rows], ccd_json=ccd_json)
     return {
         "schema": SCHEMA,
         "generated": now_iso(),
@@ -350,7 +520,14 @@ def scan(root: Path, la_dirs) -> dict:
             "status": dist,
             "unregistered": len(unreg),
             "unregistered_products": sum(r["products"] for r in unreg),
+            "disposed": cov["disposed"],
+            "unclaimed": cov["unclaimed"],
+            "coverage": cov,
+            "freshness_gap": fgap,
         },
+        "disposition_path": str(Path(disposition_path) if disposition_path
+                                else (root / DISPOSITION_REL)),
+        "disposition": disp,
         "families": rows,
         "unregistered": unreg,
         "rc": 1 if unreg else 0,
@@ -399,6 +576,61 @@ def render(rep: dict) -> str:
     if n == 0:
         L.append("  （无）")
     L.append(f"rc={rep['rc']}  （rc=1 仅表示存在登记面空洞，不等于链路故障；请结合产物新旧人工判读）")
+    return "\n".join(L)
+
+
+# --------------------------------------------------------------------------- disposition CLI
+
+
+def disposition_report(root: Path, la_dirs, disposition_path=None, ccd_json=None) -> dict:
+    """扫描 + 处置闸门。rc：0 无违规 / 1 有违规 / 2 输入无效（产物面或登记源为空）。"""
+    rep_ = scan(root, la_dirs, disposition_path=disposition_path, ccd_json=ccd_json)
+    if rep_.get("error"):
+        rep_["violations"] = []
+        rep_["disposition_rc"] = 2
+        return rep_
+    disp = load_family_disposition(disposition_path, root)
+    bad = guard_disposition(rep_["families"], disp, root)
+    rep_["violations"] = bad
+    rep_["disposition_rc"] = 1 if bad else 0
+    return rep_
+
+
+def render_disposition(rep_: dict) -> str:
+    L = [render(rep_)]
+    c = rep_.get("counts") or {}
+    cov = c.get("coverage") or {}
+    fg = c.get("freshness_gap") or {}
+    L.append("== ④ 处置登记覆盖 ==")
+    L.append(f"  家族 {cov.get('families')} = 四源在册 {cov.get('registered_four_source')}"
+             f" + ④ {cov.get('unregistered')}（其中已登记处置 {cov.get('disposed')}）")
+    L.append(f"  登记面覆盖 {cov.get('covered')}/{cov.get('families')}"
+             f" ({cov.get('covered_pct')}%)  未认领 {len(cov.get('unclaimed') or [])}")
+    if cov.get("unclaimed"):
+        L.append(f"  未认领族: {', '.join(cov['unclaimed'])}")
+    L.append("== 判据表口径差（R520 增量信息）==")
+    L.append(f"  判据表可见族 {len(fg.get('visible_families') or [])} ／ 本器分母"
+             f" {cov.get('families')} ⇒ 口径差 {fg.get('gap_count')} 族")
+    if fg.get("gap_families"):
+        L.append(f"  两器盲区（任何在册判据都看不见）: {', '.join(fg['gap_families'])}")
+    fgap_unreg = [f for f in (fg.get("gap_families") or [])
+                  if f in set(cov.get("unclaimed") or [])]
+    L.append(f"  其中未认领（④ ∧ 判据表不可见）: {len(fgap_unreg)} 族"
+             + (f" — {', '.join(fgap_unreg)}" if fgap_unreg else ""))
+    if fg.get("ccd_error"):
+        L.append(f"  精确口径差: 不可得 — {fg['ccd_error']}")
+    elif "ccd_gap_families" in fg:
+        L.append(f"  精确口径差（实测 CCD 集合）: CCD 侧 {fg['ccd_families']} 族 ／ 本器"
+                 f" {cov.get('families')} ⇒ 差 {fg['ccd_gap_count']} 族")
+        if fg["ccd_gap_families"]:
+            L.append(f"    两套在册内容级监控同时漏掉: {', '.join(fg['ccd_gap_families'])}")
+    L.append(f"== 闸门违规（{len(rep_.get('violations') or [])}）==")
+    if not rep_.get("violations"):
+        L.append("  （无）")
+    for v in rep_.get("violations") or []:
+        L.append(f"  {v}")
+    L.append(f"disposition_rc={rep_.get('disposition_rc')}"
+             f"  （0=无违规 1=有违规 2=输入无效）  登记表 {rep_.get('disposition_path')}")
     return "\n".join(L)
 
 
@@ -538,6 +770,22 @@ def _mk_fixture(base: Path):
     return root, la
 
 
+def _mk_disposition(root: Path, entries: dict) -> Path:
+    """夹具：在 root 下写 ④ 处置登记表（内容由用例给定）。"""
+    p = root / DISPOSITION_REL
+    _write(p, json.dumps({"_doc": {"purpose": "selftest fixture"},
+                          "entries": entries}, ensure_ascii=False, indent=1))
+    return p
+
+
+_EV = "sche_tasks/alpha.json | alpha"
+_EV_WC = "sche_tasks/wechat_daily_sqlcipher.json | wechat_daily_sqlcipher"
+
+
+def _codes(violations) -> list:
+    return sorted({v.split()[0] for v in violations})
+
+
 def selftest() -> int:
     base = Path(tempfile.mkdtemp(prefix="sra_selftest_"))
     try:
@@ -633,6 +881,134 @@ def selftest() -> int:
         _case("NC18 真仓只读自证（语料 sha256 前后一致）",
               real_before == real_after and len(real_before) > 0, f"files={len(real_before)}")
 
+        # ---------------------------------------------------------- ④ 处置登记闸门
+        root4, la4 = _mk_fixture(base / "b4")
+        d0 = disposition_report(root4, [la4])
+        _case("NC19 无登记 ⇒ 两族 UNDISPOSED 且 rc=1",
+              d0["disposition_rc"] == 1 and _codes(d0["violations"]) == ["UNDISPOSED"]
+              and d0["counts"]["unclaimed"] == ["gamma", "wechat_daily_sqlcipher_output"],
+              f"{d0['disposition_rc']} {d0['violations']}")
+        ent = {
+            "gamma": {"status": "DEFERRED", "evidence": [_EV], "note": "selftest"},
+            "wechat_daily_sqlcipher_output": {"status": "LEGACY", "evidence": [_EV_WC],
+                                              "note": "selftest"},
+        }
+        _mk_disposition(root4, ent)
+        d1 = disposition_report(root4, [la4])
+        cov1 = d1["counts"]["coverage"]
+        _case("NC20 全部登记 ⇒ rc=0 / 未认领 0 / 覆盖 6⁄6",
+              d1["disposition_rc"] == 0 and not d1["violations"]
+              and cov1["covered"] == 6 and cov1["covered_pct"] == 100.0
+              and cov1["unclaimed"] == [], str(cov1))
+        _case("NC20b 覆盖分母口径：6 = 四源在册 4 + ④ 已登记 2",
+              cov1["registered_four_source"] == 4 and cov1["disposed"] == 2, str(cov1))
+        # 删登记 ⇒ 回落 UNDISPOSED（负控 1）
+        ent2 = dict(ent)
+        ent2.pop("wechat_daily_sqlcipher_output")
+        _mk_disposition(root4, ent2)
+        d2 = disposition_report(root4, [la4])
+        _case("NC21 删一条登记 ⇒ UNDISPOSED 复现且 rc=1",
+              d2["disposition_rc"] == 1 and _codes(d2["violations"]) == ["UNDISPOSED"]
+              and d2["counts"]["unclaimed"] == ["wechat_daily_sqlcipher_output"],
+              f"{d2['disposition_rc']} {d2['violations']}")
+        # 凭空登记：证据 token 不存在（负控 2）
+        ent3 = dict(ent)
+        ent3["gamma"] = {"status": "DEFERRED", "evidence": ["sche_tasks/alpha.json | no_such_token"]}
+        _mk_disposition(root4, ent3)
+        d3 = disposition_report(root4, [la4])
+        _case("NC22 凭空登记（证据 token 不存在）⇒ CLAIM_WITHOUT_EVIDENCE",
+              d3["disposition_rc"] == 1 and _codes(d3["violations"]) == ["CLAIM_WITHOUT_EVIDENCE"],
+              str(d3["violations"]))
+        # 非法 status 枚举（负控 3）
+        ent3b = dict(ent)
+        ent3b["gamma"] = {"status": "RETIRED", "evidence": [_EV]}
+        _mk_disposition(root4, ent3b)
+        d3b = disposition_report(root4, [la4])
+        _case("NC22b 非枚举 status ⇒ CLAIM_WITHOUT_EVIDENCE",
+              _codes(d3b["violations"]) == ["CLAIM_WITHOUT_EVIDENCE"], str(d3b["violations"]))
+        # 证据为空（负控 4）
+        ent3c = dict(ent)
+        ent3c["gamma"] = {"status": "DEFERRED", "evidence": []}
+        _mk_disposition(root4, ent3c)
+        _case("NC22c evidence 为空 ⇒ CLAIM_WITHOUT_EVIDENCE",
+              _codes(disposition_report(root4, [la4])["violations"]) == ["CLAIM_WITHOUT_EVIDENCE"])
+        # 家族消失仍留册（负控 5）
+        ent4 = dict(ent)
+        ent4["ghost_family"] = {"status": "LEGACY", "evidence": [_EV]}
+        _mk_disposition(root4, ent4)
+        d4 = disposition_report(root4, [la4])
+        _case("NC23 家族消失仍留册 ⇒ DISPOSITION_STALE",
+              d4["disposition_rc"] == 1 and "DISPOSITION_STALE" in _codes(d4["violations"]),
+              str(d4["violations"]))
+        # 家族已被四源认领仍留册（负控 6）
+        ent5 = dict(ent)
+        ent5["alpha"] = {"status": "LEGACY", "evidence": [_EV]}
+        _mk_disposition(root4, ent5)
+        _case("NC23b 家族已被四源认领仍留册 ⇒ DISPOSITION_STALE",
+              _codes(disposition_report(root4, [la4])["violations"]) == ["DISPOSITION_STALE"])
+        # 产物面空 ⇒ disposition rc=2（负控 7）
+        root5, la5 = _mk_fixture(base / "b5")
+        _mk_disposition(root5, {"gamma": {"status": "DEFERRED", "evidence": [_EV]}})
+        for f in (root5 / "sche_tasks" / "done").glob("*.md"):
+            f.unlink()
+        d5 = disposition_report(root5, [la5])
+        _case("NC24 产物面空 ⇒ disposition rc=2（fail-closed）",
+              d5["disposition_rc"] == 2 and bool(d5.get("error")) and d5["violations"] == [],
+              f"{d5['disposition_rc']} {d5.get('error')}")
+        # 登记面全空也 rc=2（负控 8）
+        root6, la6 = _mk_fixture(base / "b6")
+        _mk_disposition(root6, {})
+        for f in (root6 / "sche_tasks").glob("*.json"):
+            f.unlink()
+        for f in (root6 / "sche_tasks" / "disabled").glob("*.json"):
+            f.unlink()
+        for f in (root6 / "reflect_scripts").glob("*.py"):
+            f.unlink()
+        for f in la6.glob("*.plist"):
+            f.unlink()
+        _case("NC24b 登记面四源全空 ⇒ disposition rc=2",
+              disposition_report(root6, [la6])["disposition_rc"] == 2)
+        # 声明侧改判 ⇒ 覆盖口径同步（④ 减一）
+        cov2 = disposition_report(root4, [la4])["counts"]["coverage"]
+        _write(root4 / "sche_tasks" / "gamma.json", '{"id":"gamma"}')
+        cov3 = disposition_report(root4, [la4])["counts"]["coverage"]
+        _case("NC25 声明侧改判（gamma 转在册）⇒ 覆盖与未认领口径同步",
+              cov2["unregistered"] == 2 and cov3["unregistered"] == 1
+              and cov3["covered"] == 6, f"{cov2['unregistered']}/{cov3['unregistered']}")
+        # 只读自证：登记面文件 sha256 跑前跑后一致（负控 9）
+        _mk_disposition(root4, ent)
+        dp = root4 / DISPOSITION_REL
+        h_before = _sha256(dp)
+        disposition_report(root4, [la4])
+        disposition_report(root4, [la4])
+        _case("NC26 只读自证（登记表 sha256 跑前跑后一致 + 两遍 verdict 一致）",
+              h_before == _sha256(dp), h_before[:16])
+        # 口径差：判据表不可见的族被点名
+        fg = disposition_report(root4, [la4])["counts"]["freshness_gap"]
+        _case("NC27 口径差块：判据表可见族 ⊆ 本器分母，gap = 差集",
+              set(fg["visible_families"]) | set(fg["gap_families"]) == {"alpha", "beta", "gamma",
+                                                                       "delta", "epsilon",
+                                                                       "wechat_daily_sqlcipher_output"}
+              and not (set(fg["visible_families"]) & set(fg["gap_families"])), str(fg))
+
+        # 口径差（精确）：注入 CCD discover JSON ⇒ 按实测集合算差集，不再用判据表代理
+        ccdp = base / "ccd_discover.json"
+        _write(ccdp, json.dumps({"discover": {"families": 2, "unregistered": [],
+                                              "rows": [{"target": "alpha"}, {"target": "beta"}]}},
+                                ensure_ascii=False))
+        fg2 = disposition_report(root4, [la4], ccd_json=str(ccdp))["counts"]["freshness_gap"]
+        _case("NC28 ccd-json 注入：精确口径差 = 本器分母 − CCD 集合",
+              fg2.get("ccd_families") == 2
+              and set(fg2.get("ccd_visible_families") or []) == {"alpha", "beta"}
+              and set(fg2.get("ccd_gap_families") or []) == {"gamma", "delta", "epsilon",
+                                                             "wechat_daily_sqlcipher_output"},
+              str(fg2))
+        fg3 = disposition_report(root4, [la4],
+                                 ccd_json=str(base / "nope.json"))["counts"]["freshness_gap"]
+        _case("NC29 ccd-json 缺失：记 ccd_error 不崩，代理口径仍可用",
+              bool(fg3.get("ccd_error")) and "ccd_gap_families" not in fg3
+              and fg3.get("gap_count") == len(fg3.get("gap_families") or []), str(fg3))
+
         failed = [n for n, ok, _ in NC if not ok]
         for name, ok, detail in NC:
             print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  {detail}" if detail and not ok else ""))
@@ -648,12 +1024,16 @@ def selftest() -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="调度注册面四源对账（只读）")
     ap.add_argument("cmd", nargs="?", default="scan",
-                    choices=["scan", "proof", "crosscheck", "selftest"])
+                    choices=["scan", "disposition", "proof", "crosscheck", "selftest"])
     ap.add_argument("--root", default=str(GA_ROOT))
     ap.add_argument("--launchagents", action="append", default=None,
                     help="可重复；默认 ~/Library/LaunchAgents")
     ap.add_argument("--json", dest="json_out", default=None)
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--disposition", default=None,
+                    help="④ 处置登记表路径（默认 <root>/memory/schedule_registry/FAMILY_DISPOSITION.json）")
+    ap.add_argument("--ccd-json", dest="ccd_json", default=None,
+                    help="content_change_detector --discover-done --json 的产物；给了就出**实测**口径差")
     a = ap.parse_args(argv)
     root = Path(a.root).resolve()
     la = a.launchagents or list(DEFAULT_LAUNCHAGENTS)
@@ -672,6 +1052,17 @@ def main(argv=None) -> int:
             Path(a.json_out).parent.mkdir(parents=True, exist_ok=True)
             Path(a.json_out).write_text(json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
         return int(res["rc"])
+    if a.cmd == "disposition":
+        rep = disposition_report(root, la, a.disposition, ccd_json=a.ccd_json)
+        if not a.quiet:
+            print(render_disposition(rep))
+        if a.json_out:
+            Path(a.json_out).parent.mkdir(parents=True, exist_ok=True)
+            Path(a.json_out).write_text(json.dumps(rep, ensure_ascii=False, indent=2),
+                                        encoding="utf-8")
+            if not a.quiet:
+                print(f"-- JSON → {a.json_out}")
+        return int(rep["disposition_rc"])
     if a.cmd == "proof":
         files = collect_files(root, la)
         before = corpus_digest(files)
@@ -681,7 +1072,7 @@ def main(argv=None) -> int:
         print(f"files={len(before)} changed={changed} scan_rc={rep['rc']}")
         return 0 if not changed else 1
 
-    rep = scan(root, la)
+    rep = scan(root, la, ccd_json=a.ccd_json)
     if not a.quiet:
         print(render(rep))
     if a.json_out:
