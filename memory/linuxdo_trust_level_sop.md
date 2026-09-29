@@ -56,3 +56,11 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
 
 - **`web_execute_js(save_to_file=...)` 保存的是「JS 返回值」，不是页面原文**：若脚本 `return JSON.stringify({...})`，落盘的就是那段 JSON(含 items 摘要)，不是原始 innerText。要按 SOP 把**原始 innerText**落盘，脚本必须 `return document.body.innerText;`（本次第二次读取即如此，得 835 B/425 字符，剔除 driver 行 15 字符后 409 字符）。两次读取可互为交叉校验：本次 12 项逐项一致 ⇒ `两次读取一致=True`。
 - **趋势判读：`已读帖子`/`浏览话题` 属 100 天滚动窗口指标，窗口滑出可能快于新增积累 ⇒ 缺口会扩大而非收敛**（实测 09-22→09-26：已读帖子 13213→12860、浏览话题 558→533；"回复"长期停在 7）。因此「连续多日缺口不减」是**预期行为而非异常**，报告里应直接给出滚动窗口解释，避免把它写成故障。
+
+## 补充（2026-09-29 实测：通道按 tab 粒度失配，`window.open` 绕行可直接读，首页等级卡约 10 秒渲染完成）
+
+- **不要因第一个 tab 失败就判「通道全坏」**：本次 driver 侧 7 个会话中**仅 1 个 tab 可执行 JS**（其余分别报 `No tab with given id` / ACK 无回包 / `Another debugger attached`）。做法=python 侧 `TMWebDriver().get_all_sessions()` 取真实 id → 逐个 `execute_js` 打最小探针（如 `1+1`）→ 取到可用者即可，通常一轮就能定位；本节实测由 727 这个 tab 完成全流程。
+- **从可用 tab `execute_js("window.open('https://connect.linux.do/','_blank')")` 开临时页后，新页直接可读**（本次未遇 CF 挑战、无需 CDP 注入，与 2026-09-22 需走 CDP 的版本不同——先直接用 `execute_js` 试读，失败再回落 CDP）。
+- **结构化抽取（比抽 innerText 更稳）**：connect 页 12 项可用 DOM 一次抽全——`访问天数/浏览话题/已读帖子` 在 `.tl3-ring`（内层 `.tl3-ring-circle` 的 class 含 `met`/`unmet`），`回复/送出赞/获赞/获赞天数/点赞用户` 在 `.tl3-bar-nums`（class 含 `met`/`unmet`），`被举报帖子/发起举报` 在 `.tl3-quota-card`，`被禁言/被封禁` 在 `.tl3-veto-item`（无 veto 时两容器各自重复出现，注意去重配对）。**判据一律取容器 class 的 `met`/`unmet`**，字形 `✓`/`○` 只作旁证。
+- **备用入口同样可用**：在同一临时页 `location.assign('https://linux.do/')` 后**约 10 秒**（多轮短等待即可）首页「要求」等级卡渲染完成（实测 `✓10 / 83% 完成度 / ○2 待完成`，12 项与 connect 逐字一致）；上次遇到的「加载中...」只是渲染未完成，**不必**直接走 2–3 分钟 CF 等待流程。
+- **收尾复核以「会话列表」为准**：`window.close()` 后 `get_all_sessions()` 由 8 → 7（临时 tab 消失、用户原 tab 全在）⇒ 该列表比 `web_scan` 的 `active_tab` 字段可靠（后者会残留已关闭 tab 的陈旧 id）。
