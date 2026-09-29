@@ -1,0 +1,288 @@
+{
+ "schema": "ga.freshness_pollution_cases/v1",
+ "note": "R511 task_freshness L2 污染信号端到端回放夹具；expect 为人工标注的 ground truth（语义来源=事件本体 vs 回声/引用）",
+ "pattern_token": "站点故障",
+ "_count_note": "files 内每个 .log 会被写进沙盒并扫描；expect.events/echoes 为期望的 signature_events/signature_echoes",
+ "cases": [
+  {
+   "id": "c1_markdown_list",
+   "kind": "polluted",
+   "label": "markdown 列表/标题/引用行（回声）",
+   "files": {
+    "logs/a.log": "# 09-29 巡检报告\n- **L2 降级签名**：站点故障 命中 2 次\n> 引用原文：站点故障\n"
+   },
+   "target": {
+    "id": "c1",
+    "kind": "sche",
+    "label": "replay c1",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c1.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": false,
+    "events": 0,
+    "echoes_min": 1,
+    "why": "报告体排版行（标题/列表/引用）是回声，不是事件本体"
+   }
+  },
+  {
+   "id": "c2_code_fence",
+   "kind": "polluted",
+   "label": "fenced code block 内（回声）",
+   "files": {
+    "logs/a.log": "说明：\n```\n# 站点故障: HTTP 000\nreturn None\n```\n结束\n"
+   },
+   "target": {
+    "id": "c2",
+    "kind": "sche",
+    "label": "replay c2",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c2.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": false,
+    "events": 0,
+    "echoes_min": 1,
+    "why": "代码块内是引述/示例，不是运行期事件"
+   }
+  },
+  {
+   "id": "c3_quoted",
+   "kind": "polluted",
+   "label": "引号成对包裹（回声）",
+   "files": {
+    "logs/a.log": "报告里写着「站点故障」这一现象，属静默降级\n"
+   },
+   "target": {
+    "id": "c3",
+    "kind": "sche",
+    "label": "replay c3",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c3.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": false,
+    "events": 0,
+    "echoes_min": 1,
+    "why": "引号内是引述原话"
+   }
+  },
+  {
+   "id": "c4_indented_code",
+   "kind": "polluted",
+   "label": "缩进 ≥4 且代码特征（源码清单回声）",
+   "files": {
+    "logs/a.log": "def probe(self):\n    # 站点故障: 覆盖\n    self.x = 1\n    return 404\n"
+   },
+   "target": {
+    "id": "c4",
+    "kind": "sche",
+    "label": "replay c4",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c4.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": false,
+    "events": 0,
+    "echoes_min": 1,
+    "why": "缩进代码行=源码/清单回声"
+   }
+  },
+  {
+   "id": "c5_true_log",
+   "kind": "true_positive",
+   "label": "独立日志行（事件本体）",
+   "files": {
+    "logs/a.log": "2026-09-29 09:00:00 ERROR 站点故障 rc=1\n"
+   },
+   "target": {
+    "id": "c5",
+    "kind": "sche",
+    "label": "replay c5",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c5.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": true,
+    "events_min": 1,
+    "echoes": 0,
+    "why": "带时间戳/级别/退出码的独立日志行=事件本体，必须告警"
+   }
+  },
+  {
+   "id": "c6_traceback",
+   "kind": "true_positive",
+   "label": "traceback 块内（事件本体）",
+   "files": {
+    "logs/a.log": "Traceback (most recent call last):\n  File \"x.py\", line 3, in <module>\n    站点故障()\nRuntimeError: boom\n"
+   },
+   "target": {
+    "id": "c6",
+    "kind": "sche",
+    "label": "replay c6",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c6.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": true,
+    "events_min": 1,
+    "echoes": 0,
+    "why": "异常栈内即使缩进也是事件本体"
+   }
+  },
+  {
+   "id": "c7_mixed",
+   "kind": "mixed",
+   "label": "同一文件既有回声又有事件（污染不得掩盖真信号）",
+   "files": {
+    "logs/a.log": "- 报告体：站点故障（回声）\n2026-09-29 09:00:00 ERROR 站点故障 rc=1\n"
+   },
+   "target": {
+    "id": "c7",
+    "kind": "sche",
+    "label": "replay c7",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c7.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": true,
+    "events_min": 1,
+    "echoes_min": 1,
+    "why": "两形态并存：回声降噪但真事件仍必须 ALERT"
+   }
+  },
+  {
+   "id": "c8_healthy",
+   "kind": "control",
+   "label": "健康日志（无命中，正控）",
+   "files": {
+    "logs/a.log": "done, 12 items\n200 OK\n"
+   },
+   "target": {
+    "id": "c8",
+    "kind": "sche",
+    "label": "replay c8",
+    "cadence": "daily",
+    "max_run_gap_days": 2,
+    "run_evidence": [
+     "done/*_c8.md"
+    ],
+    "scans": [
+     {
+      "globs": [
+       "logs/*.log"
+      ],
+      "window_days": 3,
+      "patterns": [
+       "站点故障"
+      ]
+     }
+    ]
+   },
+   "expect": {
+    "alert": false,
+    "events": 0,
+    "echoes": 0,
+    "why": "无命中即不告警（不得假绿也不得误报）"
+   }
+  }
+ ]
+}

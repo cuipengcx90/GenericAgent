@@ -40,6 +40,7 @@ import datetime
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -151,25 +152,166 @@ def tail_text(path, max_bytes=200_000):
         return ""
 
 
-def scan_signatures(paths, patterns, root, cap=6):
-    """在给定文件里找降级签名，返回命中列表 [{file, pattern, line}]。"""
+# ---- L2 命中上下文分级（R511：回声/引用 vs 事件本体）----------------------------
+# 背景：本层原用纯子串命中（text.find(pat)），而运行期日志常把工具输入输出、报告正文、
+# 源码清单、清单表格**原样回显**⇒关键词命中被回声污染（R466 实测 26 命中里 24 条是回声，
+# 且报告正文/源码里的「失败」字样会被当成降级信号）。本层把命中行分两级：
+#   strong（事件本体）：独立日志行（时间戳/级别/退出码/traceback 块内）或普通散文行
+#   echo  （回声/引用）：fenced code block 内、markdown 结构行（标题/列表/引用/表格）、
+#                        命中串被引号成对包裹（引述原话）、缩进 ≥4 且行内带代码特征（源码清单）
+# 语义：echo 命中只作可见性提示（INFO），不计为事件；只有 strong 才升 ALERT。
+# 回退：scan 段写 "echo_policy": "keep" ⇒ 回到旧行为（逐字）。
+LOG_HEAD_RX = re.compile(
+    r"^\s*(?:\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"                        # 2026-09-29T10:00 / 2026-09-29 10:00
+    r"|(?:ERROR|WARN|WARNING|FATAL|CRITICAL)\b"                       # 级别词打头
+    r"|\[(?:ERROR|WARN|WARNING|FATAL|CRITICAL)\]"
+    r"|rc[=: ]\s*\d+"                                                 # rc=1 / rc: 1
+    r"|exit[_ ]?code[=: ]\s*\d+|exit:\s*\d+"
+    r"|Traceback \(most recent call last\)"
+    r"|File \")")
+MD_MARK_RX = re.compile(r"^\s*(?:#{1,6}\s|[-*+]\s|>\s?|\||\d+[.)]\s|\*\*[^*]+\*\*\s*$)")
+FENCE_RX = re.compile(r"^\s*(?:```|~~~)")
+CODEISH_RX = re.compile(
+    r"(?:^|\W)(?:def|class|import|from|return|raise|yield|lambda|print|assert)\s"
+    r"|[A-Za-z_]\w*\s*=\s*[^=]|\bself\.|>>>")
+QUOTE_PAIRS = (("\"", "\""), ("'", "'"), ("`", "`"), ("「", "」"), ("“", "”"))
+
+
+def _line_index(text, idx):
+    """idx 落在 text 的第几行（0-based，整份 text 切行）。"""
+    pos = 0
+    for i, ln in enumerate(text.split("\n")):
+        nxt = pos + len(ln)
+        if idx <= nxt:
+            return i
+        pos = nxt + 1
+    return max(0, len(text.split("\n")) - 1)
+
+
+def _in_fence(lines, lineno):
+    """命中行是否落在 markdown fenced code block（``` / ~~~）内。"""
+    n = 0
+    for ln in lines[:lineno]:
+        if FENCE_RX.match(ln):
+            n += 1
+    return (n % 2) == 1
+
+
+def _in_traceback(lines, lineno):
+    """命中行是否落在 traceback 块内（事件本体，即使该行缩进）。"""
+    lo = max(0, lineno - 80)
+    s = None
+    for i in range(lineno, lo - 1, -1):
+        if lines[i].startswith("Traceback (most recent call last)"):
+            s = i
+            break
+    if s is None:
+        return False
+    if s == lineno:
+        return True
+    opened = 0
+    for j in range(s + 1, lineno + 1):
+        ln = lines[j]
+        if not ln.strip() or ln[:1] in (" ", "\t"):
+            continue
+        opened += 1
+        if opened > 1:                 # 块已在更早处结束（只有一个非缩进终止行）
+            return False
+    return True
+
+
+def _quoted_here(lines, lineno, pattern):
+    """命中串在该行是否被引号成对包裹（引述原话 ⇒ 回声）。"""
+    line = lines[lineno]
+    start = 0
+    while True:
+        k = line.find(pattern, start)
+        if k < 0:
+            return False
+        j = k - 1
+        while j >= 0 and line[j] in " \t":
+            j -= 1
+        e = k + len(pattern)
+        while e < len(line) and line[e] in " \t":
+            e += 1
+        left = line[j] if j >= 0 else ""
+        right = line[e] if e < len(line) else ""
+        if (left, right) in QUOTE_PAIRS:
+            return True
+        start = k + 1
+
+
+def classify_hit_context(text, idx, pattern=""):
+    """判定命中行属于「事件本体」(strong) 还是「回声/引用」(echo)。纯只读。
+
+    返回 (context, reason)；reason 用于报告与调试（log-head/traceback-block/
+    code-fence/markdown/quoted/indented-code/plain）。
+    """
+    lines = text.split("\n")
+    lineno = _line_index(text, idx)
+    line = lines[lineno]
+    if LOG_HEAD_RX.match(line):
+        return "strong", "log-head"
+    if _in_traceback(lines, lineno):
+        return "strong", "traceback-block"
+    if _in_fence(lines, lineno):
+        return "echo", "code-fence"
+    if MD_MARK_RX.match(line):
+        return "echo", "markdown"
+    if pattern and _quoted_here(lines, lineno, pattern):
+        return "echo", "quoted"
+    indent = len(line) - len(line.lstrip(" \t"))
+    if indent >= 4 and CODEISH_RX.search(line):
+        return "echo", "indented-code"
+    return "strong", "plain"
+
+
+def scan_signatures(paths, patterns, root, cap=6, classify=False):
+    """在给定文件里找降级签名，返回命中列表 [{file, pattern, line}]。
+
+    classify=True（R511）：额外为每条命中打上下文级别
+      rec["context"]="strong"|"echo"、rec["context_reason"]、rec["echo"]=bool；
+      并对**同一文件内同内容回声行**去重（同一段被反复回显只留一条，防刷屏）。
+      ★同一文件同一 pattern 的**全部**命中都会被取（旧版只取首个）——否则「报告体里
+        先回显一次关键词」会让同文件后面的真事件行被整段跳过 = 回声掩盖真信号。
+      每文件的命中按 strong 优先排序后再计入 cap，保证真事件不被回声挤掉。
+    classify=False（默认）：行为与旧版逐字一致（channel 检查等既有调用点不受影响）。
+    """
     hits = []
+    seen_echo = set()
     for p in paths:
         text = tail_text(p)
         if not text:
             continue
+        rel = os.path.relpath(p, root) if p.startswith(root) else p
         for pat in patterns or []:
-            idx = text.find(pat)
-            if idx < 0:
-                continue
-            # 取该行原文（截断）
-            start = text.rfind("\n", 0, idx) + 1
-            end = text.find("\n", idx)
-            line = text[start:end if end > 0 else len(text)].strip()
-            hits.append({"file": os.path.relpath(p, root) if p.startswith(root) else p,
-                         "pattern": pat, "line": line[:180]})
+            if classify:
+                idxs = [m.start() for m in re.finditer(re.escape(pat), text)]
+            else:
+                i0 = text.find(pat)
+                idxs = [i0] if i0 >= 0 else []
+            per = []
+            for idx in idxs:
+                # 取该行原文（截断）
+                start = text.rfind("\n", 0, idx) + 1
+                end = text.find("\n", idx)
+                line = text[start:end if end > 0 else len(text)].strip()
+                rec = {"file": rel, "pattern": pat, "line": line[:180]}
+                if classify:
+                    ctx, why = classify_hit_context(text, idx, pat)
+                    rec["context"], rec["context_reason"] = ctx, why
+                    rec["echo"] = (ctx == "echo")
+                    if rec["echo"]:
+                        key = (rel, line[:180])
+                        if key in seen_echo:
+                            continue
+                        seen_echo.add(key)
+                per.append(rec)
+            if classify and per:
+                per.sort(key=lambda r: bool(r.get("echo")))      # strong 在前，回声在后
+            hits.extend(per)
             if len(hits) >= cap:
-                return hits
+                return hits[:cap]
     return hits
 
 
@@ -464,7 +606,7 @@ def check_target(t, root, ref=None, ld=None, pf=None):
                 else:
                     res["checks"].append({"level": "OK", "text": "L1b 产出内容在变：%s" % desc})
 
-    # ---- L2 静默降级签名 ----
+    # ---- L2 静默降级签名 ----（R511：命中行分「事件本体 / 回声·引用」两级）
     sig_hits = []
     for sc in t.get("scans") or []:
         files = all_matches(sc["globs"], root)
@@ -473,19 +615,29 @@ def check_target(t, root, ref=None, ld=None, pf=None):
             res["checks"].append({"level": "INFO", "text": "L2 无窗口内日志可扫（%s）" % sc["globs"][0]})
             continue
         target = max(fresh, key=os.path.getmtime)
-        hits = scan_signatures([target], sc.get("patterns") or [], root)
+        # echo_policy=keep ⇒ 关闭回声分级，回到旧行为（A/B 复算与回退用）
+        hits = scan_signatures([target], sc.get("patterns") or [], root,
+                               classify=(sc.get("echo_policy") != "keep"))
         for h in hits:
             h["source"] = "log"
             h["scan_soft"] = bool(sc.get("soft"))   # 扫描级软判据随命中一起带出（勿用路径回查：h["file"] 是相对路径）
             sig_hits.append(h)
+    sig_events = [h for h in sig_hits if not h.get("echo")]
+    sig_echoes = [h for h in sig_hits if h.get("echo")]
     if sig_hits:
         for h in sig_hits[:4]:
-            # 扫描级软判据（sc.soft）：命中只作可见性提示，不计入硬问题（如「按设计跳过」类前置缺失）
-            lvl = "INFO" if h.get("scan_soft") else "ALERT"
+            # 三级口径：扫描级软判据 / 回声命中（非事件本体）⇒ INFO；只有事件本体 ⇒ ALERT
+            if h.get("scan_soft"):
+                lvl, tag = "INFO", "（软判据）"
+            elif h.get("echo"):
+                lvl, tag = "INFO", "（回声/引用·不计事件）"
+            else:
+                lvl, tag = "ALERT", ""
             h["soft"] = (lvl == "INFO")
-            bump(lvl, "L2 降级签名命中%s %s: %s「%s」" % ("（软判据）" if lvl == "INFO" else "",
-                                                        h["file"], h["pattern"], h["line"][:120]))
+            bump(lvl, "L2 降级签名命中%s %s: %s「%s」" % (tag, h["file"], h["pattern"], h["line"][:120]))
     res["signatures"] = sig_hits
+    res["signature_events"] = len(sig_events)     # R511：事件本体命中数（硬信号口径）
+    res["signature_echoes"] = len(sig_echoes)     # R511：回声命中数（仅可见性提示）
 
     # ---- launchd 专属 ----
     if res["kind"] == "launchd":
@@ -712,6 +864,13 @@ def selftest(tmp=None):
     touch("sche_tasks/done/2026-05-31_0900_legacy_quiet.md", 120.0, "# done\n")
     touch("sche_tasks/done/2026-09-27_0900_legacy_revived.md", 1.0, "# done\n")
     touch("sche_tasks/done/2026-06-30_0900_ondemand_manual.md", 90.0, "# done\n")
+    # fixture G：L2 命中上下文分级（R511）—— echo-only / event-only / 关分类器负控
+    touch("temp/pollution/echo_0929.log", 0.2,
+          "# 09-29 巡检报告\n- **L2 降级签名**：站点故障 命中 1 次\n> 报告正文引用：站点故障\n")
+    touch("temp/pollution/event_0929.log", 0.2,
+          "2026-09-29 09:00:00 ERROR 站点故障 rc=1\n")
+    for _t in ("pollution_echo", "pollution_event", "pollution_echo_keep"):
+        touch("sche_tasks/done/2026-09-29_0900_%s.md" % _t, 0.2, "# done\n")
 
     criteria = {"_source": "selftest-fixture", "targets": [
         {"id": "birdie_daily_monitor", "kind": "sche", "cadence": "daily", "max_run_gap_days": 2,
@@ -786,6 +945,24 @@ def selftest(tmp=None):
          "sources": ["chrome"], "roots": {"chrome": r_lost},
          "live_dates": {"chrome": (_t0 - datetime.timedelta(days=4)).isoformat()}},
     ]
+    # fixture G：L2 命中上下文分级（R511）
+    criteria["targets"] += [
+        {"id": "pollution_echo", "kind": "sche", "label": "回声污染（selftest 夹具）",
+         "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_pollution_echo.md"],
+         "scans": [{"globs": ["temp/pollution/echo_*.log"], "window_days": 3,
+                    "patterns": ["站点故障"]}]},
+        {"id": "pollution_event", "kind": "sche", "label": "事件本体（selftest 夹具）",
+         "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_pollution_event.md"],
+         "scans": [{"globs": ["temp/pollution/event_*.log"], "window_days": 3,
+                    "patterns": ["站点故障"]}]},
+        {"id": "pollution_echo_keep", "kind": "sche", "label": "关分类器负控（selftest 夹具）",
+         "cadence": "daily", "max_run_gap_days": 2,
+         "run_evidence": ["sche_tasks/done/*_pollution_echo_keep.md"],
+         "scans": [{"globs": ["temp/pollution/echo_*.log"], "window_days": 3,
+                    "patterns": ["站点故障"], "echo_policy": "keep"}]},
+    ]
 
     checks = []
     def expect(name, cond, detail=""):
@@ -829,9 +1006,10 @@ def selftest(tmp=None):
     # 语料自证：确认夹具被真读到
     # 夹具固定语料：3 个 payload 文件（birdie/haisou seen_items + tech_trends 产物）
     # + 4 个内容族夹具（temp/contentfam/snap_*.json，经 content_heartbeat 的 payloads 计入）
-    # + 1 个单文件族（temp/oneshot/only_*.json）+ 2 个带签名的日志（birdie_0925.log / haisou_20260925_1115.log）
-    expect("⑦ 语料自证：payload=8 且日志=2 且内容族=3（精确计数）",
-           res["corpus"]["payload_files_seen"] == 8 and res["corpus"]["log_files_scanned"] == 2
+    # + 1 个单文件族（temp/oneshot/only_*.json）+ 4 个带签名的日志
+    #   （birdie_0925.log / haisou_20260925_1115.log / R511 新增 temp/pollution/{echo,event}_0929.log）
+    expect("⑦ 语料自证：payload=8 且日志=4 且内容族=3（精确计数）",
+           res["corpus"]["payload_files_seen"] == 8 and res["corpus"]["log_files_scanned"] == 4
            and res["corpus"]["content_families"] == 3,
            str(res["corpus"]))
     # ⑧–⑫ L1b 内容级判据（跑而不产出不得判健康）——本段五条即 R457 候选的接线负控
@@ -946,6 +1124,26 @@ def selftest(tmp=None):
     expect("㉕ 负控：补上缺口目录 → retention_gap 转 INFO（判定随输入变，非硬编码结论）",
            rg9["verdict"] == "INFO" and rg9["id"] not in res9["hard_issue_ids"],
            "%s / %s" % (rg9["verdict"], rg9["retention"]["sources"]["chrome"]["missing_days"]))
+
+    # ㉖–㉙ L2 命中上下文分级（R511）—— ㉘㉙ 为负控
+    pe = rows["pollution_echo"]
+    expect("㉖ 回声命中（markdown/引用行）⇒ 不升 ALERT、signature_events=0 且回声计数≥1",
+           pe["verdict"] != "ALERT" and pe["signature_events"] == 0 and pe["signature_echoes"] >= 1
+           and pe["id"] not in res["hard_issue_ids"],
+           "%s / events=%s echoes=%s" % (pe["verdict"], pe.get("signature_events"),
+                                        pe.get("signature_echoes")))
+    pv = rows["pollution_event"]
+    expect("㉗ 事件本体命中（独立日志行）⇒ ALERT 且 signature_events≥1、进硬问题",
+           pv["verdict"] == "ALERT" and pv["signature_events"] >= 1
+           and pv["id"] in res["hard_issue_ids"],
+           "%s / events=%s" % (pv["verdict"], pv.get("signature_events")))
+    pk = rows["pollution_echo_keep"]
+    expect("㉘ 负控：echo_policy=keep ⇒ 同一夹具回到 ALERT（证明分级开关生效非硬编码）",
+           pk["verdict"] == "ALERT" and pk["signature_events"] >= 1,
+           "%s / events=%s" % (pk["verdict"], pk.get("signature_events")))
+    expect("㉙ 负控：回声命中的可见性提示须带「回声/引用」标记（INFO 不吞没）",
+           any(c["level"] == "INFO" and "回声" in c["text"] for c in pe["checks"]),
+           str([c["text"][:44] for c in pe["checks"]]))
 
     ok = True
     for name, good, detail in checks:
