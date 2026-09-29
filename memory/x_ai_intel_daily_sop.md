@@ -9,7 +9,7 @@
 ```python
 import sys; sys.path.insert(0,".")            # cwd=仓库根
 from TMWebDriver import TMWebDriver
-d=TMWebDriver(); print(d.is_remote, len(d.get_all_sessions()), d.find_session("x.com"))
+d=TMWebDriver(); print(d.is_remote, len(d.get_all_sessions()), d.set_session("x.com"))  # ★勿用 d.find_session()：remote 模式下它只遍历本地 self.sessions（恒空）⇒ 假「无会话」
 ```
 1. `is_remote=True` + 端口 18765/18766 可连 ⇒ 驱动在线（问题在前置，不在驱动）；
 2. `get_all_sessions()==0` + `web_scan(tabs_only=True)` 也报无标签 ⇒ 真无会话（两侧同空=真无，非陈旧）；
@@ -31,3 +31,10 @@ d=TMWebDriver(); print(d.is_remote, len(d.get_all_sessions()), d.find_session("x
 
 ## 零副作用核验（失败时也应回读，证明"没动过东西"）
 去重库 `temp/x_ai_intel/x_intel.sqlite3` mtime、`temp/x_ai_intel/reports/` 份数与最新文件、`pgrep -fl x_intel.py`；本任务**只允许**写 `/tmp/x_ai_intel.log`（启动前先备份旧日志再截断，方能判新鲜度）。
+
+## 第四形态复现 + 一处速判假阴性（2026-09-29 09:03 实测）
+
+- **第四形态复现**：`get_all_sessions()` 7 条中含 x.com 标签（id `2109120745`）⇒ `set_session("x.com")` **成功** ⇒ 随后任意 `execute_js` 均报 `CDP fallback failed: No tab with given id 2109120745.`（title/url/账号按钮三探针全 FAIL）。即「标签在册 ∧ default session 可设 ∧ JS 通道仍死」。
+- **脚本实跑同因失败**：日志 `/tmp/x_ai_intel.log` 显示 `x_intel.py` 在 `driver.jump(...)` 处经 `TMWebDriver.execute_js`（`TMWebDriver.py:194`）抛 `Exception: {'name': 'Error', 'message': 'CDP fallback failed: No tab with given id 2109120745.', 'stack': ''}`，**未进入采集循环** ⇒ 零推送、零写库、零报告。
+- **速判假阴性坑（本次新发现，已改正上方速判代码）**：`TMWebDriver().find_session("x.com")` 在 `is_remote=True` 时**恒返回 `[]`**（该实现只遍历本地 `self.sessions`，remote 实例本地表为空；只有 `set_session()` 走 `_remote_cmd({"cmd":"find_session"})`）。⇒ 判「有无 x.com 会话」一律以 `set_session()` 返回值为准（或 agent 侧 `web_scan` 作第二来源）；`find_session()` 的空结果**不构成证据**，据此判「无标签」会与事实相反。
+- **量化刷新（2026-09-29 现场）**：`ls sche_tasks/done/*_x_ai_intel_daily.md | wc -l` = **40**；严格正则 `Saved [0-9]+ new posts` 命中 **0**；去重库 mtime 仍 `2026-08-17 16:03:49`（无 `-wal/-shm`）；`reports/` 仍 5 份（末份 `20260817_160400.md`）⇒ 末次真实成功仍为 2026-08-17。处置仍属**外部前置**（需用户手动保留一个已登录 x.com 标签，勿收进 OneTab）；退役提案见 `pending_decisions/DECISIONS_R484*`，未批准前保持现状、勿改脚本。
