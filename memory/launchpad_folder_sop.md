@@ -227,4 +227,5 @@ time.sleep(5)  # 等全新 bootstrap
 
 - **2026-09-12**：完成从空壳目录到可渲染分类的修复与 UI/截图验收；建立本节作为可持续调整基线。未在本次自动执行“开发者高频优先”重排，也未擅自处理 CORE Keygen、danbo、LiveAgent。
 - **2026-09-12（实施细节补充）**：新增“可复用实施 Runbook”：动态定位 DB、F→P→A 三层模型、备份/停 Dock/事务与触发器隔离、连续排序重建、Dock bootstrap、DB+真实 UI 双验收，以及现象→取证→修复决策表。后续不允许只凭抽象原则或临时手写 SQL 重试。
+- **2026-09-29**：本 SOP 已全量镜像到 OB 知识库（vault `~/develop/obsidian-note`）=`60 Wiki/topics/macos-launchpad-folder-organize.md`，并在 `60 Wiki/INDEX.md` 登记；vault 侧本地 git 提交 75328b5b（vault 无远端）。给非 GA 的 agent 看时以 vault 版为准，数值时效见该页尾部说明。
 
