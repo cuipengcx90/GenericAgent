@@ -64,3 +64,11 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
 - **结构化抽取（比抽 innerText 更稳）**：connect 页 12 项可用 DOM 一次抽全——`访问天数/浏览话题/已读帖子` 在 `.tl3-ring`（内层 `.tl3-ring-circle` 的 class 含 `met`/`unmet`），`回复/送出赞/获赞/获赞天数/点赞用户` 在 `.tl3-bar-nums`（class 含 `met`/`unmet`），`被举报帖子/发起举报` 在 `.tl3-quota-card`，`被禁言/被封禁` 在 `.tl3-veto-item`（无 veto 时两容器各自重复出现，注意去重配对）。**判据一律取容器 class 的 `met`/`unmet`**，字形 `✓`/`○` 只作旁证。
 - **备用入口同样可用**：在同一临时页 `location.assign('https://linux.do/')` 后**约 10 秒**（多轮短等待即可）首页「要求」等级卡渲染完成（实测 `✓10 / 83% 完成度 / ○2 待完成`，12 项与 connect 逐字一致）；上次遇到的「加载中...」只是渲染未完成，**不必**直接走 2–3 分钟 CF 等待流程。
 - **收尾复核以「会话列表」为准**：`window.close()` 后 `get_all_sessions()` 由 8 → 7（临时 tab 消失、用户原 tab 全在）⇒ 该列表比 `web_scan` 的 `active_tab` 字段可靠（后者会残留已关闭 tab 的陈旧 id）。
+
+## 补充（2026-09-30 实测：`/link` 的 `sessionId` 必须是**字符串**，传 int 会静默回落 ⇒ 任意 tab 读出同一页）
+
+- **根因（通用坑，非本任务专属）**：`TMWebDriver.execute_js(code, timeout, session_id)` 直接拿 `session_id` 查会话表 `self.sessions.get(session_id)`（`TMWebDriver.py:188-208`），而会话表的**键是字符串**（ws 注册时 `session_id = str(tab['id'])`，见 `TMWebDriver.py:145` 与 `169-174`）。经 `/link` 传 JSON 数字 id（如 `{"cmd":"execute_js","sessionId":2109121033}`）时**查不到**，但代码**不报错**：仅打印「会话 … 未连接，自动切换到最新活动会话」并**回落到 `alive_sessions[0]`**（`TMWebDriver.py:197-206`）。
+- **症状**：无论传哪个 tab 的 id，读出的都是同一个页面（本次=活动标签的 GitHub 页）⇒ 极易误判成「通道全坏 / tab id 失配」。**判据**：响应里出现「自动切换到最新活动会话」即回落已发生；正确做法=**一律传 `str(id)`**（本次改传字符串后即读到 connect 页）。
+- 本次 `/link` 只暴露 3 个 cmd（`get_all_sessions`/`find_session`/`execute_js`）；`{"cmd":"tabs"}` 在 `/link` 上**不支持**（返回非 JSON），取真实 id 一律用 `get_all_sessions`。
+- 与 2026-09-29 节(通道按 tab 粒度失配)的差异：本次 4 个用户 tab **全部**可执行 JS（未出现 `No tab with given id`/`Another debugger attached`），失败面只剩「传错 id 类型」这一条。
+- connect 页本次首读**仍被 CF 挑战**（`innerText` 仅含 driver 行、`title`=「请稍候…」）⇒ 同临时页 `location.assign('https://linux.do/')` 回落首页等级卡，约 10 秒内渲染完成（与 09-29 一致）；12 项与 connect 页口径一致。
