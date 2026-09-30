@@ -4,7 +4,7 @@
 - 定时任务在册：`sche_tasks/smyze_stock_watch.json`（`08:30` daily，enabled）。
 - 唯一入口（勿依赖 cwd，先 cd）：
   ```bash
-  cd /Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/bar_smyze_opserver/.claude/worktrees/master-sync-bubble/docs/analysis/supply-chain/stock-watch
+  cd /Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/bar_smyze_opserver/.claude/worktrees/stock-watch-daily/docs/analysis/supply-chain/stock-watch
   set -o allexport; . /Users/cuip/.config/smyze/stock-watch.env; set +o allexport
   ./deploy/daily-run.sh; echo "exit=$?"
   ```
