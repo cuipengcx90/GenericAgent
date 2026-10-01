@@ -72,3 +72,19 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
 - 本次 `/link` 只暴露 3 个 cmd（`get_all_sessions`/`find_session`/`execute_js`）；`{"cmd":"tabs"}` 在 `/link` 上**不支持**（返回非 JSON），取真实 id 一律用 `get_all_sessions`。
 - 与 2026-09-29 节(通道按 tab 粒度失配)的差异：本次 4 个用户 tab **全部**可执行 JS（未出现 `No tab with given id`/`Another debugger attached`），失败面只剩「传错 id 类型」这一条。
 - connect 页本次首读**仍被 CF 挑战**（`innerText` 仅含 driver 行、`title`=「请稍候…」）⇒ 同临时页 `location.assign('https://linux.do/')` 回落首页等级卡，约 10 秒内渲染完成（与 09-29 一致）；12 项与 connect 页口径一致。
+
+## 补充（2026-10-01 实测：禁自造指标名映射 + 连续期断言必须逐份回源）
+
+- **指标名一律取页面原文，禁自造 NAME_MAP**：connect 页直接用 `访问天数 / 浏览话题 / 浏览帖子` 三名，**与首页等级卡同名同义**（首页卡只把另外几项叫「送出赞/发起举报/点赞用户」，`浏览帖子` 在首页卡旁注为「已读帖子」）。本次图省事自造了 `活跃程度→访问天数→浏览话题→已读帖子` 的换名映射，结果推送文案**整体错位一格**（把访问天数 `79/50` 写成「浏览话题」、把浏览话题 `504/500` 写成「已读帖子」）⇒ 必须补发更正私信。**规则**：ring 的 `值|/ 门槛|名` 取**末段**作名（`txt.split('|')[-1].strip()`）；bars/quota/veto 同理；**不得**用任何自造对照表换名。
+- **连续期（连续同状态天数）必须逐份回源，禁沿用上文口径**：本次沿用昨日报告写「连续第 4 天」，实况是 **09-19 = 已符合（COMPLIANT）**、**09-20 起逐日 NOT_COMPLIANT** ⇒ 今日为**连续第 12 天**（09-30 那份报告口径偏低）。回源命令：
+  ```bash
+  python3 - <<'PY'
+  import glob,os
+  for f in sorted(glob.glob('sche_tasks/done/*linuxdo_trust_level_check.md')):
+      head='\n'.join(open(f,encoding='utf-8').read().split('\n')[:14])
+      print(os.path.basename(f)[:10], 'COMPLIANT' if '已符合' in head else 'NOT_COMPLIANT')
+  PY
+  ```
+  判据取**报告头部结论行**（`已符合`/`未达标`），不要用全文关键词（会把 `✓ 已达标` 的指标行、正文举例混进来）。
+- **connect 页首读可能直接成功**（本次未遇 CF，`title`=`Connect - LINUX DO Connect`、正文含「信任级别 3 的要求」）⇒ 仍按「先试 connect、失败再回落首页」执行；页面里出现 `challenges.cloudflare.com/turnstile/...` 只是站点常驻脚本引用，**不是**拦截态，判拦截看 `title` 是否为「请稍候…」/正文是否只剩 driver 行。
+- **判据只用 DOM 容器 class（`.met`/`.unmet`）**：本次 `.met`=14 / `.unmet`=3，其中第 3 个 unmet 是 `.tl3-bar-fill unmet`（进度条填充，**非独立指标**）⇒ 去重后 = 12 项（10 met / 2 unmet）。结构性抽取结果建议落 JSON，供脚本复算（本次 `temp/linuxdo_tl3_1001_dom.json`）。
