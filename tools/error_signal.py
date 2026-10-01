@@ -408,8 +408,12 @@ def _selftest() -> int:
             after = hashlib.sha256(tmp.read_bytes()).hexdigest()
             ck(before == after, "NC10 只读：输入文件 sha256 不变")
             ck(json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True), "NC10 幂等")
-            ck(a["event_count"] >= 1, "NC10 真日志里至少有 1 个 traceback 事件")
-            ck(a["legacy_keyword_hits"] > a["event_count"], "NC10 旧口径虚高（回声污染）实证")
+            # 金丝雀取**全档**：尾部 2000 行窗口会随真实日志内容滚动到「无事件」区间
+            # （2026-10-01 实测该窗口 event_count=0 而全档 235），
+            # 若绑死尾部窗口，自测的通过与否会由现场日志内容决定（假红/假绿皆非缺陷信号）。
+            whole = analyze_file(tmp, 0)
+            ck(whole["event_count"] >= 1, "NC10 真日志里至少有 1 个 traceback 事件（全档）")
+            ck(whole["legacy_keyword_hits"] > whole["event_count"], "NC10 旧口径虚高（回声污染）实证（全档）")
     else:
         ck(True, "NC10 跳过（无真日志）")
 
