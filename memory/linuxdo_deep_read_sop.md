@@ -142,6 +142,7 @@ function getLikeCount(post) {
 ### 发现（比 Google 更可靠）
 - 日报作者固定 `xtc0809`（分类 前沿快讯 cat 78），标题形如 `linux.do人工智能技术日报+播客-YY-MM-DD`（**标题日期 = 发布日**；PDF 里的数据日期 = 标题日期 - 1）。
 - **首选**站内搜索：同源 tab `fetch('/search.json?q=' + encodeURIComponent('人工智能技术日报 order:latest'))` → `topics[]` 即完整时间倒序列表（含 topic_id / title / created_at），一次拿全，还能交叉确认无其他作者同类贴。
+- ★2026-10-01 实测（**CF 可整通道拦住 `/search.json`，却放行 HTML 搜索页导航**）：当日登录态正常（同 tab 能读帖正文、`/t/topic/<id>` 可访问），但 `search.json` **两条通道**都被 CF 挑战页拦下——同源 `fetch()` 返回的正文是 `Just a moment...` HTML，把该 URL **整页导航**过去同样停在挑战页。改用 **HTML 搜索页** `https://linux.do/search?q=人工智能技术日报` 直接导航 ⇒ 正常渲染结果列表（当日帖赫然在列，7 小时前发布），据此取到 `topic_id` 后即按常规流程走。⇒ 判据=**JSON 端点被拦 ≠ 论坛不可用**，先试 HTML 搜索页导航（结果项的链接形如 `/t/topic/<id>`）；不要在同一通道上反复重试（有 IP 级 429 风险，见下「限流与 429」）。
 - 备选：`/user_actions.json?username=xtc0809&filter=5&offset=0&limit=40`（filter=5 = 该用户创建的主题）。
 - ⚠️ `https://linux.do/u/<name>/activity/topics.json` **不是**有效 API（返回 HTML，解析后 `user_actions` 为空），别用。
 - ⚠️ Google `site:linux.do/t/topic "人工智能技术日报"` 结果严重滞后，只能兜底。
