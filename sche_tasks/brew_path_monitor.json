@@ -3,5 +3,5 @@
   "repeat": "weekly",
   "enabled": true,
   "max_delay_hours": 24,
-  "prompt": "【brew PATH冲突监控】执行以下命令检测brew与系统工具的PATH冲突：\n```bash\ncd /Users/cuip/projects/GenericAgent\npython3 temp/brew_path_checker.py > temp/brew_path_reports/$(date +%Y-%m-%d).txt 2>&1\ncat temp/brew_path_reports/$(date +%Y-%m-%d).txt\n```\n检测内容：\n1. PATH配置分析(anaconda/homebrew/system优先级)\n2. 工具冲突检测(python3/curl/git/node/npm多版本)\n3. 关键依赖检查(selenium等)\n\n如发现新冲突或依赖缺失，调用飞书通知：\n```python\nimport sys\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nfrom reflect_scripts.reflect_common import notify_feishu\nnotify_feishu('brew PATH冲突告警\\n' + report_content)\n```"
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n【brew PATH冲突监控】执行以下命令检测brew与系统工具的PATH冲突：\n```bash\ncd /Users/cuip/projects/GenericAgent\npython3 temp/brew_path_checker.py > temp/brew_path_reports/$(date +%Y-%m-%d).txt 2>&1\ncat temp/brew_path_reports/$(date +%Y-%m-%d).txt\n```\n检测内容：\n1. PATH配置分析(anaconda/homebrew/system优先级)\n2. 工具冲突检测(python3/curl/git/node/npm多版本)\n3. 关键依赖检查(selenium等)\n\n如发现新冲突或依赖缺失，调用飞书通知：\n```python\nimport sys\nsys.path.insert(0, '/Users/cuip/projects/GenericAgent')\nfrom reflect_scripts.reflect_common import notify_feishu\nnotify_feishu('brew PATH冲突告警\\n' + report_content)\n```"
 }

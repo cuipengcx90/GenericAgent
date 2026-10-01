@@ -3,5 +3,5 @@
   "repeat": "every_10d",
   "enabled": true,
   "max_delay_hours": 12,
-  "prompt": "按 ../memory/navicat_trial_reset_sop.md 执行 Navicat Premium 试用期重置。步骤：(1) 先用 pgrep -i navicat 记录 Navicat Premium 触发前是否在运行，记为 was_running。(2) 若在运行则 osascript quit 后确认/必要时 pkill 彻底关闭。(3) 用 bash 执行 /Users/cuip/develop/WorkSpaces/idea/git/navicat_for_mac_reset/reset_navicat.sh，不要用 sh。(4) 验证 ~/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Navicat Premium/ 下的 .[0-9A-Z]{32} 隐藏文件已按当前时间重新生成；若已生成则重置成功，若未生成可 open 一次触发再验证后关闭。(5) 收尾打开策略：仅当 was_running 为真时才 open -a 'Navicat Premium' 恢复；若触发前本来没开，则不要打开，保持关闭。把执行结果写入调度器提供的报告路径。"
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n按 memory/navicat_trial_reset_sop.md 执行 Navicat Premium 试用期重置。步骤：(1) 先用 pgrep -i navicat 记录 Navicat Premium 触发前是否在运行，记为 was_running。(2) 若在运行则 osascript quit 后确认/必要时 pkill 彻底关闭。(3) 用 bash 执行 /Users/cuip/develop/WorkSpaces/idea/git/navicat_for_mac_reset/reset_navicat.sh，不要用 sh。(4) 验证 ~/Library/Application Support/PremiumSoft CyberTech/Navicat CC/Navicat Premium/ 下的 .[0-9A-Z]{32} 隐藏文件已按当前时间重新生成；若已生成则重置成功，若未生成可 open 一次触发再验证后关闭。(5) 收尾打开策略：仅当 was_running 为真时才 open -a 'Navicat Premium' 恢复；若触发前本来没开，则不要打开，保持关闭。把执行结果写入调度器提供的报告路径。"
 }

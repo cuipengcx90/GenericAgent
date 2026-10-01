@@ -2,6 +2,6 @@
   "schedule": "09:00",
   "repeat": "daily",
   "enabled": true,
-  "prompt": "运行效率监控采集：import sys; sys.path.insert(0,'./temp'); from efficiency_monitor import EfficiencyMonitor; from pathlib import Path; m=EfficiencyMonitor(Path('./logs/autonomous_reflect.log')); r=m.parse_log(); print(r); m.save_report('./temp/efficiency_report_latest.json')",
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n运行效率监控采集：import sys; sys.path.insert(0,'./temp'); from efficiency_monitor import EfficiencyMonitor; from pathlib import Path; m=EfficiencyMonitor(Path('./logs/autonomous_reflect.log')); r=m.parse_log(); print(r); m.save_report('./temp/efficiency_report_latest.json')",
   "max_delay_hours": 24
 }
