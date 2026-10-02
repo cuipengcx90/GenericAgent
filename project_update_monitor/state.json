@@ -2,55 +2,55 @@
   "schema_version": 1,
   "sources": {
     "paseo": {
-      "release_tag": "v0.10.2",
-      "release_url": "https://github.com/getpaseo/paseo/releases/tag/v0.10.2",
-      "release_published": "2026-09-29T23:53:30Z",
-      "release_body": "## 0.10.2 - 2026-09-30\n\n### Fixed\n\n- Fixed OpenCode v2 turns longer than five minutes failing with `UND_ERR_HEADERS_TIMEOUT` ([#5674](https://github.com/getpaseo/paseo/pull/5674))\n- Fixed the context meter staying empty during OpenCode v2 turns and disappearing after them ([#5710](https://github.com/getpaseo/paseo/pull/5710) by @mcowger)\n- Fixed OpenCode v2 question cards showing only the header and offering no typed answer ([#5679](https://github.com/getpaseo/paseo/pull/5679))\n- Fixed OpenCode v2 patch edits from GPT models showing as a raw Patch card instead of an edit diff ([#5696](https://github.com/getpaseo/paseo/pull/5696))\n- Fixed completed OpenCode v2 edits showing no diff ([#5609](https://github.com/getpaseo/paseo/pull/5609))\n",
-      "release_prerelease": false,
-      "tag": "v0.10.2",
-      "tag_sha": "919c737c1948c5a16220307403a82e90d3e27ea0",
-      "commit_sha": "e0a0cf990d27f9a40cb1ef2fc490a1d2d7a7e4ef",
-      "commit_message": "Ask OpenCode before running a Paseo tool (#5801)\n\nOpenCode checks permissions for its own tools and wraps MCP tools in an\nask, but leaves plugin tools to call ctx.ask themselves. The bridge plugin\nnever did, so an \"ask\" rule for paseo_* tools never produced a prompt and\nthe tool ran. The bridge now asks with the tool's catalog name before\ndispatching, the same shape OpenCode uses for MCP tools. With no paseo_*\nrule OpenCode's default allow applies, so nothing new prompts.\n\nFixes #5324\n\nCo-authored-by: paseo-bot[bot] <266920839+paseo-bot[bot]@users.noreply.github.com>\nCo-authored-by: Yuval Marcus <ymarcus93@gmail.com>",
-      "commit_url": "https://github.com/getpaseo/paseo/commit/e0a0cf990d27f9a40cb1ef2fc490a1d2d7a7e4ef",
+      "release_tag": "v0.11.0-beta.2",
+      "release_url": "https://github.com/getpaseo/paseo/releases/tag/v0.11.0-beta.2",
+      "release_published": "2026-10-01T15:03:10Z",
+      "release_body": "## 0.11.0-beta.2 - 2026-10-01\n\n### Added\n\n- Added Usage discovery of ChatGPT logins from Codex CLI, OpenCode, Pi, and OMP ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n- Added Usage discovery of Claude logins from the Claude Code credential file, the macOS keychain, Pi, and OMP ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n\n### Changed\n\n- Changed Usage to show one card per subscription account ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n- Changed Usage to try the account's next login when one is missing, expired, or signed into a different account ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n- Changed the sidebar Usage summary to stay hidden until a usage window has data ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n\n### Fixed\n\n- Fixed built-in plugins, including usage sources, failing to start in packaged desktop apps ([#5844](https://github.com/getpaseo/paseo/pull/5844))\n- Fixed each Paseo skill appearing twice in Codex's skill list ([#5827](https://github.com/getpaseo/paseo/pull/5827) by @3ae3ae)\n- Fixed plugin client code failing to import npm packages that declare only `main` or `module` ([#5838](https://github.com/getpaseo/paseo/pull/5838))\n",
+      "release_prerelease": true,
+      "tag": "v0.11.0-beta.2",
+      "tag_sha": "8498c741699bfeb062ca6c433f982a6fe063b4bb",
+      "commit_sha": "05e94ab52ebf20ee6012c2bafbd892856643a7e5",
+      "commit_message": "Keep usage logins visible and explain unavailable quota (#5876)\n\n* fix(usage): keep existing logins visible and explain unavailable quota\n\nCredential discovery must preserve accounts whose login exists even when it has expired. Keep vendor failures on the discovered account and isolate discovery failures without inventing provider cards.\n\n* test(usage): align credential route tests with account discovery",
+      "commit_url": "https://github.com/getpaseo/paseo/commit/05e94ab52ebf20ee6012c2bafbd892856643a7e5",
       "changelog_hash": null,
       "changelog_body": "",
       "local_versions": [],
       "local_paths": [],
-      "checked_at": "2026-10-01T08:02:09+08:00"
+      "checked_at": "2026-10-02T08:04:16+08:00"
     },
     "ruflo": {
-      "release_tag": "@claude-flow/plugins@3.0.1",
-      "release_url": "https://github.com/ruvnet/ruflo/releases/tag/%40claude-flow/plugins%403.0.1",
-      "release_published": "2026-09-30T21:26:40Z",
-      "release_body": "## Security fix: SQL injection in the RuVector GNN SQL builders\n\n`npm install @claude-flow/plugins@3.0.1`. All dist-tags (`latest`, `alpha`, `v3alpha`) point to 3.0.1.\n\n**Who is affected:** code that calls the SQL-generating methods in `integrations/ruvector/gnn.ts` with input it doesn't fully control, then runs the result against PostgreSQL/RuVector. This applies to `@claude-flow/plugins` **3.0.0 and earlier**. Affected methods: `BaseGNNLayer.toSQL()` (every GNN layer), `GraphOperations.kHopNeighborsSQL/shortestPathSQL/pageRankSQL/communityDetectionSQL`, and the `GNNSQLGenerator` static builders. `gnn.js` isn't in the package's `exports` map, so it is only reachable by importing the file by path.\n\n**What was wrong:** node ids, `source`/`target` and the community algorithm name were placed inside single quotes (`WHERE target_id = '${nodeId}'`), so a `'` broke out of the literal. `schema`/`table`/`edgeTable`/`cacheTable` identifiers were wrapped in `\"…\"`, which doesn't help when the value contains `\"`. `nodeColumn` wasn't quoted at all. Numbers (`k`, `damping`, `maxIterations`, `resolution`, `dimension`), layer-config JSON and the prepared-statement `paramPrefix` were interpolated unchecked.\n\n**What changed:** every interpolation now goes through a validator. Identifiers must match `^[A-Za-z_][A-Za-z0-9_]*$` and are quoted. Strings are single-quote-escaped. Numbers must be finite, or integers with a minimum where that makes sense. JSON config is escaped before it is embedded in `jsonb`. Unsafe input throws `TypeError` instead of producing SQL. Legitimate input produces the same SQL as before, except that `nodeColumn` is now quoted. This mirrors the `attention.ts` hardening in #3530.\n\n**What to do:** upgrade to 3.0.1. There are no API changes. If you pass non-plain identifiers (such as `my-table` or `schema.table` strings), the builders now reject them, so map them to plain identifiers first.\n\n## Verification\n- A new 25-test injection suite fails 22 tests against the old code and passes against the fix. The full plugins suite (473 passed / 3 skipped) is unchanged, and all 110 CI checks passed on the release PR.\n- **Published artifact:** in a fresh `npm install` of 3.0.1, an exploit smoke test passes 8/8. Against 3.0.0 as a control, the same test fails 7/8.\n- **Tarball:** the registry tarball is file-for-file identical to `npm pack` of a clean build at `3bcf7e96a`. `dist.integrity` is `sha512-cl86h1eEs5sgCRtenrh4XablDmSQmSEjZRaYOOdwUDMRBz38O1NymS4KJyfVWA49nJ/2A4jIlHi1GtBipxbodw==`.\n\nFixes #3531 · Fix: #3564 · Release: #3574\n\nThis is a standalone `@claude-flow/plugins` release. The `@claude-flow/cli` / `claude-flow` / `ruflo` train is unchanged (latest train release: v3.48.0).\n\n**Full write-up** (affected surface, before/after examples, validation, artifact integrity): https://gist.github.com/ruvnet/1cb9c6894394d5f51cf9e8f52b2ddcc4\n\n🤖 Generated with [RuFlo](https://github.com/ruvnet/ruflo)\n",
+      "release_tag": "v3.49.0",
+      "release_url": "https://github.com/ruvnet/ruflo/releases/tag/v3.49.0",
+      "release_published": "2026-10-01T00:12:05Z",
+      "release_body": "## ruflo 3.49.0\n\nInstall: `npx ruflo@latest` (also `@claude-flow/cli@3.49.0`, `claude-flow@3.49.0`). `@claude-flow/security@3.0.1` is bundled and published standalone.\n\nThis release fixes eleven issues reported by **Martin Vladimirov (@martinvlad)**. Each report included measurements and a reproduction, and that is what made fixing them quick. It also includes two PRs from **Nick Ruest (@nicholas-ruest)** and one from **@drakeo338**.\n\n### Fixes\n- **#3555: helpers load in `\"type\":\"module\"` projects.** `router`, `session` and `memory` now ship as `.cjs`, so ESM projects no longer get \"Router not available\" (#3583).\n- **#3565: post-install helper tampering is detected and healed.** An integrity re-check runs even when the version stamp matches, contributed by Nick Ruest (#3576). `doctor` now reports it as well (#3583).\n- **#3567: `hooks_route` no longer reports high confidence on no match.** It used to report 70% when nothing matched; it now returns 30% with `matched:false` / `no-match-default`. Whitespace-only tasks are rejected (#3581).\n- **#3568: policy ledger truncation is now detectable.** The ledger records its head anchor and length; this change is in `@claude-flow/security` 3.0.1 (#3579).\n- **#3557: plugin install trust policy.** Install scripts are gated (#3580).\n- **#3556: ai-team discovery uses a CORS allowlist.** 0.1.6 is live on team.ruv.io (#3577).\n- **#3566: sibling-namespace disclosure.** Partial matches are disclosed, and import reports real vector counts (#3582).\n- **#3570: memory key and namespace validation.** One shared validator covers the CLI and MCP; contributed by @drakeo338 (#3571).\n- **#3572: `swarm status` progress.** It reports `null` instead of invented numbers (#3578).\n- **#3573, #3575: session import and memory fixes** (#3584).\n- **doctor native-driver detection.** The better-sqlite3 loader is now injectable; contributed by Nick Ruest (#3569).\n\n### Verified on the published packages\nFresh `npm i ruflo@3.49.0` in a `\"type\":\"module\"` project: helpers install as `.cjs` and routing works; no-match routes report 30%; `swarm status` progress is `null`; a tampered `router.cjs` is detected and restored. Witness manifests verify 117/117 on linux, macos and windows, and the signed helper manifest verifies.\n\nThanks to Martin, Nick and drakeo338.\n\nGist: https://gist.github.com/ruvnet/75fea5568fc33a4ba55c04104a28a779\n",
       "release_prerelease": false,
-      "tag": "v3.48.0",
-      "tag_sha": "bd42d873b0333d3ab7dbcc85c9beb601ef944bd3",
-      "commit_sha": "d8e4d9535e0becc3a2629ef99e7e88904b65d6fc",
-      "commit_message": "Merge pull request #3583 from ruvnet/fix/3555-3565-helpers\n\nfix(helpers): ship CommonJS helpers as .cjs so they load in ESM projects (#3555)",
-      "commit_url": "https://github.com/ruvnet/ruflo/commit/d8e4d9535e0becc3a2629ef99e7e88904b65d6fc",
+      "tag": "v3.49.0",
+      "tag_sha": "0bd8e3142e5de68ca6075dad11b4ae2cfdaa0bec",
+      "commit_sha": "b470828bd93b158b1c159fcb82a303b526b8885c",
+      "commit_message": "Merge pull request #3605 from ruvnet/feat/ruflo-ruos\n\nfeat(ruflo-ruos): run swarm agents on your own ruOS desktops (ADR-405)",
+      "commit_url": "https://github.com/ruvnet/ruflo/commit/b470828bd93b158b1c159fcb82a303b526b8885c",
       "changelog_hash": null,
       "changelog_body": "",
       "local_versions": [],
       "local_paths": [],
-      "checked_at": "2026-10-01T08:02:14+08:00"
+      "checked_at": "2026-10-02T08:04:47+08:00"
     },
     "multica": {
-      "release_tag": "v0.6.0",
-      "release_url": "https://github.com/multica-ai/multica/releases/tag/v0.6.0",
-      "release_published": "2026-09-28T07:07:30Z",
-      "release_body": "## Changelog\n* dbfc014bdd0f0052e732bf4ac63a18084ebef924 MUL-7610: fix(autopilot): avoid loading task history during webhook recovery (#8710)\n* 7dac88a6a8c5b2e28b3b57d83142722163b24cd1 MUL-7649: issue deliverables and dynamic blocks — sidebar section, overview grid, viewer info panel, html/mermaid block frame (#8779)\n* 6dc6a0b9a2db36ac31995c7a98ec2d36a1c9f188 MUL-7650: attachment viewer — CSV tables, JSON/YAML tree, numbered code, HTML viewports, every kind in a new tab (#8868)\n* 5ed09342af2ef09b823ac090549320badfadb436 MUL-7680: issue wakeup v2 — conditions, runaway protection, check-ins and visibility (#8807)\n* 07059303f4f1dff16f1f16fd61a3930ef6af1d1c MUL-7682 feat(issues): give every reply a tick on the thread rail (#8809)\n* 815fe37b1faabe41af30f5d7823659c1d3e92521 MUL-7685: fix(agents): paginate task history and aggregate duration (#8804)\n* 005462ec22fc2fbde70619110a3e89f19756193c MUL-7705 docs(channels): correct comments main's own later changes made false (#8833)\n* fa5d470ae40a082d952b50e843287906566785a6 MUL-7706 feat(wecom): every notice reads the language of whoever will read it (#8831)\n* 4e2afed72013bac2683f9d76bec156cfd3901d41 MUL-7710 fix(channel): refuse an inbound turn from a member who may not run the agent (#8838)\n* 692dd019acbefe199a2461a6a9710c6f91da4c52 MUL-7713: docs(troubleshooting): explain macOS TCC re-prompt after CLI upgrade (#8843)\n* 57fabfc0789b162399afb5b48a3dcfe65e01184e MUL-7724 feat(desktop): left-align window toolbar as Back / Forward / sidebar toggle (#8859)\n* fc4a61570063c69ee94b7f636e3ae58f295a4944 MUL-7726: let the workspace choose the status merged PRs move an issue to (#8862)\n* 104bf7be357091ba26d674df1cb68ee1725b5293 MUL-7732: regroup settings by scope and consolidate scattered pages (#8874)\n* 4f2fdc0b152fc6317f930c982f50a217c4323dc7 MUL-7733: more room around dynamic blocks, actions on hover (#8867)\n* 9c6622787d56c19327e4c85ec934bdffc3c8ec59 MUL-7735: docs(readme): fix stale facts, sync the Chinese README, retake the hero screenshot (#8869)\n* 344ffaf1becd165b123bdc3634d2db7edaf5549e MUL-7737: feat(views): address bar for HTML attachment previews (#8873)\n* e8a16d334f3e13cd54ee3475a1dad467998260e4 MUL-7753: one verdict per PR in the issue sidebar (#8884)\n* 3d2592a9a2e4286f4a6549b01da8ba06d1f88f4b MUL-7754: feat: local search index for web and desktop (#8891)\n* 4054d57802c1719839a180d3d27d3e07dae43a46 MUL-7755: feat(issues): configurable side peek in every issue view (#8886)\n* 13094caf7a5f3ac8d7266cb60aba458996d2b5a9 MUL-7758: lay an issue's runs out in time (#8890)\n* 0a51a6cc433a926548f40ad6b01275468874cdaa MUL-7759: copy image from the desktop attachment viewer (#8888)\n* f76cde8e609ec65a8ab627d0696d591c379fe0c8 MUL-7766: feat(editor): fit Mermaid previews to show the whole diagram, with inline zoom (#8898)\n* 400791262f185caa37d3222028b3c35951c7b870 build(views): upgrade Tiptap to 3.31.3, fixing select-all + delete (MUL-7725) (#8860)\n* ea94c7cd5bbce9c8e1f28c5fa049c47ee7651d02 docs(changelog): add v0.6.0 release entry (2026-09-28) (MUL-7777) (#8909)\n* ba9f6392429bc91ab51e7ffa98a67a58a07305e8 docs(mobile): correct the app icon comment after #7453 (#8844)\n* 12f8f3f31111564e5e1b9aac3f7f916e8bba4039 feat(agent): list Claude Opus 5.5 and GPT-6 Sol/Luna in the fallback catalogs (#8840)\n* 3125bd2ea266733eb3f110c4ad37f01d90eb3beb feat(comments): show every attached image at full size (MUL-7736) (#8870)\n* 1c908ea52c19f193d301ca9460fc1d7d100a1b3d feat(issues): state a failed or cancelled run once in the thread (MUL-7692) (#8813)\n* 570f8f82a17185152f8e7420c7760bf5edaa5d59 feat(projects): show descriptions in repository pickers (MUL-7575) (#8668)\n* e2f4a22030171d296e5dc134349241b7786258cd feat: steer a running agent from the normal composer, per recipient (MUL-7631) (#8760)\n* 138134d34104c16b1a5b57a7a00757296415c6c8 fix(agent): pass Hermes custom args before the acp subcommand (MUL-7748) (#8882)\n* 82847e275175ea082d1a4cf492d3f2c116504fca fix(chat): keep tool rows rendering when MCP input fields are objects (MUL-7708) (#8883)\n* 1aa815a73880e2ea0045fcab032c961bb21a860c fix(daemon): stop validating saved model settings against fallback catalogs (#8811)\n* 79b9327837707c1c6d362ff1e666f26b11dd9d96 fix(issue): bind update attachments safely (#8588) (#8766)\n* bb40537c59fe9ed8420b89e21dbac54065cb0d5b fix(issues): keep the run spinner turning after a steer moves it (MUL-7729) (#8871)\n* 6328e8183409fad986b598ba2330beab3bbeb3db fix(mobile): avoid seeding incomplete project lists (#8854)\n* 04cdd4857d98669dc6211c735b8c46ceb2a4d99a fix(notifications): ignore malformed member mention IDs (#8876)\n* bd7308742c3c47406803d9f206556e6c168df1f2 fix(plugins): avoid hook tool name collisions (#8856)\n* cf2b84708dc621c3af6e36e80d79d9dc26b4e085 fix(release): replace assets on same-tag reruns (MUL-7683) (#8812)\n* f1560daff3809efcf1e5bd7a5439fd341eb1ebee fix(search): fold/unfold all comments on identifier URLs (#8842)\n* 64b06b3de840b205cb37c3017e447a616a97822e fix(telegram): attach the file a reply quotes (#8828)\n* 54987006b5ce0c017ba5f24d500157c29a228f60 fix(views): keep the PR row diff whole and spin the running-checks icon (MUL-7767) (#8900)\n* e427ed7dfbc15f11efa9edf37087e140e4098c81 fix(views): keep the Save as view name while the host re-renders (MUL-7756) (#8885)\n* decd602a57e71789039f63cabe08fc5b04396703 fix(views): stack wakeup condition hints under their labels (MUL-7769) (#8899)\n* 32a396fd520bdbdec2d6cd95b5742da946003ca9 fix(views): stop dialog scroll lock from re-rendering Mermaid diagrams (MUL-7760) (#8889)\n* 92649de29c33eb6701dfbc627a69a7b69922957e fix(wakeup): scope test scheduler passes to their own workspaces (#8901)\n* 7551ff1ddccd3d3a7c515fe7e179ce401300ef2a fix(wecom): answer an unreadable message once per message, not once per delivery (#8836)\n\n",
+      "release_tag": "v0.6.1",
+      "release_url": "https://github.com/multica-ai/multica/releases/tag/v0.6.1",
+      "release_published": "2026-10-01T10:29:32Z",
+      "release_body": "## Changelog\n* 67d61a2073bad0fbb7140fd2000f1ab7ec0a4f25 MUL-7780 feat(issues): run charts follow the pointer; a cost sparkline replaces the sidebar strip (#8912)\n* e31da86c90794b5c488279a3ead13ac2f31ac269 MUL-7801 fix(daemon): follow directory junctions when authorizing repo checkout workdirs (#8958)\n* 262dcb5fa7ee2986aaabf3a78ee698f4afb4f151 MUL-7816 fix(taskfailure): classify a 403 usage limit as provider quota, not auth (#8967)\n* 43b0571f992567a919c7f1f699ff160922594b94 MUL-7821: feat(cli): mark duplicates with issue status/update --duplicate-of (#8979)\n* 2ea01ae4ef55de4310b99af192d2dbd367832883 docs(changelog): add v0.6.1 release entry (2026-10-01) (MUL-7840) (#9006)\n* 448411e5c0a962ca1278848de512ebc6b1f59e06 docs(skills): document wakeup v2 conditions and check-ins in multica-platform (MUL-7791) (#8950)\n* 4736a85d41b966b10ce9f60778cbfc47cecad4cb fix(chat): preserve workspace switches from open sessions (#8928)\n* 19c5a23c2b3a357b2f062fa2b45727e25fb3881c fix(chat): release hidden floating composer focus (#8998)\n* ba30324e10dfc69fb0f0a6732dd3d0f0559e01fe fix(codex): add GPT-6.1 Sol fallback and current model pricing (MUL-7834) (#8996)\n* da540ea6eedf7e55ccf84dd54af93fa16784f386 perf(issues): limit working-agent refresh queries (MUL-7838 PR2) (#9005)\n* d36ef1d1bd439331dca4bcd53cc706e90409af6e perf(issues): scope working-agent facet tasks by visible agents (MUL-7838) (#9004)\n\n",
       "release_prerelease": false,
-      "tag": "v0.6.0",
-      "tag_sha": "ea94c7cd5bbce9c8e1f28c5fa049c47ee7651d02",
-      "commit_sha": "43b0571f992567a919c7f1f699ff160922594b94",
-      "commit_message": "MUL-7821: feat(cli): mark duplicates with issue status/update --duplicate-of (#8979)\n\n* feat(cli): mark duplicates from issue status and issue update (MUL-7821)\n\nAdd --duplicate-of to `multica issue status` and `multica issue update`.\nIt resolves an issue key or UUID and sends duplicate_of_issue_id, which\nthe server already accepts (MUL-7349). The CLI rejects a status other than\ncancelled, and description or attachment changes, before any request or\nupload. It fails when the response has no duplicate_of field, so a server\nolder than v0.5.2 cannot silently drop the mark.\n\nCloses #8974\n\nCo-authored-by: multica-agent <github@multica.ai>\n\n* docs: teach agents to mark duplicates with --duplicate-of (MUL-7821)\n\nAdd the command to the agent runtime brief, the multica-platform issues\nreference, CLI_AND_DAEMON.md and the CLI docs tables, so agents record the\nmark instead of cancelling a duplicate and explaining it in a comment.\n\nCo-authored-by: multica-agent <github@multica.ai>\n\n---------\n\nCo-authored-by: multica-agent <github@multica.ai>",
-      "commit_url": "https://github.com/multica-ai/multica/commit/43b0571f992567a919c7f1f699ff160922594b94",
-      "changelog_hash": "8d2ab614db9a4a131e179ad0e8634b567465a92c11d59980afcc45b9686f39e8",
+      "tag": "v0.6.1",
+      "tag_sha": "2ea01ae4ef55de4310b99af192d2dbd367832883",
+      "commit_sha": "2ea01ae4ef55de4310b99af192d2dbd367832883",
+      "commit_message": "docs(changelog): add v0.6.1 release entry (2026-10-01) (MUL-7840) (#9006)\n\nAdd the 0.6.1 entry to the four changelog locales and bump the web and desktop package versions to 0.6.1.\n\nCo-authored-by: Yushen <yushen@devv.ai>\nCo-authored-by: multica-agent <github@multica.ai>",
+      "commit_url": "https://github.com/multica-ai/multica/commit/2ea01ae4ef55de4310b99af192d2dbd367832883",
+      "changelog_hash": "1b166af938a70e765318c2d88cf2773b9a2659a71bbf67fea2b1a7b22a6d1534",
       "changelog_body": "",
       "local_versions": [],
       "local_paths": [],
-      "checked_at": "2026-10-01T08:02:48+08:00"
+      "checked_at": "2026-10-02T08:05:16+08:00"
     },
     "tutti": {
       "release_tag": "v0.2.33",
@@ -67,7 +67,7 @@
       "changelog_body": "",
       "local_versions": [],
       "local_paths": [],
-      "checked_at": "2026-10-01T08:02:53+08:00"
+      "checked_at": "2026-10-02T08:05:47+08:00"
     },
     "orca": {
       "release_tag": "v1.4.218",
@@ -77,9 +77,9 @@
       "release_prerelease": false,
       "tag": "v1.4.218",
       "tag_sha": "75ea50273328d9bd5465170d10a098711d61b5a4",
-      "commit_sha": "3ab3c9239fba5eaa36c3c4ce10aab4cf346ee812",
-      "commit_message": "fix(native-chat): the working line shows only what the agent is doing now (#24218)\n\n* fix(native-chat): the working line shows only what the agent is doing now\n\nA chat's live \"Working…\" line could show an old notice, such as \"Claude hit a\ntemporary problem and is retrying.\", long after the agent had moved on and was\nrunning new commands. When the host had no live activity for the turn, the line\nfell back to the newest status row in the turn, and any status row qualified:\nretry warnings, \"Context compacted\", \"Cancellation requested.\", and notification\nsummaries. Those rows record the past and already appear in the transcript.\n\nThe line now reads only the host's live, per-turn activity, which is never saved\nand is cleared at turn boundaries. Without it, the line says Thinking or\nWorking…. Desktop and mobile share the selector, so both change.\n\n* test(codex): guard that a subagent's compaction never becomes the parent's live activity",
-      "commit_url": "https://github.com/stablyai/orca/commit/3ab3c9239fba5eaa36c3c4ce10aab4cf346ee812",
+      "commit_sha": "8c1670f2c4a80ec2a3f876b7e6e3162f9017989f",
+      "commit_message": "test(e2e): fake Codex answers the --no-daemon --help probe without a spawn (#24440)\n\n* test(e2e): fake Codex answers the --no-daemon --help probe without a spawn\n\nSince #23933 Orca runs `codex --help` before a path-named Codex launch. The\nfakes logged it as an agent spawn and held the probe for its 5 s timeout.\nMove the app-server refusal and --help answer into one shared\nFAKE_CODEX_LAUNCH_PROBES_SOURCE used by every fake Codex.\n\n* test(e2e): stop asserting the dispatch capability column a current worker no longer has\n\n#23994 stopped minting the per-dispatch capability, so capability_hash is null.\nThe --help spawn failure used to stop this test before it got here.",
+      "commit_url": "https://github.com/stablyai/orca/commit/8c1670f2c4a80ec2a3f876b7e6e3162f9017989f",
       "changelog_hash": null,
       "changelog_body": "",
       "local_versions": [
@@ -88,7 +88,7 @@
       "local_paths": [
         "/usr/local/bin/orca"
       ],
-      "checked_at": "2026-10-01T08:02:57+08:00"
+      "checked_at": "2026-10-02T08:05:50+08:00"
     },
     "genericagent": {
       "release_tag": "desktop-portable-v0.2.0",
@@ -108,7 +108,7 @@
         "/Users/cuip/projects/GenericAgent",
         "/Users/cuip/projects/GenericAgent/.trellis"
       ],
-      "checked_at": "2026-10-01T08:03:23+08:00"
+      "checked_at": "2026-10-02T08:05:52+08:00"
     },
     "claude_codex_bridge": {
       "release_tag": "v8.7.5",
@@ -125,7 +125,7 @@
       "changelog_body": "",
       "local_versions": [],
       "local_paths": [],
-      "checked_at": "2026-10-01T08:03:29+08:00"
+      "checked_at": "2026-10-02T08:05:55+08:00"
     },
     "trellis": {
       "release_tag": null,
@@ -138,8 +138,8 @@
       "commit_sha": "f089cb3286071199e84118dee86b6d76aab032f1",
       "commit_message": "Merge pull request #629 from zz80900/fix/archive-commit-untracked-task\n\nfix(scripts): skip the moved-away path when committing an archive",
       "commit_url": "https://github.com/mindfold-ai/Trellis/commit/f089cb3286071199e84118dee86b6d76aab032f1",
-      "changelog_hash": "e17733b80fa27657e2a6c8298e161eb492cd150e45514a5bef1965d8c82d2bcc",
-      "changelog_body": "> ## Documentation Index\n> Fetch the complete documentation index at: https://docs.trytrellis.app/llms.txt\n> Use this file to discover all available pages before exploring further.\n\n# v0.6.17\n\n> 2026-09-12\n\nDevin CLI 会话记忆、按需读取 SQLite 页，以及任务/会话绑定修复。\n\n## 功能增强\n\n### Devin CLI 会话适配器\n\n`trellis mem` 通过现有的零依赖解析器读取 Cognition Devin CLI 会话，数据在 `~/.local/share/devin/cli/sessions.db`（WAL SQLite）。这不是 `trellis init --devin`（Desktop/Cascade），也不是 Factory Droid。（#614）\n\n* `list` / `search` / `extract` / `context` / `projects` 支持 `--platform devin`\n* OpenCode、ZCode 与 Devin 共用 `packages/core/src/mem/internal/sqlite-adapter.ts` 和 `packages/core/src/mem/platforms.ts`\n* Devin 会话树要求 `main_chain_id`；缺少 tip 时返回 `devin-main-chain-missing`（不再回退到 `max(node_id)`）\n* 解析前去掉 `CREATE TABLE` 的 `--` 行注释，这样 live `sessions.db` 里的 `parent_node_id` 和 `chat_message` 能被识别\n\n## 问题修复\n\n### SQLite 主文件页懒读\n\n`packages/core/src/mem/internal/sqlite-readonly.ts` 里的零依赖 SQLite 读取器按需加载主文件页，不再把整个数据库读进内存。（#596）\n\n### Pi 无头子代理提示\n\nPi `trellis_subagent` 把 ask-policy 提示转发到父会话。serving heartbeat 设置 `PI_SUBAGENT_PARENT_SESSION`（不用过期的 `PI_SESSION_ID`），设置 `PI_SUBAGENT_CHILD=1`，并丢掉继承来的 `PI_SESSION_ID`，让子进程自己签发会话 id。（#611）\n\n### 活动任务会话回退\n\n当前会话 id 缺失时，不再回退到项目里仅有的那条会话去解析活动任务。该回退改为显式 opt-in，避免一个会话绑到另一个会话的任务。（#608）\n\n### archive 子任务 unlink 回滚\n\n如果 `task.py archive` 在已经 unlink 部分子任务之后失败，会按清除前的快照把每个子任务的 `parent` 写回去。`children` 里的重复条目只快照一次，避免第二次访问把 `parent: null` 写回去。（#613）\n\n## 升级\n\n```bash theme={null}\nnpm install -g @mindfoldhq/trellis@latest\ntrellis update\n```\n\n无需 `--migrate`。\n",
+      "changelog_hash": "cec3de59377ad2ecb1e1dd288ea6e75d8b0cc186b564bff7834191639cb4c148",
+      "changelog_body": "> ## Documentation Index\n> Fetch the complete documentation index at: https://docs.trytrellis.app/llms.txt\n> Use this file to discover all available pages before exploring further.\n\n# v0.6.17\n\n> 2026-09-12\n\nDevin CLI 会话记忆、按需读取 SQLite 页，以及任务/会话绑定修复。\n\n## 功能增强\n\n### Devin CLI 会话适配器\n\n`trellis mem` 通过现有的零依赖解析器读取 Cognition Devin CLI 会话，数据在 `~/.local/share/devin/cli/sessions.db`（WAL SQLite）。这不是 `trellis init --devin`（Desktop/Cascade），也不是 Factory Droid。（#614）\n\n* `list` / `search` / `extract` / `context` / `projects` 支持 `--platform devin`\n* OpenCode、ZCode 与 Devin 共用 `packages/core/src/mem/internal/sqlite-adapter.ts` 和 `packages/core/src/mem/platforms.ts`\n* Devin 会话树要求 `main_chain_id`；缺少 tip 时返回 `devin-main-chain-missing`（不再回退到 `max(node_id)`）\n* 解析前去掉 `CREATE TABLE` 的 `--` 行注释，这样 live `sessions.db` 里的 `parent_node_id` 和 `chat_message` 能被识别\n\n## 问题修复\n\n### SQLite 主文件页懒读\n\n`packages/core/src/mem/internal/sqlite-readonly.ts` 里的零依赖 SQLite 读取器按需加载主文件页，不再把整个数据库读进内存。（#596）\n\n### Pi 无头子代理提示\n\nPi `trellis_subagent` 把 ask-policy 提示转发到父会话。serving heartbeat 设置 `PI_SUBAGENT_PARENT_SESSION`（不用过期的 `PI_SESSION_ID`），设置 `PI_SUBAGENT_CHILD=1`，并丢掉继承来的 `PI_SESSION_ID`，让子进程自己签发会话 id。（#611）\n\n### 活动任务会话回退\n\n当前会话 id 缺失时，不再回退到项目里仅有的那条会话去解析活动任务。该回退改为显式 opt-in，避免一个会话绑到另一个会话的任务。（#608）\n\n### archive 子任务 unlink 回滚\n\n如果 `task.py archive` 在已经 unlink 部分子任务之后失败，会按清除前的快照把每个子任务的 `parent` 写回去。`children` 里的重复条目只快照一次，避免第二次访问把 `parent: null` 写回去。（#613）\n\n## 升级\n\n```bash theme={null}\nnpm install -g @mindfoldhq/trellis@latest\ntrellis update\n```\n\n无需 `--migrate`。\n\n\nThis documentation is built and hosted on [Mintlify](https://mintlify.com), a developer documentation platform.",
       "local_versions": [
         "⚠️  Trellis update available: 0.5.19 → 0.6.17"
       ],
@@ -147,7 +147,7 @@
         "/Users/cuip/projects/GenericAgent/.trellis",
         "/Users/cuip/projects/GenericAgent/.trellis/.version"
       ],
-      "checked_at": "2026-10-01T08:03:42+08:00"
+      "checked_at": "2026-10-02T08:06:01+08:00"
     }
   }
 }
