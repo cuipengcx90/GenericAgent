@@ -12,7 +12,7 @@
 - `schedule` 粒度只到 HH:MM；"在某窗口内每分钟探一次"**不能**靠 scheduler。
 - 正确姿势＝**scheduler 只在窗口起点唤起一次**，任务 prompt 里用 `tools/bg_task.py start --name <唯一名> -- <解释器绝对路径> tools/xxx.py --watch ...` 把自轮询进程挂到窗口结束（`--max-minutes` 硬超时兜底，进程脱离会话）。
 - prompt 里**禁止 sleep / 轮询等待**：命令立即返回，后台进程自己覆盖窗口；会话只负责贴 `bg_task status` 的 pid + 日志路径。
-- 解释器写**绝对路径**（如 `/opt/anaconda3/bin/python3`）：scheduler/launchd 环境的 PATH 里没有 anaconda（见下方"解释器与 PATH"坑）。
+- 解释器写**绝对路径**（如 `/opt/anaconda3/bin/python3`）：GA scheduler/bg_task 子进程的 PATH 不保证；详见 `memory/agentrouter_quota_sop.md` 的「典型坑」。
 
 ## 任务JSON格式（*.json）
 ```json
