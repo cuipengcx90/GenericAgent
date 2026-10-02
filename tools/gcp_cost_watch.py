@@ -307,8 +307,11 @@ def evaluate(st):
                 amt = 0.0
             nm = b.get("name") or "?"
             if amt < 5:
-                add("WARN", "budget:" + nm,
-                    "金额仅 $%g/月 ⇒ 真实月成本远高于此，阈值天天触发=形同虚设（建议提到 $5~$10）" % amt)
+                # 阈值过小=配置建议，不是健康问题：真实月成本远高于此 ⇒ 告警天天触发、
+                # 失去信号价值。降为 INFO 以免日检 verdict 恒为 WARN 而掩盖真告警；
+                # 改预算属计费配置，脚本只报告不动手（需人工在 Console 调整）。
+                add("INFO", "budget:" + nm,
+                    "金额仅 $%g/月 ⇒ 真实月成本远高于此，阈值天天触发=形同虚设（建议提到 $5~$10；改预算需人工在 Console 操作）" % amt)
             else:
                 add("OK", "budget:" + nm, "金额 $%g/月" % amt)
 
@@ -434,9 +437,9 @@ def selftest():
     # N6 VM Manager 策略回归
     check("N6 VM Manager", _fake(instances=STOPPED, disks=[], os_policy_assignments=1),
           "ALERT", "ALERT", "vm-manager")
-    # N7 预算金额过小 ⇒ WARN
+    # N7 预算金额过小 ⇒ INFO（配置建议，不影响 verdict；见 evaluate 注释）
     check("N7 预算过小", _fake(instances=STOPPED, disks=[], budgets=[{"name": "x", "amount": "0.1"}]),
-          "WARN", "WARN", "budget:")
+          "OK", "INFO", "budget:")
     # N8 新增结算项目
     check("N8 新挂项目", _fake(instances=STOPPED, disks=[], billed_projects=[PROJECT, "other"]),
           "ALERT", "ALERT", "billed-projects")
