@@ -88,3 +88,9 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
   判据取**报告头部结论行**（`已符合`/`未达标`），不要用全文关键词（会把 `✓ 已达标` 的指标行、正文举例混进来）。
 - **connect 页首读可能直接成功**（本次未遇 CF，`title`=`Connect - LINUX DO Connect`、正文含「信任级别 3 的要求」）⇒ 仍按「先试 connect、失败再回落首页」执行；页面里出现 `challenges.cloudflare.com/turnstile/...` 只是站点常驻脚本引用，**不是**拦截态，判拦截看 `title` 是否为「请稍候…」/正文是否只剩 driver 行。
 - **判据只用 DOM 容器 class（`.met`/`.unmet`）**：本次 `.met`=14 / `.unmet`=3，其中第 3 个 unmet 是 `.tl3-bar-fill unmet`（进度条填充，**非独立指标**）⇒ 去重后 = 12 项（10 met / 2 unmet）。结构性抽取结果建议落 JSON，供脚本复算（本次 `temp/linuxdo_tl3_1001_dom.json`）。
+## 补充（2026-10-02 实测：在册 tab 全部不可用时的「新开临时 tab + 探针」通道）
+
+- **症状**：`get_all_sessions` 在册 7 个 tab（全是 Google Cloud 账单页），逐个打 `'1+1'` 探针 **0 个可用**（5 个 `execute_js` 无回包/超时、2 个报 CDP 错误）；本机无 CDP 调试端口，AppleScript 的 `execute javascript` 也被 Chrome 禁用（需 视图→开发者→允许 Apple 事件中的 JavaScript，默认关）。
+- **修法**：用 AppleScript 由 Chrome 自己开一个**新临时 tab**（`open location "https://connect.linux.do/"`，绝不动用户原页），再从 `get_all_sessions` 取该 tab 的真 id（**必须传 str**）→ 打 `'1+1'` 探针确认能执行 JS（本次 0.3s 返 `2`）⇒ 新 tab 可用，随后照常读页解析。收尾仍按 §4 关掉这个临时 tab（本次复核 8→7）。
+- **判据**：「在册 tab 全不可用」≠「驱动坏了 / 该重试」；通道到底能不能用，只由「新开 tab + 探针」的一次实测定（本次通过，页面未遇 CF）。
+- **prompt 口径空档（待批）**：本任务 prompt 只写「检查是否达标」，未定义判据口径；与 10-01 确立的「按页面 ✓/○ 标记判定、上限类指标禁机械比较、指标名取页面原文」之间存在空档（本次按 SOP 执行、未触发误报）⇒ 建议在 prompt 里加一句判据引用。
