@@ -2,6 +2,18 @@
 
 目录：`../sche_tasks/` 放任务定义JSON，`../sche_tasks/done/` 放执行报告
 
+## ⛔ 红线：GA 内加定时任务的唯一入口（2026-10-02 用户纠正）
+- **只写 `sche_tasks/*.json`**。禁止注册系统 `launchd`（`~/Library/LaunchAgents/*.plist`）或 `crontab` 直接跑 Python 脚本——那是"系统定时任务"，不是"GA 的定时"。
+- GA 自带的 `com.cuip.genericagent-scheduler` 只是把调度器本身拉起来；真正的任务由它读 `sche_tasks/` 派发。**不要绕过它自己挂 plist。**
+- 落一个 json 即生效：`reflect/scheduler.py` 每轮**重新 glob** `sche_tasks/*.json`，**无需重启、无需改 plist**。
+- 反例（我 2026-10-02 踩过）：给 agentrouter 额度监控建了 `com.cuip.genericagent-agentrouter-quota.plist` 直跑脚本 → 被用户纠正，plist 已删除入废纸篓。别再犯。
+
+## ⏱️ 分钟级 / 窗口内高频：scheduler 只给 HH:MM，靠 bg_task 挂窗口（2026-10-02 实践）
+- `schedule` 粒度只到 HH:MM；"在某窗口内每分钟探一次"**不能**靠 scheduler。
+- 正确姿势＝**scheduler 只在窗口起点唤起一次**，任务 prompt 里用 `tools/bg_task.py start --name <唯一名> -- <解释器绝对路径> tools/xxx.py --watch ...` 把自轮询进程挂到窗口结束（`--max-minutes` 硬超时兜底，进程脱离会话）。
+- prompt 里**禁止 sleep / 轮询等待**：命令立即返回，后台进程自己覆盖窗口；会话只负责贴 `bg_task status` 的 pid + 日志路径。
+- 解释器写**绝对路径**（如 `/opt/anaconda3/bin/python3`）：scheduler/launchd 环境的 PATH 里没有 anaconda（见下方"解释器与 PATH"坑）。
+
 ## 任务JSON格式（*.json）
 ```json
 {"schedule":"08:00", "repeat":"daily", "enabled":true, "prompt":"...", "max_delay_hours":6}
