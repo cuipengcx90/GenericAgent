@@ -169,6 +169,7 @@ function getLikeCount(post) {
 - 正确取法二选一：
   1. 浏览器 fetch 后读 `r.url` 拿真实 CDN 实链，如 `https://cdn3.ldstatic.com/original/4X/0/0/f/<hash>.pdf`，再用 curl_cffi 直连下载（实测 200 / application/pdf）；
   2. 直接对 `/uploads/short-url/xxx.pdf` 做浏览器 fetch → `blob()`（SOP 里 PDF blob 链路）。
+  3. 【2026-10-02 实测新增·CF 429 免依赖兜底】若已有该 PDF（或拿到其 sha1），可直接按 Discourse 附件 CDN 分层规则自构实链：`https://cdn3.ldstatic.com/original/4X/<sha1[0]>/<sha1[1]>/<sha1[2]>/<sha1>.<ext>`（即 sha1 **前 3 个字符**逐字符建三级目录）。实测 2026-10-01 期 PDF：sha1=`3a29f0ff7e3400c998a9de06f1a2562ce14c51be` ⇒ 实链 `https://cdn3.ldstatic.com/original/4X/3/a/2/3a29f0ff7e3400c998a9de06f1a2562ce14c51be.pdf`，curl 直连 200 且字节数(1,216,262 B)与本地逐字相符。此路完全不碰浏览器与 CF ⇒ 短链 404 / short-url 被 429 时优先试它（2026-10-02 实测正是 CF 整通道拦 `search.json` 时的实际绕行手段）。
 - 抽文本：`pdftotext -layout in.pdf out.txt`（本机已装，实测 1.9MB PDF → 29k 字符 / 815 行），比 Python 库更省事。
 
 ### 归档结构（与既有 09-14~09-18 期保持一致）
