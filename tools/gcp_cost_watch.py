@@ -16,6 +16,25 @@
 只读：仅调用 gcloud 的 list/describe/get 类命令，绝不创建/修改/删除任何资源。
 赠金余额（Cloud Billing credits）没有公开的 CLI 端点（实测 404），
 故「赠金还有没有新券」需人工在控制台核对，脚本会打印 URL 与判据。
+
+v2 扩充（2026-10-02）——回答三个问题：
+  Q1 定时任务本身花不花钱？本脚本每次只调 gcloud/监控 API 的 list/get（只读），
+     不创建任何资源；API 调用本身不计费（Cloud Monitoring 读取在 已启用 API 的
+     免费额度内）。真正的成本来自它监控的资源，不来自守望本身。
+  Q2 除了实例/磁盘/静态IP/快照/LB/NAT，还有哪些可能花钱的维度？v2 逐项落成检查：
+     对象存储桶(免费 5GB 且仅限 us 三区)、Artifact Registry/Container Registry 镜像
+     (免费 0.5GB)、App Engine 遗留应用、Cloud Logging 摄取量(免费 50GiB/项目/月)、
+     已启用 API 面变化、以及 SQL/Run/Functions/PubSub/Scheduler/DNS/KMS/Secret/
+     Firestore/BigQuery 十类按量计费资源面。
+  Q3 能不能实时知道？资源面=实时(gcloud 直查)；用量面=近实时(Cloud Monitoring，
+     通常滞后 1~3 分钟，本脚本打印最近样本时间戳与滞后分钟数)；费用面=**不可实时**
+     (Cloud Billing 无「查当前花费」的公开 CLI/REST，credits 端点实测 404；账单金额
+     只能人工看 Console→结算→报告 的「小计」列，或配置 BigQuery 账单导出后自查)。
+     另做一项交叉验证：实例状态=停机，但运行时长监控样本出现在停机之后 ⇒ 疑似已重启。
+
+用法（子命令为位置参数）：
+    python3 tools/gcp_cost_watch.py check [--json] [--notify] [--ledger] [--accept-services]
+    python3 tools/gcp_cost_watch.py selftest
 """
 import json
 import os
@@ -23,6 +42,9 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 
 PROJECT = os.environ.get("GCP_PROJECT", "cpgoagent-11013")
 ZONE = os.environ.get("GCP_ZONE", "us-west1-b")
@@ -37,6 +59,42 @@ FREE_DISK_GB = 30
 PRICE_EXT_IP_MONTH = 3.65      # 运行中实例的外部 IPv4 约 $0.005/h
 PRICE_PD_STD_GB_MONTH = 0.04   # pd-standard 超出免费层后
 PRICE_SNAPSHOT_GB_MONTH = 0.026
+
+# ---- v2 新增常量：其它维度的免费额度与单价 ----
+FREE_STORAGE_GB = 5.0            # Cloud Storage Always Free: 5GB-months（**仅** us-east1/us-west1/us-central1 区域桶）
+PRICE_STORAGE_GB_MONTH = 0.026   # standard 多区域 US 约 $0.026/GiB·月（区域桶约 $0.020）
+FREE_ARTIFACT_GB = 0.5           # Artifact Registry 免费 0.5GB
+PRICE_ARTIFACT_GB_MONTH = 0.10   # 超出后约 $0.10/GiB·月
+FREE_LOGGING_GIB_MONTH = 50.0    # Cloud Logging(_Default/_Required 桶) 每项目每月免费 50GiB
+PRICE_LOGGING_PER_GIB = 0.50     # 超出后约 $0.50/GiB
+MON_ROOT = "https://monitoring.googleapis.com/v3/projects/%s/timeSeries"
+
+# 其它按量计费资源面：gcloud list 命令 → 短名
+LIST_CMDS = [
+    (["sql", "instances", "list"], "cloud-sql"),
+    (["run", "services", "list"], "cloud-run"),
+    (["functions", "list"], "cloud-functions"),
+    (["pubsub", "topics", "list"], "pubsub"),
+    (["scheduler", "jobs", "list"], "cloud-scheduler"),
+    (["dns", "managed-zones", "list"], "cloud-dns"),
+    (["kms", "keyrings", "list", "--location=global"], "cloud-kms"),
+    (["secrets", "list"], "secret-manager"),
+    (["firestore", "databases", "list"], "firestore"),
+]
+# 短名 → (有资源时的级别, 计费说明)
+OTHER_META = {
+    "cloud-sql": ("ALERT", "Cloud SQL 实例按小时计费(最小档约 $0.01/h)"),
+    "cloud-run": ("ALERT", "Cloud Run 按请求/CPU/内存计费(有少量免费额度)"),
+    "cloud-functions": ("ALERT", "Cloud Functions 按调用次数/时长计费"),
+    "pubsub": ("WARN", "Pub/Sub 按消息量计费(每月前 10GiB 免费)"),
+    "cloud-scheduler": ("ALERT", "Cloud Scheduler 每个作业约 $0.10/月"),
+    "cloud-dns": ("ALERT", "Cloud DNS 每个托管区域约 $0.20/月"),
+    "cloud-kms": ("WARN", "KMS 每个密钥版本约 $0.06/月"),
+    "secret-manager": ("WARN", "Secret Manager 超 6 个活跃版本后每个约 $0.06/月"),
+    "firestore": ("WARN", "Firestore/Datastore 按存储与读写计费"),
+    "bigquery-datasets": ("WARN", "BigQuery 数据集按存储计费(账单导出数据集本身也计费)"),
+}
+SERVICE_BASELINE = os.path.join(GA_ROOT, "temp", "gcp_cost_watch", "enabled_services.json")
 
 GCLOUD_CANDIDATES = [
     os.path.expanduser("~/google-cloud-sdk/bin/gcloud"),
@@ -80,6 +138,115 @@ def _val(args, timeout=60):
     if rc != 0:
         return None
     return out.strip()
+
+
+def _parse_ts(s):
+    """解析 RFC3339（gcloud 'Z'/带偏移、Monitoring 的 'Z' 两种写法都吃）。"""
+    if not s:
+        return None
+    t = str(s).strip().replace("Z", "+00:00")
+    try:
+        d = datetime.fromisoformat(t)
+    except Exception:  # noqa
+        d = None
+        for f in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+            try:
+                d = datetime.strptime(t, f)
+                break
+            except Exception:  # noqa
+                pass
+    if d is None:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def _listcount(args, timeout=60):
+    """按 json 列表长度计数。API 未启用/无权限 → (0, 说明)；其它错误 → (None, 错误首行)。
+
+    只读：仅 list 类命令。
+    """
+    rc, out, err = gcloud(list(args) + ["--project=" + PROJECT, "--format=json"], timeout)
+    low = (err or "").lower()
+    if rc == 0:
+        try:
+            return len(json.loads(out or "[]") or []), ""
+        except Exception:  # noqa
+            return None, "parse error"
+    for k in ("not enabled", "has not been used", "is disabled", "accessnotconfigured",
+              "permission_denied", "permission denied", "does not have permission"):
+        if k in low:
+            return 0, "API 未启用/无权限"
+    first = (err or "").strip().splitlines()
+    return None, (first[0][:120] if first else "rc=%d" % rc)
+
+
+def monitoring_point(metric, hours=24, period="3600s", aligner="ALIGN_SUM"):
+    """只读查 Cloud Monitoring 时间序列，返回 (points, note)；points=[{end,v},...] 按时间升序。
+
+    需要 access token（gcloud auth print-access-token，只读）。失败返回 (None, 原因)。
+    """
+    tok = _val(["auth", "print-access-token"], 30)
+    if not tok:
+        return None, "无法获取 access token"
+    now = time.time()
+    params = {
+        "filter": 'metric.type="%s"' % metric,
+        "interval.startTime": datetime.fromtimestamp(now - hours * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "interval.endTime": datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "aggregation.alignmentPeriod": period,
+        "aggregation.perSeriesAligner": aligner,
+        "aggregation.crossSeriesReducer": "REDUCE_SUM",
+    }
+    url = (MON_ROOT % PROJECT) + "?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            j = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:  # noqa
+        return None, "monitoring 请求失败: %s" % e
+    pts = []
+    for ts in (j.get("timeSeries") or []):
+        for p in (ts.get("points") or []):
+            v = (p.get("value") or {})
+            num = v.get("int64Value", v.get("doubleValue"))
+            try:
+                num = float(num)
+            except Exception:  # noqa
+                continue
+            pts.append({"end": (p.get("interval") or {}).get("endTime"), "v": num})
+    pts.sort(key=lambda x: x.get("end") or "")
+    return pts, None
+
+
+def _bq_datasets():
+    """BigQuery 数据集个数（REST；未启用/无权限按 0 计）。"""
+    tok = _val(["auth", "print-access-token"], 30)
+    if not tok:
+        return None
+    url = "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets" % PROJECT
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return len(json.loads(r.read().decode("utf-8", "replace")).get("datasets") or [])
+    except Exception:  # noqa
+        return 0
+
+
+def load_services_baseline():
+    """已启用 API 基线（首次运行由 --accept-services 建立）。"""
+    try:
+        with open(SERVICE_BASELINE, encoding="utf-8") as fh:
+            return json.load(fh).get("services") or None
+    except Exception:  # noqa
+        return None
+
+
+def save_services_baseline(services):
+    os.makedirs(os.path.dirname(SERVICE_BASELINE), exist_ok=True)
+    with open(SERVICE_BASELINE, "w", encoding="utf-8") as fh:
+        json.dump({"updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                   "services": sorted(services)}, fh, ensure_ascii=False, indent=2)
+    return SERVICE_BASELINE
 
 
 def collect_state():
@@ -183,6 +350,95 @@ def collect_state():
         if cur:
             budgets.append(cur)
     st["budgets"] = budgets
+
+    # ---- v2 扩充：回答「还有哪些可能花钱的维度」「能不能实时知道」 ----
+    # 10. Cloud Storage 桶（Always Free 5GB 仅限 us 三区区域桶）
+    rc, out, err = gcloud(["storage", "buckets", "list", "--format=json"], 60)
+    if rc == 0:
+        try:
+            st["buckets"] = [{"name": b.get("name"), "location": b.get("location"),
+                              "storageClass": b.get("storageClass"),
+                              "created": b.get("timeCreated")}
+                             for b in (json.loads(out or "[]") or [])]
+        except Exception as e:  # noqa
+            st["buckets"] = None
+            st["errors"].append("buckets parse: %s" % e)
+    else:
+        st["buckets"] = None
+        st["errors"].append("buckets list rc=%s" % rc)
+
+    # 10b. 桶总量（Monitoring，近实时，非实时账）
+    pts, note = monitoring_point("storage.googleapis.com/storage/total_bytes",
+                                 hours=1, period="300s", aligner="ALIGN_MAX")
+    st["bucket_bytes"] = pts[-1]["v"] if pts else None
+
+    # 11. Artifact Registry（免费 0.5GB）
+    rc, out, err = gcloud(["artifacts", "repositories", "list", "--format=json"], 60)
+    if rc == 0:
+        try:
+            st["artifacts"] = [{"name": (r.get("name") or "").rsplit("/", 1)[-1],
+                                "format": r.get("format"),
+                                "sizeBytes": int(r.get("sizeBytes") or 0)}
+                               for r in (json.loads(out or "[]") or [])]
+        except Exception as e:  # noqa
+            st["artifacts"] = None
+            st["errors"].append("artifacts parse: %s" % e)
+    else:
+        st["artifacts"] = None
+        st["errors"].append("artifacts list rc=%s" % rc)
+
+    # 12. App Engine 遗留应用（0 实例无实例费，但存储/日志仍可能计费）
+    rc, out, err = gcloud(["app", "describe", "--format=json"], 60)
+    ae = None
+    low = (err or "").lower()
+    if rc == 0:
+        try:
+            j = json.loads(out or "{}")
+            srv, ver, ins = _listcount(["app", "services", "list"]), \
+                _listcount(["app", "versions", "list"]), _listcount(["app", "instances", "list"])
+            ae = {"exists": True, "id": j.get("id"), "location": j.get("locationId"),
+                  "services": srv[0], "versions": ver[0], "instances": ins[0]}
+        except Exception as e:  # noqa
+            st["errors"].append("appengine parse: %s" % e)
+    elif "not found" in low or "not enabled" in low or "not exist" in low or "does not have" in low:
+        ae = {"exists": False}
+    st["app_engine"] = ae
+
+    # 13. Cloud Logging 摄取量（免费 50GiB/项目/月）
+    pts, note = monitoring_point("logging.googleapis.com/billing/bytes_ingested",
+                                 hours=24, period="86400s", aligner="ALIGN_SUM")
+    st["logging_bytes_24h"] = pts[-1]["v"] if pts else None
+    st["monitoring_note"] = note
+
+    # 14. 运行时长样本（与实例状态交叉验证：停机后不该再有样本）
+    pts, _ = monitoring_point("compute.googleapis.com/instance/uptime",
+                              hours=3, period="300s", aligner="ALIGN_MAX")
+    st["uptime_last"] = pts[-1] if pts else None
+    st["uptime_points"] = len(pts or [])
+
+    # 15. 已启用服务清单（对比基线，发现新增 API 面）
+    rc, out, err = gcloud(["services", "list", "--enabled",
+                           "--format=value(config.name)"], 60)
+    if rc == 0:
+        st["enabled_services"] = sorted([l.strip() for l in (out or "").splitlines() if l.strip()])
+    else:
+        st["enabled_services"] = None
+        st["errors"].append("services list rc=%s" % rc)
+    base = load_services_baseline()
+    st["enabled_services_baseline"] = base
+    if st["enabled_services"] and base:
+        st["enabled_services_new"] = sorted(set(st["enabled_services"]) - set(base))
+        st["enabled_services_gone"] = sorted(set(base) - set(st["enabled_services"]))
+    else:
+        st["enabled_services_new"] = st["enabled_services_gone"] = None
+
+    # 16. 其它按量计费资源面（十类）
+    others = {}
+    for args, key in LIST_CMDS:
+        n, ote = _listcount(args)
+        others[key] = {"count": n, "note": ote}
+    others["bigquery-datasets"] = {"count": _bq_datasets(), "note": ""}
+    st["other_services"] = others
 
     return st
 
@@ -330,6 +586,134 @@ def evaluate(st):
         "URL: https://console.cloud.google.com/billing/%s/credits ; "
         "判据：出现新的 DevProgram 券(剩余>0) ⇒ 赠金仍在发；若某月账单「小计」>0 ⇒ 赠金已停" % BILLING)
 
+    # ---- v2：11. 对象存储桶 ----
+    bks = st.get("buckets")
+    bbytes = st.get("bucket_bytes")
+    if bks is None:
+        add("UNKNOWN", "storage", "无法读取桶列表")
+    elif not bks:
+        add("OK", "storage", "无存储桶")
+    else:
+        names = ",".join(b.get("name") or "?" for b in bks)
+        gb = (float(bbytes) / 1073741824.0) if isinstance(bbytes, (int, float)) else None
+        if gb is None:
+            add("WARN", "storage", "%d 个桶(%s)；体积不可得 ⇒ 无法确认是否超 5GB 免费额度，需人工核对"
+                % (len(bks), names))
+        elif gb > FREE_STORAGE_GB:
+            add("ALERT", "storage", "%d 个桶合计 %.2fGB > 免费 5GB ⇒ 超出部分约 $%.2f/月 (%s)"
+                % (len(bks), gb, (gb - FREE_STORAGE_GB) * PRICE_STORAGE_GB_MONTH, names))
+        else:
+            add("OK", "storage",
+                "%d 个桶合计 %.3fGB，低于免费 5GB；注意 Always Free 仅限 us-east1/us-west1/us-central1 区域桶，"
+                "其它位置按约 $%.3f/GiB·月 计 (%s)"
+                % (len(bks), gb, PRICE_STORAGE_GB_MONTH, names))
+
+    # 12. Artifact Registry 镜像
+    ars = st.get("artifacts")
+    if ars is None:
+        add("UNKNOWN", "artifacts", "无法读取 Artifact Registry")
+    elif not ars:
+        add("OK", "artifacts", "无镜像仓库")
+    else:
+        tot = sum(a.get("sizeBytes") or 0 for a in ars)
+        gb = tot / 1073741824.0
+        nm = ",".join("%s(%s)" % (a.get("name"), a.get("format") or "?") for a in ars)
+        if gb > FREE_ARTIFACT_GB:
+            add("ALERT", "artifacts", "%d 个仓库合计 %.2fGB > 免费 0.5GB ⇒ 超出部分约 $%.3f/月 (%s)"
+                % (len(ars), gb, (gb - FREE_ARTIFACT_GB) * PRICE_ARTIFACT_GB_MONTH, nm))
+        else:
+            add("OK", "artifacts", "%d 个仓库合计 %.1fMiB，低于免费 0.5GB (%s)"
+                % (len(ars), tot / 1048576.0, nm))
+
+    # 13. App Engine 遗留应用
+    ae = st.get("app_engine")
+    if ae is None:
+        add("UNKNOWN", "app-engine", "无法读取 App Engine")
+    elif not ae.get("exists"):
+        add("OK", "app-engine", "无 App Engine 应用（不产生实例/存储费）")
+    elif (ae.get("instances") or 0) > 0:
+        add("ALERT", "app-engine", "存在 App Engine 应用且有 %s 个运行实例 ⇒ 按实例小时计费"
+            % ae.get("instances"))
+    else:
+        add("INFO", "app-engine",
+            "存在遗留 App Engine 应用(%s 服务/%s 版本/0 实例)：0 实例不产生实例费，但应用配额存储与日志仍可能计少量费用 ⇒ 建议人工在 Console 评估删除（脚本不动手）"
+            % (ae.get("services"), ae.get("versions")))
+
+    # 14. Cloud Logging 摄取量（免费 50GiB/项目/月）
+    lb = st.get("logging_bytes_24h")
+    if lb is None:
+        add("INFO", "logging", "近 24h 日志摄取量不可得（Monitoring 未返回：%s）⇒ 需人工核对是否超 50GiB/月"
+            % (st.get("monitoring_note") or "未知原因"))
+    else:
+        est = float(lb) * 30.0 / 1073741824.0
+        if est > FREE_LOGGING_GIB_MONTH:
+            add("ALERT", "logging", "近 24h 摄取 %.1fMiB ⇒ 折月约 %.1fGiB > 免费 %.0fGiB ⇒ 超出部分约 $%.2f/月"
+                % (float(lb) / 1048576.0, est, FREE_LOGGING_GIB_MONTH,
+                   (est - FREE_LOGGING_GIB_MONTH) * PRICE_LOGGING_PER_GIB))
+        elif est > FREE_LOGGING_GIB_MONTH * 0.8:
+            add("WARN", "logging", "近 24h 摄取 %.1fMiB ⇒ 折月约 %.1fGiB，已接近免费 %.0fGiB"
+                % (float(lb) / 1048576.0, est, FREE_LOGGING_GIB_MONTH))
+        else:
+            add("OK", "logging", "近 24h 日志摄取 %.1fMiB ⇒ 折月约 %.2fGiB，远低于免费 %.0fGiB"
+                % (float(lb) / 1048576.0, est, FREE_LOGGING_GIB_MONTH))
+
+    # 15. 停机状态 × 运行时长样本（交叉验证：防「已重启却仍报停机」）
+    ups = st.get("uptime_last")
+    stops = [i for i in (st.get("instances") or [])
+             if (i.get("status") or "").upper() in ("TERMINATED", "STOPPED", "STOPPING") and i.get("lastStop")]
+    if not ups or not stops:
+        add("INFO", "runtime-crosscheck", "运行时长样本/停机时刻不可得 ⇒ 未做交叉验证（%s）"
+            % (st.get("monitoring_note") or "样本缺失"))
+    else:
+        bad = []
+        for i in stops:
+            su, ss = _parse_ts(ups.get("end")), _parse_ts(i.get("lastStop"))
+            if su and ss and (su - ss).total_seconds() > 600:
+                bad.append("%s(样本晚 %.0f 分钟)" % (i.get("name"), (su - ss).total_seconds() / 60.0))
+        if bad:
+            add("ALERT", "runtime-crosscheck",
+                "实例状态为停机，但运行时长监控样本出现在停机之后 ⇒ 疑似已重新启动: %s" % ",".join(bad))
+        else:
+            add("OK", "runtime-crosscheck", "停机与运行时长样本一致（最近样本 %s，停机后无新样本 ⇒ 未在运行）"
+                % ups.get("end"))
+
+    # 16. 已启用 API 面变化
+    svc, base = st.get("enabled_services"), st.get("enabled_services_baseline")
+    news, gone = st.get("enabled_services_new"), st.get("enabled_services_gone")
+    if svc is None:
+        add("UNKNOWN", "services", "无法读取已启用服务清单")
+    elif not base:
+        add("INFO", "services", "已启用 %d 项服务；尚未建立基线 ⇒ 确认无误后运行 check --accept-services 建立（之后新增 API 会点名提醒）"
+            % len(svc))
+    elif news:
+        add("WARN", "services", "新增启用 API: %s ⇒ 新 API 常伴随新资源，需确认其是否在花钱（确认合规后 check --accept-services 刷新基线）"
+            % ",".join(news))
+    else:
+        add("OK", "services", "已启用 %d 项服务，与基线一致%s"
+            % (len(svc), ("；已停用: " + ",".join(gone)) if gone else ""))
+
+    # 17. 其它十类按量计费资源面
+    others = st.get("other_services") or {}
+    if not others:
+        add("INFO", "other-resources", "其它资源面未采集（见 state.other_services）")
+    else:
+        hot, unk = [], []
+        for key in [k for _a, k in LIST_CMDS] + ["bigquery-datasets"]:
+            ent = others.get(key) or {}
+            c, ote = ent.get("count"), ent.get("note")
+            lvl, why = OTHER_META.get(key, ("WARN", "按量计费"))
+            if c is None:
+                unk.append("%s(%s)" % (key, ote or "未知"))
+            elif c > 0:
+                hot.append((lvl, key, c, why))
+        for lvl, key, c, why in hot:
+            add(lvl, "other:" + key, "%d 个 ⇒ %s" % (c, why))
+        if unk:
+            add("INFO", "other-unresolved", "无法判定（API 未启用或无权）: %s" % ",".join(sorted(unk)))
+        if not hot:
+            add("OK", "other-resources",
+                "SQL/Run/Functions/PubSub/Scheduler/DNS/KMS/Secret/Firestore/BigQuery 十类均无资源 ⇒ 无按量计费项")
+
     return f
 
 
@@ -356,7 +740,18 @@ def render(st, findings):
         lines.append("-" * 62)
         lines.append("采集告警: " + "; ".join(st["errors"])[:300])
     lines.append("-" * 62)
-    lines.append("停机三前提：①实例 TERMINATED ②磁盘 ≤30GB ③无新增资源(静态IP/快照/LB/NAT)")
+    up = st.get("uptime_last") or {}
+    lag = ""
+    if up.get("end"):
+        d = _parse_ts(up["end"])
+        if d:
+            lag = "；最近用量样本 %s（滞后约 %.0f 分钟）" % (
+                up["end"], max(0.0, (datetime.now(timezone.utc) - d).total_seconds() / 60.0))
+    lines.append("实时性：资源面=实时(gcloud 直查，采集于 %s)%s" % (st.get("collected_at") or "?", lag))
+    lines.append("        用量面=近实时(Cloud Monitoring，通常滞后 1~3 分钟)；费用面=不可实时"
+                 "(Cloud Billing 无「当前花费」CLI/REST，credits 端点实测 404 ⇒ 只能人工看 Console「小计」列)")
+    lines.append("-" * 62)
+    lines.append("停机三前提：①实例 TERMINATED ②磁盘 ≤30GB ③无新增资源(静态IP/快照/LB/NAT/桶/镜像/AppEngine/新API)")
     lines.append("真实金额请看 Console → 结算 → 报告 的「小计」列（不是「使用费」列）。")
     return "\n".join(lines)
 
@@ -387,7 +782,14 @@ def _fake(**kw):
     base = {"instances": [], "disks": [], "addresses": 0, "snapshots": 0,
             "forwarding_rules": 0, "routers": 0, "os_policy_assignments": 0,
             "billed_projects": [PROJECT], "budgets": [{"name": "b", "amount": "10"}],
-            "domains": 0, "errors": []}
+            "domains": 0, "errors": [],
+            # v2 默认值取「安静路径」：不产生 ALERT/UNKNOWN，避免旧用例被新维度污染
+            "buckets": [], "bucket_bytes": None, "artifacts": [],
+            "app_engine": {"exists": False}, "logging_bytes_24h": 0,
+            "uptime_last": None, "monitoring_note": None,
+            "enabled_services": [], "enabled_services_baseline": None,
+            "enabled_services_new": None, "enabled_services_gone": None,
+            "other_services": {}}
     base.update(kw)
     return base
 
@@ -457,6 +859,58 @@ def selftest():
     # N13 空实例列表 = OK 而非 WARN
     check("N13 无实例=OK", _fake(instances=[], disks=[]), "OK")
 
+    # ---- v2 新维度用例（每条都对应一个真实免费额度/计费点）----
+    D30 = [{"name": "d", "sizeGb": 30, "type": "pd-standard"}]
+    # T1 桶在 5GB 免费层内 ⇒ OK
+    check("T1 桶<5GB", _fake(instances=STOPPED, disks=D30, buckets=[{"name": "b", "location": "US"}],
+                             bucket_bytes=1024 * 1024), "OK", "OK", "storage")
+    # T2 桶超 5GB ⇒ ALERT
+    check("T2 桶>5GB", _fake(instances=STOPPED, disks=D30, buckets=[{"name": "b", "location": "US"}],
+                             bucket_bytes=6 * 1024 ** 3), "ALERT", "ALERT", "storage")
+    # T3 桶体积取不到 ⇒ WARN（不得冒充 OK）
+    check("T3 桶体积不可得", _fake(instances=STOPPED, disks=D30, buckets=[{"name": "b"}], bucket_bytes=None),
+          "WARN", "WARN", "storage")
+    # T4 Artifact 仓库超免费 0.5GB ⇒ ALERT
+    check("T4 镜像仓库超标", _fake(instances=STOPPED, disks=D30,
+                                artifacts=[{"name": "r", "format": "DOCKER", "sizeBytes": 700 * 1024 ** 2}]),
+          "ALERT", "ALERT", "artifacts")
+    # T5 App Engine 有运行实例 ⇒ ALERT
+    check("T5 AppEngine 有实例", _fake(instances=STOPPED, disks=D30,
+                                      app_engine={"exists": True, "services": 1, "versions": 1, "instances": 2}),
+          "ALERT", "ALERT", "app-engine")
+    # T6 App Engine 存在但 0 实例 ⇒ INFO（不升 verdict，但要点名遗留应用）
+    check("T6 AppEngine 0实例", _fake(instances=STOPPED, disks=D30,
+                                     app_engine={"exists": True, "services": 1, "versions": 1, "instances": 0}),
+          "OK", "INFO", "app-engine")
+    # T7 日志摄取折月超 50GiB ⇒ ALERT
+    check("T7 日志摄取超标", _fake(instances=STOPPED, disks=D30, logging_bytes_24h=2 * 1024 ** 3),
+          "ALERT", "ALERT", "logging")
+    # T8 日志摄取不可得 ⇒ INFO（不冒充 OK）
+    check("T8 日志量不可得", _fake(instances=STOPPED, disks=D30, logging_bytes_24h=None,
+                                 monitoring_note="monitoring 请求失败"), "OK", "INFO", "logging")
+    # T9 停机但运行时长样本晚于停机 ⇒ ALERT（交叉验证核心用例）
+    check("T9 疑似重启", _fake(instances=[dict(STOPPED[0], lastStop="2026-10-01T19:43:34+00:00")], disks=D30,
+                              uptime_last={"end": "2026-10-02T03:00:00Z", "v": 120.0}),
+          "ALERT", "ALERT", "runtime-crosscheck")
+    # T10 样本止于停机时刻 ⇒ OK
+    check("T10 交叉验证一致", _fake(instances=[dict(STOPPED[0], lastStop="2026-10-02T02:43:00+00:00")], disks=D30,
+                                   uptime_last={"end": "2026-10-02T02:45:43Z", "v": 202.0}),
+          "OK", "OK", "runtime-crosscheck")
+    # T11 新增启用 API ⇒ WARN
+    check("T11 新增API", _fake(instances=STOPPED, disks=D30,
+                              enabled_services=["a.googleapis.com", "b.googleapis.com"],
+                              enabled_services_baseline=["a.googleapis.com"],
+                              enabled_services_new=["b.googleapis.com"], enabled_services_gone=[]),
+          "WARN", "WARN", "services")
+    # T12 其它资源面出现 Cloud SQL 实例 ⇒ ALERT
+    check("T12 SQL 实例", _fake(instances=STOPPED, disks=D30,
+                               other_services={"cloud-sql": {"count": 1, "note": ""}}),
+          "ALERT", "ALERT", "other:cloud-sql")
+    # T13 其它资源面全 0 ⇒ OK
+    check("T13 其它面全空", _fake(instances=STOPPED, disks=D30,
+                                 other_services={"cloud-sql": {"count": 0, "note": ""}}),
+          "OK", "OK", "other-resources")
+
     passed = sum(1 for _, ok, _ in cases if ok)
     for n, ok, m in cases:
         print(("PASS " if ok else "FAIL ") + n + (("  <- " + m) if m else ""))
@@ -487,6 +941,12 @@ def main(argv):
         return 2
 
     st = collect_state()
+    if "--accept-services" in argv and st.get("enabled_services"):
+        p = save_services_baseline(st["enabled_services"])
+        st["enabled_services_baseline"] = sorted(st["enabled_services"])
+        st["enabled_services_new"], st["enabled_services_gone"] = [], []
+        if not as_json:
+            print("已刷新服务基线: %s (%d 项)" % (p, len(st["enabled_services"])))
     findings = evaluate(st)
     v = verdict(findings)
 

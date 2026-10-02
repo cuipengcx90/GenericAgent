@@ -28,15 +28,18 @@
 
 
 ## CLI 侧成本守望（2026-10-02 落地：无人值守日常巡检，只读）
-- **工具** `tools/gcp_cost_watch.py`（`check` / `--json` / `--selftest` 14/14）；**定时** `sche_tasks/gcp_cost_watch.json`（每日 09:40，enabled，max_delay 8h）⇒ scheduler=`agentmain --reflect` 读 `sche_tasks/*.json`，无需注册。设计：全绿静默，仅 ⚠️/❌/rc=2 才推 飞书私信+钉钉群（与其它 AGENT 的 `~/tools/gcp-billing-check.sh` 差异=本工具**含固费/漏费面与预算阈值体检**，且进 GA 任务体系；两者可并存，本工具为准）。
+- **工具** `tools/gcp_cost_watch.py`（`check` / `--json` / `--selftest` **27/27**；`check` 面共 **17 项**体检 = 停机三前提 + 固费/漏费面 + 新增资源面(桶/镜像/AppEngine/日志摄取/API 基线) + 运行时交叉核验；另有 `--notify` 推送 / `--ledger` 落账 / `--accept-services` 刷新服务基线）；**定时** `sche_tasks/gcp_cost_watch.json`（每日 09:40，enabled，max_delay 8h）⇒ scheduler=`agentmain --reflect` 读 `sche_tasks/*.json`，无需注册。设计：全绿静默，仅 ⚠️/❌/rc=2 才推 飞书私信+钉钉群（与其它 AGENT 的 `~/tools/gcp-billing-check.sh` 差异=本工具**含固费/漏费面与预算阈值体检**，且进 GA 任务体系；两者可并存，本工具为准）。
 - **停机三前提（任一破即 ALERT）**：①实例 TERMINATED ②磁盘 ≤30GB（免费层 pd-standard 30GB）③无新增资源（静态 IP / 快照 / 转发规则 / Cloud Router-NAT；域名年费单列）。
 - **固费/漏费面**（对方脚本缺）：Cloud Domains 年费、VM Manager OS 策略、结算账号下的其它项目。
 - **gcloud 本机**：binary `/opt/homebrew/share/google-cloud-sdk/bin/gcloud`，账号 cuipengcx（非交互 shell 无 PATH ⇒ 脚本内写死绝对路径）。
 - **赠金 CLI 读不到**（实测 `billingAccounts/*/credits` 404）⇒ 只能人工看 `https://console.cloud.google.com/billing/017EE2-1FDFF1-148293/credits`；判据：出现新的 DevProgram 券(剩余>0) ⇒ 赠金仍在发；某月账单「小计」>0 ⇒ 赠金已停。
 - **金额口径**：真实扣款看 Console→结算→报告 的**小计**列（不是「使用费」列）。
-- 2026-10-02 11:44 真跑（verdict=OK；预算阈值问题自 11:44 起降为 ℹ️，**不参与 verdict**）：
+- **服务基线（新增 API 点名）**：`temp/gcp_cost_watch/enabled_services.json`（首次 `check --accept-services` 建立，实测 23 项）；之后新增启用 API 报 ⚠️ ⇒ 新 API 常伴随新资源，确认合规后再 `--accept-services` 刷新基线。
+- **实时性口径（脚本尾注同文，判读勿混）**：资源面 = **实时**（gcloud 直查，行首时间即采集时刻）；用量面 = **近实时**（Cloud Monitoring，通常滞后 1~3 分钟，样本时间戳随行打印）；费用面 = **不可实时**（Cloud Billing 无「当前花费」CLI/REST）⇒ 费用只能人工看 Console「小计」。
+- **台账**：`--ledger` 追加一行到 `temp/gcp_cost_watch/ledger.jsonl`；定时任务默认走 `--notify --ledger`。
+- 2026-10-02 12:07 真跑（verdict=OK；预算阈值/赠金/App Engine 等**建议类一律 ℹ️、不参与 verdict**；含新建服务基线后稳态输出；采集 48.7s）：
 ```text
-GCP 成本守望 · 2026-10-02T11:44:16+0800 · verdict=OK
+GCP 成本守望 · 2026-10-02T12:07:11+0800 · verdict=OK
 项目=cpgoagent-11013  结算=017EE2-1FDFF1-148293
 --------------------------------------------------------------
 ✅ [instance:cuip-20251215-084618] 已停机(TERMINATED)，不收计算费
@@ -50,8 +53,18 @@ GCP 成本守望 · 2026-10-02T11:44:16+0800 · verdict=OK
 ℹ️ [budget:每月预算提醒] 金额仅 $0.1/月 ⇒ 真实月成本远高于此，阈值天天触发=形同虚设（建议提到 $5~$10；改预算需人工在 Console 操作）
 ✅ [domains] 无 Cloud Domains 注册（无年费漏项）
 ℹ️ [credits] 赠金余额无公开 CLI 端点（credits 实测 404）⇒ 需人工核对；URL: https://console.cloud.google.com/billing/017EE2-1FDFF1-148293/credits ; 判据：出现新的 DevProgram 券(剩余>0) ⇒ 赠金仍在发；若某月账单「小计」>0 ⇒ 赠金已停
+✅ [storage] 1 个桶合计 0.001GB，低于免费 5GB；注意 Always Free 仅限 us-east1/us-west1/us-central1 区域桶，其它位置按约 $0.026/GiB·月 计 (cpgoagent-11013_cloudbuild)
+✅ [artifacts] 1 个仓库合计 25.5MiB，低于免费 0.5GB (cliproxy-repo(DOCKER))
+ℹ️ [app-engine] 存在遗留 App Engine 应用(1 服务/1 版本/0 实例)：0 实例不产生实例费，但应用配额存储与日志仍可能计少量费用 ⇒ 建议人工在 Console 评估删除（脚本不动手）
+✅ [logging] 近 24h 日志摄取 59.8MiB ⇒ 折月约 1.75GiB，远低于免费 50GiB
+✅ [runtime-crosscheck] 停机与运行时长样本一致（最近样本 2026-10-02T02:47:39Z，停机后无新样本 ⇒ 未在运行）
+✅ [services] 已启用 23 项服务，与基线一致
+✅ [other-resources] SQL/Run/Functions/PubSub/Scheduler/DNS/KMS/Secret/Firestore/BigQuery 十类均无资源 ⇒ 无按量计费项
 --------------------------------------------------------------
-停机三前提：①实例 TERMINATED ②磁盘 ≤30GB ③无新增资源(静态IP/快照/LB/NAT)
+实时性：资源面=实时(gcloud 直查，采集于 2026-10-02T12:07:11+0800)；最近用量样本 2026-10-02T02:47:39Z（滞后约 80 分钟）
+        用量面=近实时(Cloud Monitoring，通常滞后 1~3 分钟)；费用面=不可实时(Cloud Billing 无「当前花费」CLI/REST，credits 端点实测 404 ⇒ 只能人工看 Console「小计」列)
+--------------------------------------------------------------
+停机三前提：①实例 TERMINATED ②磁盘 ≤30GB ③无新增资源(静态IP/快照/LB/NAT/桶/镜像/AppEngine/新API)
 真实金额请看 Console → 结算 → 报告 的「小计」列（不是「使用费」列）。
 ```
 - 待办（需用户拍板，只读不代改；**ℹ️ 级、不推送、不升 verdict**）：两个预算告警阈值 $1/月、$0.1/月 远低于真实月成本 ⇒ 天天触发、失去告警意义；建议提到 **$5~$10/月**（改预算属计费配置，SOP 纪律禁止代办）。
