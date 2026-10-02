@@ -5,12 +5,15 @@
 
 **入口**
 - 工具 `tools/agentrouter_quota_watch.py`（stdlib + `curl_cffi`，449 行）
-  - `--once` 单次探测 / `--notify` 有额度才推 / `--force` 忽略窗口 / `--dry-run` 不真推 / `--models` 只读列模型 / `--selftest`（离线 32/32）
+  - `--once` 单次探测 / `--notify` 有额度才推 / `--force` 忽略窗口 / `--dry-run` 不真推 / `--models` 只读列模型 / `--selftest`（离线 43/43）
+  - `--watch` 窗口内自轮询（`--interval` 默认 60s、`--max-minutes` 默认 35）= 抢额度用的常驻模式；出窗口或批次已通知即退 rc=0
   - 退出码：`0` 正常（无额度 / 窗口外跳过 / 批次已通知）/ `1` 至少一个模型 AVAILABLE / `2` 环境或全量探测异常
-- 定时 `~/Library/LaunchAgents/com.cuip.genericagent-agentrouter-quota.plist`
-  - `StartCalendarInterval` **60 项** = 10:00–10:29 与 19:00–19:29 各 30 次（**每分钟 1 次**）
-  - 命令 `/opt/anaconda3/bin/python3 -u tools/agentrouter_quota_watch.py --once --notify`（**必须**用带 curl_cffi 的解释器）
-  - 重载：`launchctl bootout gui/501/<label>; launchctl bootstrap gui/501 <plist>`
+- 定时 = **GA sche_tasks（用户 2026-10-02 纠正：禁止注册系统 launchd / crontab）**
+  - `sche_tasks/agentrouter_quota_am.json`（北京 10:00 daily）、`sche_tasks/agentrouter_quota_pm.json`（19:00 daily）
+  - prompt 头插 `${GA_ROOT}` 锚定行，再 `python3 tools/bg_task.py start --name agentrouter_watch_<slot> -- /opt/anaconda3/bin/python3 tools/agentrouter_quota_watch.py --watch --notify`
+  - 因 sche_tasks 粒度只到 `HH:MM`，**分钟级高频靠 `--watch` 自轮询**，而不是靠 60 项 `StartCalendarInterval`
+  - 观察：`python3 tools/bg_task.py status --name agentrouter_watch_am`；日志 `temp/bg_task/logs/agentrouter_watch_am.log`
+  - ⚠️ 不要再往 `~/Library/LaunchAgents/` 写 plist（历史遗留 `com.cuip.genericagent-agentrouter-quota.plist` 已卸载并移入备份）
 - Key：keychain 名 `agentrouter_api_key`（脚本回退顺序 env `AGENTROUTER_API_KEY` → keychain → `~/.config/agentrouter/key`）
 - 状态/账本：`temp/agentrouter_watch/state.json`（批次幂等）、`ledger.jsonl`（每次探测一行）
 
@@ -35,8 +38,8 @@
 - DeepSeek/GLM 不限量，**不参与**本监控。
 
 **典型坑**
-- 5 分钟粒度太粗：限量额度秒级抢光 ⇒ 必须每分钟 1 次（60 项 `StartCalendarInterval`）。
-- launchd 环境 PATH 精薄 ⇒ 用**绝对路径**的解释器（`/opt/anaconda3/bin/python3`）；已实测该解释器下 `reflect_scripts/reflect_common.notify_feishu` 与 `notify_dingtalk_group.notify_group` 均可导入。
+- 5 分钟粒度太粗（限量额度秒级抢光），而 GA sche_tasks 粒度只到**分钟** ⇒ 组合拳：sche_tasks 负责准时唤起，窗口内每分钟 1 轮交给 `--watch` 自轮询。
+- 解释器必须带 `curl_cffi` ⇒ 一律写**绝对路径** `/opt/anaconda3/bin/python3`（scheduler / bg_task 子进程的 PATH 不保证）。
 - 推送成功判据看**返回**（`notify_feishu`/`notify_group` 布尔 + detail），不看日志文案。
 - 2026-10-02 14:46 真探测：三模型全 `http=402 EXHAUSTED` ⇒ 探针链路确认可用，只是当天额度已发完（`--force --dry-run` 无推送副作用）。
 

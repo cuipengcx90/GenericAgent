@@ -43,6 +43,7 @@ import datetime
 import json
 import os
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -286,12 +287,16 @@ def run_once(args):
 
     if available:
         text = _build_text(batch or "(手动强制检测)", results, now_bj)
+        pushed = False
         if args.notify:
             ok, detail = send_notifications(text, dry_run=args.dry_run)
+            pushed = bool(ok)
             print("[agentrouter] 通知: %s (%s)" % ("已推送" if ok else "失败", detail))
         else:
             print("[agentrouter] (未加 --notify，跳过推送)\n" + text)
-        if batch and args.notify and not args.dry_run:
+        # ★幂等键只在推送成功时写：失败也写会把「未送达」记成已通知，
+        #   同一批次的后续轮次将被静默跳过（真缺陷，由 3h 负控锁死）。
+        if pushed and batch and not args.dry_run:
             st[batch] = {"notified": now_bj.isoformat(),
                          "models": {r["model"]: r["verdict"] for r in results}}
             _save_state(st)
@@ -302,6 +307,48 @@ def run_once(args):
         print("[agentrouter] 探测异常: %s" % ",".join(verdicts), file=sys.stderr)
         return 2
     return 0
+
+
+def watch_deadline(start, max_minutes):
+    """watch 模式硬超时时刻；max_minutes<=0 表示不设上限（靠窗口结束退出）。"""
+    return start + datetime.timedelta(minutes=max_minutes) if max_minutes else None
+
+
+def run_watch(args):
+    """投放窗口内自轮询：每分钟一轮，直到「命中额度并推送成功 / 出窗口 / 达硬超时」。
+
+    GA 定时（sche_tasks）只支持 HH:MM 粒度，表达不了「窗口内每分钟」；
+    故由 GA 定时在窗口起点唤起一次，用 tools/bg_task.py 把本函数拉到后台，
+    一次进程覆盖整个 30 分钟窗口（纯脚本、零 LLM token），命中即推送并退出。
+    """
+    start = beijing_now()
+    hard_end = watch_deadline(start, args.max_minutes)
+    rounds = 0
+    print("[agentrouter] watch 启动 %s（间隔 %ds，硬超时 %s）"
+          % (start.strftime("%Y-%m-%d %H:%M:%S"), args.interval,
+             hard_end.strftime("%H:%M:%S") if hard_end else "无(随窗口结束)"))
+    while True:
+        rounds += 1
+        print("[agentrouter] watch 第 %d 轮 %s"
+              % (rounds, beijing_now().strftime("%H:%M:%S")), flush=True)
+        rc = run_once(args)
+        # ★退出凭据只认 state 落账（幂等键），不认 rc：rc==1 只说明「命中额度」，
+        #   推送失败时 rc 同为 1 ⇒ 若据此退出，失败轮将不再重试（真缺陷，已由 3h 负控锁死）。
+        b = current_batch()
+        st = _load_state()
+        if b and st.get(b, {}).get("notified"):
+            print("[agentrouter] watch: %s，退出（共 %d 轮）"
+                  % ("命中额度且已推送" if rc == 1 else "该批次此前已通知", rounds))
+            return 0
+        if rc == 1 and args.notify and not args.dry_run:
+            print("[agentrouter] watch: 命中但推送未成功，%ds 后重试" % args.interval, flush=True)
+        if not args.force and b is None:
+            print("[agentrouter] watch: 已出投放窗口，退出（共 %d 轮）" % rounds)
+            return 0
+        if hard_end and beijing_now() >= hard_end:
+            print("[agentrouter] watch: 达到 --max-minutes 上限，退出（共 %d 轮）" % rounds)
+            return 0
+        time.sleep(args.interval)
 
 
 # ---------------------------------------------------------------- 自测
@@ -404,6 +451,73 @@ def selftest():
     globals()["_load_key"] = orig_load_key
     chk("无 key rc=2", rc == 2)
 
+    # 3f-3h) watch 模式：窗口内自轮询的退出语义（不真等：interval=0）
+    class W:
+        notify = True
+        dry_run = False
+        force = False
+        interval = 0
+        max_minutes = 30
+
+    orig_sleep = time.sleep
+    orig_load_state = globals()["_load_state"]
+    orig_load_key2 = globals()["_load_key"]
+    calls = {"probe": 0, "sleep": 0, "sent": 0}
+    time.sleep = lambda s: calls.__setitem__("sleep", calls["sleep"] + 1)
+    globals()["_load_key"] = lambda: "sk-test-notional"
+
+    def _probe_avail(m, k, **kw):
+        calls["probe"] += 1
+        return {"model": m, "http": 200, "verdict": "AVAILABLE", "detail": ""}
+
+    # 3f) 窗口外：零探测、零 sleep、立即 rc=0（不起进程空转）
+    globals()["current_batch"] = lambda *a, **k: None
+    globals()["probe_model"] = _probe_avail
+    rc = run_watch(W())
+    chk("watch 窗口外 rc=0", rc == 0)
+    chk("watch 窗口外零探测零等待", calls["probe"] == 0 and calls["sleep"] == 0)
+
+    # 3g) 窗口内命中且推送成功：第 1 轮即退出 + 幂等 state 落盘
+    globals()["current_batch"] = lambda *a, **k: "2026-10-02@19:00"
+    globals()["send_notifications"] = lambda t, dry_run=False: (calls.__setitem__("sent", calls["sent"] + 1) or True, "stub-ok")
+    w_state = os.path.join(d, "watch_hit_state.json")
+    globals()["STATE_FILE"] = w_state
+    calls["probe"] = 0
+    rc = run_watch(W())
+    chk("watch 命中即退出 rc=0", rc == 0)
+    chk("watch 命中只探 1 轮", calls["probe"] == len(MODELS) and calls["sleep"] == 0)
+    chk("watch 命中推送 1 次", calls["sent"] == 1)
+    _ws = json.load(open(w_state, encoding="utf-8")) if os.path.exists(w_state) else {}
+    chk("watch 命中落 state(幂等)", bool(_ws.get("2026-10-02@19:00", {}).get("notified")))
+
+    # 3h) 负控：推送失败 ⇒ 不写 state 且未出窗口时继续轮询（第 3 次问窗口才结束）
+    globals()["send_notifications"] = lambda t, dry_run=False: (False, "stub-fail")
+    # 每轮消耗 2 次 current_batch（run_once 内 1 次 + 循环尾 1 次）⇒ 给 3 个元素恰好跑满 2 轮后出窗口
+    seq = ["2026-10-02@19:00"] * 3
+
+    def _batch_then_out(*a, **k):
+        return seq.pop(0) if seq else None
+    globals()["current_batch"] = _batch_then_out
+    w_state2 = os.path.join(d, "watch_fail_state.json")
+    globals()["STATE_FILE"] = w_state2
+    calls["probe"] = 0
+    calls["sleep"] = 0
+    rc = run_watch(W())
+    chk("watch 推送失败仍 rc=0", rc == 0)
+    chk("watch 推送失败连跑 2 轮", calls["probe"] == 2 * len(MODELS) and calls["sleep"] == 1)
+    chk("watch 推送失败不落 state", not os.path.exists(w_state2))
+
+    # watch 硬超时语义（max_minutes<=0 = 不设上限，靠窗口结束退出）
+    _t0 = beijing_now()
+    chk("watch_deadline<=0 无上限", watch_deadline(_t0, 0) is None)
+    chk("watch_deadline>0 精确偏移",
+        watch_deadline(_t0, 30) == _t0 + datetime.timedelta(minutes=30))
+
+    time.sleep = orig_sleep
+    globals()["_load_key"] = orig_load_key2
+    globals()["_load_state"] = orig_load_state
+    globals()["STATE_FILE"] = old[1]
+
     globals()["probe_model"] = orig_probe
     globals()["current_batch"] = orig_batch
     globals()["send_notifications"] = orig_send
@@ -425,15 +539,26 @@ def selftest():
     return 0 if ok else 1
 
 
-def main():
-    ap = argparse.ArgumentParser()
+def _build_parser():
+    ap = argparse.ArgumentParser(
+        prog="agentrouter_quota_watch.py",
+        description="AgentRouter 限量额度投放监控（TLS 指纹破限；GA sche_tasks + bg_task 唤起）")
     ap.add_argument("--once", action="store_true", help="单次检测（默认行为）")
+    ap.add_argument("--watch", action="store_true",
+                    help="窗口内自轮询：每分钟一轮，命中额度并推送成功即退出（供 GA 定时用 bg_task 唤起）")
+    ap.add_argument("--interval", type=int, default=60, help="--watch 轮询间隔秒数（默认 60）")
+    ap.add_argument("--max-minutes", type=int, default=0, dest="max_minutes",
+                    help="--watch 硬超时分钟数（默认 0=不设上限，随窗口结束退出）")
     ap.add_argument("--notify", action="store_true", help="检测到有额度时推送通知")
     ap.add_argument("--force", action="store_true", help="无视投放窗口强制检测")
     ap.add_argument("--dry-run", action="store_true", help="不真正发送通知")
     ap.add_argument("--models", action="store_true", help="只读列举站点在册模型（/v1/models）")
     ap.add_argument("--selftest", action="store_true", help="负控自测")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = _build_parser().parse_args()
     if args.selftest:
         return selftest()
     if args.models:
@@ -442,6 +567,8 @@ def main():
         for m in r["models"]:
             print("  -", m)
         return 0 if r["http"] == 200 else 2
+    if args.watch:
+        return run_watch(args)
     return run_once(args)
 
 

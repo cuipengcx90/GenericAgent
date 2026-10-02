@@ -1,0 +1,7 @@
+{
+  "schedule": "19:00",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 1,
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n\nAgentRouter 额度投放巡检（北京时间 19:00-19:30 投放窗口 批次，零 token 成本）：\n\n站点 https://agentrouter.org/ 的额度按批次投放（claude-opus-5 / claude-opus-4-8 / gpt-6-astra 等模型在池内有余额时返回 HTTP 200，无余额返回 402）。\n本任务的可见窗口是北京 19:00-19:30 投放窗口，脚本需在窗口内每分钟探测一次直到命中——GA 定时只支持 HH:MM 粒度，故由本任务「唤起一次」，再用后台任务把探测进程挂到窗口结束。\n\n1. 【记录报告路径】先用 update_working_checkpoint 记下 scheduler 注入的 [报告路径] 行，防长任务遗忘。\n\n2. 【起后台探测】执行（纯本地脚本，零 LLM token；命令立即返回，进程已脱离会话）：\n   python3 tools/bg_task.py start --name agentrouter_watch_pm -- /opt/anaconda3/bin/python3 tools/agentrouter_quota_watch.py --watch --notify --interval 60 --max-minutes 35\n\n3. 【取凭据】紧接着执行，把输出（含 pid 与日志路径）原样贴进报告：\n   python3 tools/bg_task.py status --name agentrouter_watch_pm --json\n   ★禁止 sleep / 轮询等待：后台进程会自己覆盖整个窗口，命中额度（HTTP 200）即自动发飞书私信给用户并退出；窗口结束或达到 35 分钟硬超时也会自行退出。本会话不需要等它跑完。\n\n4. 【收尾】报告内容只需：本任务启动时间、bg_task status 的 pid/日志路径、以及「后台巡检已挂起，命中额度会自动私信」一句。不要伪造探测结果（本轮并未同步拿到探测输出）。\n\n5. 【异常】若步骤 2 返回非 0（未启动成功）：在报告里贴原样 stderr，并额外发一条飞书私信说明「AgentRouter 额度巡检未能启动：<原因>」（参考 memory/notify_channels_sop.md 或 reflect_scripts/reflect_common.py 的 notify_feishu()）。禁止静默失败。\n"
+}
