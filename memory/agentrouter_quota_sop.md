@@ -81,6 +81,7 @@
 - 直连（绕代理）物理不通：域名解析 `108.160.169.185` + IPv6 `2a03:2880:f12c:83:face:b00c:0:25de`，逐个 `curl --resolve … --max-time 8` 全 rc=28 超时；`node fetch` 直连 = ConnectTimeoutError。
 - 分界判据（A/B 同刻实测，各 3 次）：Python `urllib` 默认 3/3 http=200，加 `ProxyHandler({})` 强制无代理 3/3 URLError；`curl -x http://127.0.0.1:7897` rc=0/200（无 key 时 401=已到应用层），清空代理 env 直连 3/3 rc=28。
   ⇒ **读系统代理的客户端（浏览器、Python urllib 经 macOS `_scproxy`）通；不读的（Node/undici、curl、只认 env 的库）直连超时。**
+- ★两条通路任选其一即可（2026-10-03 用户侧实况）：① **Clash 开 TUN 模式** ⇒ 系统级路由接管，Node/curl 无需任何 env 即通（本次用户所遇「Pi/CC 连不上、普通请求可以」的真因就是 Clash 未开 TUN）；② 仅『系统代理』模式 ⇒ Node 系必须显式配代理（见下）。判据=`/sbin/ifconfig` 出现 `utun*` RUNNING + `scutil --proxy` 三项全开。
 - 修法：
   - Pi（node）：`~/.pi/agent/settings.json` 加 `"httpProxy": "http://127.0.0.1:7897"`（Pi 的 http-dispatcher 会置 HTTP(S)_PROXY 并用 EnvHttpProxyAgent proxyTunnel），或启动时给 `HTTPS_PROXY=http://127.0.0.1:7897`。
   - Node 通用逃生门：`NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7897`（实测 node v26.5.0 的 fetch 已到应用层）。
