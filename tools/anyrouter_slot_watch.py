@@ -38,6 +38,15 @@
   python3 tools/anyrouter_slot_watch.py --watch [--interval 60] [--max-minutes 30] [--notify]
   python3 tools/anyrouter_slot_watch.py --models        # 只读列站点在册模型
   python3 tools/anyrouter_slot_watch.py --selftest
+
+故障告警（2026-10-03 新增，因「跑挂了没人知道」）
+  「没坑」与「监控自己坏了」是两件事，前者静默、后者必须响：
+    POOL_BUSY / NEED_1M / 混合  ⇒ 正常观测，静默
+    全部 UNKNOWN / KEY_INVALID / CLIENT_REJECTED / MODEL_UNSUPPORTED / 无 key
+    ⇒ 连续 --fault-streak 轮（默认 3 轮 ≈ 15min）判故障并推送一次；
+      持续存在时按 --fault-cooldown（默认 6h）重复提醒；恢复时补一条「已恢复」。
+  单轮异常被 try/except 捕获，不会让长驻进程死在半夜（否则当天剩余时段全瞎）。
+  进程级守护见 tools/anyrouter_slot_watchd.py（崩了/卡了自动重启，零 LLM token）。
 """
 import argparse
 import datetime
@@ -69,6 +78,14 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 LEDGER_FILE = os.path.join(STATE_DIR, "ledger.jsonl")
 WATCH_LOCK = os.path.join(STATE_DIR, "watch.lock")
 NOTIFY_COOLDOWN_S = 3600  # 同一「可用」信号的最小重复推送间隔
+# 故障/恢复文案里引用的日志路径：守进程（watchd）起子进程时会用 GA_ANYROUTER_LOG_HINT 覆盖，
+# 使「日志：…」始终指向真正在写的那份（默认值=本监控被 bg_task 直接起时的落点）。
+LOG_HINT_DEFAULT = "temp/bg_task/logs/anyrouter_slot_watch.log"
+
+
+def _log_hint():
+    return (os.environ.get("GA_ANYROUTER_LOG_HINT") or "").strip() or LOG_HINT_DEFAULT
+
 
 AVAILABLE = "SLOT_AVAILABLE"
 BUSY = "POOL_BUSY"
@@ -78,6 +95,16 @@ CLIENT_REJECTED = "CLIENT_REJECTED"
 KEY_INVALID = "KEY_INVALID"
 UNKNOWN = "UNKNOWN"
 BROKEN = (CLIENT_REJECTED, KEY_INVALID)  # 属「配置/凭据坏了」而非「坑满了」
+
+# ---- 故障面（≠「没坑」）：连续 N 轮都是这些，才算「监控链路本身出问题」并告警 ----
+#   POOL_BUSY / NEED_1M 属正常观测（站点没坑），绝不算故障——否则每轮没坑都吵你一次。
+FAULT_TRANSPORT = "TRANSPORT"        # 全 UNKNOWN（网络/代理/DNS/超时）
+FAULT_CREDENTIAL = "CREDENTIAL"      # 全 KEY_INVALID（令牌失效）
+FAULT_CLIENT = "CLIENT"              # 全 CLIENT_REJECTED（UA 白名单被拒）
+FAULT_MODEL_DRIFT = "MODEL_DRIFT"    # 全 MODEL_UNSUPPORTED（模型名不在 messages 面）
+FAULT_NO_KEY = "NO_KEY"              # 本机取不到 key
+FAULT_STREAK = 3                     # 连续 3 轮（默认 5min/轮 ≈ 15min）才告警，防抖
+FAULT_NOTIFY_COOLDOWN_S = 6 * 3600   # 故障持续时，最多每 6h 提醒一次
 
 ICON = {
     AVAILABLE: "✅ 可用（抢到坑）",
@@ -130,6 +157,84 @@ def should_notify(state, results, now_ts, cooldown=NOTIFY_COOLDOWN_S):
     if now_ts - last_ok >= cooldown:
         return True, "cooldown_elapsed"
     return False, "cooldown_active"
+
+
+def _apply_state_dir(path):
+    """覆盖状态目录（演练/并行实例用；默认 temp/anyrouter_watch）。"""
+    global STATE_DIR, STATE_FILE, LEDGER_FILE, WATCH_LOCK
+    if not path:
+        return
+    STATE_DIR = os.path.abspath(os.path.expanduser(path))
+    STATE_FILE = os.path.join(STATE_DIR, "state.json")
+    LEDGER_FILE = os.path.join(STATE_DIR, "ledger.jsonl")
+    WATCH_LOCK = os.path.join(STATE_DIR, "watch.lock")
+
+
+def fault_kind(results):
+    """全量结果 -> 故障种类（None = 正常观测，含「没坑」）。纯函数。
+
+    ★判据边界：结果里只要有 BUSY/NEED_1M/AVAILABLE，就说明链路是通的 ⇒ 不是故障。
+      只有「全部都是异常态」才算故障，避免把「站点没坑」误报成「监控挂了」。
+    """
+    if not results:
+        return FAULT_NO_KEY
+    vs = [r.get("verdict") for r in results]
+    if any(v in (AVAILABLE, BUSY, NEED_1M) for v in vs):
+        return None
+    if all(v == UNKNOWN for v in vs):
+        return FAULT_TRANSPORT
+    if all(v == KEY_INVALID for v in vs):
+        return FAULT_CREDENTIAL
+    if all(v == CLIENT_REJECTED for v in vs):
+        return FAULT_CLIENT
+    if all(v == MODEL_UNSUPPORTED for v in vs):
+        return FAULT_MODEL_DRIFT
+    return None
+
+
+def should_notify_fault(state, kind, now_ts, streak, need_streak=FAULT_STREAK,
+                        cooldown=FAULT_NOTIFY_COOLDOWN_S):
+    """故障告警判据（纯函数）：连续 streak 轮同类故障才报；持续时按冷却重复提醒。"""
+    if not kind:
+        return False, "no_fault"
+    if streak < need_streak:
+        return False, "streak_%d_lt_%d" % (streak, need_streak)
+    last = state.get("last_fault_notify_ts") or 0
+    if (state.get("fault_announced") and state.get("fault_kind") == kind
+            and now_ts - last < cooldown):
+        return False, "fault_cooldown_active"
+    return True, "fault_%s" % str(kind).lower()
+
+
+def _build_fault_text(kind, results, now_bj, streak):
+    what = {
+        FAULT_TRANSPORT: "探测全部不可判定（网络/代理/DNS/超时）",
+        FAULT_CREDENTIAL: "令牌失效（401/403 令牌无效类）",
+        FAULT_CLIENT: "客户端不在白名单（401/403 unauthorized client）",
+        FAULT_MODEL_DRIFT: "在册模型名全部 404（站点可能改了 API 面）",
+        FAULT_NO_KEY: "本机取不到 key（keychain/env/文件均无）",
+    }.get(kind, kind)
+    lines = ["⚠️ anyrouter 抢坑监控自身异常（不是「没坑」）",
+             "时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+             "现象：%s，已连续 %d 轮" % (what, streak)]
+    for r in (results or [])[:5]:
+        lines.append("- %s：http=%s %s" % (r.get("model", "?"), r.get("http"), r.get("verdict")))
+    lines += [
+        "",
+        "区别：429/503=号池忙（正常，没坑）；本条=探测链路/凭据本身坏了，"
+        "脚本会自动重试，不需要你操作；若持续超过 12h 再人工看一眼。",
+        "日志：%s" % _log_hint(),
+        "（自动重试中：%s）" % kind,
+    ]
+    return "\n".join(lines)
+
+
+def _build_recover_text(now_bj, kind, since):
+    return "\n".join([
+        "✅ anyrouter 抢坑监控已恢复（此前异常：%s，起始 %s）" % (kind or "?", since or "?"),
+        "时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S"),
+        "恢复含义：探测链路已能正常到达站点并拿到判据（不代表此刻有坑）。",
+    ])
 
 
 def overall_rc(results):
@@ -304,15 +409,18 @@ def run_once(args):
     key = _load_key()
     if not key:
         print("[anyrouter] 无可用密钥（env ANYROUTER_API_KEY / keychain anyrouter_api_key / ~/.config/anyrouter/key）")
-        return 2
     models = args.model_list or MODELS
-    results = [probe_model(m, key, timeout=args.timeout) for m in models]
+    results = [probe_model(m, key, timeout=args.timeout) for m in models] if key else []
     rc = overall_rc(results)
     for r in results:
         print("[anyrouter] %-28s http=%s %s" % (r["model"], r["http"], r["verdict"]))
 
+    kind = fault_kind(results)
+    now_ts = time.time()
     st = _load_state()
-    do_push, reason = should_notify(st, results, time.time(), args.cooldown)
+
+    # --- 1) 抢到坑 → 可用推送 ---
+    do_push, reason = should_notify(st, results, now_ts, args.cooldown)
     pushed, push_detail = (False, "not_requested")
     if do_push and args.notify:
         text = _build_text(results, now_bj, reason)
@@ -321,18 +429,53 @@ def run_once(args):
     elif do_push:
         print("[anyrouter] 有可用坑，但未要求推送（--notify 未开）")
 
+    # --- 2) 监控自身故障/恢复 → 告警（离散 N 轮防抖；与「没坑」严格区分）---
+    streak = (int(st.get("fault_streak") or 0) + 1) if kind else 0
+    f_push, f_reason, f_text = False, "no_fault", ""
+    if getattr(args, "fault_notify", True):
+        if kind:
+            f_push, f_reason = should_notify_fault(
+                st, kind, now_ts, streak,
+                getattr(args, "fault_streak", FAULT_STREAK),
+                getattr(args, "fault_cooldown", FAULT_NOTIFY_COOLDOWN_S))
+            if f_push:
+                f_text = _build_fault_text(kind, results, now_bj, streak)
+        elif st.get("fault_active"):
+            f_push, f_reason = True, "recovered"
+            f_text = _build_recover_text(now_bj, st.get("fault_kind"), st.get("fault_since"))
+    f_pushed, f_detail = (False, "not_requested")
+    if f_push and args.notify:
+        f_pushed, f_detail = send_notifications(f_text, dry_run=args.dry_run)
+        print("[anyrouter] 故障通知=%s (%s: %s)" % (f_pushed, f_reason, f_detail))
+    elif f_push:
+        print("[anyrouter] 需故障通知（%s）但 --notify 未开" % f_reason)
+
     if not args.dry_run:
         rec = {"ts": now_bj.isoformat(), "results": [
             {"model": r["model"], "http": r["http"], "verdict": r["verdict"]} for r in results],
             "rc": rc, "notify": bool(do_push and args.notify), "pushed": pushed,
-            "reason": reason}
+            "reason": reason, "fault": kind or "", "fault_streak": streak,
+            "fault_notify": f_reason}
         _append_ledger(rec)
         st["last_ts"] = rec["ts"]
         st["last_verdict"] = AVAILABLE if rc == 1 else (
-            results[0]["verdict"] if len(set(r["verdict"] for r in results)) == 1 else "MIXED")
+            results[0]["verdict"] if results and len(set(r["verdict"] for r in results)) == 1 else "MIXED")
         st["last_rc"] = rc
         if do_push and args.notify and pushed:
-            st["last_available_notify_ts"] = time.time()
+            st["last_available_notify_ts"] = now_ts
+        st["fault_streak"] = streak
+        if kind:
+            if not st.get("fault_active"):
+                st["fault_since"] = rec["ts"]
+            st["fault_kind"] = kind
+            st["fault_active"] = True
+            if f_push and args.notify and f_pushed:
+                st["last_fault_notify_ts"] = now_ts
+                st["fault_announced"] = True
+        else:
+            st["fault_kind"] = ""
+            st["fault_active"] = False
+            st["fault_announced"] = False
         _save_state(st)
     return rc
 
@@ -401,7 +544,15 @@ def run_watch(args):
         while True:
             rounds += 1
             print("[anyrouter] watch 第 %d 轮 %s" % (rounds, beijing_now().strftime("%H:%M:%S")), flush=True)
-            rc = run_once(args)
+            try:
+                rc = run_once(args)
+            except Exception as e:
+                # ★单轮异常绝不致死：进程死在半夜＝当天剩余时段全瞎（且没人知道）。
+                import traceback
+                rc = 2
+                print("[anyrouter] watch: 本轮异常已捕获，继续下一轮: %s: %s"
+                      % (type(e).__name__, e), flush=True)
+                traceback.print_exc()
             if rc == 1 and args.notify and not args.dry_run:
                 st = _load_state()
                 if st.get("last_available_notify_ts"):
@@ -489,6 +640,55 @@ def selftest():
     chk("MODELS 扩面 >=5", len(MODELS) >= 5, True)
     chk("NC: MODELS 无重复", len(set(MODELS)) == len(MODELS), True)
 
+    # 7) 故障面判据（★核心：防「站点没坑」被误报成「监控挂了」）
+    chk("fault: 全 BUSY -> None", fault_kind(busy), None)
+    chk("NC: BUSY+UNKNOWN 混合 -> None（链路通的就不算故障）",
+        fault_kind([{"verdict": BUSY}, {"verdict": UNKNOWN}]), None)
+    chk("NC: BUSY+NEED_1M -> None", fault_kind([{"verdict": BUSY}, {"verdict": NEED_1M}]), None)
+    chk("NC: AVAILABLE+UNKNOWN -> None", fault_kind([{"verdict": UNKNOWN}, {"verdict": AVAILABLE}]), None)
+    chk("fault: 全 UNKNOWN -> TRANSPORT", fault_kind([{"verdict": UNKNOWN}]), FAULT_TRANSPORT)
+    chk("fault: 全 KEY_INVALID -> CREDENTIAL", fault_kind([{"verdict": KEY_INVALID}]), FAULT_CREDENTIAL)
+    chk("fault: 全 CLIENT_REJECTED -> CLIENT", fault_kind([{"verdict": CLIENT_REJECTED}]), FAULT_CLIENT)
+    chk("fault: 全 MODEL_UNSUPPORTED -> MODEL_DRIFT",
+        fault_kind([{"verdict": MODEL_UNSUPPORTED}]), FAULT_MODEL_DRIFT)
+    chk("fault: 空结果 -> NO_KEY", fault_kind([]), FAULT_NO_KEY)
+    chk("NC: 404 名漂移+503 混合 -> None", fault_kind([{"verdict": MODEL_UNSUPPORTED}, {"verdict": BUSY}]), None)
+
+    # 8) 故障告警判据（离散 N 轮 + 冷却）
+    chk("fnotify: 无故障 -> False", should_notify_fault({}, None, 1000, 5)[0], False)
+    chk("NC: streak 不足 -> False", should_notify_fault({}, FAULT_TRANSPORT, 1000, 2, 3, 21600)[0], False)
+    chk("fnotify: streak 达标首报 -> True", should_notify_fault({}, FAULT_TRANSPORT, 1000, 3, 3, 21600)[0], True)
+    chk("NC: 已报且冷却内 -> False",
+        should_notify_fault({"fault_announced": True, "fault_kind": FAULT_TRANSPORT,
+                             "last_fault_notify_ts": 1000}, FAULT_TRANSPORT, 1000 + 3600, 9, 3, 21600)[0], False)
+    chk("fnotify: 冷却到期 -> True",
+        should_notify_fault({"fault_announced": True, "fault_kind": FAULT_TRANSPORT,
+                             "last_fault_notify_ts": 1000}, FAULT_TRANSPORT, 1000 + 21600, 9, 3, 21600)[0], True)
+    chk("NC: 故障种类变化(TRANSPORT->CREDENTIAL) 可立刻再报",
+        should_notify_fault({"fault_announced": True, "fault_kind": FAULT_TRANSPORT,
+                             "last_fault_notify_ts": 1000}, FAULT_CREDENTIAL, 1001, 3, 3, 21600)[0], True)
+
+    # 9) 故障/恢复文案
+    ftxt = _build_fault_text(FAULT_TRANSPORT, [{"model": "m", "http": 0, "verdict": UNKNOWN}],
+                             beijing_now(), 3)
+    chk("fault text: 标明「不是没坑」", "不是「没坑」" in ftxt, True)
+    chk("NC: fault text 无密钥泄漏", ("sk-" in ftxt), False)
+    chk("fault text: 含模型行", "http=0" in ftxt, True)
+    chk("recover text: 含已恢复", "已恢复" in _build_recover_text(beijing_now(), FAULT_TRANSPORT, "t0"), True)
+
+    # 9b) 故障文案里的「日志：」路径可覆盖（watchd 起子进程时注入真实日志路径）
+    _old_hint = os.environ.pop("GA_ANYROUTER_LOG_HINT", None)
+    chk("log hint: 默认指向 bg_task 日志",
+        LOG_HINT_DEFAULT in _build_fault_text(FAULT_TRANSPORT, [], beijing_now(), 3), True)
+    os.environ["GA_ANYROUTER_LOG_HINT"] = "/tmp/x/watchd.log"
+    _txt_hint = _build_fault_text(FAULT_TRANSPORT, [], beijing_now(), 3)
+    chk("log hint: env 覆盖生效", "/tmp/x/watchd.log" in _txt_hint, True)
+    chk("NC: 覆盖后不再出现默认路径", LOG_HINT_DEFAULT in _txt_hint, False)
+    if _old_hint is None:
+        os.environ.pop("GA_ANYROUTER_LOG_HINT", None)
+    else:
+        os.environ["GA_ANYROUTER_LOG_HINT"] = _old_hint
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]), sum(1 for c in cases if not c[3])))
@@ -511,6 +711,16 @@ def _build_parser():
                     help="同状态重复推送最小间隔秒数（默认 3600）")
     ap.add_argument("--models", nargs="?", const="__list__", default=None,
                     help="逗号分隔的模型列表；不带值=只读列站点在册模型")
+    ap.add_argument("--state-dir", default=None,
+                    help="状态目录覆盖（演练/并行实例用；默认 temp/anyrouter_watch）")
+    ap.add_argument("--fault-streak", type=int, default=FAULT_STREAK, dest="fault_streak",
+                    help="连续 N 轮故障才告警（默认 3；同一故障持续时按 --fault-cooldown 重复提醒）")
+    ap.add_argument("--fault-cooldown", type=int, default=FAULT_NOTIFY_COOLDOWN_S, dest="fault_cooldown",
+                    help="故障持续时重复提醒的最小间隔秒数（默认 21600）")
+    ap.add_argument("--no-fault-notify", action="store_false", dest="fault_notify", default=True,
+                    help="关闭「监控自身故障」告警（只报抢到坑）")
+    ap.add_argument("--log-hint", default=None, dest="log_hint",
+                    help="故障文案里「日志：」指向的路径（默认 temp/bg_task/logs/anyrouter_slot_watch.log）")
     ap.add_argument("--selftest", action="store_true", help="负控自测")
     return ap
 
@@ -519,6 +729,9 @@ def main():
     args = _build_parser().parse_args()
     if args.selftest:
         return selftest()
+    if getattr(args, "log_hint", None):
+        os.environ["GA_ANYROUTER_LOG_HINT"] = str(args.log_hint)
+    _apply_state_dir(getattr(args, "state_dir", None))
     raws = getattr(args, "models", None)
     if raws == "__list__":
         r = list_models(_load_key())
