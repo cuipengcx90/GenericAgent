@@ -4,8 +4,8 @@
 抢到要趁早 ⇒ 在投放窗口内每分钟探一次，一旦有额度立刻推飞书私信 + 钉钉群。
 
 **入口**
-- 工具 `tools/agentrouter_quota_watch.py`（stdlib + `curl_cffi`，449 行）
-  - `--once` 单次探测 / `--notify` 有额度才推 / `--force` 忽略窗口 / `--dry-run` 不真推 / `--models` 只读列模型 / `--selftest`（离线 43/43）
+- 工具 `tools/agentrouter_quota_watch.py`（stdlib + `curl_cffi`；696 行 / 30622 B）
+  - `--once` 单次探测 / `--notify` 有额度才推 / `--force` 忽略窗口 / `--dry-run` 不真推 / `--models` 只读列模型 / `--selftest`（离线 48/48）
   - `--watch` 窗口内自轮询（`--interval` 默认 60s、`--max-minutes` 默认 35）= 抢额度用的常驻模式；出窗口或批次已通知即退 rc=0
   - 退出码：`0` 正常（无额度 / 窗口外跳过 / 批次已通知）/ `1` 至少一个模型 AVAILABLE / `2` 环境或全量探测异常
 - 定时 = **GA sche_tasks（用户 2026-10-02 纠正：禁止注册系统 launchd / crontab）**
@@ -17,10 +17,16 @@
 - Key：keychain 名 `agentrouter_api_key`（脚本回退顺序 env `AGENTROUTER_API_KEY` → keychain → `~/.config/agentrouter/key`）
 - 状态/账本：`temp/agentrouter_watch/state.json`（批次幂等）、`ledger.jsonl`（每次探测一行）
 
-**★ 传输层铁律（2026-10-02 实测，最值钱的一条）**
-- 站点按 **TLS 指纹**拦截：原生 `urllib` / `curl` 一律握手后被 reset（表现为 `SSL EOF` / `SSL_ERROR_SYSCALL`，`http=0`），
-  而 Clash 对该站全节点 delay 测试却是**成功**的 ⇒ 「网络不通」是假象，别去查网络/换节点。
-- 必须用 `curl_cffi` 的 `impersonate="chrome124"`（浏览器指纹）才拿得到响应；**换 UA 无效**（UA 只影响 `401 unauthorized client` 那一层）。
+**★ 传输层铁律（2026-10-03 复测订正——旧记方向已过时，最值钱的一条）**
+- 站点确会按 **TLS 指纹** reset 部分客户端，但**被 reset 的是哪一种会随时间变化**，禁写死单一实现：
+  - 2026-10-02 实测：原生 `urllib` / `curl` 被 reset（`SSL EOF` / `SSL_ERROR_SYSCALL`，`http=0`），只有 `curl_cffi` 通；
+  - **2026-10-03 复测：方向反转**——`curl` 原生 `rc=35`、`curl_cffi(impersonate="chrome124")` 3/3 被 reset
+    （`Recv failure: Connection reset by peer`），而**原生 `urllib` 3/3 拿到真 completion**（真 id `msg_bdrk_*`）。
+- 另一层是 **User-Agent 白名单**（与传输层正交）：非白名单 UA 恒 `401 unauthorized client`；
+  实测可用 `claude-cli/1.0.0 (external, cli)`；实测被拒 `OpenAI/Python`、`curl/8.0`、`Chrome`。
+- ⇒ 现行实现 = `TRANSPORTS = ("urllib", "cffi")` **顺序回退**：任一档拿到响应即用，两档全败才判 `UNKNOWN`（fail-closed），
+  并把实际生效档落进结果/台账/日志（`transport` 字段 + 打印 `via=urllib`）。
+  **结论：额度真伪只看 `http=200` 与真 completion 正文，`http=0` 只说明当次传输层全灭，不等于没额度。**
 - 另一个门禁：站点按 **User-Agent 白名单**放行「支持客户端」，非白名单 UA 恒 401。
   实测可用 `claude-cli/1.0.0 (external, cli)`；实测被拒 `OpenAI/Python`、`curl/8.0`、`Chrome`。
 
@@ -39,12 +45,14 @@
 
 **典型坑**
 - 5 分钟粒度太粗（限量额度秒级抢光），而 GA sche_tasks 粒度只到**分钟** ⇒ 组合拳：sche_tasks 负责准时唤起，窗口内每分钟 1 轮交给 `--watch` 自轮询。
-- 解释器必须带 `curl_cffi` ⇒ 一律写**绝对路径** `/opt/anaconda3/bin/python3`（scheduler / bg_task 子进程的 PATH 不保证）。
+- 解释器一律写**绝对路径** `/opt/anaconda3/bin/python3`（scheduler / bg_task 子进程的 PATH 不保证）；`curl_cffi` 现为**次选**传输层，缺席只降级不影响首选 `urllib` 通路。
 - 推送成功判据看**返回**（`notify_feishu`/`notify_group` 布尔 + detail），不看日志文案。
 - 2026-10-02 14:46 真探测：三模型全 `http=402 EXHAUSTED` ⇒ 探针链路确认可用，只是当天额度已发完（`--force --dry-run` 无推送副作用）。
 
 **复用启示（超越本任务）**
-- 「站点不通」先分三层判：DNS → TCP/TLS → 应用层；**TLS 指纹**这类拦截会让 `curl` 与「节点延迟测试」给出相反结论。
+- 「站点不通」先分三层判：DNS → TCP/TLS → 应用层；**TLS 指纹**这类拦截会让 `curl` 与「节点延迟测试」给出相反结论，且**同一站点不同日可能 reset 不同实现**⇒ 探活器要带回退与「实际生效传输层」标注（本次即 urllib 反转胜出）。
 - 抢资源型定时任务：窗口内高频 + 批次幂等 + 失败不写幂等键 = 既不漏也不重复打扰。
 - 同批「部分命中 + 部分传输失败」是常态，不是全或无：连续两批（`2026-10-02@19:00`、`2026-10-03@10:00`）实测 `claude-opus-5` `http=200 AVAILABLE`（已双通道推送 `feishu:ok; dingtalk:ok`）而 `claude-opus-4-8`/`gpt-6-astra` 均为 `http=0 UNKNOWN`（`transport: agentrouter.org=SSLError, ps.air-outer.com=ConnectionError/SSLError`）⇒ 命中即推送并退出是设计行为（`run_watch` 命中分支 `return 0`，故 `--watch` 命中时退出码是 0 而非 1）；**勿把同批其它模型的 UNKNOWN 读成「其余模型都没额度」**（UNKNOWN 是 fail-closed，需下一次批次重测）。
 - **★state.json `notified` 时间戳口径（2026-10-03 复核）**：值为**本机本地时间**但后缀误标 `+00:00`（实测：19:00 窗口的 pm 记 `2026-10-02T19:01:35+00:00`、10:00 窗口的 am 记 `2026-10-03T10:01:14+00:00`，与 bg_task/ps 的本地启动时刻 19:00:54 吻合；若按 UTC 换算会差 8h）⇒ 判读 **禁做 UTC 偏移换算**；另该键**仅推送成功后写入**，可作送达凭据。
+- **★2026-10-03 现场（用户报「监控说有额度、我自己用报错」）**：监控侧为真——`--once --force` 三模型 `http=200 AVAILABLE`（台账 `ledger.jsonl` 2026-10-03T19:00/19:48/19:49/19:49 四行全 200，末两行带 `"transport":"urllib"`），且 `--models` 真列 4 个在册模型（`claude-opus-4-8`/`claude-opus-5`/`deepseek-v4-flash`/`gpt-6-astra`）。用户侧报的错=**同批被 reset 的另一传输层**（curl 系客户端最易中招）⇒ 处置=换 `urllib`/换支持列表内客户端重试，**不要判成「没额度」**。
+- **同批修掉的真缺陷**：`_get_urllib()` 缺局部 `import urllib.request`（顶层亦无）⇒ `--models` 恒 `NameError` 静默回落 `curl_cffi` 后报 `http=0`（修复前 `[agentrouter] None http=0 n=0`，修复后 `http=200 n=4`）；教训=**回退链每一档都要有自己的负控**，否则首选静默失效会被当成「站点不通」。

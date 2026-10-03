@@ -6,10 +6,14 @@
       本脚本按 HOSTS 顺序回退）
       —— 内部大模型 API 网关，OpenAI/Anthropic 兼容端点
 
-★ 传输层铁律（2026-10-02 实测）: 站点按 **TLS 指纹** 拦截，原生 urllib / curl
-  一律在握手后立即被 reset（表现为 SSL EOF / SSL_ERROR_SYSCALL，http=0），
-  而 Clash 自身对该站全节点 delay 测试却成功 ⇒ 「网络不通」是假象。
-  必须走 curl_cffi 的 impersonate（浏览器指纹）才能拿到响应；换 UA 无效。
+★ 传输层铁律（2026-10-03 复测订正）: 站点会按 **TLS 指纹** reset 部分客户端，
+  且被 reset 的是哪一种**会随时间变化**，不能写死单一实现：
+    - 2026-10-02 实测：原生 urllib / curl 被 reset，只有 curl_cffi(impersonate) 通；
+    - 2026-10-03 复测：curl 原生 rc=35、curl_cffi(chrome124) 3/3 被 reset
+      （"Recv failure: Connection reset by peer"），而 urllib 3/3 拿到真 completion。
+  ⇒ 现行实现= TRANSPORTS=("urllib","cffi") 顺序回退（见 --selftest 1c 段）：
+    任一档拿到响应即用，两档全败才判 UNKNOWN(fail-closed)，绝不因单一实现失效而误报
+    「无额度」。UA 仍须在白名单内（非白名单恒 401 unauthorized client）。
 
 背景（站点 /api/status 公告）:
   Claude / GPT 系列为限量供应，每日分批次发放、用完即止；
@@ -52,7 +56,7 @@ HOSTS = ["https://agentrouter.org", "https://ps.air-outer.com"]
 BASE = HOSTS[0]
 # 白名单 UA（站点按客户端指纹放行；非白名单 UA 恒 401）
 UA = "claude-cli/1.0.0 (external, cli)"
-# 客户端 TLS 指纹（curl_cffi impersonate 取值）
+# 客户端 TLS 指纹（curl_cffi impersonate 取值；仅在 urllib 回退档使用）
 IMPERSONATE = "chrome124"
 # 限量池模型（/v1/models 实测真名；deepseek-v4-flash 为不限量平台模型，不参与监控）
 MODELS = ["claude-opus-5", "claude-opus-4-8", "gpt-6-astra"]
@@ -114,20 +118,102 @@ def _load_key():
     return ""
 
 
-def _http_post(url, key, body, timeout=30):
-    """POST JSON。★必须走 curl_cffi（浏览器 TLS 指纹）：原生 urllib/curl 会被站点 reset。"""
+class _Resp(object):
+    """传输层统一响应壳（urllib / curl_cffi 两种实现共用）。"""
+
+    __slots__ = ("status_code", "text", "transport")
+
+    def __init__(self, status_code, text, transport=""):
+        self.status_code = status_code
+        self.text = text
+        self.transport = transport
+
+
+def _headers(key):
+    return {"Authorization": "Bearer %s" % key, "User-Agent": UA,
+            "Content-Type": "application/json"}
+
+
+def _post_urllib(url, key, body, timeout=30):
+    """Python 标准库 urllib（本机实测当前可用，见 --selftest 与 SOP 传输层节）。"""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, data=body, headers=_headers(key))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _Resp(r.status, (r.read() or b"").decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:  # 4xx/5xx 也是有效判据，不能吞
+        return _Resp(e.code, (e.read() or b"").decode("utf-8", "replace"))
+
+
+def _post_cffi(url, key, body, timeout=30):
+    """curl_cffi 浏览器 TLS 指纹（chrome124）——站点可能按指纹 reset，故只作回退。"""
     from curl_cffi import requests as cffi_requests
-    return cffi_requests.post(
-        url,
-        data=body,
-        impersonate=IMPERSONATE,
-        headers={
-            "Authorization": "Bearer %s" % key,
-            "User-Agent": UA,
-            "Content-Type": "application/json",
-        },
-        timeout=timeout,
-    )
+    r = cffi_requests.post(url, data=body, impersonate=IMPERSONATE,
+                           headers=_headers(key), timeout=timeout)
+    return _Resp(r.status_code, r.text or "")
+
+
+POST_IMPL = {"urllib": _post_urllib, "cffi": _post_cffi}
+# ★传输层顺序：站点会 reset 部分 TLS 指纹（实测 curl 原生 rc=35、curl_cffi 也曾被 reset，
+#   而 urllib 连打 3 次全 200）⇒ 先 urllib，失败再回退 curl_cffi；两者全败才判 UNKNOWN。
+TRANSPORTS = ("urllib", "cffi")
+
+
+def _http_post(url, key, body, timeout=30, transports=None):
+    """POST JSON：按 TRANSPORTS 顺序回退；全败抛 RuntimeError（由调用方判 UNKNOWN）。"""
+    errs = []
+    for name in (transports or TRANSPORTS):
+        fn = POST_IMPL.get(name)
+        if fn is None:
+            errs.append("%s:unknown-transport" % name)
+            continue
+        try:
+            resp = fn(url, key, body, timeout)
+            if isinstance(resp, _Resp) and not resp.transport:
+                resp.transport = name
+            return resp
+        except Exception as e:  # TLS reset / 超时 / DNS
+            errs.append("%s:%s" % (name, type(e).__name__))
+    raise RuntimeError("transport failed: " + ", ".join(errs))
+
+
+def _get_urllib(url, key, timeout=30):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers=_headers(key), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _Resp(r.status, (r.read() or b"").decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        return _Resp(e.code, (e.read() or b"").decode("utf-8", "replace"))
+
+
+def _get_cffi(url, key, timeout=30):
+    from curl_cffi import requests as cffi_requests
+    r = cffi_requests.get(url, impersonate=IMPERSONATE, headers=_headers(key), timeout=timeout)
+    return _Resp(r.status_code, r.text or "")
+
+
+GET_IMPL = {"urllib": _get_urllib, "cffi": _get_cffi}
+
+
+def _http_get(url, key, timeout=30, transports=None):
+    """GET：与 _http_post 同一套传输层回退（urllib -> curl_cffi）。"""
+    errs = []
+    for name in (transports or TRANSPORTS):
+        fn = GET_IMPL.get(name)
+        if fn is None:
+            errs.append("%s:unknown-transport" % name)
+            continue
+        try:
+            resp = fn(url, key, timeout)
+            if isinstance(resp, _Resp) and not resp.transport:
+                resp.transport = name
+            return resp
+        except Exception as e:
+            errs.append("%s:%s" % (name, type(e).__name__))
+    raise RuntimeError("transport failed: " + ", ".join(errs))
 
 
 def probe_model(model, key, hosts=None, timeout=30):
@@ -147,29 +233,23 @@ def probe_model(model, key, hosts=None, timeout=30):
             text = resp.text or ""
             code = resp.status_code
             return {"model": model, "http": code, "verdict": classify(code, text),
-                    "detail": text[:200], "host": host}
-        except Exception as e:  # TLS reset / 超时 / DNS
-            tried.append("%s=%s" % (host.split("//")[-1], type(e).__name__))
+                    "detail": text[:200], "host": host,
+                    "transport": getattr(resp, "transport", "")}
+        except Exception as e:  # TLS reset / 超时 / DNS / 全部传输层失败
+            tried.append("%s=%s" % (host.split("//")[-1], str(e)[:80]))
     return {"model": model, "http": 0, "verdict": "UNKNOWN",
             "detail": "transport: " + ", ".join(tried)}
 
 
 # ---------------------------------------------------------------- 状态 / 台账
 def list_models(key="", timeout=30):
-    """只读列举站点在册模型（/v1/models）。TLS 层同 probe_model。"""
-    body = b""
+    """只读列举站点在册模型（/v1/models）。传输层同 probe_model（urllib->cffi 回退）。"""
     tried = []
     for host in HOSTS:
         try:
-            from curl_cffi import requests as cffi_requests
-            resp = cffi_requests.get(
-                host + "/v1/models",
-                impersonate=IMPERSONATE,
-                headers={"Authorization": "Bearer %s" % key, "User-Agent": UA},
-                timeout=timeout,
-            )
+            resp = _http_get(host + "/v1/models", key, timeout)
             try:
-                data = resp.json()
+                data = json.loads(resp.text or "{}")
                 ids = [m.get("id") for m in data.get("data", [])]
             except Exception:
                 ids = []
@@ -278,12 +358,14 @@ def run_once(args):
     available = [r for r in results if r["verdict"] == "AVAILABLE"]
 
     rec = {"ts": now_bj.isoformat(), "batch": batch or "(force)",
-           "results": [{k: r[k] for k in ("model", "http", "verdict")} for r in results]}
+           "results": [{k: r.get(k, "") for k in ("model", "http", "verdict", "transport")}
+                       for r in results]}
     _append_ledger(rec)
 
     for r in results:
-        print("[agentrouter] %-18s http=%-4s %s  %s"
-              % (r["model"], r["http"], r["verdict"], r["detail"][:100]))
+        print("[agentrouter] %-18s http=%-4s %-10s via=%-6s %s"
+              % (r["model"], r["http"], r["verdict"], r.get("transport") or "-",
+                 r["detail"][:80]))
 
     if available:
         text = _build_text(batch or "(手动强制检测)", results, now_bj)
@@ -381,6 +463,44 @@ def selftest():
     r = probe_model("claude-opus-5", "sk-x", hosts=["https://127.0.0.1:1"], timeout=2)
     chk("全域名失败->http0/UNKNOWN", r["http"] == 0 and r["verdict"] == "UNKNOWN")
     chk("失败留 transport 足迹", "transport:" in r["detail"])
+
+    # 1c) 传输层回退（★2026-10-03 实测：站点会 reset 部分 TLS 指纹 ⇒ 必须能换传输层再用）
+    chk("TRANSPORTS 首选 urllib", list(TRANSPORTS)[0] == "urllib" and "cffi" in TRANSPORTS)
+    calls = []
+    real = dict(POST_IMPL)
+
+    def _boom(url, key, body, timeout=30):
+        calls.append("boom")
+        raise RuntimeError("simulated TLS reset")
+
+    def _ok(url, key, body, timeout=30):
+        calls.append("ok")
+        return _Resp(402, '{"error":{"message":"Budget pool quota has been exhausted."}}')
+
+    POST_IMPL["urllib"] = _boom
+    POST_IMPL["cffi"] = _ok
+    try:
+        resp = _http_post("https://example.invalid/v1/chat/completions", "sk-x", b"{}")
+        chk("首选失败->回退次选", resp.status_code == 402 and calls == ["boom", "ok"])
+        chk("回退生效->标注实际传输层", resp.transport == "cffi")
+        POST_IMPL["urllib"] = _ok
+        POST_IMPL["cffi"] = _boom
+        resp2 = _http_post("https://example.invalid/v1/chat/completions", "sk-x", b"{}")
+        chk("首选可用->标注首选且不换档", resp2.transport == "urllib")
+    finally:
+        POST_IMPL.clear()
+        POST_IMPL.update(real)
+    POST_IMPL["urllib"] = _boom
+    POST_IMPL["cffi"] = _boom
+    try:
+        try:
+            _http_post("https://example.invalid/x", "sk-x", b"{}")
+            chk("全传输层失败->抛错(fail-closed)", False)
+        except RuntimeError as e:
+            chk("全传输层失败->抛错(fail-closed)", "transport failed" in str(e))
+    finally:
+        POST_IMPL.clear()
+        POST_IMPL.update(real)
 
     # 2) 窗口边界（北京时间）
     def bj(h, m):
