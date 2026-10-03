@@ -57,6 +57,12 @@ python3 -m py_compile ../project_update_monitor/monitor.py
 - 处置（temp 侧，不改仓源码）：`temp/pum_wrapper2.py` = `import monitor` 后 patch ①`subprocess.run` timeout 120→420 ②`_translate_to_chinese` 容错版（剥 ``` 围栏 → `json.loads` → 退 `raw_decode` 取**首个** JSON 数组 → 3 次尝试；仍失败留样 `temp/pum_translate_dbg/` 并抛错，保持 all-or-nothing 不静默）。自带 `--selftest` 负控 7/7（含"两数组拼接但首数组条数不足**必须拒**"）。
 - 实测节奏：08:06:25 起 → 08:11:47 落盘（≈5.4 分钟，8 源），必须 `Popen(start_new_session=True)` 后台起 + 轮询；成功判据=`state.json` mtime/sha1 推进（推送失败 `return 3` 且不落盘 ⇒ 推进充要于"卡片已送达"）。
 
+## 回执核验口径（2026-10-03 实测沉淀）
+- **变更源数必须逐源比对**：`state.json` 顶层只有 `schema_version` + `sources` 两个键 ⇒ 直接比顶层键会得出「仅 1 个源变更」的**假结论**（2026-10-03 实际踩到：日志有 4 个项目块，顶层比对却只报 paseo 变）。正确口径=`git show HEAD:project_update_monitor/state.json` 的 `sources` ⊗ 现文件 `sources`，**逐 sid** 比 `release_tag`/`tag`/`changelog_hash`（触发判据）与 `commit_sha`（不触发）；命中数应等于日志 `report()` 打印的项目块数（`monitor.py` 只对有 diff 的源建块）。
+- 一次采样可跨多版本：中间版本（如 Ruflo v3.50.x）不会单独出卡，只以最新 tag 呈现 —— **在册口径，非缺陷**，回执里应显式写明。
+- 耗时/起止口径：`temp/bg_task/wrappers/<name>.sh` 的 mtime ≈ 启动时刻，`temp/bg_task/exit/<name>.exit` 与日志 mtime = 结束时刻（2026-10-03 实测 08:00:47 → 08:04:10 ≈ 3 分 23 秒）。
+- 判「无采集异常」用日志中「采集异常（未覆盖既有基线）」段是否出现（该段走 stderr，与正常报告同落一份日志）。
+
 ## 卡片图标规范
 为提升可读性，卡片固定使用以下图标前缀（改动集中在 `monitor.py` 的 `classify`/`project_card_element`/`build_notification_card`）：
 - 标题：🚀 重点项目更新监控；汇总行：有更新用 🔔，全部无更新用 📊。
