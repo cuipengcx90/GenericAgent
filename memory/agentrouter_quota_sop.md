@@ -47,3 +47,4 @@
 - 「站点不通」先分三层判：DNS → TCP/TLS → 应用层；**TLS 指纹**这类拦截会让 `curl` 与「节点延迟测试」给出相反结论。
 - 抢资源型定时任务：窗口内高频 + 批次幂等 + 失败不写幂等键 = 既不漏也不重复打扰。
 - 同批「部分命中 + 部分传输失败」是常态，不是全或无：连续两批（`2026-10-02@19:00`、`2026-10-03@10:00`）实测 `claude-opus-5` `http=200 AVAILABLE`（已双通道推送 `feishu:ok; dingtalk:ok`）而 `claude-opus-4-8`/`gpt-6-astra` 均为 `http=0 UNKNOWN`（`transport: agentrouter.org=SSLError, ps.air-outer.com=ConnectionError/SSLError`）⇒ 命中即推送并退出是设计行为（`run_watch` 命中分支 `return 0`，故 `--watch` 命中时退出码是 0 而非 1）；**勿把同批其它模型的 UNKNOWN 读成「其余模型都没额度」**（UNKNOWN 是 fail-closed，需下一次批次重测）。
+- **★state.json `notified` 时间戳口径（2026-10-03 复核）**：值为**本机本地时间**但后缀误标 `+00:00`（实测：19:00 窗口的 pm 记 `2026-10-02T19:01:35+00:00`、10:00 窗口的 am 记 `2026-10-03T10:01:14+00:00`，与 bg_task/ps 的本地启动时刻 19:00:54 吻合；若按 UTC 换算会差 8h）⇒ 判读 **禁做 UTC 偏移换算**；另该键**仅推送成功后写入**，可作送达凭据。
