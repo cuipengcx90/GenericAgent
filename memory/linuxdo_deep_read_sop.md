@@ -180,6 +180,7 @@ function getLikeCount(post) {
 
 ### 浏览器与收尾坑（2026-09-22 实测）
 - 临时 tab 收尾：用 CDP `{"cmd":"cdp","tabId":<id>,"method":"Page.close"}`，再用 `{"cmd":"tabs"}` 复核回到原单 tab；页内 `window.close()` 对新开的 CDP 驱动 tab 不保证生效，别依赖。
+- ★2026-10-03 实测回退路径：本机 `127.0.0.1:{9222,9223,9333,9229}` 全无监听（`curl /json/version` 无响应）⇒ CDP 通路不可用时，用 **AppleScript 按 URL 精确匹配关标签**：`osascript -e 'tell application "Google Chrome" to close (every tab of every window whose URL contains "<topic 或临时页 URL 片段>")'`，判据=返回值 `killed=1` 且再列一次标签确认该 URL 已消失、用户原有 tab 未动。
 - `web_execute_js` 的 script 传 **JSON 数组**（想一次跑 `[{cdp...},{tabs}]`）不被支持 → 报 `Unknown cmd: undefined`；必须逐条单独调用。
 - ★收尾关 tab 的**假象坑（2026-09-24 实测）**：`web_execute_js(switch_tab_id=<临时 tab>)` 执行 `window.close()` 时，注入**可能回落到活动 tab**（返回的 diff 里 DOM 是活动 tab 的页面，而非目标 tab）⇒ close 实际送到活动 tab；Chrome 对「非脚本打开的 tab」直接忽略 close，所以可能既没关掉临时 tab 又白冒一次关错风险。判据不能只看 `web_scan`/驱动快照（可能是陈旧或失联），要用**无歧义的真列表**权威核实：
   `osascript -e 'tell application "Google Chrome" to get (URL of every tab of every window)'`（本轮实测：真实只剩 1 个 tab = 用户 linux.do 主页，临时 search.json tab 已消失 ⇒ 未关错）。主 tab 若被误关，用同一 AppleScript `make new tab ... with properties {URL:"https://linux.do/"}` 复原。
