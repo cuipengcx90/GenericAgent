@@ -46,7 +46,7 @@
 - 该任务**无推送要求**，不要额外发通知。
 
 ## R5 常驻告警（2026-09-29 起实测，待批修复）
-- 症状：R1–R4 全不触发，只有 **R5 `unclass7 > 0`（fail-closed）每日 FIRES**；`unclass` 名单唯一为 `smyze_stock_watch`（新上线任务，首份 done 为 `2026-09-29_1425_smyze_stock_watch.md`）。
+- 症状：R1–R4 全不触发，只有 **R5 `unclass7 > 0`（fail-closed）每日 FIRES**；`unclass7` 名单随新增任务增长——2026-09-29 实测 1 个（`smyze_stock_watch`，首份 done `2026-09-29_1425_smyze_stock_watch.md`）⇒ **2026-10-03 实测 4 个**：`agentrouter_quota_am` / `agentrouter_quota_pm`（10-02 上线，北京 10:00 / 19:00）/ `gcp_cost_watch` / `smyze_stock_watch`（当日现场 3 次 = am+gcp+smyze）⇒ 当日 legacy `all=13` 而 `biz=9`，差额 3 就是被漏算成 unclass 的业务执行（日报须写「13 = 心跳 1 + 业务 9 + 未登记 3」）。
 - 根因：`tools/roi_task_class.json` 的 `generated_at=2026-09-29T02:11:53` / `last_date=2026-09-28` 早于该任务首份回执 ⇒ **注册表未随新增任务刷新**（非业务退化、非来源不明产出）。
 - 工具面无写入入口：`tools/roi_task_class.py` 仅 `classify` / `names` / `audit` / `selftest` / `proof` 五个子命令（`_mk_registry` 是内部构造器）⇒ **重生成属 R497 生产端接线待批范围**（`temp/pending_decisions/DECISIONS_R497_roi_calibration.md`），注册表是仓内文件，改前须请示。
 - 判读口径：修复前每日报告须显式写明「R5 FIRES = 注册表过期，非业务异常」，并同时给出该任务按业务口径计入的数值（勿因 unclass 就漏算）。
