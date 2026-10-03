@@ -43,10 +43,36 @@ python3 tools/anyrouter_slot_watch.py --selftest        # 37 项负控自测
 
 ## 3. 巡检接线（GA 定时，禁系统 launchd/crontab）
 
-`sche_tasks/anyrouter_slot_watch.json`：每天 08:50 起，用 `tools/bg_task.py start --name anyrouter_slot_watch` 挂起 23h 长驻探测（`--interval 300 --max-minutes 1380`）⇒ 对 LLM **零 token 成本**覆盖全天，命中即私信 + 钉钉群。
+`sche_tasks/anyrouter_slot_watch.json`：每天 08:50 起，用 `tools/bg_task.py start --name anyrouter_slot_watchd -- /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23` 挂起**自愈守护**（守护包着探测脚本）⇒ 对 LLM **零 token 成本**覆盖全天，命中即私信 + 钉钉群。
+
+## 3.1 自愈守护 `tools/anyrouter_slot_watchd.py`（2026-10-04 加装）
+
+长驻探测的两个致命退化：进程悄悄死掉、进程活着但**卡死/不产出**。守护每 60s 巡检子进程，两种都当场重启（指数退避），子进程自然退出（跑满 `--max-minutes`）也按 RESTART_EXITED 续起：
+
+```bash
+python3 tools/anyrouter_slot_watchd.py --max-hours 23                     # 生产用法（随 bg_task 起）
+python3 tools/anyrouter_slot_watchd.py --once --dry-run                   # 只巡检一轮，不真起子进程
+python3 tools/anyrouter_slot_watchd.py --stall-min-grace 60 --max-hours 0.05   # 演练卡死升级路径
+python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 项自测（含负控）
+```
+
+- 判定事件落 `temp/anyrouter_watch/watchd.jsonl`：`START` / `RESTART_DEAD` / `RESTART_STALLED` / `RESTART_EXITED` / `HOLD_BUSY` / `HOLD_OK`；子进程 stdout 落 `temp/anyrouter_watch/watch.log`。
+- 单实例锁沿用探测脚本自己的 `watch.lock`：锁被占 ⇒ `HOLD_BUSY` 让位（不会双开），锁过期 ⇒ 接管。
+- 默认参数：巡检 60s、停滞判据 600s（`--stall-min-grace`）、退避上限 `--backoff`（默认 300s）、寿命 `--max-hours`。
+
+## 3.2 故障也会把人叫回来（探测脚本侧）
+
+「轮询什么都不推」等于静默失效，故探测脚本自带故障通知（与「抢到坑」通知共用 feishu 私信 + 钉钉群通道）：
+
+- `--fault-streak`（默认 3）连续 N 轮拿不到可用态 ⇒ 推一条故障通知，含**日志路径**与最近判定/错误摘要；
+- `--fault-cooldown`（默认 21600s = 6h）同一故障不反复刷；
+- 故障恢复（再次拿到 POOL_BUSY/可用等正常判定）⇒ 推「已恢复」；
+- 故障文案由 `--log-hint` / 环境变量 `GA_ANYROUTER_LOG_HINT` 可覆盖日志路径（守护启动子进程时自动注入 `watch.log` 路径）。
 
 ## 4. 排错
 
 - 全 POOL_BUSY 且长期无 200：先查 `/api/log/self` 是否有成功记录；再试换 kind（`gpt-6-astra-cc-format[1m]`）。
 - 启动即「已有实例在跑」：`python3 tools/bg_task.py status --name anyrouter_slot_watch --json` 核对 pid/lstart；确为陈旧进程再 stop。
-- 通知未到：查 `memory/notify_channels_sop.md` 的通道口径与体积上限；`--dry-run` 可零推送验证链路。
+- 通知未到：查 `memory/notify_channels_sop.md` 的通道口径与体积上限；`--dry-run` 可零推送验证链路；故障通知自检=`python3 tools/anyrouter_slot_watch.py --once --fault-streak 1 --notify`（会真发）。
+- 子进程莫名没了/不产出：看 `temp/anyrouter_watch/watchd.jsonl` 的 RESTART_* 事件；守护本身不在跑则重新起（`bg_task start --name anyrouter_slot_watchd`）。
+- 长驻期间「一轮都没推」不等于没故障：默认 3 连败才报（`--fault-streak`），要更灵敏就调小。
