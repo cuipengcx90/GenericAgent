@@ -46,3 +46,4 @@
 **复用启示（超越本任务）**
 - 「站点不通」先分三层判：DNS → TCP/TLS → 应用层；**TLS 指纹**这类拦截会让 `curl` 与「节点延迟测试」给出相反结论。
 - 抢资源型定时任务：窗口内高频 + 批次幂等 + 失败不写幂等键 = 既不漏也不重复打扰。
+- 同批「部分命中 + 部分传输失败」是常态，不是全或无：连续两批（`2026-10-02@19:00`、`2026-10-03@10:00`）实测 `claude-opus-5` `http=200 AVAILABLE`（已双通道推送 `feishu:ok; dingtalk:ok`）而 `claude-opus-4-8`/`gpt-6-astra` 均为 `http=0 UNKNOWN`（`transport: agentrouter.org=SSLError, ps.air-outer.com=ConnectionError/SSLError`）⇒ 命中即推送并退出是设计行为（`run_watch` 命中分支 `return 0`，故 `--watch` 命中时退出码是 0 而非 1）；**勿把同批其它模型的 UNKNOWN 读成「其余模型都没额度」**（UNKNOWN 是 fail-closed，需下一次批次重测）。
