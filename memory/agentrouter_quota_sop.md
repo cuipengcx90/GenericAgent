@@ -27,14 +27,28 @@
 - ⇒ 现行实现 = `TRANSPORTS = ("urllib", "cffi")` **顺序回退**：任一档拿到响应即用，两档全败才判 `UNKNOWN`（fail-closed），
   并把实际生效档落进结果/台账/日志（`transport` 字段 + 打印 `via=urllib`）。
   **结论：额度真伪只看 `http=200` 与真 completion 正文，`http=0` 只说明当次传输层全灭，不等于没额度。**
-- 另一个门禁：站点按 **User-Agent 白名单**放行「支持客户端」，非白名单 UA 恒 401。
-  实测可用 `claude-cli/1.0.0 (external, cli)`；实测被拒 `OpenAI/Python`、`curl/8.0`、`Chrome`。
-
 **判据（单模型一次最小调用 `POST /v1/chat/completions`）**
 - `200` → `AVAILABLE` 有额度（唯一推送条件）
 - `402` → `EXHAUSTED` 本批池已耗尽（文案 `Budget pool quota has been exhausted.`）
 - `401/403` + `unauthorized client` → `CLIENT_REJECTED`（UA 不在白名单，属环境问题不是没额度）
 - 其它（5xx/超时/其它 4xx）→ `UNKNOWN`（**fail-closed，绝不当成有额度**）
+
+**★ 客户端接入面（Pi / CLI 直连，2026-10-03 实测复现）**
+- `POST /v1/chat/completions` **带 function tools** 在 **gpt-6-astra 系（reasoning）模型**上恒 `400`，原文：
+  `Function tools with reasoning_effort are not supported for MaaS_GP_6_astra_20260903_off in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'`
+- ★**该 400 是模型专属、不是「面」专属**：同样带 tools，`claude-opus-5` / `claude-opus-4-8` 走 chat 面 `200`（真 completion）。
+  ⇒ 判「站点不支持工具调用」前必须先**分模型**跑，别把一个模型的 400 当成全站限制。
+- ★**400 自带的逃生门无效**：顶层 `reasoning_effort:"none"` 仍 `400`，`reasoning:{"enabled":false}` 亦 `400`
+  ⇒ 唯一可用修法 = **客户端把 api 从 `openai-completions` 切到 `openai-responses`**（`baseUrl` 不变，仍是 `https://agentrouter.org/v1`）。
+- 决定性验收（Pi 同款头 `User-Agent: claude-cli/2.1.220 (external, cli)` + `x-app: cli`）：
+  `POST /v1/responses` + tools ⇒ `200`，且 `output[0].type == "function_call"`（`name=get_time`，`arguments={}`）。
+- **UA 门禁细节**：闸门是 **UA 串本身**——`Python-urllib/*`、`curl/8.0` 恒 `401 unauthorized client`；
+  ★**单加 `x-app: cli` 无效**（curl-UA + x-app 仍 401）；`claude-cli/*` 不带 `x-app` 也 `200`。
+- **死模型**：`gpt-5.6-sol` 在 chat 与 responses **两面都 `503`**（`当前分组 default 下对于模型 gpt-5.6-sol 无可用渠道`）
+  ⇒ 属死配置，任何模型清单都该摘掉（Pi 侧已无；本仓监控 `MODELS` 本就只含 3 个在册模型）。
+- Pi 侧落地现状（本坑的原始受害者）：`~/.pi/agent/models.json` 的 `agentrouter` provider = `api: openai-responses`
+  + `baseUrl: https://agentrouter.org/v1`（2026-10-03 12:53 起多次备份为证）；`agentrouter-anthropic` = `anthropic-messages`（走 `/v1/messages`，不涉此坑）。
+- ⚠️ 本仓探针（`agentrouter_quota_watch.py`）只发**无 tools 的最小请求**，故**不触发**该 400，也不会因它误判额度 ⇒ 监控面与本坑互不影响。
 
 **窗口 / 幂等口径**
 - 投放时间 = **北京时间** 10:00 与 19:00（UTC 02:00 / 11:00）；脚本内 `WINDOWS=10:00–10:30 / 19:00–19:30`（闭开区间），自算北京时间，不吃本机时区。
@@ -48,6 +62,8 @@
 - 解释器一律写**绝对路径** `/opt/anaconda3/bin/python3`（scheduler / bg_task 子进程的 PATH 不保证）；`curl_cffi` 现为**次选**传输层，缺席只降级不影响首选 `urllib` 通路。
 - 推送成功判据看**返回**（`notify_feishu`/`notify_group` 布尔 + detail），不看日志文案。
 - 2026-10-02 14:46 真探测：三模型全 `http=402 EXHAUSTED` ⇒ 探针链路确认可用，只是当天额度已发完（`--force --dry-run` 无推送副作用）。
+
+- **★「站点/额度都正常，但我自己的客户端报错」先查「面」与「模型」的组合**（2026-10-03 实例）：同一 key、同一 UA，`chat/completions` 带 tools 在 `gpt-6-astra` 系恒 400 而 `claude-*` 系 200 ⇒ 修法是**改客户端 api 面**（→ `openai-responses`），不是换 key、不是等额度。详见上文「客户端接入面」节。
 
 **复用启示（超越本任务）**
 - 「站点不通」先分三层判：DNS → TCP/TLS → 应用层；**TLS 指纹**这类拦截会让 `curl` 与「节点延迟测试」给出相反结论，且**同一站点不同日可能 reset 不同实现**⇒ 探活器要带回退与「实际生效传输层」标注（本次即 urllib 反转胜出）。
