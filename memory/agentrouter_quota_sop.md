@@ -72,3 +72,25 @@
 - **★state.json `notified` 时间戳口径（2026-10-03 复核）**：值为**本机本地时间**但后缀误标 `+00:00`（实测：19:00 窗口的 pm 记 `2026-10-02T19:01:35+00:00`、10:00 窗口的 am 记 `2026-10-03T10:01:14+00:00`，与 bg_task/ps 的本地启动时刻 19:00:54 吻合；若按 UTC 换算会差 8h）⇒ 判读 **禁做 UTC 偏移换算**；另该键**仅推送成功后写入**，可作送达凭据。
 - **★2026-10-03 现场（用户报「监控说有额度、我自己用报错」）**：监控侧为真——`--once --force` 三模型 `http=200 AVAILABLE`（台账 `ledger.jsonl` 2026-10-03T19:00/19:48/19:49/19:49 四行全 200，末两行带 `"transport":"urllib"`），且 `--models` 真列 4 个在册模型（`claude-opus-4-8`/`claude-opus-5`/`deepseek-v4-flash`/`gpt-6-astra`）。用户侧报的错=**同批被 reset 的另一传输层**（curl 系客户端最易中招）⇒ 处置=换 `urllib`/换支持列表内客户端重试，**不要判成「没额度」**。
 - **同批修掉的真缺陷**：`_get_urllib()` 缺局部 `import urllib.request`（顶层亦无）⇒ `--models` 恒 `NameError` 静默回落 `curl_cffi` 后报 `http=0`（修复前 `[agentrouter] None http=0 n=0`，修复后 `http=200 n=4`）；教训=**回退链每一档都要有自己的负控**，否则首选静默失效会被当成「站点不通」。
+
+
+## 传输层与客户端代理面（2026-10-03 实测，用户现场排障）
+**结论：本机访问 agentrouter.org 必须经 Clash 系统代理；「普通请求能用、CLI 连不上」= 客户端是否读 macOS 系统代理。**
+
+- 系统代理实时读数：`/usr/sbin/scutil --proxy` ⇒ HTTPEnable 1 / HTTPSEnable 1 / SOCKSEnable 1，三者均 `127.0.0.1:7897`（Clash Verge 进程实听 7897）；env 里**没有**任何 proxy 变量（所以"env 无代理"≠"没走代理"）。
+- 直连（绕代理）物理不通：域名解析 `108.160.169.185` + IPv6 `2a03:2880:f12c:83:face:b00c:0:25de`，逐个 `curl --resolve … --max-time 8` 全 rc=28 超时；`node fetch` 直连 = ConnectTimeoutError。
+- 分界判据（A/B 同刻实测，各 3 次）：Python `urllib` 默认 3/3 http=200，加 `ProxyHandler({})` 强制无代理 3/3 URLError；`curl -x http://127.0.0.1:7897` rc=0/200（无 key 时 401=已到应用层），清空代理 env 直连 3/3 rc=28。
+  ⇒ **读系统代理的客户端（浏览器、Python urllib 经 macOS `_scproxy`）通；不读的（Node/undici、curl、只认 env 的库）直连超时。**
+- 修法：
+  - Pi（node）：`~/.pi/agent/settings.json` 加 `"httpProxy": "http://127.0.0.1:7897"`（Pi 的 http-dispatcher 会置 HTTP(S)_PROXY 并用 EnvHttpProxyAgent proxyTunnel），或启动时给 `HTTPS_PROXY=http://127.0.0.1:7897`。
+  - Node 通用逃生门：`NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7897`（实测 node v26.5.0 的 fetch 已到应用层）。
+  - Claude Code（node，同样不读系统代理）：在 `~/.claude/settings.json` 的 `env` 段加 `HTTPS_PROXY`/`HTTP_PROXY`（Clash 已把 localhost/127.0.0.1 列入 ExceptionsList，不会代理回环）。
+- 验收判据：CC 加代理后真跑由「Connection error」变为 **402 Budget pool quota**（=传输层已通，只剩配额）。
+
+## 三层报错语义矩阵（本次实测，「到底谁坏了」照此分类）
+- 连接超时 / Connection error / `rc=28` / ConnectTimeoutError ⇒ **传输层**（未走代理）⇒ 配代理。
+- `503 当前分组 default 下对于模型 X 无可用渠道` ⇒ **模型名不在册**（永久，与额度无关）⇒ 改名。
+- `402 Budget pool quota has been exhausted` ⇒ **本批额度耗尽** ⇒ 等下一批（北京 10:00/19:00）或切 `claude-opus-4-8` / `deepseek-v4-flash`。
+- `401 unauthorized client` ⇒ UA 不在白名单（见上节，用 claude-cli/* 等编程客户端）。
+- `GET /v1/models` 实测 4 名：`claude-opus-4-8`、`claude-opus-5`、`deepseek-v4-flash`、`gpt-6-astra`。
+- 带 `[1M]`/`[1m]` 后缀（4router/micuapi 那类中转的命名习惯）在本站恒 503；`~/.claude/settings.json` 曾有 5 个键带头（ANTHROPIC_MODEL / DEFAULT_OPUS / DEFAULT_SONNET / DEFAULT_FABLE / REASONING_MODEL），同文件 `*_MODEL_NAME` 变体已是正确名 ⇒ 去掉后缀即可。
