@@ -10,7 +10,7 @@
 | 429 / 503 | `{"error":{"message":"Service Unavailable"}}` | `POOL_BUSY` | 号池满，本轮没抢到 |
 | 400 | 「1m 上下文已经全量可用，请启用 1m 上下文后重试」 | `NEED_1M` | 未带 1m beta 头 |
 | 400 | 「invalid codex request」（`code=invalid_responses_request`，~1.1s 瞬拒） | `CODEX_SHAPE_REQUIRED` | 该名只吃 **Codex 形状**（走 `/v1/responses` 且带组合键），见 §1.4 |
-| 400 | 「由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型…」 | `MODEL_NOTICE` | **官方通告**（如 `claude-opus-5-5`）：该名站点不提供服务，通告塞在 400 里；不是 1m 头问题、重试无用（2026-10-04 新增判据） |
+| 400 | 「由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型…」 | `MODEL_NOTICE` | **官方通告**（如 `claude-opus-5-5`）：该名站点不提供服务，通告塞在 400 里；不是 1m 头问题、重试无用（2026-10-04 新增判据）；★**分发规则（2026-10-04 对照实测）**：通告按**具体名**返回——乱造名 `claude-opus-9`／`claude-opus-5-5-turbo`／`claude-sonnet-6-0` 反而都拿 429，⇒ **429 不能判「该名在册」** |
 | 404 | 「当前 API 不支持所选模型」 | `MODEL_UNSUPPORTED` | 该名不在册 / 只走 OpenAI 面（需换名，重试无用） |
 | 401 / 403 | 含 `unauthorized client` | `CLIENT_REJECTED` | UA 白名单门禁 |
 | 401 / 403 | 其它 | `KEY_INVALID` | 令牌失效 |
@@ -24,6 +24,7 @@
 - **17 名标定（2026-10-03，带 beta 头，逐个 `/v1/messages`）**：12 名真进号池（claude-3-5-haiku、claude-3-5/3-7-sonnet、Fable-5-1-reversed、opus-4-1/4/4-5/4-6/4-7、sonnet-4、sonnet-4-5、astra-cc-format[1m] 全 503/429=号池满）；`gemini-2.5-pro`/`gpt-5-codex`/`gpt-6-astra` 404=只走 OpenAI 面；`haiku-4-5` 520（Cloudflare 侧异常）；`claude-opus-5-5` 返回站点公告式 400（未放出）。**=名越多命中概率越高，故 MODELS 由 3 扩到 5**。
 - **★17 名复测（2026-10-04，同一把探针形状，原始 JSON=`temp/anyrouter_watch/registry_sweep_20261004.json`）**：`claude-fable-5-1-reversed` **200=真坑**（37.5s 走上游、返回 `event: message_start`）；10 名 claude（opus-4-7/4-6/4-5-1/4-1/4、sonnet-4-5/4、3-7-sonnet、3-5-sonnet、3-5-haiku、haiku-4-5）全 429=POOL_BUSY；`claude-opus-5-5` 400=**官方通告**（原文「由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，支持 messages 格式…」）⇒ 新判据 `MODEL_NOTICE`；`gemini-2.5-pro`/`gpt-5-codex` 404；`gpt-6-astra`/`gpt-6-astra-cc-format` 双面 61s 读超时（与帖内「10-04 06:12 起 astra 上游故障」互证）。
 - **监测面收敛（2026-10-04 用户要求）**：只探**高模型**=Opus 线与 Fable 线；4.x 系与小模型退出（只赚 POOL_BUSY、白占探测预算）。当前 `MODELS`=2（见 §2）；GPT 系暂摘（上游故障中；恢复只需加回名单，`MODEL_FACE` 已登记 codex 面）。
+- **★逆向渠道 fable 的实测画像（2026-10-04，本机真发一次 messages 请求）**：`claude-fable-5-1-reversed` 命中后真调一次 —— 响应 `model=anthropic/claude-fable-5.1`（站点把它路由到 fable 5.1，非独立实现）、答案正确（鸡兔同笼答 8）、**耗时 38.1s**（thinking 60 tokens）、成本 **$0.00702**（132 入 token $0.00132 + 114 出 $0.0057 ⇒ 约 $10/M 入、$50/M 出）；社区口碑（帖 2496114 逐字）：偏贵／慢／智商一般／长对话 `let me…` 死循环（#22468/#22479/#22525/#22526/#22540）。⇒ 定位=**能用但不优质的备胎**：短会话、一次一件事；命中通知已自动附这段提示（工具 `_build_text`）。
 - `gpt-6-astra-cc-format[1m]` 实测连打 8/8 恒 429（与 claude 的 503 同义=号池满），不存在「重试就转 200」的可靠性。
 - 大陆优化端点 `https://a-ocnfniawgw.cn-shanghai.fcapp.run` 对本站 key 返回 403 AccessDenied（FC 侧门禁）⇒ 不作为通道。
 - 本机既有资产：`~/.local/bin/anyrouter-ip-refresh`（维护 Clash hosts 里的站点锁定 IP；R506 记录其每 30min abort，因两份 clash 配置的锁定行已被移除）。

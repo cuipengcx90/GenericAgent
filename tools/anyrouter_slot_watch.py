@@ -1030,6 +1030,12 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
         "提示：客户端走 Anthropic messages 端点并带 anthropic-beta: %s；" % BETA,
         "      Claude Code 里可用 `claude --model 'gpt-6-astra-cc-format[1m]'`（官方公告写法）。",
     ]
+    # ★2026-10-04：命中 fable 逆向渠道时附口碑提示（我方实测 + 社区帖 topic/2496114 逐字证据）
+    if any("fable" in (r.get("model") or "").lower() for r in results):
+        lines.append("⚠️ 命中的是**逆向渠道**模型（实测响应 model=anthropic/claude-fable-5.1，社区疑为 kiro 逆向）：")
+        lines.append("   实测：132 入/114 出 token 收 $0.00702（约 $10/M 入、$50/M 出）、简单题 38s；")
+        lines.append("   社区口碑：偏贵、慢、智商一般、长对话易 `let me…` 死循环（#22468/#22479/#22525/#22526/#22540）")
+        lines.append("   建议：短会话、一次一件事；要高质量可优先等 opus 线或 gpt-6-astra 恢复（本轮 opus-5-5 已收官方通告=不供）。")
     if auto_hold_minutes:
         lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 打一次最小请求；被踢即停、下次命中重占）。"
                      % (("%g" % float(auto_hold_minutes)), int(keepalive_seconds)))
