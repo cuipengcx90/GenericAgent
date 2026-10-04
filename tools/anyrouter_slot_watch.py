@@ -171,8 +171,10 @@ FAULT_EDGE = "EDGE_BLOCK"            # 全 EDGE_BLOCK（被边缘 WAF 拦）
 FAULT_NO_KEY = "NO_KEY"              # 本机取不到 key
 FAULT_STREAK = 3                     # 连续 3 轮（默认 5min/轮 ≈ 15min）才告警，防抖
 FAULT_NOTIFY_COOLDOWN_S = 6 * 3600   # 故障持续时，最多每 6h 提醒一次
-FAULT_GATE_REJECT = "GATE_REJECT"    # 全 BUSY 且**全部瞬时快返** ⇒ 探针自身形状/身份被网关拒（假阴性）
-FAST_REJECT_S = 3.0                  # 429/503 快返阈值（秒）：≤该值 = 网关瞬时拒，没进上游
+FAULT_GATE_REJECT = "GATE_REJECT"    # ★2026-10-04 订正：仅当「对照（真 CC 形状）能过闸而我方不能」才成立
+FAST_REJECT_S = 3.0                  # 429/503 快返阈值（秒）。★订正：快返**不等于**形状不对 —— 抓包逐发
+                                     #   计时证明真 CC 的 9 发请求同样全是 429@1.5-2.3s（95KB 完整体）
+                                     #   ⇒ 快返=号池满的常见形态，「全快返」不足以判形状门
 QUEUED_MIN_S = 8.0                   # 传输超时、但从发起到挂满 ≥ 该秒数 ⇒ 判「过闸后无空闲上游」
 
 ICON = {
@@ -238,11 +240,13 @@ def _is_uuid(s):
 def classify_latency(http, verdict, elapsed_s, link_ok=None):
     """在 HTTP 判据之上加「延迟维度」（纯函数，供负控自测）。返回 (verdict, latency, queued)。
 
-    ★为什么必须有两维：2026-10-04 实测同一形状——被网关瞬时拒时 429/503 恒 ~1.1-1.9s，
-    真过闸走上游的请求恒 30-70s（挂着等生成）⇒ 只看状态码会把「被自己的形状门拒掉」
-    与「号池满」混为一谈（本工具因此假阴性一整段，台账里 648×503+173×429 全属此）。
-      fast    = ≤FAST_REJECT_S 的 429/503 ⇒ 疑似形状/身份被拒（GATE_REJECT 候选）
-      slow    = 其余 429/503（挂了一会儿才回 = 真池满）
+    ★为什么必须有两维：快返（429/503 ≤ ~3s）与「挂满超时」是两种可观测形态。
+    ★2026-10-04 订正（原说法已作废）：**快返不等于「形状不对」** —— 本地抓包逐发计时证明真 Claude Code
+    的 9 发请求全是 429 @1.5-2.3s（95KB 完整体，HTTP/1.1），与我方探针**同等待遇**；
+    「CC 挂满 90-100s、探针 1s 被拒」是 CC 内部重试+退避造成的假象。故 fast 仅表示
+    「网关快速回绝（号池满常见形态）」，**不得**单独推出「探针姿势不对」。
+      fast    = ≤FAST_REJECT_S 的 429/503 ⇒ 网关快速回绝（别读成形状门）
+      slow    = 其余 429/503（挂了一会儿才回）
       ok      = 200
       timeout = 传输超时但已连上挂起（≥QUEUED_MIN_S）且链路可达 ⇒ queued=True
       no-link = 传输超时且同栈控制探针也拿不到响应（link_ok=False）⇒ LINK_DOWN（链路故障）
@@ -326,10 +330,13 @@ def fault_kind(results):
 
 
 def gate_suspect(results):
-    """全 BUSY 且全部瞬时快返 ⇒ 「我方身份/形状可能被拒」的**候选**（纯函数，不等于判决）。
+    """全 BUSY 且全部快返 ⇒ 「可能被网关形状/身份门拒」的**候选**（纯函数，不等于判决）。
 
-    升级为 FAULT_GATE_REJECT 必须再拿到对照证据（见 gate_control_probe）：
-    有人能过闸而我方不能，才说明是探针自身的问题。
+    ★2026-10-04 订正（重要，别再用错）：该信号**极易假阳**。本地抓包逐发计时证明真 Claude Code
+    的 9 发请求同样全是 429 @1.5-2.3s（95KB 完整体），即「全快返」就是号池满的常见形态，
+    **不能**推出形状门。故本函数只作**观测标记**；升级为 FAULT_GATE_REJECT 必须有对照证据
+    （gate_control_probe / verify_pose）：**同一时刻**对照（真 CC 形状）能过闸而我方不能，
+    才说明问题在探针自身。仅凭本函数返回值下结论 = R538 那次误判的成因。
     """
     if not results:
         return False
@@ -977,6 +984,153 @@ def _ledger_snippet(r):
     return txt[:160] or None
 
 
+# ---------------------------------------------------------------- 姿势自证（--verify-pose）
+# ★2026-10-04 起因：R538 引入「429 快返 = 形状不对」的判据（gate_suspect），但本地抓包逐发计时
+#   证明真 Claude Code 的 9 发请求**同样全是 429@1.5-2.3s**（95KB 完整体）⇒ 该判据属误判。
+#   为让「姿势到底对不对」可随时**自证**（而不是靠推断/靠人解释），做一次 A/B：
+#   同一时刻、同一模型，分别用「我方探针形状」与「真 CC 形状」各打 n 发，比对结果分布。
+#     POSE_OK           两形状同态（都 200 / 都排队 / 都 429-503）⇒ 形状非瓶颈
+#     POSE_DIVERGED     一方可用、另一方被快拒 ⇒ 形状确有影响（此时才该改形状）
+#     POSE_INCONCLUSIVE 数据不足（缺一边/全 OTHER）
+POSE_OK = "POSE_OK"
+POSE_DIVERGED = "POSE_DIVERGED"
+POSE_INCONCLUSIVE = "POSE_INCONCLUSIVE"
+
+CC_SHAPE_REF = os.path.join(STATE_DIR, "cc_shape_ref.json")
+CC_FULL_REQ = os.path.join(STATE_DIR, "cc_full_request.json")
+CC_FULL_REQ_TMP = "/tmp/anr_dump/001.json"
+
+
+def _pose_state(http):
+    """单发响应 → 形状可比的粗状态（纯函数，供负控自测）。"""
+    if http == 200:
+        return "UP"          # 拿到放行/生成
+    if http == 0:
+        return "QUEUE"       # 传输超时 = 没被拒，挂在上游排队/生成上
+    if http in (429, 503):
+        return "BUSY"        # 网关快速回绝（号池满的常见形态，★非形状门）
+    return "OTHER"
+
+
+def pose_conclusion(pairs):
+    """A/B 对照结论（纯函数，供负控自测）。pairs=[{"shape":"probe"|"cc","http":int}, ...]。"""
+    st = {}
+    for r in pairs or []:
+        st.setdefault(r.get("shape"), set()).add(_pose_state(r.get("http")))
+    a = (st.get("probe") or set()) - {"OTHER"}
+    b = (st.get("cc") or set()) - {"OTHER"}
+    if not a or not b:
+        return POSE_INCONCLUSIVE
+    if ("UP" in a) == ("UP" in b) and ("QUEUE" in a) == ("QUEUE" in b):
+        return POSE_OK
+    return POSE_DIVERGED
+
+
+CC_HDR_DROP = {"host", "content-length", "connection", "accept-encoding",
+               "authorization", "x-api-key", "cookie"}
+
+
+def _filter_cc_headers(h):
+    """抓包头 → 安全形状头：剔除传输层与凭据（凭据一律用本工具自己的 key）。
+
+    ★2026-10-04 实测坑：直接回放抓包头，authorization（别人的凭据）会覆盖我们自己的 key，
+    且 content-length 与实际 body 冲突 ⇒ 请求必废 ⇒ 会被误读成「形状分歧」。纯函数，供自测。
+    """
+    if not isinstance(h, dict):
+        return {}
+    out = {}
+    for k, v in h.items():
+        if not isinstance(k, str) or k.lower() in CC_HDR_DROP:
+            continue
+        if isinstance(v, str):
+            out[k] = v
+    return out
+
+
+def _norm_body(b):
+    """请求体归一为 bytes（None 原样）。★坑：抓包文件里的 body 是 str，直接喂 _http_post 会在
+    urllib 里报 TypeError: can't concat str to bytes（实测 ⇒ 被误读成 POSE_DIVERGED）。"""
+    if b is None or isinstance(b, (bytes, bytearray)):
+        return b
+    if isinstance(b, str):
+        return b.encode("utf-8")
+    try:
+        return json.dumps(b).encode()
+    except Exception:
+        return None
+
+
+def _cc_shape_material():
+    """真 CC 形状素材 → (headers|None, body|None, source)。
+
+    优先级：STATE_DIR/cc_full_request.json > /tmp/anr_dump/001.json（抓包，易失）> cc_shape_ref.json（仅头）。
+    ★这些文件只含**请求**，不含任何生成正文（200 的正文绝不落盘）。
+    """
+    for p in (CC_FULL_REQ, CC_FULL_REQ_TMP):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get("headers"), dict):
+                return _filter_cc_headers(d.get("headers")), _norm_body(d.get("body")), p
+        except Exception:
+            pass
+    try:
+        with open(CC_SHAPE_REF) as f:
+            d = json.load(f)
+        if isinstance(d, dict) and isinstance(d.get("headers"), dict):
+            return _filter_cc_headers(d["headers"]), None, CC_SHAPE_REF
+    except Exception:
+        pass
+    return None, None, None
+
+
+def verify_pose(model, key, n=3, timeout=60, post=None, hosts=None):
+    """同刻 A/B：我方探针形状 vs 真 CC 形状，各 n 发。返回 dict（含 conclusion/pairs）。"""
+    post = post or _http_post
+    ch, cb, src = _cc_shape_material()
+    pairs = []
+    for shape, extra, body in (("probe", None, None), ("cc", ch, cb)):
+        for _ in range(max(1, n)):
+            if len([p for p in pairs if p["shape"] == shape and p["http"] == 200]):
+                break                      # 该形状已拿到 200 ⇒ 收手（省调用）
+            for host in (hosts or HOSTS):
+                b = body if body is not None else build_probe_body(model)
+                t0 = time.time()
+                try:
+                    code, text = post(host + CC_PATH, key, b, timeout,
+                                      read_limit=256, extra_headers=extra)
+                except TypeError:          # 桩替身可能是窄签名
+                    code, text = post(host + CC_PATH, key, b, timeout)
+                el = time.time() - t0
+                r = {"shape": shape, "host": host, "http": code,
+                     "elapsed_s": round(el, 2), "state": _pose_state(code),
+                     "snippet": (None if code == 200
+                                 else (" ".join((text or "").split())[:160] or None))}
+                pairs.append(r)
+                print("[pose] %-5s http=%-4s %6.2fs %s" % (shape, code, el, r["snippet"] or ""))
+    return {"model": model, "n": n, "cc_shape_source": src, "cc_headers_available": bool(ch),
+            "cc_body_available": cb is not None, "pairs": pairs,
+            "conclusion": pose_conclusion(pairs), "ts": time.time(),
+            "when": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def run_verify_pose(args):
+    """--verify-pose：跑一次 A/B 自证并落证据 JSON。rc=0 同态（姿势非瓶颈）/1 分歧。"""
+    key = _load_key()
+    model = (args.model_list or MODELS)[0]
+    r = verify_pose(model, key, n=getattr(args, "pose_n", 3), timeout=args.timeout)
+    if not args.dry_run:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        path = os.path.join(STATE_DIR, "pose_verify_%s.json" % time.strftime("%Y%m%dT%H%M%S"))
+        with open(path, "w") as f:
+            json.dump(r, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        r["json_path"] = path
+        print("[pose] 证据：%s" % path)
+    print("[pose] 结论=%s（真 CC 形状来源：%s headers=%s body=%s）"
+          % (r["conclusion"], r["cc_shape_source"], r["cc_headers_available"], r["cc_body_available"]))
+    return 0 if r["conclusion"] == POSE_OK else 1
+
+
 def run_once(args):
     now_bj = beijing_now()
     key = _load_key()
@@ -1183,6 +1337,48 @@ def selftest():
         cases.append((name, got, want, good))
 
     # 1) classify 正例
+    # 1b) 姿势自证：A/B 结论判据（★2026-10-04 订正：快返 ≠ 形状门）
+    chk("pose: 双429 -> POSE_OK", pose_conclusion([{"shape": "probe", "http": 429},
+                                                   {"shape": "cc", "http": 429}]), POSE_OK)
+    chk("pose: 双200 -> POSE_OK", pose_conclusion([{"shape": "probe", "http": 200},
+                                                   {"shape": "cc", "http": 200}]), POSE_OK)
+    chk("pose: 双排队(0) -> POSE_OK", pose_conclusion([{"shape": "probe", "http": 0},
+                                                       {"shape": "cc", "http": 0}]), POSE_OK)
+    chk("NC: 我方429/真CC排队 -> POSE_DIVERGED",
+        pose_conclusion([{"shape": "probe", "http": 429}, {"shape": "cc", "http": 0}]), POSE_DIVERGED)
+    chk("NC: 真CC 200/我方429 -> POSE_DIVERGED",
+        pose_conclusion([{"shape": "probe", "http": 429}, {"shape": "cc", "http": 200}]), POSE_DIVERGED)
+    chk("pose: 空 -> POSE_INCONCLUSIVE", pose_conclusion([]), POSE_INCONCLUSIVE)
+    chk("pose: 缺一边 -> POSE_INCONCLUSIVE",
+        pose_conclusion([{"shape": "probe", "http": 429}]), POSE_INCONCLUSIVE)
+    # 1d) 形状素材归一（★抓包回放的三个实测坑：str body / content-length / 别人凭据）
+    chk("body 归一: str -> bytes", _norm_body("abc"), b"abc")
+    chk("body 归一: bytes 原样", _norm_body(b"xy"), b"xy")
+    chk("body 归一: None 原样", _norm_body(None), None)
+    chk("body 归一: dict -> JSON bytes", _norm_body({"a": 1}), b'{"a": 1}')
+    _fh = _filter_cc_headers({"content-length": "95162", "authorization": "Bearer other",
+                              "host": "anyrouter.top", "x-app": "cli",
+                              "user-agent": "claude-cli/2.1.220", "accept-encoding": "gzip",
+                              "cookie": "s=1", "x-num": 5})
+    chk("头过滤: 剔 content-length", "content-length" in _fh, False)
+    chk("头过滤: 剔别人 authorization", "authorization" in _fh, False)
+    chk("头过滤: 剔 host/cookie/accept-encoding",
+        any(k in _fh for k in ("host", "cookie", "accept-encoding")), False)
+    chk("头过滤: 保留形状头", _fh.get("x-app"), "cli")
+    chk("头过滤: 非 str 值丢弃", "x-num" in _fh, False)
+    chk("头过滤: 非 dict 输入", _filter_cc_headers(None), {})
+    chk("pose_state: 503->BUSY", _pose_state(503), "BUSY")
+    chk("pose_state: 0->QUEUE", _pose_state(0), "QUEUE")
+    chk("pose_state: 404->OTHER", _pose_state(404), "OTHER")
+    # 1c) verify_pose 端到端（桩替身，零网络；静音其打印）
+    def _stub_post(url, key=None, body=None, timeout=0, read_limit=None, extra_headers=None):
+        return (429, '{"error":{"message":"Service Unavailable"}}')
+    import io as _io, contextlib as _ctx
+    with _ctx.redirect_stdout(_io.StringIO()):
+        _vp = verify_pose("claude-opus-4-8", "sk-x", n=1, timeout=5, post=_stub_post,
+                          hosts=["https://pose.invalid"])
+    chk("verify_pose: 全429 -> POSE_OK", _vp["conclusion"], POSE_OK)
+    chk("verify_pose: 每形状1发", len(_vp["pairs"]), 2)
     chk("200->AVAILABLE", classify(200, '{"ok":1}'), AVAILABLE)
     chk("429->BUSY", classify(429, '{"error":{"message":"Service Unavailable"}}'), BUSY)
     chk("503->BUSY", classify(503, '{"error":{"message":"Service Unavailable"}}'), BUSY)
@@ -1591,6 +1787,10 @@ def _build_parser():
                     help="故障文案里「日志：」指向的路径（默认 temp/bg_task/logs/anyrouter_slot_watch.log）")
     ap.add_argument("--claim", action="store_true",
                     help="抢坑模式：固定 session id + 爆满立即重发 + 命中后同 id 保活（L 站原方）")
+    ap.add_argument("--verify-pose", action="store_true", dest="verify_pose",
+                    help="姿势自证：同刻 A/B（我方形状 vs 真 CC 形状）各打 N 发，输出 POSE_OK/POSE_DIVERGED")
+    ap.add_argument("--pose-n", type=int, default=3, dest="pose_n",
+                    help="--verify-pose 每个形状的发数（默认 3；拿到 200 提前收手）")
     ap.add_argument("--claim-model", default=CLAIM_DEFAULT_MODEL, dest="claim_model",
                     help="抢坑用的模型名（默认 %s，唯一实测到 200 的名字）" % CLAIM_DEFAULT_MODEL)
     ap.add_argument("--claim-seconds", type=float, default=300, dest="claim_seconds",
@@ -1620,6 +1820,9 @@ def main():
             print("  -", m)
         return 0 if r["http"] == 200 else 2
     args.model_list = [m.strip() for m in raws.split(",") if m.strip()] if raws else []
+    if getattr(args, "verify_pose", False):
+        return run_verify_pose(args)
+
     if args.claim:
         return run_claim(args)
     if args.watch:

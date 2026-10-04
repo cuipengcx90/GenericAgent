@@ -83,6 +83,17 @@
 `ANR_GATE_CONTROL_UID_JSON=none|off|0` 可禁用对照（无对照 ⇒ 该维度判 `unknown`，**不得**凭空升级为
 `GATE_REJECT`，fail-closed 只体现在「不冤枉站点」方向）。
 
+**★2026-10-04 深夜订正（推翻「快返 ⇒ 形状/身份问题」的解读）**：拿**真 CC 原样请求**（95 KB body / 21 tools /
+真 UUID `session_id`，源 `temp/anyrouter_watch/cc_full_request.json`）**连发 9 次**，结果**全是 `429 @1.5–2.3 s`**
+—— 与探针（515 B、uuid5 身份）**同一量级、同一结论**。故：
+
+- 「1–2 s 快返」**不是**形状/身份被拒的判据，就是站点**号池满**时的正常应答；把快返读成「网关形状门」是**归因错误**
+  （探针与真 CC 待遇一致 ⇒ 形状早已不是分水岭）；
+- 反向同样不成立：真 CC 有时**挂满 90–100 s 直到断开**，那是 CC **客户端内部重试 + 退避**（`attempt 1 of 10`）的表现，
+  **不是**「过闸成功」的证据；探针单发无重试，耗时天然更短；
+- 姿势自证命令：`python3 tools/anyrouter_slot_watch.py --verify-pose`（同一时刻分别打「探针体」与「真 CC 体」各 N 发，
+  输出 `POSE_ALIGNED` / `POSE_DIVERGED`）—— 两者判决档位一致 ⇒ 姿势不构成差异，剩下只由号池决定。
+
 ### （3）新增观测维度与状态
 
 - `elapsed_s` / `latency_class` 落台账：区分「瞬时拒（~1-2s）」与「过闸排队（≥`QUEUED_MIN_S`=8s，直到传输超时）」；
@@ -116,6 +127,8 @@
 
 - **身份形态先行**：`session_id` 必须像真 CC（见 §1.2），否则连号池都碰不到 —— 此时任何换名或重试都无效。
 - **抬高超时无收益**：`--timeout 240` 单测 `gpt-6-astra-cc-format` ⇒ `http=0 QUEUED_NO_UPSTREAM (155.9 s/timeout)`，即挂到 155.9 s 后被断开、仍未转 200 ⇒ 默认 `--timeout 90` 维持，抢坑靠**轮次密度**而非单轮长挂。
+- **形状非门禁：真 CC 体同刻同等待遇（2026-10-04 深夜）**：真 CC 原样 body（95 KB / 21 tools / 真 UUID）**9 发全 `429@1.5–2.3s`**，
+  探针 `429@1.3s` ⇒ 体大小 / tools / 真 UUID 都不改变结局；「挂满 90–100 s」只出现在**带重试的 CC 客户端**里，非过闸证据。
 - **形状不再是分水岭（2026-10-04 09:48 同刻 A/B）**：真 CC 原样 body（113945 B / 21 tools）`429@103.0s`、极简探针 body（515 B，uuid5）`429@19.8s`、真 CC body 仅换 uuid5 `session_id` `429@24.3s` —— 三发**都过闸并排队**（无 1–2 s 瞬拒）之后才吃到 429 ⇒ 修好 `session_id` 形态后，body 大小 / 有无 tools **都不再是门禁**；证据 `temp/anr_truth/shape_ab2_*.jsonl`。
 - **凌晨那批 200 的归因（2026-10-04 04:52–05:09）**：站点消费日志里的 10 条成功 = **真容量窗口**内的「CC 形状复刻」实验（04:52:08 / 04:54:06 / 04:56:17 三条 `200`，耗时 35–37 s），**不是**本探针发的 —— 同刻 04:53 / 04:58 / 05:03 / 05:08 四轮探针全 429（2026-10-04 全天 117 轮 591 发**零 200**：503×448 / 429×140 / 挂超时×3），因为当时探针还在用旧自造 `session_id`（恒瞬拒），结构性看不见该窗口。修形后此类窗口即由探针正常捕获并推送。
 - 命中口径：**200 且正文非空**才算抢到（唯一推送条件）；429/503/500「负载已经达到上限」= 号池满，不推送。
@@ -151,7 +164,8 @@
 python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（按名路由到 messages / codex 两面，见 §1.4）
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
 python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
-python3 tools/anyrouter_slot_watch.py --selftest        # 150 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记）
+python3 tools/anyrouter_slot_watch.py --verify-pose     # 姿势自证：探针体 vs 真 CC 体同刻对照（--pose-n 控制发数）
+python3 tools/anyrouter_slot_watch.py --selftest        # 177 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
