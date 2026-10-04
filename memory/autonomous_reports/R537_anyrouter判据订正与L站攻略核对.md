@@ -115,3 +115,28 @@ ABBA 交错复验（`temp/anr_truth/truth7_20261004_092409.jsonl`，同模型 `g
 §1.1 讲的是**站点语义**（429/503/500 都属「号池供给态」，非没额度）——修正后仍然成立；
 本节讲的是**我方探针自伤**（身份格式非法 ⇒ 连站点的号池都没碰到）。两者叠加才解释得通「明明有额度却全 429」。
 `session id` 保活/粘性仍属 UNVERIFIED（5 篇原文 0 命中），uuid5 只是**满足门禁 + 保持稳定**，不代表站点真的绑定坑位。
+
+### 9. 收尾复测：抬高超时无收益 + 社区实操落地（2026-10-04 上午）
+
+**9.1 抬高超时（本机实测，bg_task 日志原文）**
+
+命令（隔离 state-dir）：
+
+    tools/anyrouter_slot_watch.py --once --dry-run --timeout 240 --models gpt-6-astra-cc-format --state-dir /tmp/anr_t240
+
+结果日志末行（逐字）：
+
+    [anyrouter] gpt-6-astra-cc-format        http=0 QUEUED_NO_UPSTREAM (155.9 s/timeout)
+
+⇒ 连接建立后挂到 155.9 s 被断开，`http=0`、仍未转 200 ⇒ **抬高超时无收益**，默认 `--timeout 90` 维持（抢坑靠轮次密度，不靠单轮长挂）。对照：文档记录真 200 约 37 s（见本报告 §7 标定）。
+
+**9.2 换码后运行态（watchd pid 1306，09:26:21 起）**
+
+首轮台账：4 个 `claude-*` 名快返 429、`gpt-6-astra-cc-format` 走上游 `90.7 s QUEUED_NO_UPSTREAM`
+⇒ 身份已过闸（不再是 §8.2 那种「自伤式全快返」），判据区分生效。
+
+**9.3 社区实操已折进 SOP §1.3**
+
+要点=换模型名本身是抢坑手段、先用易挤的名字占住再切目标模型、`Server is busy. Retrying now (attempt 1 of 10)` 属号池重试不是没额度、判「挤进去」看有没有正常吐字、长上下文自身会触发 retrying。
+
+本节引文按 RULE 18 用脚本抽取回源 `temp/anr_lstation/` 逐字校验（7/7 OK；另 1 处为我自造词，已改成无引号写法）。
