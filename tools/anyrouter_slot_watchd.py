@@ -51,7 +51,11 @@ DEFAULT_CHECK_EVERY = 60          # 守护自己的巡检间隔（秒）——�
 DEFAULT_INTERVAL = 300            # 子进程（watch）的探测间隔（用户 2026-10-03 拍板 5 分钟）
 DEFAULT_COOLDOWN = 21600          # 命中推送冷却
 DEFAULT_MAX_HOURS = 23            # 守护寿命：与每日 08:50 的 sche_tasks 相位对齐
-DEFAULT_STALL_FACTOR = 3          # now - last_ts > interval×factor ⇒ 判卡死
+# ★2026-10-04：watch 端已改「随机间隔 300-600s + 概率长休(×3~6 ⇒ 最长 60min)」⇒
+# 旧 factor=3（300×3=900s）会把「长休中的正常静默」误判成卡死并重启（实测已发生一次）。
+# 现取 8（300×8=2400s / 600×8=4800s），并**优先信 watch 写进 state 的 next_round_ts**
+# （见 decide）⇒ 长休期间不被误杀，真卡死仍能在 ~1-1.3h 内被发现。
+DEFAULT_STALL_FACTOR = 8          # now - last_ts > interval×factor ⇒ 判卡死
 STALL_MIN_GRACE_S = 600           # 判卡死的最小宽限（防冷启动/慢轮误判）
 RESTART_BACKOFF = [30, 60, 120, 300, 600]   # 连续重启的退避阶梯（秒）
 BACKOFF_RESET_S = 1800            # 距上次重启超过这么久 ⇒ 退避计数归零
@@ -158,6 +162,16 @@ def decide(child_pid, child_lstart, spawn_ts, state_file, now, interval,
         return "HOLD_OK", "存活但尚无产出记录（宽限内）"
     age = now - lt.timestamp()
     limit = max(interval * stall_factor, stall_min_grace)
+    # ★2026-10-04：watch 端随机节奏（间隔 300-600s、概率长休到 60min）⇒ 它每轮结束会把
+    # 「预期下一轮时刻」(next_round_ts, epoch 秒) 写进 state.json；本处据此把阈值放宽到
+    # 「到点 + 宽限」，避免长休期间的正常静默被误判卡死而遭重启。字段缺失/过期 ⇒ 逐字回落
+    # 到 interval×factor（旧行为）。
+    try:
+        _nrt = read_json(state_file).get("next_round_ts")
+        if _nrt:
+            limit = max(limit, float(_nrt) + stall_min_grace - lt.timestamp())
+    except Exception:
+        pass
     if age > limit:
         return "RESTART_STALLED", "last_ts 已停滞 %.0fs（阈值 %.0fs）" % (age, limit)
     return "HOLD_OK", "存活且产出新鲜（%.0fs 前）" % age
@@ -214,16 +228,55 @@ def append_ledger(path, rec):
         pass
 
 
+def child_argv(args, minutes_left):
+    """构造将被 spawn 的子进程 argv。
+
+    ★2026-10-04 教训：本函数产出的参数**必须**与 watch.py 的 argparse 形状一致
+    （事故：曾用 str(float) 透传 300.0 而子进程声明 type=int ⇒ 子进程秒退）。
+    selftest 里有「形状自测 + 负控」守这一点。
+    """
+    argv = [sys.executable, WATCH, "--watch"]
+    if args.notify:
+        argv.append("--notify")
+    # ★2026-10-04：随机节奏优先——给了区间就透传（不给则回落固定 --interval 旧行为）
+    if getattr(args, "interval_min", 0) and getattr(args, "interval_max", 0):
+        argv += ["--interval-min", str(args.interval_min),
+                 "--interval-max", str(args.interval_max)]
+    else:
+        argv += ["--interval", str(args.interval)]
+    if getattr(args, "sample", None) is not None:
+        argv += ["--sample", str(args.sample)]
+    argv += ["--cooldown", str(args.cooldown),
+             "--fault-streak", str(args.fault_streak),
+             "--fault-cooldown", str(args.fault_cooldown)]
+    # ★自动占坑（2026-10-04 用户要求）：命中可用即用探测同 session 抢下并保活，确保「能直接用」
+    if getattr(args, "auto_hold_minutes", 0):
+        argv += ["--auto-hold-minutes", str(args.auto_hold_minutes),
+                 "--hold-cooldown", str(getattr(args, "hold_cooldown", 0) or 0)]
+    if getattr(args, "state_dir", None):
+        argv += ["--state-dir", args.state_dir]
+    if minutes_left:
+        argv += ["--max-minutes", str(int(minutes_left))]
+    return argv
+
+
 def spawn_watch(args, minutes_left, child_log):
     """真起子进程（新会话 ⇒ 可整组回收）；命令可被 --child-cmd 覆盖（供演练）。"""
     if args.child_cmd:
         argv = list(args.child_cmd)
     else:
-        argv = [sys.executable, WATCH, "--watch"]
+        argv = child_argv(args, minutes_left)
         if args.notify:
             argv.append("--notify")
-        argv += ["--interval", str(args.interval),
-                 "--cooldown", str(args.cooldown),
+        # ★2026-10-04：随机节奏优先——给了区间就透传（不给则回落固定 --interval 旧行为）
+        if getattr(args, "interval_min", 0) and getattr(args, "interval_max", 0):
+            argv += ["--interval-min", str(args.interval_min),
+                     "--interval-max", str(args.interval_max)]
+        else:
+            argv += ["--interval", str(args.interval)]
+        if getattr(args, "sample", None) is not None:
+            argv += ["--sample", str(args.sample)]
+        argv += ["--cooldown", str(args.cooldown),
                  "--fault-streak", str(args.fault_streak),
                  "--fault-cooldown", str(args.fault_cooldown)]
         # ★自动占坑（2026-10-04 用户要求）：命中可用即用探测同 session 抢下并保活，确保「能直接用」
@@ -464,12 +517,43 @@ def selftest():
     chk("RESTART_STALLED: 无 state.json 且超宽限",
         decide(me, my_lstart, now - 3600, sf, now, 300)[0], "RESTART_STALLED")
 
-    # 2) 卡死阈值口径（阈值=max(interval×factor, 600)）
+    # 2) 卡死阈值口径（阈值=max(interval×factor, stall_min_grace)；factor 显式给定）
     write_state(901)
-    chk("阈值 900s: 901s 判卡死", decide(me, my_lstart, now - 3600, sf, now, 300)[0],
-        "RESTART_STALLED")
+    chk("阈值 900s(factor=3): 901s 判卡死",
+        decide(me, my_lstart, now - 3600, sf, now, 300, stall_factor=3)[0], "RESTART_STALLED")
     write_state(899)
-    chk("NC 阈值 900s: 899s 不判", decide(me, my_lstart, now - 3600, sf, now, 300)[0], "HOLD_OK")
+    chk("NC 阈值 900s(factor=3): 899s 不判",
+        decide(me, my_lstart, now - 3600, sf, now, 300, stall_factor=3)[0], "HOLD_OK")
+
+    # 2b) ★2026-10-04 随机节奏安全网（这组用例就是「长休被误杀」事故的回归）
+    write_state(2300)
+    chk("随机节奏: factor 默认 8（阈值 2400s）⇒ 2300s 不判卡死",
+        decide(me, my_lstart, now - 3600, sf, now, 300)[0], "HOLD_OK")
+    write_state(5000)
+    chk("随机节奏: 5000s ⇒ 判卡死（真卡）",
+        decide(me, my_lstart, now - 3600, sf, now, 300)[0], "RESTART_STALLED")
+    write_state(3000)
+    with open(sf) as _f:
+        _st = json.load(_f)
+    _st["next_round_ts"] = now + 3600          # watch 正在长休（预期下轮在 1h 后）
+    with open(sf, "w") as _f:
+        json.dump(_st, _f)
+    chk("随机节奏: 长休中(next_round_ts 在未来) 3000s 不判卡死",
+        decide(me, my_lstart, now - 7200, sf, now, 300)[0], "HOLD_OK")
+    chk("随机节奏: 长休中 + 已超「到点+宽限」⇒ 判卡死",
+        decide(me, my_lstart, now, sf, now + 7200, 300)[0], "RESTART_STALLED")
+    with open(sf) as _f:
+        _st = json.load(_f)
+    _st["next_round_ts"] = now - 100000        # 早已过期 ⇒ 回落常规阈值
+    with open(sf, "w") as _f:
+        json.dump(_st, _f)
+    chk("随机节奏: next_round_ts 过期 ⇒ 回落常规阈值判卡死",
+        decide(me, my_lstart, now - 7200, sf, now, 300)[0], "RESTART_STALLED")
+    with open(sf, "w") as _f:
+        json.dump({"last_ts": (beijing_now() - datetime.timedelta(seconds=5000)).isoformat(),
+                   "next_round_ts": "bad"}, _f)      # 坏值 ⇒ 不得崩，回落常规阈值
+    chk("随机节奏: next_round_ts 非数字 ⇒ 不崩仍判卡死",
+        decide(me, my_lstart, now - 7200, sf, now, 300)[0], "RESTART_STALLED")
 
     # 3) 锁让位
     chk("锁: 文件缺失 ⇒ None", lock_holder(lf), None)
@@ -525,6 +609,26 @@ def selftest():
     chk("文案: 卡死重启含原因", "自动重启（进程卡死）" in txt, True)
     chk("NC 文案: 无密钥", "sk-" in txt, False)
 
+    # 7) ★2026-10-04 形状自测：spawn 出去的 argv 必须能被 watch.py 的 argparse 接受
+    #    （事故回归：曾用 str(float) 透传 300.0 而子进程声明 type=int ⇒ 子进程秒退、守护空转）
+    class _A:
+        pass
+    _a = _A()
+    for k, v in (("notify", True), ("interval", 60), ("interval_min", 300.0), ("interval_max", 600.0),
+                 ("sample", 4), ("cooldown", 21600), ("fault_streak", 3), ("fault_cooldown", 21600),
+                 ("auto_hold_minutes", 30.0), ("hold_cooldown", 900.0), ("state_dir", tmp)):
+        setattr(_a, k, v)
+    base = child_argv(_a, 60)[2:]                      # 去掉解释器，只要参数
+    r1 = subprocess.run([sys.executable, WATCH] + base + ["--help"],
+                        capture_output=True, text=True)
+    chk("形状: spawn argv 可被 watch.py 解析", r1.returncode, 0)
+    chk("形状: argv 含随机区间参数", ("--interval-min" in base) and ("--interval-max" in base), True)
+    bad = list(base)
+    bad[bad.index("--interval-min") + 1] = "notanumber"
+    r2 = subprocess.run([sys.executable, WATCH] + bad + ["--help"],
+                        capture_output=True, text=True)
+    chk("NC 形状: 坏值必须让子进程报错（证明自测能失败）", r2.returncode != 0, True)
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]),
@@ -541,6 +645,12 @@ def _build_parser():
     ap.add_argument("--cooldown", type=int, default=DEFAULT_COOLDOWN, help="命中推送冷却秒")
     ap.add_argument("--max-hours", type=float, default=DEFAULT_MAX_HOURS,
                     help="守护寿命小时（默认 23；到点收掉子进程退出，由每日定时接棒）")
+    ap.add_argument("--interval-min", type=float, default=300.0,
+                    help="透传给子进程的随机轮间隔下界秒（默认 300；与 --interval-max 同给才生效）")
+    ap.add_argument("--interval-max", type=float, default=600.0,
+                    help="透传给子进程的随机轮间隔上界秒（默认 600）")
+    ap.add_argument("--sample", type=int, default=None,
+                    help="透传给子进程的每轮抽样模型数（默认不传=用子进程默认 4）")
     ap.add_argument("--stall-factor", type=float, default=DEFAULT_STALL_FACTOR,
                     help="last_ts 停滞超过 interval×该值 ⇒ 判卡死（默认 3）")
     ap.add_argument("--stall-min-grace", type=int, default=STALL_MIN_GRACE_S,
@@ -581,11 +691,11 @@ def main():
         args.backoff = [int(x) for x in str(args.backoff).split(",") if x.strip()]
     if args.hello:
         sd = args.state_dir or DEFAULT_STATE_DIR
+        args.state_dir = sd
         print(json.dumps({
             "watch": WATCH,
-            "child_argv": ["<python>", WATCH, "--watch", "--notify",
-                           "--interval", args.interval, "--cooldown", args.cooldown,
-                           "--state-dir", sd] + (["--max-minutes", str(int(args.max_hours * 60))]),
+            # ★单一源：显示的就是真会 spawn 的 argv（别在这里另写一份，会漂移）
+            "child_argv": ["<python>"] + child_argv(args, int(args.max_hours * 60))[1:],
             "check_every": args.check_every,
             "auto_hold_minutes": args.auto_hold_minutes,
             "hold_cooldown": args.hold_cooldown,

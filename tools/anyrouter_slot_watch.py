@@ -65,6 +65,7 @@ import argparse
 import datetime
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -139,6 +140,23 @@ NOTIFY_COOLDOWN_S = 3600  # 同一「可用」信号的最小重复推送间隔
 # 故障/恢复文案里引用的日志路径：守进程（watchd）起子进程时会用 GA_ANYROUTER_LOG_HINT 覆盖，
 # 使「日志：…」始终指向真正在写的那份（默认值=本监控被 bg_task 直接起时的落点）。
 LOG_HINT_DEFAULT = "temp/bg_task/logs/anyrouter_slot_watch.log"
+
+# ---------------- 反检测：请求节奏（2026-10-04 用户要求「分散随机，禁固定频次」）----------------
+#   为什么：固定 5 分钟 / 固定 10 分钟、每轮同一份名单、同一秒多发起伏，是三种最容易被识别成
+#   机器的指纹。本站的号池对「像不像真 Claude Code」敏感（见 CC_* 常量与 SOP §1.2），因此除请求
+#   形状外，**节奏形状**也要像人：
+#     ① 轮间隔  : 每轮在 [min,max] 内均匀取；另有 pause_prob 概率叠加「长休」（×[3,6]）⇒ 间隔分布重尾
+#     ② 轮内错峰: 每个请求发出前随机 sleep ⇒ 不再「同一秒 N 发」并发突发
+#     ③ 轮内名单: 每轮只打 sample 个（含 pin 名单），轮转保证每个模型每循环必被探到 ⇒ 同一模型再现间隔浮动
+#     ④ 日预算  : --max-per-day 兜底（超了睡到次日），防任何 bug 把请求量放大成扫描器
+DEFAULT_INTERVAL_MIN_S = 300      # 随机间隔下界（5 min）
+DEFAULT_INTERVAL_MAX_S = 600      # 随机间隔上界（10 min）
+DEFAULT_PAUSE_PROB = 0.12         # 每轮以该概率进入「长休」（拟人化：人不会像钟表一样准点）
+DEFAULT_PAUSE_MULT = (3.0, 6.0)   # 长休 = 本轮随机间隔 × [3,6] ⇒ 15~60 min
+DEFAULT_STAGGER = (2.0, 12.0)     # 轮内每个请求发出前的随机错峰秒
+DEFAULT_WORKERS = 3               # 轮内并发上限（旧硬编码 5；并发越小越不像批量扫描）
+DEFAULT_SAMPLE = 4                # 每轮抽样的模型数（含 pin；0=全量）
+DEFAULT_MAX_PER_DAY = 800         # 每日请求预算（0=不限）
 
 
 def _log_hint():
@@ -1048,18 +1066,28 @@ def send_notifications(text, dry_run=False):
 
 
 # ---------------------------------------------------------------- 主流程
-def probe_models(models, key, timeout=90, workers=5):
+def probe_models(models, key, timeout=90, workers=5, stagger=None, sleeper=None):
     """并行探测多个模型（纯为控轮次耗时）。
 
     ★2026-10-04：形状修对后，真过闸的请求会挂满超时（实测 200 恒 ~37s、排队态 60s+）⇒
     串行 5 个会把一轮拉到 300s+，与 --interval（现役 300s）打结；并发后一轮≈单个耗时。
+
+    stagger=(lo,hi)：提交每个请求前随机 sleep [lo,hi] 秒（默认 None=不睡=旧行为逐字不变）。
+    作用是把「同一秒 N 发」的批量突发摊成散点（见反检测常量块）；sleeper 仅供自测注入。
     """
     ms = list(models)
+    sl = sleeper or time.sleep
     if len(ms) <= 1:
+        if ms and stagger:
+            sl(random.uniform(stagger[0], stagger[1]))
         return [probe_model(m, key, timeout=timeout) for m in ms]
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=min(workers, len(ms))) as ex:
-        futs = [ex.submit(probe_model, m, key, timeout=timeout) for m in ms]
+        futs = []
+        for i, m in enumerate(ms):
+            if i and stagger:
+                sl(random.uniform(stagger[0], stagger[1]))
+            futs.append(ex.submit(probe_model, m, key, timeout=timeout))
         return [f.result() for f in futs]
 
 
@@ -1297,13 +1325,151 @@ def run_verify_pose(args):
     return 0 if r["conclusion"] == POSE_OK else 1
 
 
+def _split_names(txt):
+    return [x.strip() for x in (txt or "").split(",") if x.strip()]
+
+
+def _pin_models(args):
+    return _split_names(getattr(args, "pin_models", ""))
+
+
+def _stagger_range(args):
+    """轮内错峰区间；两端都为 0/缺省 ⇒ None（=不睡=旧行为逐字不变）。"""
+    lo = float(getattr(args, "stagger_min", 0) or 0)
+    hi = float(getattr(args, "stagger_max", 0) or 0)
+    if lo <= 0 and hi <= 0:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return (max(0.0, lo), max(0.0, hi))
+
+
+def _round_cost(args):
+    """一轮要发几个请求（=日预算的计价单位）。"""
+    n = len(getattr(args, "model_list", None) or MODELS)
+    k = int(getattr(args, "sample", 0) or 0)
+    return n if (k <= 0 or k >= n) else max(1, k)
+
+
+def pick_round_models(models, st, sample, pinned=None, rng=None):
+    """本轮探测名单：轮内抽样 + 轮转游标（保证每个模型每循环必被探到，且再现间隔不固定）。
+
+    返回 (名单, 全量数, 是否轮转)。抽样关（sample<=0 或 >= 全量）⇒ 全量乱序、rot=False（旧行为等价）。
+    游标存在 state["rotation"]（order/pos）⇒ 跨轮、跨重启都续着走；状态损坏则 fail-open 取前 k 个
+    （宁可多探、绝不因状态坏而停摆）。
+    """
+    ms = list(models)
+    n = len(ms)
+    rng = rng or random.Random()
+    pin = [m for m in (pinned or []) if m in ms]
+    k = int(sample or 0)
+    if n <= 1 or k <= 0 or k >= n:
+        out = list(ms)
+        rng.shuffle(out)
+        return out, n, False
+    rest = [m for m in ms if m not in pin]
+    kk = max(1, k - len(pin))
+    try:
+        rot = st.setdefault("rotation", {})
+        order = rot.get("order")
+        if not isinstance(order, list) or set(order) != set(rest):
+            order = list(rest)
+            rng.shuffle(order)
+            rot["pos"] = 0
+        pos = int(rot.get("pos") or 0)
+        if pos < 0 or pos > len(order):
+            pos = 0
+        picked = order[pos:pos + kk]
+        pos += len(picked)
+        if len(picked) < kk:                     # 收尾不足 ⇒ 开新循环补齐（每循环全覆盖）
+            order = list(rest)
+            rng.shuffle(order)
+            need = kk - len(picked)
+            picked = picked + order[:need]
+            pos = need
+        rot["order"] = order
+        rot["pos"] = pos % len(order) if order else 0
+    except Exception:
+        picked = list(rest)[:kk]
+    return pin + picked, n, True
+
+
+def next_interval(args, rng=None):
+    """本轮结束后的睡眠秒数。
+
+    --interval-min/--interval-max 同时给 ⇒ 均匀随机（禁固定频次）；pause_prob 概率叠加长休
+    （× pause_mult）。未给区间 ⇒ 逐字回落到旧的固定 --interval（老配置行为不变）。
+    """
+    rng = rng or random.Random()
+    lo = int(getattr(args, "interval_min", 0) or 0)
+    hi = int(getattr(args, "interval_max", 0) or 0)
+    if lo > 0 and hi > 0:
+        if hi < lo:
+            lo, hi = hi, lo
+        base = rng.uniform(lo, hi)
+    else:
+        base = float(getattr(args, "interval", 0) or 0)
+    p = float(getattr(args, "pause_prob", 0) or 0)
+    if base > 0 and p > 0 and rng.random() < p:
+        mult = getattr(args, "pause_mult", None) or DEFAULT_PAUSE_MULT
+        base *= rng.uniform(float(mult[0]), float(mult[1]))
+    return max(1.0, base)
+
+
+def _budget_spent(st, results):
+    """把本轮实际请求数记进 state（--max-per-day 的唯一计数处）；形状自愈重发按 2 计。"""
+    try:
+        day = beijing_now().strftime("%Y-%m-%d")
+        n = len(results or []) + sum(1 for r in (results or []) if r.get("shape_retry"))
+        if st.get("req_day") != day:
+            st["req_day"] = day
+            st["req_count"] = 0
+        st["req_count"] = int(st.get("req_count") or 0) + n
+        return st["req_count"]
+    except Exception:
+        return 0
+
+
+def budget_verdict(st, pending, max_per_day):
+    """(allow, used, sleep_hint)。超预算 ⇒ 不硬停，睡到次日 0 点 + 0~20min 抖动再继续。"""
+    m = int(max_per_day or 0)
+    if m <= 0:
+        return True, 0, 0.0
+    now = beijing_now()
+    used = int(st.get("req_count") or 0) if st.get("req_day") == now.strftime("%Y-%m-%d") else 0
+    if used + max(1, int(pending)) <= m:
+        return True, used, 0.0
+    nxt = now.replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+    return False, used, max(60.0, (nxt - now).total_seconds()) + random.uniform(0, 1200)
+
+
+def _note_next_round(sleep_s):
+    """把「预期下一轮时刻」写进 state：守护进程据此放宽卡死阈值（长休不被误杀）。"""
+    try:
+        st = _load_state()
+        st["next_sleep_s"] = int(round(sleep_s))
+        st["next_round_ts"] = round(time.time() + sleep_s, 1)
+        _save_state(st)
+    except Exception:
+        pass
+
+
 def run_once(args):
     now_bj = beijing_now()
+    st = _load_state()          # ★提前加载：抽样轮转/日预算都写在同一份 state（只加载一次）
     key = _load_key()
     if not key:
         print("[anyrouter] 无可用密钥（env ANYROUTER_API_KEY / keychain anyrouter_api_key / ~/.config/anyrouter/key）")
     models = args.model_list or MODELS
-    results = probe_models(models, key, timeout=args.timeout) if key else []
+    rng = getattr(args, "_rng", None) or random.Random()
+    models, _all_n, _rot = pick_round_models(models, st, getattr(args, "sample", 0),
+                                             _pin_models(args), rng)
+    if _rot:
+        print("[anyrouter] 本轮名单 %d/%d（轮转抽样）：%s"
+              % (len(models), _all_n, ",".join(m.split("/")[-1] for m in models)), flush=True)
+    results = probe_models(models, key, timeout=args.timeout,
+                           workers=int(getattr(args, "workers", DEFAULT_WORKERS) or DEFAULT_WORKERS),
+                           stagger=_stagger_range(args)) if key else []
     rc = overall_rc(results)
     for r in results:
         # 面标注：messages 面不加后缀（保持与旧日志逐字一致）；codex 面/形状自愈才打标，
@@ -1329,7 +1495,6 @@ def run_once(args):
         if gate_ctl == "pass":
             kind = FAULT_GATE_REJECT
     now_ts = time.time()
-    st = _load_state()
 
     # --- 1) 抢到坑 → 可用推送 ---
     do_push, reason = should_notify(st, results, now_ts, args.cooldown)
@@ -1383,7 +1548,8 @@ def run_once(args):
             results[0]["verdict"] if results and len(set(r["verdict"] for r in results)) == 1 else "MIXED")
         st["last_rc"] = rc
         if do_push and args.notify and pushed:
-            st["last_available_notify_ts"] = now_ts
+            _budget_spent(st, results)
+        st["last_available_notify_ts"] = now_ts
         st["fault_streak"] = streak
         if kind:
             if not st.get("fault_active"):
@@ -1459,11 +1625,28 @@ def run_watch(args):
     start = beijing_now()
     hard_end = (start + datetime.timedelta(minutes=args.max_minutes)) if args.max_minutes else None
     rounds = 0
-    print("[anyrouter] watch 启动 %s（间隔 %ds，冷却 %ds，硬超时 %s）"
-          % (start.strftime("%Y-%m-%d %H:%M:%S"), args.interval, args.cooldown,
+    rng = getattr(args, "_rng", None) or random.Random()
+    args._rng = rng                       # 同一 rng 贯穿各轮（抽样/间隔共享）
+    _lo, _hi = int(getattr(args, "interval_min", 0) or 0), int(getattr(args, "interval_max", 0) or 0)
+    if _lo > 0 and _hi > 0:
+        _pat = "随机 %d-%ds（长休概率 %.0f%%×%s）" % (min(_lo, _hi), max(_lo, _hi),
+                                                    (getattr(args, "pause_prob", 0) or 0) * 100,
+                                                    getattr(args, "pause_mult", DEFAULT_PAUSE_MULT))
+    else:
+        _pat = "固定 %ds" % args.interval
+    print("[anyrouter] watch 启动 %s（间隔 %s，冷却 %ds，每轮请求 %d 个，日上限 %s，硬超时 %s）"
+          % (start.strftime("%Y-%m-%d %H:%M:%S"), _pat, args.cooldown,
+             _round_cost(args), getattr(args, "max_per_day", 0) or "不限",
              hard_end.strftime("%H:%M:%S") if hard_end else "无"))
     try:
         while True:
+            _allow, _used, _hint = budget_verdict(_load_state(), _round_cost(args),
+                                                  getattr(args, "max_per_day", 0))
+            if not _allow:
+                print("[anyrouter] watch: 当日请求预算用尽（已 %d + 本轮 %d > %d）⇒ 睡 %.0fs 到次日"
+                      % (_used, _round_cost(args), getattr(args, "max_per_day", 0), _hint), flush=True)
+                time.sleep(_hint)
+                continue
             rounds += 1
             print("[anyrouter] watch 第 %d 轮 %s" % (rounds, beijing_now().strftime("%H:%M:%S")), flush=True)
             try:
@@ -1495,7 +1678,10 @@ def run_watch(args):
             if hard_end and beijing_now() >= hard_end:
                 print("[anyrouter] watch: 达到 --max-minutes 上限，退出（共 %d 轮）" % rounds)
                 return 0 if rc != 1 else 1
-            time.sleep(args.interval)
+            _sleep = next_interval(args, rng)
+            _note_next_round(_sleep)
+            print("[anyrouter] watch: 第 %d 轮结束，下一轮 %.0fs 后" % (rounds, _sleep), flush=True)
+            time.sleep(_sleep)
     finally:
         try:
             if lock_fd:
@@ -2035,6 +2221,119 @@ def selftest():
     chk("NC: 不可用台账的文本不冒充摘要",
         render_summary(_miss).startswith("[anyrouter] 台账摘要不可用"), True)
 
+    # ---------------- 反检测节奏（2026-10-04）：随机间隔 / 长休 / 抽样轮转 / 日预算 ----------------
+    class _Args(object):
+        pass
+
+    _a = _Args()
+    _a.interval = 300
+    _a.interval_min = 300
+    _a.interval_max = 600
+    _a.pause_prob = 0.0
+    _a.pause_mult = [3.0, 6.0]
+    _r = random.Random(20261004)
+    _vals = [next_interval(_a, _r) for _ in range(40)]
+    chk("节奏: 随机间隔全落 [300,600]", all(300 <= v <= 600 for v in _vals), True)
+    chk("节奏: 随机间隔非恒定(>=20 种)", len(set(round(v, 3) for v in _vals)) >= 20, True)
+    _a.pause_prob = 1.0
+    _vals2 = [next_interval(_a, _r) for _ in range(20)]
+    chk("节奏: 长休 >= 下界*3", all(v >= 900 for v in _vals2), True)
+    chk("节奏: 长休 <= 上界*6", all(v <= 3600 for v in _vals2), True)
+    _a.pause_prob = 0.0
+    _a.interval_min = _a.interval_max = 0
+    chk("节奏: 未给区间 ⇒ 回落固定 --interval", set(next_interval(_a, _r) for _ in range(5)), {300.0})
+    chk("节奏: sleep 恒 >0", min(next_interval(_a, _r) for _ in range(5)) > 0, True)
+
+    # 抽样轮转：8 模型 / 每轮 4 ⇒ 两个循环内全覆盖、轮内不重复
+    _ms = ["m%d" % i for i in range(8)]
+    _st = {}
+    _r2 = random.Random(7)
+    _seen, _lens, _dups, _rotflags = set(), [], 0, []
+    for _ in range(4):
+        _gm, _tot, _rot = pick_round_models(_ms, _st, 4, [], _r2)
+        _seen |= set(_gm)
+        _lens.append(len(_gm))
+        _rotflags.append(_rot)
+        _dups += len(_gm) - len(set(_gm))
+    chk("抽样: 每轮 4 个", _lens, [4, 4, 4, 4])
+    chk("抽样: 轮内不重复", _dups, 0)
+    chk("抽样: 4 轮并集=全部 8 模型", sorted(_seen), sorted(_ms))
+    chk("抽样: 标记轮转=True", sorted(set(_rotflags)), [True])
+    _st2 = {}
+    _pinall = []
+    for _ in range(3):
+        _gm2, _t2, _r3 = pick_round_models(_ms + ["pinned"], _st2, 3, ["pinned"], _r2)
+        _pinall.append(("pinned" in _gm2, len(_gm2)))
+    chk("抽样: pin 每轮都在且总数=3", set(_pinall), {(True, 3)})
+    chk("抽样: sample=0 ⇒ 全量不轮转",
+        pick_round_models(_ms, {}, 0, [], _r2)[0].__len__(), 8)
+    chk("抽样: sample>n ⇒ 全量不轮转", pick_round_models(_ms, {}, 99, [], _r2)[2], False)
+    chk("抽样: 状态损坏仍给 3 个(fail-open)",
+        len(pick_round_models(_ms, {"rotation": {"order": "bad", "pos": "x"}}, 3, [], _r2)[0]), 3)
+    chk("抽样: 单模型不轮转", pick_round_models(["only"], {}, 2, [], _r2)[2], False)
+
+    # 日预算：计数（形状重发按 2 计）/ 跨日重置 / 0=不限 / 超限给次日 hint
+    _sb = {}
+    _budget_spent(_sb, [{"model": "a"}] * 3)
+    chk("预算: 计数=3", _sb.get("req_count"), 3)
+    _budget_spent(_sb, [{"model": "a"}, {"model": "b"}, {"model": "c", "shape_retry": True}])
+    chk("预算: 形状重发按 2 计(3+4=7)", _sb.get("req_count"), 7)
+    chk("预算: 未超 ⇒ allow", budget_verdict(_sb, 2, 10)[0], True)
+    _ok2, _used2, _hint2 = budget_verdict(_sb, 4, 8)
+    chk("预算: 超出 ⇒ 拒", _ok2, False)
+    chk("预算: 超出 ⇒ hint 落 [60, 次日+1200]", 60.0 <= _hint2 <= 86400 + 1260, True)
+    chk("预算: 0=不限", budget_verdict({"req_day": "1970-01-01", "req_count": 99999}, 8, 0)[0], True)
+    chk("预算: 跨日重置", budget_verdict({"req_day": "1970-01-01", "req_count": 9999}, 8, 10)[0], True)
+
+    # 错峰区间解析 + 轮成本
+    _b = _Args()
+    _b.stagger_min, _b.stagger_max = 2.0, 12.0
+    chk("错峰: 区间解析", _stagger_range(_b), (2.0, 12.0))
+    _b.stagger_min = _b.stagger_max = 0.0
+    chk("错峰: 两端 0 ⇒ 关(None)", _stagger_range(_b), None)
+    _c = _Args()
+    _c.model_list, _c.sample = None, 0
+    chk("预算: 轮成本 sample=0 ⇒ 全量", _round_cost(_c), len(MODELS))
+    _c.sample = 4
+    chk("预算: 轮成本 sample=4", _round_cost(_c), 4)
+
+    # 错峰真的落到 probe_models（monkeypatch probe_model，零网络）
+    _slept = []
+    _orig_pm = globals()["probe_model"]
+    globals()["probe_model"] = lambda m, k, **kw: {"model": m, "http": 429, "verdict": BUSY}
+    try:
+        _res2 = probe_models(["a", "b", "c"], "k", timeout=1, workers=3,
+                             stagger=(0.01, 0.02), sleeper=lambda x: _slept.append(x))
+        _slept2 = []
+        probe_models(["a", "b"], "k", timeout=1, stagger=None, sleeper=lambda x: _slept2.append(x))
+    finally:
+        globals()["probe_model"] = _orig_pm
+    chk("错峰: 3 请求 ⇒ 2 次错峰 sleep", len(_slept), 2)
+    chk("错峰: sleep 值落区间", all(0.01 <= x <= 0.02 for x in _slept), True)
+    chk("错峰: 结果齐全", len(_res2), 3)
+    chk("错峰: 不给区间 ⇒ 零 sleep(旧行为)", len(_slept2), 0)
+
+    # 「预期下一轮时刻」落账（守护据此放宽卡死阈值）——写 /tmp 隔离，绝不碰真 state
+    _sf0, _sd0 = globals()["STATE_FILE"], globals()["STATE_DIR"]
+    globals()["STATE_FILE"] = "/tmp/anw_selftest_state.json"
+    globals()["STATE_DIR"] = "/tmp"
+    try:
+        try:
+            os.unlink("/tmp/anw_selftest_state.json")
+        except Exception:
+            pass
+        _note_next_round(123)
+        with open("/tmp/anw_selftest_state.json") as _f:
+            _nst = json.load(_f)
+        chk("守护: next_sleep_s 落账", _nst.get("next_sleep_s"), 123)
+        chk("守护: next_round_ts ≈ now+123", abs(_nst.get("next_round_ts", 0) - (time.time() + 123)) < 5, True)
+    finally:
+        globals()["STATE_FILE"], globals()["STATE_DIR"] = _sf0, _sd0
+        try:
+            os.unlink("/tmp/anw_selftest_state.json")
+        except Exception:
+            pass
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]), sum(1 for c in cases if not c[3])))
@@ -2047,7 +2346,29 @@ def _build_parser():
         description="anyrouter.top 抢坑（slot）可用性监控（stdlib urllib；余额≠可用，须抢到上游）")
     ap.add_argument("--once", action="store_true", help="单次检测（默认行为）")
     ap.add_argument("--watch", action="store_true", help="长驻自轮询（单实例锁；命中即推送，冷却内不重复，不退出）")
-    ap.add_argument("--interval", type=int, default=60, help="--watch 轮询间隔秒数（默认 60）")
+    ap.add_argument("--interval", type=int, default=60, help="--watch 轮询间隔秒数（--interval-min/max 同时给时忽略）")
+    # 反检测节奏（2026-10-04）：默认即「随机 5-10 分钟 + 长休 + 轮内错峰 + 每轮抽样 4 个」，
+    # 目的=既保持探测密度，又不给站点留下「固定周期 + 同秒突发 + 同名单」的机器指纹。
+    ap.add_argument("--interval-min", type=float, default=float(DEFAULT_INTERVAL_MIN_S), dest="interval_min",
+                    help="随机轮间隔下界秒（默认 %d；设 0 与 --interval-max 同关）" % DEFAULT_INTERVAL_MIN_S)
+    ap.add_argument("--interval-max", type=float, default=float(DEFAULT_INTERVAL_MAX_S), dest="interval_max",
+                    help="随机轮间隔上界秒（默认 %d）" % DEFAULT_INTERVAL_MAX_S)
+    ap.add_argument("--pause-prob", type=float, default=DEFAULT_PAUSE_PROB, dest="pause_prob",
+                    help="每轮以该概率进入「长休」（拟人化，默认 %.2f；0=关）" % DEFAULT_PAUSE_PROB)
+    ap.add_argument("--pause-mult", type=float, nargs=2, default=list(DEFAULT_PAUSE_MULT), dest="pause_mult",
+                    help="长休倍数区间（默认 %s）" % (list(DEFAULT_PAUSE_MULT),))
+    ap.add_argument("--stagger-min", type=float, default=DEFAULT_STAGGER[0], dest="stagger_min",
+                    help="轮内每个请求发出前的错峰下界秒（默认 %.0f；两端 0=关）" % DEFAULT_STAGGER[0])
+    ap.add_argument("--stagger-max", type=float, default=DEFAULT_STAGGER[1], dest="stagger_max",
+                    help="轮内错峰上界秒（默认 %.0f）" % DEFAULT_STAGGER[1])
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help="轮内并发上限（默认 %d；越小越不像批量扫描）" % DEFAULT_WORKERS)
+    ap.add_argument("--sample", type=int, default=DEFAULT_SAMPLE,
+                    help="每轮抽样的模型数（默认 %d，含 --pin-models；0=全量）" % DEFAULT_SAMPLE)
+    ap.add_argument("--pin-models", default="", dest="pin_models",
+                    help="每轮必探的模型（逗号分隔，默认空=不固定，靠轮转全覆盖）")
+    ap.add_argument("--max-per-day", type=int, default=DEFAULT_MAX_PER_DAY, dest="max_per_day",
+                    help="每日请求预算，超出则睡到次日（默认 %d；0=不限）" % DEFAULT_MAX_PER_DAY)
     ap.add_argument("--max-minutes", type=int, default=0, dest="max_minutes",
                     help="--watch 硬超时分钟数（默认 0=不设上限）")
     ap.add_argument("--notify", action="store_true", help="抢到坑时推送通知")

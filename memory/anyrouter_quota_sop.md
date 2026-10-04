@@ -220,10 +220,10 @@
 ```bash
 python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（按名路由到 messages / codex 两面，见 §1.4）
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
-python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
+python3 tools/anyrouter_slot_watch.py --watch --notify --cooldown 21600 --max-minutes 1380   # 随机节奏（默认 300–600s/轮，见 §3.5）
 python3 tools/anyrouter_slot_watch.py --verify-pose     # 姿势自证：探针体 vs 真 CC 体同刻对照（--pose-n 控制发数）
 python3 tools/anyrouter_slot_watch.py --summary          # 只读台账摘要：最近 N 轮各模型判据分布 + claude 面覆盖（零请求/零推送）
-python3 tools/anyrouter_slot_watch.py --selftest        # 208 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记/--summary 摘要）
+python3 tools/anyrouter_slot_watch.py --selftest        # 240 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记/--summary 摘要/★随机节奏与长休）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
@@ -235,7 +235,7 @@ python3 tools/anyrouter_slot_watch.py --selftest        # 208 项负控自测（
 
 ## 3. 巡检接线（GA 定时，禁系统 launchd/crontab）
 
-`sche_tasks/anyrouter_slot_watch.json`：每天 08:50 起，用 `tools/bg_task.py start --name anyrouter_slot_watchd -- /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23` 挂起**自愈守护**（守护包着探测脚本）⇒ 对 LLM **零 token 成本**覆盖全天，命中即私信 + 钉钉群。
+`sche_tasks/anyrouter_slot_watch.json`：每天 08:50 起，用 `tools/bg_task.py start --name anyrouter_slot_watchd -- /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23` 挂起**自愈守护**（守护包着探测脚本）⇒ 对 LLM **零 token 成本**覆盖全天，命中即私信 + 钉钉群。守护起子进程时**默认带随机节奏**（`--interval-min 300 --interval-max 600`，见 §3.5），要固定频次才显式传 `--interval N`。
 
 ## 3.1 自愈守护 `tools/anyrouter_slot_watchd.py`（2026-10-04 加装）
 
@@ -245,12 +245,13 @@ python3 tools/anyrouter_slot_watch.py --selftest        # 208 项负控自测（
 python3 tools/anyrouter_slot_watchd.py --max-hours 23                     # 生产用法（随 bg_task 起）
 python3 tools/anyrouter_slot_watchd.py --once --dry-run                   # 只巡检一轮，不真起子进程
 python3 tools/anyrouter_slot_watchd.py --stall-min-grace 60 --max-hours 0.05   # 演练卡死升级路径
-python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 项自测（含负控）
+python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 项自测（含负控 + ★spawn 形状自测：argv 必须能被 watch.py 解析）
 ```
 
 - 判定事件落 `temp/anyrouter_watch/watchd.jsonl`：`START` / `RESTART_DEAD` / `RESTART_STALLED` / `RESTART_EXITED` / `HOLD_BUSY` / `HOLD_OK`；子进程 stdout 落 `temp/anyrouter_watch/watch.log`。
 - 单实例锁沿用探测脚本自己的 `watch.lock`：锁被占 ⇒ `HOLD_BUSY` 让位（不会双开），锁过期 ⇒ 接管。
-- 默认参数：巡检 60s、停滞判据 600s（`--stall-min-grace`）、退避上限 `--backoff`（默认 300s）、寿命 `--max-hours`。
+- 默认参数：巡检 60s、停滞判据 **2400s**（基准 300s × `DEFAULT_STALL_FACTOR=8`；`--stall-min-grace` 可覆盖，见 §3.5 为何必须放宽）、退避上限 `--backoff`（默认 300s）、寿命 `--max-hours`。
+- **spawn 参数单一源**：`child_argv()` 是唯一构造点（`--hello` 也读它，不再另写一份）⇒ 探针侧新增参数时位置参数/类型/透传一起改，且自测里有「子进程能解析 argv」的**形状负控**（坏值必须让子进程报错）。
 
 ## 3.2 故障也会把人叫回来（探测脚本侧）
 
@@ -289,10 +290,27 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 - **通知文案**：命中推送显式写「**已自动保活 N 分钟**」，并**不再**出现「尽快连着用」这类要人盯的措辞（未开保活时该措辞保留）。
 - **通知里给「怎么用」**（2026-10-04 本轮加）：命中推送**直接印出保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可粘贴的复用命令 `claude --session-id <uuid>`，并注明「不指定 session 也照常能用；指定=复用这个正在被保活的身份」。实现=`_build_text(..., sid=...)` 形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；不传 `sid` 时文本逐字不变。⇒ 收到推送即可原地接上，无需再问「保活的是哪个身份」。自测随之 197 → **200 passed**（三断言：带 sid 出完整 UUID / 出可粘贴命令 / 不带 sid 无 `--session-id`）。
 - **CLI / 透传**：`tools/anyrouter_slot_watch.py --auto-hold-minutes 30 --hold-cooldown 900`；`tools/anyrouter_slot_watchd.py` 同名参数并在 `spawn_watch()` 透传（守护默认起 `--auto-hold-minutes 30`）。
-- **自测**：watch `--selftest` **208/208**（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控 / `--summary` 摘要与截断）；watchd `--selftest` 27/27。
+- **自测**：watch `--selftest` **240/240**（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控 / `--summary` 摘要与截断 / ★随机节奏与长休）；watchd `--selftest` **36/36**（含 spawn 形状自测与负控）。
 - **边界**（与 §1.2(4) 的关系）：保活**不假设**站点把坑位绑到 session id 上；它只是「以已过闸的同身份持续发请求」这一**行为层**兜底。§1.2(4) 的 UNVERIFIED 结论不变（那是「机制是否存在于站点侧」），本节的效力仅来自「同一个已过闸身份保持活跃」。
 - **成本**：30 分钟窗口 + 900s 冷却 ⇒ 额外额度消耗**非零但有限**（已登记）。
 - **残余**：① 号池满时保活无解（它不能创造上游供给）；② 若站点将来改为每请求强绑 session，保活会与被探测请求脱钩，须重新标定。
+
+## 3.5 防封随机化节奏（2026-10-04 加装，用户要求：别固定频次）
+
+固定 5 分钟一轮 = 机器指纹（站点按规律即可识别）。探测改**随机节奏**，四个旋钮都是 CLI 参数、默认即开启：
+
+| 旋钮 | 默认 | 作用 |
+|---|---|---|
+| `--interval-min/--interval-max` | 300 / 600 s | 每轮间隔在区间内均匀随机（`--interval N` 仍是固定档，只在需要稳定节奏时用） |
+| `--pause-prob` × `--pause-mult` | 0.12 × [3,6] | 每轮有 12% 概率进入「长休」＝本轮结束后歇 15–60 分钟（拟人化停顿） |
+| `--stagger-min/--stagger-max` | 2 / 12 s | 轮内每个请求发出前各自随机延迟（避免同毫秒批量打点） |
+| `--workers` / `--sample` / `--max-per-day` | 3 / 4 / 800 | 轮内并发≤3、每轮只抽 4 个模型（轮转全覆盖 8 名）、日请求预算封顶 |
+
+- **与守护的耦合（关键）**：长休会让「产出停滞」判据误判卡死 ⇒ `watchd` 阈值从 300s×3=900s 放宽到 300s×**8**=2400s，且探测每轮把 `next_round_ts`（下一轮计划时刻）写进 `state.json`，守护**优先按它顺延**判据（字段缺失/损坏回落固定阈值）。两头都改才不误杀：2026-10-04 11:43 就因 900s 阈值误杀过一轮（`watchd.jsonl` 有 `RESTART_STALLED` 实证）。
+- **成本**：区间均值 450s ⇒ 约 190 轮/天 × 4 请求 ≈ **760 发/天**（`--max-per-day 800` 兜底）；对 LLM 仍是零 token。
+- **何时该改成固定**：短窗盯守（想在人守着的 30 分钟内提高命中率）才临时 `--interval 60`；长期默认一律走随机。
+- **自测**：随机节奏的区间/长休/错峰/抽样/日预算各有断言（watch 240 项内），另有一条「spawn argv 可被解析」形状自测（watchd 36 项内，含坏值负控）。
+- **跨进程参数坑（实测）**：`str(300.0)` 透传给声明为 `type=int` 的子进程 ⇒ argparse 直接报错、子进程秒退、守护空转。故 watch 侧 `--interval-min/max` 已改 `type=float`（内部 `int()` 转换），并加了形状自测把这类错误钉死在 CI 前。
 
 ## 4. 排错
 
