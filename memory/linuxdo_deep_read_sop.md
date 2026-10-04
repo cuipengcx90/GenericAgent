@@ -160,6 +160,20 @@ function getLikeCount(post) {
 - ★同条实测：当日 09:30 的 TL3 定时检查能正常读到 `connect.linux.do` 的个人进度卡 ⇒ **connect 的 `auth.session-token` 与论坛登录态是两套独立会话**（connect 有效 ≠ 论坛已登录，反之亦然）⇒ 二者**不可互推**（与 `linuxdo_trust_level_sop` 交叉验证，别拿 connect 能打开当"论坛没登出"的证据）。
 - ★阻塞告警节流（2026-09-28 定）：同因连续阻塞只发**一次**私信告警，其后同因仅首次 + 每 3 天最多提醒一次（本次即 09-28 只发 1 次），避免每天刷屏；报告仍**每天照写**（记当日证据与到期状态），归档动作按「未登录则跳过」。
 
+### 按楼段补采（不碰 JSON 端点、不过 CF 挑战页 · 2026-10-04 实测）
+
+- 适用场景：要某**楼号附近**的原文（补缺口、取证），而 `/t/<id>/<n>.json` 被 CF 403 拦、站内搜索也够不到时。
+- 做法：在**已有 linux.do 普通 tab** 上同源 `fetch('/t/topic/<id>?page=<N>')` 取整页 HTML（同源 GET 不被 CF 拦，实测 5/5 成功，单页约 1.0 MB），再从 HTML 里取 Discourse 的预载数据 `<script type="application/json" id="data-preloaded">{…}</script>`。
+- ★解析三坑（当时连栽 3 轮）：
+  1. `data-preloaded` 是 **script 的文本节点**（`>…</script>` 形式），**不是属性** ⇒ 正则必须写 `id="data-preloaded"[^>]*>([\s\S]*?)<\/script>`；写成 `data-preloaded="(.*?)"` 恒 `no_match`。
+  2. 顶层是**二次编码**的 JSON：`{"topic_<id>": "<内层 JSON 字符串>"}` ⇒ 要 `JSON.parse` **两遍**才拿到 `topic.post_stream.posts`。
+  3. **DOM 里的 `#data-preloaded` 会被 Discourse 启动后清空** ⇒ 只能 fetch 原始 HTML；直接读 `document.getElementById('data-preloaded').textContent` 得空。
+- ★fetch 必须**异步落全局**（如 `window.__gap.raw[anchor]`）后下一轮再取：`web_execute_js` 约 15s 上限，阻塞等 5 页必超时（实测连续超时 2 轮）。
+- 窗口口径：Discourse 每页约 20 楼，锚点 N 所在页覆盖 ≈ `N−5 … N+14`（多锚点交错即可覆盖整段）。
+- 产出示例：帖 2496114 的语料 `temp/l2496114/corpus.jsonl` 由 577 → **632 楼**（补 `22377–22382`、`22433–22482` 共 55 楼）。
+- ★语料字段名可能不一致（早期抽样条目用 `txt`、DOM 逐字抽取条目用 `c`）：回源校验脚本一律写成 `c.get('c') or c.get('txt')`，否则 `KeyError` 会在中途炸掉整轮校验。
+- ★坑：即便整段补全，仍可能有 **1–2 个楼号在 `post_stream` 里被整体跳过**（本例 `22266`/`22380`）——那是**已删除帖**，不是采不到；判据=「同窗其它楼都在 ∧ 该号在语料与 stream 双缺」⇒ 记「已删除」，勿反复重试。
+
 ### 正文=纯附件时的取 PDF
 - 主帖 body 只有「PDF 附件 + catbox 播客 mp3 + 小宇宙播客页 + 往期回顾链接」。
 - ⚠️ **`posts_count` 不固定**：09-21 期之前=1（无回帖），2026-09-22 期=5（主帖 + 4 条回帖，如「建议弄个黑色主题」「打卡」等）。**不要拿 `posts_count==1` 当判据**；仍按通用规则抓 `post_stream.stream` 分批补齐并机械校验 `posts.length === posts_count`（5 条一次到位）。Raw 里回帖也要落一段，标题格式随期漂移，现行=`## 回帖原文（post 2-N / 共 N 楼）`。
