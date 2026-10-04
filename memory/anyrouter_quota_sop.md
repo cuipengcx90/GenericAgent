@@ -352,6 +352,21 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
 - **自测**：随机节奏的区间/长休/错峰/抽样/日预算各有断言（watch 272 项内），另有一条「spawn argv 可被解析」形状自测（watchd 36 项内，含坏值负控）。
 - **跨进程参数坑（实测）**：`str(300.0)` 透传给声明为 `type=int` 的子进程 ⇒ argparse 直接报错、子进程秒退、守护空转。故 watch 侧 `--interval-min/max` 已改 `type=float`（内部 `int()` 转换），并加了形状自测把这类错误钉死在 CI 前。
 
+## 3.6 「一键停止保活」面板与飞书按钮（傻瓜化，2026-10-04 加装）
+
+保活跑起来后，人不需要碰命令行就能停 —— 两条入口都指向同一个「写 `hold.stop` 旗标」的动作（旗标被保活循环的分片睡眠以 ≤5s 步长轮询，~1s 内收手）：
+
+| 入口 | 形态 | 说明 |
+|---|---|---|
+| **飞书卡片按钮** | 卡片上的红色「⏹ 停止保活」按钮 | 命中 200 时随「已自动保活 N 分钟」的通知一起发；按钮 URL 就是 `ctl.url` 里的 `stop_url`，手机点一下即可 |
+| **本地面板** | `http://<LAN-IP>:8766/?t=<token>` | 面板首页同样有「停止保活」和「延长保活（hold-minutes）」；`local_url` 供本机、`url` 供手机（自动取真实 LAN IP，避开 Clash TUN 假 IP 198.18.x） |
+
+- **去哪拿这两个 URL**：`temp/anyrouter_watch/ctl.url`（JSON：`port/token/url/local_url/stop_url/stop_local_url`）。**不是** `panel.json`；用错文件名会 curl 出 403（无令牌 = 403，这是门禁设计不是故障）。
+- **★令牌持久化（本日修复）**：令牌存在 `temp/anyrouter_watch/panel.token`（0600），`start_panel` 优先读它、坏了才重新生成。此前每次重启守护都新发令牌 ⇒ **上一张卡片上的按钮立刻变 403 死链**；现在同 state-dir 跨重启令牌稳定，卡片按钮长期有效。
+- **令牌门禁**：面板所有路由都要求 `?t=<token>`，错/缺令牌一律 403 且**不动状态**（先验令牌后写旗标）。
+- **保活时长**：默认 3 分钟（`--auto-hold-minutes 3`）；面板可临时改 `hold-minutes`（下一次命中按新值走）。想长时间占坑就 `--hold-until-stopped`（不建议，白烧请求）。
+- **自测**：watchd 自测 79 项覆盖「令牌持久化/0600/坏令牌重生成/start_panel 复用/错令牌 403 不写旗标/首页按钮链到 /stop」。
+
 ## 4. 排错
 
 - 全 POOL_BUSY 且长期无 200：先查 `/api/log/self` 是否有成功记录；再试换 kind（`gpt-6-astra-cc-format[1m]`）。
