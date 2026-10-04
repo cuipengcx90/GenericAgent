@@ -169,6 +169,9 @@ function getLikeCount(post) {
   2. 顶层是**二次编码**的 JSON：`{"topic_<id>": "<内层 JSON 字符串>"}` ⇒ 要 `JSON.parse` **两遍**才拿到 `topic.post_stream.posts`。
   3. **DOM 里的 `#data-preloaded` 会被 Discourse 启动后清空** ⇒ 只能 fetch 原始 HTML；直接读 `document.getElementById('data-preloaded').textContent` 得空。
 - ★fetch 必须**异步落全局**（如 `window.__gap.raw[anchor]`）后下一轮再取：`web_execute_js` 约 15s 上限，阻塞等 5 页必超时（实测连续超时 2 轮）。
+- ★**只取末页/单页时改用同步 XHR 一次到位**（2026-10-04 实测，收「新楼增量」最省轮次）：`const x=new XMLHttpRequest(); x.open('GET',url,false); x.send(null); x.responseText` —— 抓取＋解析＋回传在**同一次调用**内完成，绕开「异步落 window 再下一轮取」两段式的两个坑：①中间若发生页面刷新，`window.__xxx` **整个上下文被清空**（症状=`Cannot read properties of undefined (reading 'raw_last')`，实测栽一次）；②多轮之间页面若被 Discourse 前端重渲染，还会看到 DOM 变化告警。同步 XHR 仅适用于**单页**（末页／一页），批量 5 页仍须走异步落全局。
+- ★**键形态随页面类型而变**：`outer['topic_<id>']` 解析后**直接含 `post_stream`**（没有 `.topic` 包裹）——2026-10-04 实测帖 2496114 的末页 preload 顶层键=`topic_2496114/site/siteSettings/currentUser/...`，`JSON.parse(outer['topic_2496114']).post_stream.posts` 才对；一律 `const t = inner.topic || inner` 兜底，硬写 `.topic` 会 `Cannot read properties of undefined (reading 'post_stream')`。
+- ★**取末页不必算页码**：`/t/topic/<id>/999999` 会被服务端**钳到最后一楼**（实测返回的就是含 `highest_post_number` 的末页窗口），比按 20 楼/页推算页码稳。
 - 窗口口径：Discourse 每页约 20 楼，锚点 N 所在页覆盖 ≈ `N−5 … N+14`（多锚点交错即可覆盖整段）。
 - 产出示例：帖 2496114 的语料 `temp/l2496114/corpus.jsonl` 由 577 → **632 楼**（补 `22377–22382`、`22433–22482` 共 55 楼）。
 - ★语料字段名可能不一致（早期抽样条目用 `txt`、DOM 逐字抽取条目用 `c`）：回源校验脚本一律写成 `c.get('c') or c.get('txt')`，否则 `KeyError` 会在中途炸掉整轮校验。
