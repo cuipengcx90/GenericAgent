@@ -10,7 +10,8 @@
 | 429 / 503 | `{"error":{"message":"Service Unavailable"}}` | `POOL_BUSY` | 号池满，本轮没抢到 |
 | 400 | 「1m 上下文已经全量可用，请启用 1m 上下文后重试」 | `NEED_1M` | 未带 1m beta 头 |
 | 400 | 「invalid codex request」（`code=invalid_responses_request`，~1.1s 瞬拒） | `CODEX_SHAPE_REQUIRED` | 该名只吃 **Codex 形状**（走 `/v1/responses` 且带组合键），见 §1.4 |
-| 404 | 「当前 API 不支持所选模型」 | `MODEL_UNSUPPORTED` | 该名只走 OpenAI 面（需换名，重试无用） |
+| 400 | 「由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型…」 | `MODEL_NOTICE` | **官方通告**（如 `claude-opus-5-5`）：该名站点不提供服务，通告塞在 400 里；不是 1m 头问题、重试无用（2026-10-04 新增判据） |
+| 404 | 「当前 API 不支持所选模型」 | `MODEL_UNSUPPORTED` | 该名不在册 / 只走 OpenAI 面（需换名，重试无用） |
 | 401 / 403 | 含 `unauthorized client` | `CLIENT_REJECTED` | UA 白名单门禁 |
 | 401 / 403 | 其它 | `KEY_INVALID` | 令牌失效 |
 | 其它 | — | `UNKNOWN` | 判据外，fail-closed |
@@ -21,6 +22,8 @@
 - 余额 ≠ 可用：2026-10-03 读数 余额 $6472.10 / 历史消耗 $227.90 / 请求 1210；`/api/log/self`（须 `New-Api-User: <uid>` 头）最近一次**成功**是 2026-07-12 ⇒ 近 3 个月零成功，「额度很多但用不了」是常态而非异常。
 - 官方公告（约 2026-09-28）：claude 供应难保证，新增 `gpt-6-astra-cc-format`（支持 messages 格式），用法 `claude --model 'gpt-6-astra-cc-format[1m]'`。
 - **17 名标定（2026-10-03，带 beta 头，逐个 `/v1/messages`）**：12 名真进号池（claude-3-5-haiku、claude-3-5/3-7-sonnet、Fable-5-1-reversed、opus-4-1/4/4-5/4-6/4-7、sonnet-4、sonnet-4-5、astra-cc-format[1m] 全 503/429=号池满）；`gemini-2.5-pro`/`gpt-5-codex`/`gpt-6-astra` 404=只走 OpenAI 面；`haiku-4-5` 520（Cloudflare 侧异常）；`claude-opus-5-5` 返回站点公告式 400（未放出）。**=名越多命中概率越高，故 MODELS 由 3 扩到 5**。
+- **★17 名复测（2026-10-04，同一把探针形状，原始 JSON=`temp/anyrouter_watch/registry_sweep_20261004.json`）**：`claude-fable-5-1-reversed` **200=真坑**（37.5s 走上游、返回 `event: message_start`）；10 名 claude（opus-4-7/4-6/4-5-1/4-1/4、sonnet-4-5/4、3-7-sonnet、3-5-sonnet、3-5-haiku、haiku-4-5）全 429=POOL_BUSY；`claude-opus-5-5` 400=**官方通告**（原文「由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，支持 messages 格式…」）⇒ 新判据 `MODEL_NOTICE`；`gemini-2.5-pro`/`gpt-5-codex` 404；`gpt-6-astra`/`gpt-6-astra-cc-format` 双面 61s 读超时（与帖内「10-04 06:12 起 astra 上游故障」互证）。
+- **监测面收敛（2026-10-04 用户要求）**：只探**高模型**=Opus 线与 Fable 线；4.x 系与小模型退出（只赚 POOL_BUSY、白占探测预算）。当前 `MODELS`=2（见 §2）；GPT 系暂摘（上游故障中；恢复只需加回名单，`MODEL_FACE` 已登记 codex 面）。
 - `gpt-6-astra-cc-format[1m]` 实测连打 8/8 恒 429（与 claude 的 503 同义=号池满），不存在「重试就转 200」的可靠性。
 - 大陆优化端点 `https://a-ocnfniawgw.cn-shanghai.fcapp.run` 对本站 key 返回 403 AccessDenied（FC 侧门禁）⇒ 不作为通道。
 - 本机既有资产：`~/.local/bin/anyrouter-ip-refresh`（维护 Clash hosts 里的站点锁定 IP；R506 记录其每 30min abort，因两份 clash 配置的锁定行已被移除）。
@@ -257,7 +260,7 @@ python3 tools/anyrouter_slot_watch.py --selftest        # 240 项负控自测（
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
-- 默认 `MODELS`（8 个，2026-10-04 扩面）：`claude-opus-4-8`、`claude-opus-4-7`、`claude-sonnet-4-5-20250929`、`claude-opus-4-6`、`claude-sonnet-4-20250514`、`claude-haiku-4-5`、`gpt-6-astra-cc-format`（messages 面）、`gpt-6-astra`（★codex 面，走 `/v1/responses`，见 §1.4）（**名单里一律不带 `[1m]`**，1m 只体现在请求头 `anthropic-beta`）；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。扩面依据=2026-10-03 全 17 名标定取 messages 面可用代表名 + 2026-10-04 名测（`claude-opus-4-8`/`claude-haiku-4-5` 均在册=429 POOL_BUSY；`gpt-5.5`/`fable-5` 404 未在册）与 L 站攻略点名的「换 4.8」「haiku 没啥人用」。
+- 默认 `MODELS`（**2 个**，2026-10-04 按用户要求收敛为「只探高模型」）：`claude-opus-5-5`、`claude-fable-5-1-reversed`（**名单里一律不带 `[1m]`**，1m 只体现在请求头 `anthropic-beta`）；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。收敛依据=**2026-10-04 全 17 名同形状实测**（原始 JSON `temp/anyrouter_watch/registry_sweep_20261004.json`）：`claude-fable-5-1-reversed` 是唯一实测 200 的真坑名、`claude-opus-5-5` 在册但只返回官方通告 400；4.x 系与小模型（只赚 POOL_BUSY）以及 GPT 系（10-04 06:12 起上游故障）已全部退出监测面。**恢复 GPT/4.x 监测**：把它们加回 `MODELS` 即可，GPT 名须同时在 `MODEL_FACE` 登记 codex 面（无其它改动）。
 - 状态：`temp/anyrouter_watch/{state.json,ledger.jsonl,watch.lock}`；推送幂等键=判定态 + 冷却（`--cooldown`，默认 3600s）。
 - **单实例锁**：`watch.lock` 存 pid + `ps -o lstart=` 身份；已有实例在跑则本次直接退出并打印对方 pid/起始时刻（防「僵尸元数据当运行中」误判）。
 - watch 语义：命中即推送但**不退出**，冷却窗内不重复；`--max-minutes` 兜底收尾。

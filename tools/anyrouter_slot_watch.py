@@ -21,6 +21,8 @@
   404 + 「不支持所选模型」     -> MODEL_UNSUPPORTED 该名不在 messages 面（走 OpenAI 面）
   500 + 「负载已经达到上限」      -> POOL_BUSY        与 429/503 同一件事（站点自述 api_error，2026-10-04 实测）
   400 + 「invalid codex request」-> CODEX_SHAPE_REQUIRED 该名只吃 Codex 形状（见下节「两面」）
+  400 + 官方通告「claude 模型供应难以保证」-> MODEL_NOTICE 名在册但当前不供（2026-10-04 实测：
+                                                 claude-opus-5-5；官方改推 gpt-6-astra-cc-format）
   其它（超时/DNS/其它 4xx5xx） -> UNKNOWN         不确定（fail-closed，不当成可用）
 
 两面（★形状单一源：探针 = 抢坑 = 实验，同一套客户端形状）
@@ -122,14 +124,13 @@ MODEL_FACE = {
 }
 # 默认探测模型：站点在册、且能代表「坑」的模型（★名字一律不带 [1m] 后缀）
 MODELS = [
-    "claude-opus-4-8",          # 2026-10-04 名测：在册（429 POOL_BUSY）；L 站攻略点名的易进名
-    "claude-opus-4-7",
-    "claude-sonnet-4-5-20250929",
-    "claude-opus-4-6",
-    "claude-sonnet-4-20250514",
-    "claude-haiku-4-5",         # 2026-10-04 名测：在册（429）；社区说「没啥人用」= 候选易进名
-    "gpt-6-astra-cc-format",    # messages 面（官方公告写法）
-    "gpt-6-astra",              # ★2026-10-04 新增：OpenAI/codex 面（探针此前完全没覆盖这一面）
+    # ★2026-10-04 按用户要求收敛：只探**高模型** —— Opus 与 Fable 两条线；
+    #   4.x 系（opus-4-8/4-7/4-6、sonnet-4-5-20250929、sonnet-4-20250514、haiku-4-5）
+    #   与小模型一律退出监测面（探它们只赚 POOL_BUSY，抢不到坑还占探测预算）。
+    #   gpt-6-astra 系亦暂摘：社区帖（topic/2496114）10-04 06:12 起多人独立确认其上游故障（空回），
+    #   要恢复监测把它们加回本表即可（面路由见 MODEL_FACE，gpt-* 走 codex 面，零额外改动）。
+    "claude-opus-5-5",             # 官方 17 名在册；实测 400 = 官方通告「claude 模型供应难以保证…」
+    "claude-fable-5-1-reversed",   # 官方在册；★2026-10-04 实测 http=200 真坑（本会话已抢到并保活 30min）
 ]
 
 STATE_DIR = os.path.join(ROOT, "temp/anyrouter_watch")
@@ -167,6 +168,9 @@ AVAILABLE = "SLOT_AVAILABLE"
 BUSY = "POOL_BUSY"
 NEED_1M = "NEED_1M"
 MODEL_UNSUPPORTED = "MODEL_UNSUPPORTED"
+MODEL_NOTICE = "MODEL_NOTICE"    # ★2026-10-04 补：400 + 官方通告「claude 模型供应难以保证」
+                                 #   = 该名**在册但不供**（官方建议改用 gpt-6-astra-cc-format）
+                                 #   ⇒ 既非「没坑」也非链路故障：不重试、不计故障（正常观测）
 CLIENT_REJECTED = "CLIENT_REJECTED"
 KEY_INVALID = "KEY_INVALID"
 UNKNOWN = "UNKNOWN"
@@ -203,6 +207,7 @@ ICON = {
     EDGE_BLOCK: "🛡 被边缘 WAF 拦（403 + 阿里 ESA 页；自动重试）",
     NEED_1M: "⚠️ 需启用 1M 上下文",
     MODEL_UNSUPPORTED: "🚫 该名不在 messages 面（404）",
+    MODEL_NOTICE: "📢 官方通告：该 claude 名当前不供（400 供应难以保证）",
     CLIENT_REJECTED: "🚫 客户端不在白名单",
     KEY_INVALID: "🔑 令牌无效",
     UNKNOWN: "❓ 不可判定",
@@ -220,6 +225,13 @@ def classify(status, body_text):
         return BUSY
     if status == 400 and ("1m" in low and ("上下文" in text or "context" in low)):
         return NEED_1M
+    if status == 400 and ("供应难以保证" in text or "供应难以保证" in text
+                          or "模型供应" in text):
+        # ★2026-10-04 实测：官方对个别 claude 名（如 claude-opus-5-5）直接回等长通告
+        #   {"error":"由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型…"}
+        #   = 名在册、但当前不供 ⇒ 与 NEED_1M 同属「换名字/换面」而非「没坑」，
+        #   故排除在故障面之外（fault_kind 里若全为它 ⇒ 视为正常观测，不告警）。
+        return MODEL_NOTICE
     if status == 400 and ("invalid codex request" in low or "invalid_responses_request" in low):
         # ★OpenAI/codex 面形状门禁（2026-10-04 实测）：请求不像真 Codex（缺 include /
         #   prompt_cache_key）⇒ ~1.1s 秒拒。既不是「没坑」也不是链路故障，是**探针形状不对**
@@ -1800,6 +1812,13 @@ def selftest():
     chk("429->BUSY", classify(429, '{"error":{"message":"Service Unavailable"}}'), BUSY)
     chk("503->BUSY", classify(503, '{"error":{"message":"Service Unavailable"}}'), BUSY)
     chk("400-1m->NEED_1M", classify(400, '{"error":"1m 上下文已经全量可用，请启用 1m 上下文后重试"}'), NEED_1M)
+    chk("400-官方通告->MODEL_NOTICE", classify(
+        400, '{"error":"由于 claude 模型供应难以保证，上线 gpt-6-astra-cc-format 模型，'
+             '支持 messages 格式，通过 claude --model \'gpt-6-astra-cc-format[1m]\' 使用该模型","type":"error"}'),
+        MODEL_NOTICE)
+    chk("NC: 400 无关正文->UNKNOWN", classify(400, '{"error":"bad request"}'), UNKNOWN)
+    chk("NC: 400 含 1m 但无上下文 -> UNKNOWN",
+        classify(400, '{"error":"model name gpt-6-astra[1m] not found"}'), UNKNOWN)
     chk("401-unauth-client", classify(401, '{"error":{"message":"unauthorized client detected"}}'), CLIENT_REJECTED)
     chk("403-unauth-client", classify(403, '{"error":{"message":"Unauthorized client detected"}}'), CLIENT_REJECTED)
     chk("401-other->KEY_INVALID", classify(401, '{"error":{"message":"invalid token"}}'), KEY_INVALID)
@@ -1860,7 +1879,18 @@ def selftest():
     chk("state keys", sorted(["last_ts", "last_verdict", "last_rc"]),
         sorted(["last_ts", "last_verdict", "last_rc"]))
     chk("NC: MODELS 均为非空 str", all(isinstance(m, str) and m for m in MODELS), True)
-    chk("MODELS 扩面 >=5", len(MODELS) >= 5, True)
+    # ★2026-10-04 收敛政策（用户要求）：只探高模型 —— Opus/Fable 两条线，4.x 与小模型退出监测面。
+    #   守卫改**结构判据**（不绑固定条数、不绑固定名），名单回退到低模型时会当场变红。
+    import re as _re
+    _low_pat = _re.compile(r"(opus-4|sonnet-4|sonnet-3|haiku|opus-3|fable-4|claude-3|gpt-4)", _re.I)
+    chk("MODELS 非空", len(MODELS) >= 1, True)
+    chk("策略: 无低模型名混入", [m for m in MODELS if _low_pat.search(m)], [])
+    chk("策略: 至少一个 opus 名", any("opus" in m.lower() for m in MODELS), True)
+    chk("策略: 至少一个 fable 名", any("fable" in m.lower() for m in MODELS), True)
+    chk("NC: 低模型名会被策略判出", bool(_low_pat.search("claude-opus-4-8")), True)
+    chk("NC: haiku 会被策略判出", bool(_low_pat.search("claude-haiku-4-5")), True)
+    chk("策略反例: 高模型名不被误判",
+        [_low_pat.search(x) for x in ("claude-opus-5-5", "claude-fable-5-1-reversed")], [None, None])
     chk("NC: MODELS 无重复", len(set(MODELS)) == len(MODELS), True)
 
     # 11) 自动占坑（--auto-hold-minutes）：★2026-10-04 用户要求「接上自动抢坑 + 抢到后保活 30 分钟」
@@ -2381,7 +2411,10 @@ def selftest():
     _c.model_list, _c.sample = None, 0
     chk("预算: 轮成本 sample=0 ⇒ 全量", _round_cost(_c), len(MODELS))
     _c.sample = 4
-    chk("预算: 轮成本 sample=4", _round_cost(_c), 4)
+    _c.model_list = None
+    chk("预算: 轮成本 sample=4(≥名单长则封顶为名单长)", _round_cost(_c), min(4, len(MODELS)))
+    _c.model_list = "a,b,c,d,e,f"
+    chk("预算: 轮成本 sample=4(短于显式名单)", _round_cost(_c), 4)
 
     # 错峰真的落到 probe_models（monkeypatch probe_model，零网络）
     _slept = []
