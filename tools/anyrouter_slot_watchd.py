@@ -35,6 +35,8 @@
 
 import argparse
 import datetime
+import ast
+import io
 import json
 import os
 import signal
@@ -351,6 +353,23 @@ def promote_exit_action(action, reason, last_exit):
     return action, reason
 
 
+def start_panel_if_enabled(args, state_dir, log):
+    """按需起本地面板；返回 panel info 或 None。
+
+    ★为什么单独成函数：面板启动要用 log()，而 log 是 supervise 的**局部函数**。
+    2026-10-04 真事故：面板启动块写在 `def log` 之前 ⇒ `log=log` 触发
+    UnboundLocalError，守护一启动就死（症状=bg_task 记 EXITED_ERR rc=1、
+    watchd.log 无新行）。抽函数后调用点被强制排在 def log 之后，并有
+    结构性负控自测守着这个顺序（见 selftest「面板启动序」）。
+    """
+    if not (getattr(args, "panel", True) and not args.dry_run and not args.once):
+        return None
+    panel = start_panel(state_dir, port=getattr(args, "panel_port", None), log=log)
+    if panel:
+        log("面板已起：%s（手机点飞书卡片按钮即可停保活）" % panel["urls"]["url"])
+    return panel
+
+
 def supervise(args):
     """守护主循环。--once 只跑一轮巡检/决策（供演练与测试）。"""
     state_dir = os.path.abspath(os.path.expanduser(args.state_dir)) if args.state_dir \
@@ -372,12 +391,6 @@ def supervise(args):
     except Exception:
         pass
 
-    panel = None
-    if getattr(args, "panel", True) and not args.dry_run and not args.once:
-        panel = start_panel(state_dir, port=getattr(args, "panel_port", None), log=log)
-        if panel:
-            log("面板已起：%s（手机点飞书卡片按钮即可停保活）" % panel["urls"]["url"])
-
     t_start = time.time()
     hard_end = t_start + args.max_hours * 3600 if args.max_hours else None
     child_pid, child_lstart, spawn_ts, child_proc, child_fh = None, None, None, None, None
@@ -398,6 +411,9 @@ def supervise(args):
         % (args.check_every, args.interval, args.max_hours, state_dir))
     if args.dry_run:
         log("dry-run：只判断、不 spawn、不杀进程")
+
+    # ★顺序铁律：面板启动会调用 log()，必须放在 def log 之后（曾在 def 之前调用 ⇒ UnboundLocalError 起不来）
+    panel = start_panel_if_enabled(args, state_dir, log)
 
     try:
         while True:
@@ -971,6 +987,56 @@ def selftest():
             stop_panel(_i2, _pd, log=lambda m: None)
     finally:
         _occ.close()
+
+    # 9) ★2026-10-04 真事故回归：面板启动序（def log 之前调 start_panel(log=log) ⇒ 守护秒死）
+    class _NS:
+        pass
+    _ns = _NS()
+    _ns.panel = True
+    _ns.panel_port = 0
+    _ns.dry_run = True
+    _ns.once = False
+    import tempfile as _tf
+    _d9 = _tf.mkdtemp(prefix="anr_panelseq_")
+    chk("NC 面板序: dry-run ⇒ 不起面板（零副作用）",
+        start_panel_if_enabled(_ns, _d9, lambda m: None), None)
+    _ns.dry_run = False
+    _ns.once = True
+    chk("NC 面板序: --once ⇒ 不起面板", start_panel_if_enabled(_ns, _d9, lambda m: None), None)
+    _ns.once = False
+    _logged9 = []
+    _i9 = start_panel_if_enabled(_ns, _d9, _logged9.append)
+    chk("面板序: 真起面板并回传 urls", bool((_i9 or {}).get("urls", {}).get("url")), True)
+    chk("面板序: 起面板会落日志（证明 log 可用）", len(_logged9) >= 1, True)
+    chk("面板序: 起面板即写 ctl.url（卡片按钮才有入口）",
+        os.path.exists(os.path.join(_d9, CTL_URL_FILE)), True)
+    if _i9:
+        stop_panel(_i9, _d9, log=lambda m: None)
+    # ★结构性负控：调用点必须排在 `def log(` 之后；拿「旧写法」样本反证本判据会报警
+    def _panel_seq_ok(src):
+        """★用 AST 判结构序（不查字面串——本函数的 docstring 里就写着该串，字面查必自欺）。"""
+        try:
+            _tree = ast.parse(src)
+        except Exception:
+            return False
+        _i_log = _i_call = None
+        for _fn in [n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == "supervise"]:
+            for _st in ast.walk(_fn):
+                if isinstance(_st, ast.FunctionDef) and _st.name == "log" and _i_log is None:
+                    _i_log = _st.lineno
+        for _st in ast.walk(_tree):
+            if isinstance(_st, ast.Call) and isinstance(_st.func, ast.Name) \
+                    and _st.func.id == "start_panel_if_enabled" and _i_call is None:
+                _i_call = _st.lineno
+        if _i_log is None or _i_call is None:
+            return False
+        return _i_log < _i_call
+    _src_real = io.open(os.path.abspath(__file__), encoding="utf-8").read()
+    chk("面板序: 真源码 调用点在 def log 之后", _panel_seq_ok(_src_real), True)
+    _src_bad = ("    panel = start_panel(state_dir, port=None, log=log)\n"
+                "    def log(msg):\n        pass\n")
+    chk("NC 面板序: 旧写法（先调面板后定义 log）必须判 False",
+        _panel_seq_ok(_src_bad), False)
 
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
