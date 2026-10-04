@@ -130,3 +130,9 @@ watchd.jsonl：10:58:20 START（前两行 10:57:20 HOLD_BUSY holder_pid=77074 = 
 2. 「探测同 session」依赖 `session_id` 跨轮稳定（uuid5，key/tag 派生）——若站点将来改为**每请求强绑定**，保活会与被探测请求脱钩，届时须重新标定。
 3. 保活期间会额外消耗少量额度（最小 completion）；30 分钟窗口 + 900s 冷却 = 上限有限，但**非零**，成本已登记。
 
+### 9.6 增补：命中通知直接给出「怎么用」（2026-10-04 本轮）
+
+「保活住了但我怎么接上」是 §9 的最后一公里 ⇒ 命中推送里**直接印出保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可直接粘贴的复用命令 `claude --session-id <uuid>`，并注明「不指定 session 也照常能用；指定=复用这个正在被保活的身份」。实现=`_build_text(..., sid=...)` 新增形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；未传 `sid` 时文本逐字不变（旧行为零回归）。自测随之 **197 → 200 passed / 0 failed**（新增三断言：带 sid 出完整 UUID、出可粘贴 `--session-id` 命令、不带 sid 时不出现 `--session-id`）。
+
+⇒ 现场读数的更新：本节 §9.3 记的 `pid 92011` 已在同一轮重启中停掉，现行守护/子进程见文末最终读数（守护 `pid 8661`、探测子进程 `pid 8665`，实参同 §9.3 口径 + `--auto-hold-minutes 30.0 --hold-cooldown 900.0`）。
+

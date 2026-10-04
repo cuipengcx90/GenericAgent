@@ -987,7 +987,7 @@ def _append_ledger(rec):
         f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=240):
+def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=240, sid=None):
     lines = ["🚀 anyrouter 抢到坑了（可以用了）",
              "检测时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S")]
     for r in results:
@@ -1004,6 +1004,10 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
         lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 打一次最小请求；被踢即停、下次命中重占）。"
                      % (("%g" % float(auto_hold_minutes)), int(keepalive_seconds)))
         lines.append("👉 你直接用即可（客户端 Anthropic messages 端点 + 上面的 beta 头）。")
+        if sid:
+            lines.append("🔑 已占住的坑位身份 session_id：%s" % sid)
+            lines.append("   想让 Claude Code 沿用这个已保活的坑位：`claude --session-id %s`" % sid)
+            lines.append("   （不指定 session 也照常能用；指定=复用这个正在被保活的身份）")
     else:
         lines.append("坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。")
     lines += [
@@ -1264,7 +1268,8 @@ def run_once(args):
     if do_push and args.notify:
         text = _build_text(results, now_bj, reason,
                            auto_hold_minutes=getattr(args, "auto_hold_minutes", 0),
-                           keepalive_seconds=getattr(args, "keepalive_seconds", 240))
+                           keepalive_seconds=getattr(args, "keepalive_seconds", 240),
+                           sid=session_id_for(key, "anyrouter-probe"))
         pushed, push_detail = send_notifications(text, dry_run=args.dry_run)
         print("[anyrouter] 推送=%s (%s)" % (pushed, push_detail))
     elif do_push:
@@ -1540,6 +1545,12 @@ def selftest():
     chk("text: 自动保活提示", ("已自动保活 30 分钟" in _txh), True)
     chk("NC: 保活时不提示'尽快连着用'", ("尽快连着用" in _txh), False)
     chk("NC: 未开保活时仍提示被踢", ("尽快连着用" in txt), True)
+    _sidt = _build_text(avail, beijing_now(), "state_changed", auto_hold_minutes=30,
+                        keepalive_seconds=20, sid="11111111-2222-3333-4444-555555555555")
+    chk("text: 保活时给出完整 session_id", ("11111111-2222-3333-4444-555555555555" in _sidt), True)
+    chk("text: 给出可直接粘贴的 --session-id 复用命令",
+        ("claude --session-id 11111111-2222-3333-4444-555555555555" in _sidt), True)
+    chk("NC: 未传 sid 时不出现 --session-id", ("--session-id" in _txh), False)
     # 6) 状态键
     chk("state keys", sorted(["last_ts", "last_verdict", "last_rc"]),
         sorted(["last_ts", "last_verdict", "last_rc"]))
