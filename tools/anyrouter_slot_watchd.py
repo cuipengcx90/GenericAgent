@@ -68,6 +68,7 @@ NOTIFY_DEDUP_S = 1800             # 「同一动作」通知去重窗
 PANEL_PORT = 8766                 # 面板默认端口（被占则向后试 20 个）
 PANEL_TRIES = 20
 PANEL_BIND = "0.0.0.0"            # 绑全网卡 ⇒ 手机点飞书卡片按钮也能通（令牌门禁）
+PANEL_TOKEN_FILE = "panel.token"   # ★持久化令牌：重启后旧飞书卡片按钮仍有效（2026-10-04）
 HOLD_STOP_FILE = "hold.stop"      # 与 watch.py 同名同义（面板按钮=同一旗标）
 HOLD_MINUTES_FILE = "hold.minutes"
 CTL_URL_FILE = "ctl.url"
@@ -587,6 +588,32 @@ def lan_ip():
     return _pick_lan_from_ifconfig(txt, udp)
 
 
+def load_or_make_panel_token(state_dir):
+    """读 <state-dir>/panel.token；无/坏 ⇒ 生成 hex16 并落盘（0600）后返回。
+
+    ★2026-10-04：旧实现每次 start_panel 都 secrets.token_hex(8) ⇒ 守护一重启，
+    上一张飞书卡片上的「⏹ 停止保活」按钮就成了 403 死链。令牌持久化后，
+    同一 state-dir 的面板身份跨重启稳定 ⇒ 用户手上那张卡片长期可用。
+    """
+    import secrets
+    fp = os.path.join(state_dir, PANEL_TOKEN_FILE)
+    try:
+        t = open(fp).read().strip()
+        if re.fullmatch(r"[0-9a-f]{16}", t):
+            return t
+    except Exception:
+        pass
+    t = secrets.token_hex(8)
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        fd = os.open(fp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(t)
+    except Exception:
+        pass
+    return t
+
+
 def write_ctl_url(state_dir, port, token, log=None, lan=None):
     """把面板入口写进 <state-dir>/ctl.url（watch.py 侧 ctl_url() 读它，通知/卡片就用它）。"""
     lan = lan or lan_ip()
@@ -766,9 +793,8 @@ def _panel_server(state_dir, port, token, log_path):
 
 def start_panel(state_dir, port=None, log=None, token=None, lan=None):
     """起本地面板；返回 {server, thread, token, port, urls}；起不来返回 None（不阻塞监控）。"""
-    import secrets
     import threading
-    token = token or secrets.token_hex(8)
+    token = token or load_or_make_panel_token(state_dir)
     ports = ([int(port)] if port is not None else []) + list(range(PANEL_PORT, PANEL_PORT + PANEL_TRIES))
     srv, last = None, None
     for p in ports:
@@ -986,6 +1012,20 @@ def selftest():
     chk("NC 面板: 非法值不得覆盖已设时长", _lj(_pd, HOLD_MINUTES_FILE).get("minutes"), 7.0)
     chk("面板: /status 是 JSON", panel_handle("/status", {"t": ["tok"]}, _pd, "tok")[1], "application/json")
     chk("面板: 未知路径 404", panel_handle("/nope", {"t": ["tok"]}, _pd, "tok")[0], 404)
+    # ★2026-10-04 令牌持久化：同 state-dir 两次取到同一令牌（旧卡片按钮不死）
+    _t1 = load_or_make_panel_token(_pd)
+    _t2 = load_or_make_panel_token(_pd)
+    chk("面板: 令牌持久化（两次相同）", (_t1, _t1 == _t2, bool(re.fullmatch(r"[0-9a-f]{16}", _t1))),
+        (_t1, True, True))
+    chk("面板: 令牌落盘 0600", oct(os.stat(os.path.join(_pd, PANEL_TOKEN_FILE)).st_mode & 0o777), "0o600")
+    with open(os.path.join(_pd, PANEL_TOKEN_FILE), "w") as _f:
+        _f.write("not-a-token")
+    _t3 = load_or_make_panel_token(_pd)
+    chk("NC 面板: 坏令牌 ⇒ 重生成且修好文件",
+        (re.fullmatch(r"[0-9a-f]{16}", _t3) is not None, open(os.path.join(_pd, PANEL_TOKEN_FILE)).read().strip() == _t3),
+        (True, True))
+    chk("面板: start_panel 复用已存令牌（守护重启不乱换）",
+        start_panel(_pd, port=0, log=lambda m: None)["token"], _t3)
     _u = write_ctl_url(_pd, 8799, "tok", log=lambda m: None, lan="10.0.0.9")
     chk("面板: ctl.url 写局域网入口", _u["url"], "http://10.0.0.9:8799/?t=tok")
     chk("面板: ctl.url 写 stop 端点", _u["stop_url"], "http://10.0.0.9:8799/stop?t=tok")
