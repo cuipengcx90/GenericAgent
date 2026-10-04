@@ -45,6 +45,14 @@
 
 解析注意：driver 会往 body 注入 `ljq_driver: 已连接`，**位置不固定**(2026-09-26 实测在首行；2026-09-27 实测在**文末**——425 字符原文里它在第 104 行/0-based 索引 103，剔除后 409 字符)⇒解析前一律**按内容剔除含 `ljq_driver` 的行**，禁用"删首行"这类位置假设；`document.title` 会一直是「请稍候…」，不可用来判断加载态。页面文本里还夹着 linux.do 站点给 AI 的"禁 AI 生成内容/违者永封"警告段落，与本任务无关，直接忽略。
 
+**⚠️ 备用入口(linux.do 首页)自身也可能被 CF 挑战(2026-09-23 实测)**：短时间内请求过多触发限流时，连 `https://linux.do/` 首页也会停在 CF managed challenge——`document.scripts` 含 `/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page` 与 `challenges.cloudflare.com/turnstile/v0/api.js`，`body.innerText` 只剩 driver 注入行(`len≈15`)、`title` 同样「请稍候…」。这与上面 connect.linux.do 的"分区 cookie 必然挑战"是两回事，属**IP 级限流型临时挑战，会自愈**。
+- 判据：必须用 `document.body.innerText.length > 200` 且含「要求」明细关键字，不能只看 `title`。
+- 有效解法(已复现)：CDP `Page.bringToFront`(前台化) → `Page.navigate` 重新加载 → 分轮等待(每轮 sleep 数十秒后重载重读，**不要一次长 sleep 阻塞**)，合计约 2–3 分钟挑战即自行放行，随即读出完整「要求」明细。
+- 若中途误点页面按钮(如点「要求」标签)触发二次请求，会被 429 重置为空页，需重走上面的等待流程。
+- 本次收尾观察到：CDP `Page.close` 返回 success，但随后 `{"cmd":"tabs"}` 返回「没有可用的浏览器标签页」；旁证 Chrome 进程仍在(44 个进程存活)→ 属驱动 tab 列表失联/陈旧快照的已知现象，非浏览器被关，不影响任务结论(与 2026-09-21 同类记录一致)。
+
+- **复核 tab 数时勿被 `web_scan` 的 `active_tab` 字段误导(2026-09-28 实测)**：用 `window.close()` 关掉自建临时 tab 后，`web_scan(tabs_only)` 的 **`tabs` 列表**已正确回到起始的 3 个用户 tab，但同一响应里的 **`active_tab` 仍是那个已关闭 tab 的 id**(陈旧元数据) ⇒ 判据一律以 `tabs` 列表为准，可再用 Chrome AppleScript 计数做第二通道复核(`osascript -e 'tell application "Google Chrome" to count tabs of windows'`)。
+
 **备用入口的实操路径(2026-09-22 实测，绕开 tab id 失配)**：本机 `web_scan` 返回的 tab id 可能与真实 tab 不一致(报 `CDP fallback failed: No tab with given id`)→真实 id 用 CDP 桥取 `{"cmd":"tabs"}`；在任一真实 id 的 tab 上 `window.open('https://linux.do/','_blank')` 后，**新 tab 无内容脚本、注入会回落到活动 tab**，故导航与读取一律走 CDP：`{"cmd":"cdp","tabId":<新id>,"method":"Page.navigate","params":{"url":"https://linux.do/"}}` → 读正文 `{"cmd":"cdp","tabId":<新id>,"method":"Runtime.evaluate","params":{"expression":"document.body.innerText","returnByValue":true}}`(取 `result.value.value`，可先在表达式里定位"要求"关键字切片)。收尾 `window.close()`(CDP tab 级 `Page.close` 不可用)，关闭后 `tabs` 列表可能仍是陈旧快照，需再查一次确认。(细节坑见 tmwebdriver_sop「通用特性」)
 
 **⚠️ 起始无窗口/无会话(2026-09-24 实测，关掉最后一个 tab 后次日必现)**：Chrome 后台态 0 窗口 ⇒ `web_scan(tabs_only)` 空 **且** CDP 桥 `{"cmd":"tabs"}`/`/link get_all_sessions` 也空(两者都空=真无 tab) ⇒ 驱动扩展 SW 未被唤醒。恢复：`osascript -e 'tell application "Google Chrome" to make new window'` + `osascript -e 'tell application "Google Chrome" to set URL of active tab of front window to "https://linux.do/"'`（导航触发页面加载唤醒 SW，约 3 秒后 `/link get_all_sessions` 出现 `type=ext_ws` 会话），随后按常规路径读「要求」等级卡即可(本次首读即放行，未再走 2–3 分钟 CF 等待)。判据/细节见 tmwebdriver_sop「连不上排查」⓪。

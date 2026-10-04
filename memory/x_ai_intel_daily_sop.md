@@ -15,7 +15,13 @@ d=TMWebDriver(); print(d.is_remote, len(d.get_all_sessions()), d.set_session("x.
 2. `get_all_sessions()==0` + `web_scan(tabs_only=True)` 也报无标签 ⇒ 真无会话（两侧同空=真无，非陈旧）；
 3. 用 AppleScript 只读枚举真实标签，定性根因：
    `osascript -e 'tell application "Google Chrome" to get URL of tabs of windows'`
-   ★**实测坑（2026-09-25）**：若唯一标签是 `chrome-extension://…/onetab.html`（OneTab 2.21 等扩展页），Chrome 会显示"有窗口有标签"，但**扩展页不注入内容脚本 ⇒ 驱动会话恒为 0**——用户把标签收进 OneTab 就等价于"没有浏览器标签"。
+   ★**实测坑（2026-09-25）**：若唯一标签是 `chrome-extension://…/onetab.html`（OneTab 2.21 等扩展页），Chrome 会显示"有窗口有标签"，但**扩展页不注入内容脚本 ⇒ 驱动会话恒为 0**——用户把标签收进 OneTab 就等价于"没有浏览器标签"。★**第三种形态（2026-09-28 实测）**：3 个标签全是**普通网页**（linux.do）但**没有 x.com** ⇒ 同样判"真无 x.com 会话"（判据仍是两来源同空：agent 侧 `web_scan` + `osascript` 枚举），与 OneTab 坑成因不同、处置相同（等用户开标签）。
+
+## 成功判据与历史失败面（2026-09-27 实测补充）
+- **成功标记须严格正则** `Saved \d+ new posts`。宽松规则（"含 new posts 且不含 RuntimeError"）会把第二类失败误判成成功——实测 38 份 done 报告里有 2 份被该规则误判，逐字复核正文均明写"未出现 `RUN_DONE` 或 `Saved N new posts` 成功标记"。
+- 历史失败两形态：①`未找到URL包含 'x.com' 的会话` → `RuntimeError: No active X browser tab was found`（缺会话，占多数）；②`CDP fallback failed: No tab with given id <id>`（会话匹配到 x.com 但该标签 id 已失效，如 2026-08-18 / 2026-09-16）。
+- 量化：`sche_tasks/done/*_x_ai_intel_daily.md` 共 **39 份**（2026-09-28 现场重算；★该计数逐日增长，判读一律以现场 `ls sche_tasks/done/*_x_ai_intel_daily.md | wc -l` 为准，勿引旧数），严格标记命中 **0**；末次真实成功 = **2026-08-17**（去重库 mtime `2026-08-17 16:03:49` + 当日 5 份报告、末份 `20260817_160400.md`）。
+- **速判坑（2026-09-27）**：裸 `TMWebDriver()` 在 `is_remote=False` 时会**自建**服务端（日志出现 `WebSocket server running on ws://127.0.0.1:18765`），此刻 `get_all_sessions()==0` 是"扩展尚未接入"的**瞬时态**，不可当"真无会话"结论；权威读数用 agent 侧同链路 `web_scan(tabs_only=True)`（实测：裸实例 0 → web_scan 见 1 个 `https://example.com/`，仍无 x.com），Chrome 真实标签用 osascript 枚举作第二来源。
 
 ## 第四形态：标签在册但该标签 JS 通道死（2026-09-28 现场实测）
 - 现象：`get_all_sessions()` 里有 x.com，`set_session("x.com")` **成功**，但 `execute_js` 报 `CDP fallback failed: No tab with given id <id>`；同批其它标签可能正常（实测 7 标签 = 2 OK / 5 FAIL）⇒ **故障按标签粒度**，非驱动整体掉线。

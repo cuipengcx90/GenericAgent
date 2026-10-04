@@ -76,6 +76,8 @@ secret = keychain.keys.openai_key
 api_key = keychain.keys.openai_key.use()
 ```
 ⚠️ 禁止 `print(keychain.keys.openai_key.use())`，日志会泄露明文。
+- 命名是**扁平**的（`keys.set(name, val)`，无 service/account 参数）：keyring 风格的 `service/account` 只能压成一个 name（例：`typesafe_jev_api_key`）；读取走属性访问 `keys.<name>` ⇒ name 必须是合法标识符，含 `/ : -` 的名字只能靠 `.set()` 写入、无法属性读取。
+- ⚠️ **通用坑（实测踩到，致 401 且难自查）**：若取数通道封装了「脱敏 / redact」（把长 secret 替换成 `<REDACTED>` 之类），**绝不能拿它取回的值去 `.set()` 写库** —— 会把占位符当成真值存进去（实测存成 17 字符假值），之后所有调用 401。写库必须走 raw 通道（如 `jsraw`/CDP 原始返回）；校验一律用指纹而非打印明文：`print(hashlib.sha256(key.encode()).hexdigest()[:12])`。
 
 ### 列出所有 key 名
 ```python
