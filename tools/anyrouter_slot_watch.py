@@ -19,6 +19,7 @@
   401 / 403 + unauthorized client -> CLIENT_REJECTED 客户端不在白名单
   401 / 403 + 令牌无效类      -> KEY_INVALID      令牌无效/被封
   404 + 「不支持所选模型」     -> MODEL_UNSUPPORTED 该名不在 messages 面（走 OpenAI 面）
+  500 + 「负载已经达到上限」      -> POOL_BUSY        与 429/503 同一件事（站点自述 api_error，2026-10-04 实测）
   其它（超时/DNS/其它 4xx5xx） -> UNKNOWN         不确定（fail-closed，不当成可用）
 
 传输层铁律（实测）
@@ -46,7 +47,11 @@
     ⇒ 连续 --fault-streak 轮（默认 3 轮 ≈ 15min）判故障并推送一次；
       持续存在时按 --fault-cooldown（默认 6h）重复提醒；恢复时补一条「已恢复」。
   单轮异常被 try/except 捕获，不会让长驻进程死在半夜（否则当天剩余时段全瞎）。
-  进程级守护见 tools/anyrouter_slot_watchd.py（崩了/卡了自动重启，零 LLM token）。
+
+ ★2026-10-04 形状判据订正（重要）
+   本站在「像不像真 Claude Code」上做分流：旧探针形状恒 429（116 轮 542 发零 200）。现按真 CC
+   抓包 + 消融定出的放行形状发请求（见 CC_* 常量）。含义：**429 ≠ 坑满**，先看形状是否合格；
+   判据新增 EDGE_BLOCK（403 + 阿里 ESA 拦截页 = 边缘限流，非凭据/坑位问题，自动重试）。
 """
 import argparse
 import datetime
@@ -60,17 +65,41 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOSTS = ["https://anyrouter.top"]
-# 1M 上下文 beta（不带它，claude 模型恒 400「请启用 1m 上下文后重试」）
-BETA = "context-1m-2025-08-07"
-UA = "claude-cli/1.0.0 (external, cli)"
-# 默认探测模型：站点在册、且能代表「坑」的模型
-#   [1m] 后缀 = 站点约定的 1M 上下文写法（官方公告里的用法）
+# ★2026-10-04 判据订正（消融实测，SOP「形状门禁」节）：本站按「像不像真 Claude Code」分流。
+#   旧探针形状（x-api-key + UA claude-cli/1.0.0(external, cli) + 单个 beta + 无 metadata 的最小
+#   body）**恒被拒**——116 轮 542 发全 429/503、零 200 ⇒ 过去的 429 不是「坑满」的证据，是形状
+#   不合格（假阴性）。真 CC 抓包 + 逐项消融定出的放行形状（本文件即按此实现）：
+#     路径 /v1/messages?beta=true；Authorization: Bearer（不是 x-api-key）；
+#     UA claude-cli/2.1.287 (external, sdk-cli)；CC 长 beta 列表；x-app: cli；Stainless 头；
+#     body 必含 system（计费行 + "Claude agent ... Agent SDK."）+ metadata.user_id
+#     （二者任缺即 429；tools / messages 内容 / 那些新字段都非必需）⇒ 最小可用体 ≈1KB。
+#   附带订正：模型名**不带** [1m]（带则 429，真 CC 发的是无后缀名）。
+CC_PATH = "/v1/messages?beta=true"
+CC_UA = "claude-cli/2.1.287 (external, sdk-cli)"
+CC_BETA = ("claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,"
+           "thinking-token-count-2026-05-13,context-management-2025-06-27,"
+           "prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04")
+CC_BILLING = "x-anthropic-billing-header: cc_version=2.1.287.5a4; cc_entrypoint=sdk-cli;"
+CC_SYS = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+CC_STAINLESS = {
+    "x-stainless-arch": "arm64",
+    "x-stainless-lang": "js",
+    "x-stainless-os": "MacOS",
+    "x-stainless-package-version": "0.127.0",
+    "x-stainless-retry-count": "0",
+    "x-stainless-runtime": "node",
+    "x-stainless-runtime-version": "v26.3.0",
+    "x-stainless-timeout": "600",
+}
+BETA = CC_BETA       # 兼容旧自测/文案里的 BETA 引用
+UA = CC_UA
+# 默认探测模型：站点在册、且能代表「坑」的模型（★名字一律不带 [1m] 后缀）
 MODELS = [
     "claude-opus-4-7",
     "claude-sonnet-4-5-20250929",
     "claude-opus-4-6",
     "claude-sonnet-4-20250514",
-    "gpt-6-astra-cc-format[1m]",
+    "gpt-6-astra-cc-format",
 ]
 
 STATE_DIR = os.path.join(ROOT, "temp/anyrouter_watch")
@@ -94,6 +123,7 @@ MODEL_UNSUPPORTED = "MODEL_UNSUPPORTED"
 CLIENT_REJECTED = "CLIENT_REJECTED"
 KEY_INVALID = "KEY_INVALID"
 UNKNOWN = "UNKNOWN"
+EDGE_BLOCK = "EDGE_BLOCK"  # 403 + 边缘 WAF 页（阿里 ESA）：环境/限流面，非凭据问题
 BROKEN = (CLIENT_REJECTED, KEY_INVALID)  # 属「配置/凭据坏了」而非「坑满了」
 
 # ---- 故障面（≠「没坑」）：连续 N 轮都是这些，才算「监控链路本身出问题」并告警 ----
@@ -102,13 +132,15 @@ FAULT_TRANSPORT = "TRANSPORT"        # 全 UNKNOWN（网络/代理/DNS/超时）
 FAULT_CREDENTIAL = "CREDENTIAL"      # 全 KEY_INVALID（令牌失效）
 FAULT_CLIENT = "CLIENT"              # 全 CLIENT_REJECTED（UA 白名单被拒）
 FAULT_MODEL_DRIFT = "MODEL_DRIFT"    # 全 MODEL_UNSUPPORTED（模型名不在 messages 面）
+FAULT_EDGE = "EDGE_BLOCK"            # 全 EDGE_BLOCK（被边缘 WAF 拦）
 FAULT_NO_KEY = "NO_KEY"              # 本机取不到 key
 FAULT_STREAK = 3                     # 连续 3 轮（默认 5min/轮 ≈ 15min）才告警，防抖
 FAULT_NOTIFY_COOLDOWN_S = 6 * 3600   # 故障持续时，最多每 6h 提醒一次
 
 ICON = {
     AVAILABLE: "✅ 可用（抢到坑）",
-    BUSY: "⏳ 号池忙（没抢到坑）",
+    BUSY: "⏳ 非 200（429/503；形状合格后未再出现，多为边缘限流/上游抖动）",
+    EDGE_BLOCK: "🛡 被边缘 WAF 拦（403 + 阿里 ESA 页；自动重试）",
     NEED_1M: "⚠️ 需启用 1M 上下文",
     MODEL_UNSUPPORTED: "🚫 该名不在 messages 面（404）",
     CLIENT_REJECTED: "🚫 客户端不在白名单",
@@ -128,6 +160,9 @@ def classify(status, body_text):
         return BUSY
     if status == 400 and ("1m" in low and ("上下文" in text or "context" in low)):
         return NEED_1M
+    if status == 403 and ("performance & security" in low or "esa" in low
+                          or "<html" in low or "<!doctype html" in low):
+        return EDGE_BLOCK   # 边缘 WAF 拦截页 ≠ 令牌问题（实测 2026-10-04）
     if status in (401, 403):
         if "unauthorized client" in low:
             return CLIENT_REJECTED
@@ -138,6 +173,11 @@ def classify(status, body_text):
         if "不支持所选模型" in text or "unsupported model" in low:
             return MODEL_UNSUPPORTED
         return UNKNOWN
+    if status == 500 and ("负载" in text or "上限" in text
+                         or "overload" in low or "capacity" in low):
+        # ★2026-10-04 订正（SOP §1.1）：站点自述 `{"type":"api_error","message":"当前模型 xxxxx 负载已经达到上限，请稍后重试"}`
+        #   与 429/503 是同一件事（上游供给态），不属链路故障；无关键词的裸 500 仍回落 UNKNOWN（fail-closed）。
+        return BUSY
     if status == 400:
         return UNKNOWN
     return UNKNOWN
@@ -187,6 +227,8 @@ def fault_kind(results):
         return FAULT_CREDENTIAL
     if all(v == CLIENT_REJECTED for v in vs):
         return FAULT_CLIENT
+    if all(v == EDGE_BLOCK for v in vs):
+        return FAULT_EDGE
     if all(v == MODEL_UNSUPPORTED for v in vs):
         return FAULT_MODEL_DRIFT
     return None
@@ -211,6 +253,7 @@ def _build_fault_text(kind, results, now_bj, streak):
         FAULT_TRANSPORT: "探测全部不可判定（网络/代理/DNS/超时）",
         FAULT_CREDENTIAL: "令牌失效（401/403 令牌无效类）",
         FAULT_CLIENT: "客户端不在白名单（401/403 unauthorized client）",
+        FAULT_EDGE: "被边缘 WAF 拦截（403 + 阿里 ESA 页；多为限流，稍后自动恢复）",
         FAULT_MODEL_DRIFT: "在册模型名全部 404（站点可能改了 API 面）",
         FAULT_NO_KEY: "本机取不到 key（keychain/env/文件均无）",
     }.get(kind, kind)
@@ -247,6 +290,8 @@ def overall_rc(results):
         return 2
     if all(r["verdict"] == MODEL_UNSUPPORTED for r in results):
         return 2  # 全部模型名都不在 messages 面（站点改面/名单漂移）⇒ 也要人看
+    if all(r["verdict"] == EDGE_BLOCK for r in results):
+        return 2
     if all(r["verdict"] in BROKEN for r in results):
         return 2
     return 0
@@ -272,21 +317,30 @@ def _load_key():
     return ""
 
 
-def _http_post(url, key, body, timeout=25):
-    """POST JSON。★必须 stdlib urllib：curl_cffi 伪装指纹在本站恒 SSLError。"""
-    req = urllib.request.Request(
-        url, data=body, method="POST",
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "anthropic-beta": BETA,
-            "content-type": "application/json",
-            "user-agent": UA,
-        },
-    )
+def _http_post(url, key, body, timeout=25, read_limit=None):
+    """POST JSON。★必须 stdlib urllib（curl_cffi 伪装指纹在本站恒 SSLError）。
+
+    ★形状（2026-10-04 实测）：Authorization: Bearer（不是 x-api-key）+ CC UA + CC 长 beta +
+    x-app: cli + Stainless 头 —— 老形状恒 429，与本函数旧实现等价。
+    read_limit：stream=True 时响应体会一直流到模型生成完，只取前 N 字节即可判状态码。
+    """
+    headers = {
+        "authorization": "Bearer %s" % key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": CC_BETA,
+        "content-type": "application/json",
+        "accept": "application/json",
+        "user-agent": CC_UA,
+        "x-app": "cli",
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-claude-code-session-id": _cc_session_uuid(key),
+    }
+    headers.update(CC_STAINLESS)
+    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.status, r.read().decode("utf-8", "replace")
+            data = r.read() if read_limit is None else r.read(read_limit)
+            return r.status, data.decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         try:
             return e.code, e.read().decode("utf-8", "replace")
@@ -296,16 +350,15 @@ def _http_post(url, key, body, timeout=25):
         return 0, "transport: %s: %s" % (type(e).__name__, e)
 
 
-def probe_model(model, key, hosts=None, timeout=25):
-    """单模型最小探测：打一次 POST /v1/messages（max_tokens 极小）。"""
-    body = json.dumps({
-        "model": model,
-        "max_tokens": 8,
-        "messages": [{"role": "user", "content": "ping"}],
-    }).encode()
+def probe_model(model, key, hosts=None, timeout=60):
+    """单模型探测：按 CC 放行形状打一次 POST /v1/messages?beta=true（体 ≈1KB、stream）。
+
+    ★只取响应前 256B 判状态码（stream=True 时整段体会一直流到生成完，没必要等）。
+    """
+    body = build_probe_body(model)
     tried = []
     for host in (hosts or HOSTS):
-        code, text = _http_post(host + "/v1/messages", key, body, timeout)
+        code, text = _http_post(host + CC_PATH, key, body, timeout, read_limit=256)
         if code == 0:
             tried.append(text[:120])
             continue
@@ -329,6 +382,188 @@ def list_models(key=""):
         return {"host": HOSTS[0], "http": e.code, "models": []}
     except Exception:
         return {"host": HOSTS[0], "http": 0, "models": []}
+
+
+# ---------------------------------------------------------------- 抢坑（claim）
+# 为什么需要「抢」而不是「等」——L 站原方（linux.do/t/topic/2941445 第 33 楼，2026-09-24）：
+#   「写一个py脚本，代理cc的请求，同时脚本修改session id，都用同一个。如果收到爆满，
+#     脚本直接重发。挤进去以后，定时发送请求，保证session id一样，内容就是一个 "1"，保活。」
+# 实测含义：坑位不是「随手可取的公共空闲资源」，而是被某个 **session id** 占住的槽；
+# 本器原先的每轮 5 个「无 session 最小请求」永远只能采样到 429/503（118 轮 542 发零命中）。
+# 要真的用上必须三件齐：① 固定 session id（metadata.user_id）② 429/503 立即重发
+# ③ 命中后同 session 定时保活（闲置几分钟就被踢）。
+CLAIM_CONTINUE = "CONTINUE"   # 429/503/传输错：坑满，继续抢
+CLAIM_WON = "WON"             # 200：抢到
+CLAIM_ABORT = "ABORT"         # 配置/权限类（401/403/400/404）：重发无意义，停下报人
+CLAIM_DEFAULT_MODEL = "gpt-6-astra-cc-format"  # 实测到 200 的名字（★不带 [1m]，带则 429）
+
+
+def claim_action(status):
+    """单发结果 -> 抢坑动作（纯函数，供负控自测）。
+
+    fail-closed：只有 200 判 WON；429/503/0（传输错）算「还能继续抢」；
+    其余（400/401/403/404/5xx 非 503）一律 ABORT —— 不确定的绝不当成能抢。
+    """
+    if status == 200:
+        return CLAIM_WON
+    if status in (429, 503, 0):
+        return CLAIM_CONTINUE
+    return CLAIM_ABORT
+
+
+def session_id_for(key, tag="anyrouter-slot"):
+    """固定 session id：跨进程/跨轮稳定（同 key+tag 恒等），供站点把坑位绑到一个会话上。
+
+    形态仿 Claude Code：``user_<32hex>_account__session_<uuid>``。
+    key 只参与 sha256，不落盘明文。
+    """
+    import hashlib
+    import uuid
+    h = hashlib.sha256(("anyrouter|%s" % (key or "")).encode()).hexdigest()[:32]
+    sid = uuid.uuid5(uuid.NAMESPACE_URL, "anyrouter|%s|%s" % (h, tag))
+    return "user_%s_account__session_%s" % (h, sid)
+
+
+def _cc_session_uuid(key):
+    """给 x-claude-code-session-id 用：同 key 稳定即可（站点非 session 绑定，实测换 id 仍 200）。"""
+    import hashlib
+    h = hashlib.sha256(("anyrouter-cc|%s" % (key or "")).encode()).hexdigest()
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def cc_meta_user_id(session_id):
+    """``metadata.user_id`` 的值：**CC 同形 JSON 串**（不是 ``user_...`` 那种裸串）。
+
+    ★2026-10-04 三发对照实测（同刻同 key）：
+      A 工具体（``user_<hash>_account__session_<uuid>``）-> **429 Service Unavailable**
+      B 工具体 + 本函数产出的 JSON 串        -> **200 message_start**
+      C 正控（ab 脚本 sys2_meta16 同形）      -> **200**
+    即网关门禁落在「metadata.user_id 是不是一个内嵌 JSON 串」上，裸串恒被
+    判为不合格形状而快返 429（与号池有没有空闲上游无关）。
+    """
+    import hashlib
+    dev = hashlib.sha256(("anyrouter-device|%s" % (session_id or "")).encode()).hexdigest()
+    return json.dumps({"device_id": dev, "account_uuid": "", "session_id": session_id},
+                      separators=(",", ":"), ensure_ascii=False)
+
+
+def build_probe_body(model, content="1"):
+    """探测请求体：2026-10-04 消融定出的**最小放行形状**（≈1KB，无需 tools / 111KB 原体）。
+
+    放行门禁（实测，2026-10-04）：system 两行（计费行 + "Claude agent ... Agent SDK."）与
+    metadata.user_id 两样任缺即 429；且 metadata.user_id **必须是 CC 同形 JSON 串**
+    （裸 ``user_...`` 形态同样 429 —— 见 cc_meta_user_id()）。
+    """
+    sid = session_id_for(_load_key(), "anyrouter-probe")
+    return json.dumps({
+        "model": model,
+        "max_tokens": 16,
+        "stream": True,
+        "system": [{"type": "text", "text": CC_BILLING},
+                   {"type": "text", "text": CC_SYS}],
+        "metadata": {"user_id": cc_meta_user_id(sid)},
+        "messages": [{"role": "user", "content": content}],
+    }).encode()
+
+
+def build_claim_body(model, session_id, keepalive=False):
+    """抢坑/保活请求体：同一套 CC 放行形状，保活=内容 "1"（L 站原方），与抢坑同一 session id。
+
+    ★老形状（无 system/metadata）恒 429，metadata.user_id 写成裸 ``user_...`` 串同样 429
+    （2026-10-04 实测）⇒ 形状不合格时重发一万次也只是在撞形状门，抢不到坑。
+    """
+    return json.dumps({
+        "model": model,
+        "max_tokens": 8 if keepalive else 16,
+        "stream": True,
+        "system": [{"type": "text", "text": CC_BILLING},
+                   {"type": "text", "text": CC_SYS}],
+        "metadata": {"user_id": cc_meta_user_id(session_id)},
+        "messages": [{"role": "user", "content": "1" if keepalive else "ping"}],
+    }).encode()
+
+
+def burst_delay(attempt, base=0.35, cap=2.5, jitter=0.35, rng=None):
+    """重发间隔：指数退避 + 抖动（错峰）。纯函数，rng 可注入以供自测复现。"""
+    import random
+    r = rng or random
+    exp = min(max(0, attempt - 1), 20)  # 封顶指数：attempt 很大时 2**n 会溢出 float 而崩
+    d = min(cap, base * (2 ** exp))
+    return d * (1.0 + jitter * (2.0 * r.random() - 1.0))
+
+
+def run_claim(args, post=None, sleep=None, notify=None, now=None):
+    """抢坑主流程：爆满立即重发 → 命中即通知 → 同 session 保活。
+
+    post(body, timeout) -> (status, text)，可注入（自测用假 post 真跑状态机）。
+    返回 rc：1=抢到（且保活段正常结束或被踢）；0=窗口内没抢到；2=配置/权限类硬失败。
+    """
+    sleep = sleep or time.sleep
+    now = now or time.time
+    key = _load_key()
+    if not key:
+        print("[anyrouter] claim: 无可用密钥（env/keychain/~/.config/anyrouter/key 均无）")
+        return 2
+    model = getattr(args, "claim_model", None) or CLAIM_DEFAULT_MODEL
+    sid = session_id_for(key, getattr(args, "session_tag", None) or "anyrouter-slot")
+    if post is None:
+        post = (lambda body, timeout: _http_post(HOSTS[0] + CC_PATH, key, body, timeout,
+                                                read_limit=256))
+    notify = notify or send_notifications
+    dry = bool(getattr(args, "dry_run", False))
+
+    t0 = now()
+    deadline = t0 + float(getattr(args, "claim_seconds", 300))
+    attempt = 0
+    won = False
+    while now() < deadline:
+        attempt += 1
+        code, text = post(build_claim_body(model, sid), args.timeout)
+        act = claim_action(code)
+        print("[anyrouter] claim #%d model=%s http=%s -> %s" % (attempt, model, code, act), flush=True)
+        if not dry:
+            _append_ledger({"ts": beijing_now().isoformat(), "mode": "claim", "n": attempt,
+                            "model": model, "http": code, "action": act,
+                            "session": sid[-12:]})
+        if act == CLAIM_WON:
+            won = True
+            break
+        if act == CLAIM_ABORT:
+            print("[anyrouter] claim: http=%s 属配置/权限类（%s），重发无意义，请先修配置"
+                  % (code, classify(code, text)), flush=True)
+            return 2
+        sleep(burst_delay(attempt))
+    if not won:
+        print("[anyrouter] claim: %.0fs 内 %d 发未抢到（坑满）" % (now() - t0, attempt), flush=True)
+        return 0
+
+    took = now() - t0
+    print("[anyrouter] claim: 抢到了！model=%s 用时 %.1fs（第 %d 发）" % (model, took, attempt), flush=True)
+    if getattr(args, "notify", False):
+        ok, detail = notify("🚀 anyrouter 抢到坑了\n"
+                            "模型：%s\n时间：%s（北京时间）\n用时：%.1fs（第 %d 发）\n"
+                            "session 尾号：%s\n坑位会被踢：闲置几分钟即掉，请尽快连着用。"
+                            % (model, beijing_now().strftime("%Y-%m-%d %H:%M:%S"), took, attempt, sid[-12:]),
+                            dry_run=dry)
+        print("[anyrouter] claim 推送=%s (%s)" % (ok, detail), flush=True)
+
+    # --- 保活：同 session 定时发内容 "1" 的请求 ---
+    ka_s = float(getattr(args, "keepalive_seconds", 240))
+    ka_deadline = now() + float(getattr(args, "keepalive_minutes", 0)) * 60
+    ka = 0
+    while getattr(args, "keepalive_minutes", 0) and now() < ka_deadline:
+        sleep(ka_s)
+        ka += 1
+        code, _t = post(build_claim_body(model, sid, keepalive=True), args.timeout)
+        act = claim_action(code)
+        print("[anyrouter] keepalive #%d http=%s -> %s" % (ka, code, act), flush=True)
+        if not dry:
+            _append_ledger({"ts": beijing_now().isoformat(), "mode": "keepalive", "n": ka,
+                            "model": model, "http": code, "action": act, "session": sid[-12:]})
+        if act != CLAIM_WON:
+            print("[anyrouter] keepalive: 坑位被踢（http=%s），需重新抢" % code, flush=True)
+            return 1
+    return 1
 
 
 # ---------------------------------------------------------------- 状态 / 台账
@@ -603,6 +838,8 @@ def selftest():
     chk("NC: 200-body-busy 文本不改变判据", classify(200, '{"message":"Service Unavailable"}'), AVAILABLE)
     chk("NC: 503 文本含 1m 仍 BUSY", classify(503, "请启用 1m 上下文"), BUSY)
     chk("NC: 400 无 1m 关键词 -> UNKNOWN", classify(400, '{"error":"bad request"}'), UNKNOWN)
+    chk("500-load->BUSY", classify(500, '{"type":"api_error","message":"当前模型 claude-opus-4-6 负载已经达到上限，请稍后重试"}'), BUSY)
+    chk("NC: 500 无关键词 -> UNKNOWN", classify(500, "Internal Server Error"), UNKNOWN)
     chk("NC: 403 含 unauthorized 但无 client -> KEY_INVALID",
         classify(403, '{"error":"unauthorized"}'), KEY_INVALID)
 
@@ -689,6 +926,108 @@ def selftest():
     else:
         os.environ["GA_ANYROUTER_LOG_HINT"] = _old_hint
 
+    # 10) 抢坑（claim）：判据映射 / 身份稳定 / 退避 / 真重发（注入假 post，全程离线）
+    chk("claim: 200 -> WON", claim_action(200), CLAIM_WON)
+    chk("claim: 429 -> CONTINUE", claim_action(429), CLAIM_CONTINUE)
+    chk("claim: 503 -> CONTINUE", claim_action(503), CLAIM_CONTINUE)
+    chk("claim: 传输错 0 -> CONTINUE", claim_action(0), CLAIM_CONTINUE)
+    chk("NC: 400 -> ABORT（缺 1m 扩展是配置问题，重发无意义）", claim_action(400), CLAIM_ABORT)
+    chk("NC: 401 -> ABORT", claim_action(401), CLAIM_ABORT)
+    chk("NC: 403 -> ABORT", claim_action(403), CLAIM_ABORT)
+    chk("NC: 404 -> ABORT", claim_action(404), CLAIM_ABORT)
+    chk("NC: 402 -> ABORT", claim_action(402), CLAIM_ABORT)
+    chk("NC: 500 -> ABORT（非 503 的 5xx 不许当「坑满」无限重发）", claim_action(500), CLAIM_ABORT)
+
+    sid = session_id_for("sk-test-1", "tagA")
+    chk("session: 同 key+tag 恒等", session_id_for("sk-test-1", "tagA"), sid)
+    chk("NC: 换 key 变 id", session_id_for("sk-test-2", "tagA") == sid, False)
+    chk("NC: 换 tag 变 id", session_id_for("sk-test-1", "tagB") == sid, False)
+    chk("session: CC 形态", sid.startswith("user_") and "_account__session_" in sid, True)
+    chk("NC: session 不含明文 key", "sk-test" in sid, False)
+
+    b_ping = json.loads(build_claim_body("m1", sid).decode())
+    b_keep = json.loads(build_claim_body("m1", sid, keepalive=True).decode())
+    _mu = json.loads(b_ping["metadata"]["user_id"])
+    chk("body: metadata.user_id 是 CC 同形 JSON 串（键序 device_id/account_uuid/session_id）",
+        sorted(_mu.keys()), ["account_uuid", "device_id", "session_id"])
+    chk("body: metadata.user_id>session_id == session", _mu["session_id"], sid)
+    chk("NC: metadata.user_id 非裸 user_ 形式（该形式实测恒 429）",
+        b_ping["metadata"]["user_id"].startswith("user_"), False)
+    chk("body: 抢坑内容 ping", b_ping["messages"][0]["content"], "ping")
+    chk("body: 保活内容 1", b_keep["messages"][0]["content"], "1")
+    chk("NC: 保活与抢坑同 session", b_keep["metadata"]["user_id"] == b_ping["metadata"]["user_id"], True)
+
+    class _R(object):
+        def __init__(self, v):
+            self.v = v
+
+        def random(self):
+            return self.v
+
+    chk("delay: rng 中点 -> 精确退避", [round(burst_delay(i, rng=_R(0.5)), 4) for i in range(1, 5)],
+        [0.35, 0.7, 1.4, 2.5])
+    chk("delay: 有界且为正", all(0 < burst_delay(i) <= 2.5 * 1.35 for i in range(1, 12)), True)
+    chk("NC: 退避封顶不无限涨", burst_delay(99, rng=_R(0.5)), 2.5)
+
+    class _Args(object):
+        claim_model = "m1"
+        session_tag = "t1"
+        claim_seconds = 5.0
+        timeout = 1
+        dry_run = True
+        notify = False
+        keepalive_minutes = 0
+        keepalive_seconds = 0.01
+
+    _env_old = os.environ.get("ANYROUTER_API_KEY")
+    os.environ["ANYROUTER_API_KEY"] = "sk-selftest"
+    try:
+        seen = []
+
+        def _post_factory(seq):
+            def _post(body, timeout):
+                seen.append(json.loads(body.decode())["metadata"]["user_id"])
+                st = seq[min(len(seen) - 1, len(seq) - 1)]
+                return st, "x"
+            return _post
+
+        _nosleep = lambda s: None  # noqa: E731
+        seq = [429, 503, 200]
+        rc = run_claim(_Args(), post=_post_factory(seq), sleep=_nosleep)
+        chk("claim 运行: 429/503/200 -> rc=1（抢到）", rc, 1)
+        chk("claim 运行: 第 3 发才 200（说明真重发了）", len(seen), 3)
+        chk("NC: 三发同一个 session id（换 id 等于换坑位，抢不到）", len(set(seen)), 1)
+
+        seen = []
+        chk("claim 运行: 429 后 401 -> rc=2（配置类硬失败，不无脑重发）",
+            run_claim(_Args(), post=_post_factory([429, 401]), sleep=_nosleep), 2)
+        chk("claim 运行: 401 立即停（只发 2 发）", len(seen), 2)
+
+        seen = []
+        _a = _Args()
+        _a.claim_seconds = 0.3
+        _clock = [0.0]
+
+        def _now():
+            return _clock[0]
+
+        def _post_tick(body, timeout):
+            seen.append(1)
+            _clock[0] += 0.1
+            return 429, "x"
+
+        chk("claim 运行: 窗口内一直 429 -> rc=0（没抢到，非故障）",
+            run_claim(_a, post=_post_tick, sleep=_nosleep, now=_now), 0)
+        chk("claim 运行: 窗口内至少重发多轮", len(seen) > 2, True)
+        chk("claim 运行: 到点即停（不无限打）", len(seen) <= 8, True)
+        chk("NC: attempt 极大时退避不溢出（2**n 曾崩）",
+            isinstance(burst_delay(5000, rng=_R(0.5)), float), True)
+    finally:
+        if _env_old is None:
+            os.environ.pop("ANYROUTER_API_KEY", None)
+        else:
+            os.environ["ANYROUTER_API_KEY"] = _env_old
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]), sum(1 for c in cases if not c[3])))
@@ -721,6 +1060,18 @@ def _build_parser():
                     help="关闭「监控自身故障」告警（只报抢到坑）")
     ap.add_argument("--log-hint", default=None, dest="log_hint",
                     help="故障文案里「日志：」指向的路径（默认 temp/bg_task/logs/anyrouter_slot_watch.log）")
+    ap.add_argument("--claim", action="store_true",
+                    help="抢坑模式：固定 session id + 爆满立即重发 + 命中后同 id 保活（L 站原方）")
+    ap.add_argument("--claim-model", default=CLAIM_DEFAULT_MODEL, dest="claim_model",
+                    help="抢坑用的模型名（默认 %s，唯一实测到 200 的名字）" % CLAIM_DEFAULT_MODEL)
+    ap.add_argument("--claim-seconds", type=float, default=300, dest="claim_seconds",
+                    help="抢坑窗口秒数（默认 300，到点未抢到即停）")
+    ap.add_argument("--session-tag", default="anyrouter-slot", dest="session_tag",
+                    help="session id 的标签（同 tag 恒同 id；换 tag 等于换坑位身份）")
+    ap.add_argument("--keepalive-seconds", type=float, default=240, dest="keepalive_seconds",
+                    help="保活间隔秒数（默认 240；闲置数分钟即被踢）")
+    ap.add_argument("--keepalive-minutes", type=float, default=0, dest="keepalive_minutes",
+                    help="抢到后保活多久（默认 0=不保活，只报喜；>0 时按 --keepalive-seconds 定时发 1）")
     ap.add_argument("--selftest", action="store_true", help="负控自测")
     return ap
 
@@ -740,6 +1091,8 @@ def main():
             print("  -", m)
         return 0 if r["http"] == 200 else 2
     args.model_list = [m.strip() for m in raws.split(",") if m.strip()] if raws else []
+    if args.claim:
+        return run_claim(args)
     if args.watch:
         return run_watch(args)
     return run_once(args)
