@@ -845,6 +845,12 @@ HOLD_COOLDOWN_S = 600
 # 保活跑在别处（后台线程/独立进程），它看不见「你此刻是否在用」⇒给一个显式开关：
 #   `--stop-hold` 写旗标 ⇒ 正在跑的保活最多 HOLD_STOP_STEP_S 秒内收手；已完成的不回补。
 HOLD_STOP_STEP_S = 5.0
+# ---- 保活状态「陈旧判据」（2026-10-04 实测缺陷）----
+# hold_active 存在 state.json 里，但它描述的是**进程内的后台线程**：探测进程被杀/重启后标志会残留 true，
+# 于是 should_auto_hold 永久返回 None ⇒ 之后即使再命中 200 也不会保活（实测 12:57 的标志残留 43min 无人察觉）。
+# 判据：① hold_pid 记的是保活线程所属进程，该进程没了 ⇒ 陈旧；② 或 now 超过 hold_deadline_ts+余量。
+DEFAULT_HOLD_MINUTES = 30          # 未登记 hold_minutes 时的兜底（与 CLI 默认一致）
+HOLD_STALE_SLACK_S = 120           # 超窗余量（keepalive 步长量级内不误判）
 
 
 def _hold_stop_path():
@@ -953,15 +959,79 @@ def sleep_with_stop(seconds, step=HOLD_STOP_STEP_S, sleep=None, stop_check=None)
     return bool(check())
 
 
-def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S):
-    """命中可用且不在保活中/冷却内 → 返回该可用结果（dict），否则 None。纯函数，供负控自测。
+def _pid_alive(pid):
+    """pid 是否存活（`ps -p`，只读判活，绝不杀进程）。异常/解析失败按「活」处理（宁可漏重启不误重启）。"""
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        import subprocess
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "pid="],
+                           capture_output=True, text=True, timeout=5)
+        return str(pid) in (r.stdout or "")
+    except Exception:
+        return True
 
-    ★负控口径：全 BUSY / 空结果 / 已在保活（hold_active）/ 距上次保活不足 cooldown ⇒ 一律 None。
+
+def _parse_iso_ts(s):
+    """ISO 时间串（含 +08:00 偏移）→ epoch 秒；无法解析 ⇒ None。"""
+    if not s:
+        return None
+    try:
+        import datetime as _dt
+        return _dt.datetime.fromisoformat(str(s)).timestamp()
+    except Exception:
+        return None
+
+
+def hold_is_stale(state, now, minutes=None, pid_alive=None):
+    """hold_active 描述的是「进程内后台线程」，却持久化在 state 里 ⇒ 进程被杀会留下假 true。
+    返回 True = 该标志已陈旧、可以重新保活。纯函数（pid_alive 可注入），供负控自测。
+
+    陈旧判据（任一成立）：
+      ① hold_pid 有值且该进程已不存在；
+      ② now > hold_deadline_ts + HOLD_STALE_SLACK_S（线程可能早结束却没来得及回写）；
+      ③ 时间信息完全缺失/不可解析（宁可多保活，不让用户丢坑——`ps -p` 判活兜住重复保活）。
+    """
+    if not state.get("hold_active"):
+        return False
+    pid = state.get("hold_pid")
+    if pid is not None:
+        pa = pid_alive or _pid_alive
+        try:
+            if not pa(int(pid)):
+                return True
+        except Exception:
+            return True
+    try:
+        deadline = state.get("hold_deadline_ts")
+        if deadline is None:
+            since = _parse_iso_ts(state.get("hold_since"))
+            if since is None:
+                return True
+            try:
+                m = float(minutes if minutes is not None else (state.get("hold_minutes") or 0) or DEFAULT_HOLD_MINUTES)
+            except Exception:
+                m = float(DEFAULT_HOLD_MINUTES)
+            deadline = since + m * 60
+        return float(now) > float(deadline) + HOLD_STALE_SLACK_S
+    except Exception:
+        return True
+
+
+def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S, hold_minutes=None, pid_alive=None):
+    """命中可用且不在（有效的）保活中/冷却内 → 返回该可用结果（dict），否则 None。纯函数，供负控自测。
+
+    ★负控口径：全 BUSY / 空结果 / 已在**有效**保活（hold_active 且非陈旧）/ 距上次保活不足 cooldown ⇒ 一律 None。
+    ★2026-10-04：hold_active 增「陈旧判据」（见 hold_is_stale）——进程被杀留下的假 true 不再永久压制保活。
     """
     avail = [r for r in (results or []) if r.get("verdict") == AVAILABLE]
     if not avail:
         return None
-    if state.get("hold_active"):
+    if state.get("hold_active") and not hold_is_stale(state, now, hold_minutes, pid_alive):
         return None
     try:
         ts = float(state.get("last_hold_ts") or 0)
@@ -1010,6 +1080,10 @@ def start_auto_hold(args, hit, post=None, log=None):
     st["hold_active"] = True
     st["hold_since"] = beijing_now().isoformat()
     st["hold_model"] = hit.get("model")
+    # ★2026-10-04 活性判据：进程没了 ⇒ 该标志即陈旧（见 hold_is_stale），否则进程更替后会永久压制保活
+    st["hold_pid"] = os.getpid()
+    st["hold_minutes"] = float(args.auto_hold_minutes)
+    st["hold_deadline_ts"] = time.time() + float(args.auto_hold_minutes) * 60
     _save_state(st)
     log("[anyrouter] 命中可用 ⇒ 启动自动占坑保活：model=%s session尾号=%s 时长=%.0f 分钟（每 %.0fs 续一次）"
         % (hit.get("model"), sid[-12:], float(args.auto_hold_minutes), float(args.keepalive_seconds)))
@@ -1021,6 +1095,7 @@ def start_auto_hold(args, hit, post=None, log=None):
                        post or _post, time.sleep, time.time, log=log, timeout=args.timeout)
         st2 = _load_state()
         st2["hold_active"] = False
+        st2.pop("hold_pid", None)          # ★清活性标记，避免下一次被误判「还在保活」
         st2["last_hold_ts"] = time.time()
         st2["last_hold_ok"] = bool(ok)
         _save_state(st2)
@@ -2082,7 +2157,19 @@ def selftest():
     chk("NC: 全 BUSY -> 不触发", should_auto_hold(_bs, {}, 1000), None)
     chk("NC: 空结果 -> 不触发", should_auto_hold([], {}, 1000), None)
     chk("NC: None 结果 -> 不触发", should_auto_hold(None, {}, 1000), None)
-    chk("NC: 保活中 -> 不重复触发", should_auto_hold(_av, {"hold_active": True}, 1000), None)
+    _alive = lambda p: p == os.getpid()
+    chk("NC: 保活在跑（活 pid+未过期）-> 不重复触发",
+        should_auto_hold(_av, {"hold_active": True, "hold_pid": os.getpid(),
+                               "hold_deadline_ts": 1000 + 600, "hold_minutes": 30},
+                         1000, 600, 30, _alive), None)
+    chk("★陈旧：hold_pid 已死 -> 允许重新保活",
+        (should_auto_hold(_av, {"hold_active": True, "hold_pid": 999999,
+                                "hold_deadline_ts": 1000 + 600}, 1000, 600, 30, _alive) or {}).get("model"), "m1")
+    chk("★陈旧：超窗（deadline 已过+余量）-> 允许重新保活",
+        (should_auto_hold(_av, {"hold_active": True, "hold_pid": os.getpid(),
+                                "hold_deadline_ts": 1000 - 300}, 1000, 600, 30, _alive) or {}).get("model"), "m1")
+    chk("★陈旧：无时间字段（旧版残留标志）-> 允许重新保活",
+        (should_auto_hold(_av, {"hold_active": True}, 1000, 600, 30, _alive) or {}).get("model"), "m1")
     chk("NC: 冷却内 -> 不触发", should_auto_hold(_av, {"last_hold_ts": 990}, 1000, 600), None)
     chk("冷却已过 -> 触发", (should_auto_hold(_av, {"last_hold_ts": 300}, 1000, 600) or {}).get("model"), "m1")
     chk("NC: last_hold_ts 脏值 -> 不崩且触发",
