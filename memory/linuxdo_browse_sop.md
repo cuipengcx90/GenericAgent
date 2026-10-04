@@ -31,3 +31,21 @@ return JSON.stringify({fail:true,now:location.pathname});
 3. **驻留 sleep 必须放 code_run**：web_execute_js 里长 sleep 会挂满超时被强杀且占住 tab。
 4. **只动任务 tab**：用户浏览器常有自己 tab，所有 web 调用显式传 `switch_tab_id`，禁碰其他 tab。
 5. 「随机」要真随机分布（`random.choice` 混合区间），非固定间隔；深翻步数同取随机。
+
+## 「浏览帖子」计数不涨的根因与修法（2026-10-05 实测）
+
+现象：40 帖只 +291（≈7 楼/帖），浏览话题涨但 posts_read 几乎不动。
+根因：Discourse posts_read 只计被 `POST /topics/timings` 上报的楼层——screen-track 每 1000ms tick、tick 瞬间该楼在视口内才 +1s、约 60s flush 提交（话题切换 reset 只提交已收集部分）。快滚（14 步×950ms×~500px）+ 每帖仅待 ~20s ⇒ 每楼 1–2 个 tick 易错过、flush 常赶不上 ⇒ 大量楼层丢失。
+修法（慢滚+底驻+回滚三件套，手动与 daemon 同款）：
+1. 滚动步长降到 300–440px（<半楼）、间隔 1.2–1.8s、22–30 步 ⇒ 每楼 ≥2 个 tick 覆盖
+2. 滚到底后**底部驻留 70–84s**（跨 60s flush 周期，flush 必触发一次）
+3. 回滚 10 步（每楼二次 tick 机会）
+预期：长帖可计 20–40 楼/帖（旧节奏 ~7）。
+
+## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
+
+触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 6/6）：
+- `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
+- 防检测（后台版在单任务版之上再拉稀）：帖间 90–240s（25% 概率 240–420s）+ 深翻步数随机 + 每批随机 2–4 次只逛列表页不进帖 + `--daily-cap` 每日话题上限 + 单段 90min 后休息 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
+- 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
