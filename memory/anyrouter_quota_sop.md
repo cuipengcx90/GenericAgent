@@ -207,7 +207,8 @@
 ## 1.6 社区状态板：linux.do「any 今天挂了吗」集中帖（长期参考入口）
 
 - 帖：<https://linux.do/t/topic/2496114> —【any 今天挂了吗】any状态&综合讨论集中贴（又名「any 在线监测器」）。**社区互报板**，主帖明文「请注意 any 无任何官方群组、社媒、客服」；判「我这次报错是常态还是事故」先扫这里。
-- OB 侧结构化判读：obsidian vault（`~/develop/obsidian-note`）的 `60 Wiki/entities/anyrouter.md`（状态码速查表 + 「挤」的机制）与 `60 Wiki/topics/linuxdo-anyrouter-status-thread.md`；逐字快照 `50 Raw/blog/linuxdo-anyrouter-status-2026-10-04.md`（vault=`~/develop/obsidian-note`）。
+- OB 侧结构化判读：obsidian vault（`~/develop/obsidian-note`）的 `60 Wiki/entities/anyrouter.md`（状态码速查表 + 「挤」的机制）与 `60 Wiki/topics/linuxdo-anyrouter-status-thread.md`（**§7「问题 → 怎么解决」14 行可执行表**=全帖结论归并）；逐字快照 `50 Raw/blog/linuxdo-anyrouter-status-2026-10-04.md`（vault=`~/develop/obsidian-note`）。
+- 查「现在各面在同刻什么状态」用 `python3 tools/anyrouter_slot_watch.py --summary`（只读台账：最近 N 轮各模型判据分布 + 末次非号池满；零请求零推送）——**claude 面一直都在探**（默认名单里 6 个 claude 名），别因推送文案只出现某个名就以为漏探。
 - 社区版错误码表（楼 #22102，09-30）：`429`=上游渠道限流→重试；`400`=会话绑定渠道切换致加密 reasoning 不兼容→重开对话/清理；`403`=**号被封禁**→无解；`500`=负载过高→重试；`524`=上游网关超时（请求过大）→重开对话/清理 image 块。
 - 与工具判据的关系：社区「没挤上去」=本工具 `POOL_BUSY`（429/503/500+负载上限）；社区常态是「一直 429 / 空回」⇒ **严禁把 429 读成没额度**（本机同刻余额 $6472.10 而 591 发 0 个 200）。
 - 抢坑经验（09-28~10-04 段）：挤/踢按分钟波动（#21309「10:45被踢，10:55挤进来了」）；没有技巧就是重试（#21297「没有技巧都一样硬挤」）；**换名比死磕有效**（#21408 astra 秒进 / #21803 换 gpt-6-astra-cc-format 立马进入）；已绑定上游的老会话更耐挤（#21794「老对话还能用」）；多人同刻报 429 才是站级事故（#22441/#22449）。
@@ -221,7 +222,8 @@ python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（按名�
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
 python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
 python3 tools/anyrouter_slot_watch.py --verify-pose     # 姿势自证：探针体 vs 真 CC 体同刻对照（--pose-n 控制发数）
-python3 tools/anyrouter_slot_watch.py --selftest        # 177 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记）
+python3 tools/anyrouter_slot_watch.py --summary          # 只读台账摘要：最近 N 轮各模型判据分布 + claude 面覆盖（零请求/零推送）
+python3 tools/anyrouter_slot_watch.py --selftest        # 208 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记/--summary 摘要）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
@@ -287,7 +289,7 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 - **通知文案**：命中推送显式写「**已自动保活 N 分钟**」，并**不再**出现「尽快连着用」这类要人盯的措辞（未开保活时该措辞保留）。
 - **通知里给「怎么用」**（2026-10-04 本轮加）：命中推送**直接印出保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可粘贴的复用命令 `claude --session-id <uuid>`，并注明「不指定 session 也照常能用；指定=复用这个正在被保活的身份」。实现=`_build_text(..., sid=...)` 形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；不传 `sid` 时文本逐字不变。⇒ 收到推送即可原地接上，无需再问「保活的是哪个身份」。自测随之 197 → **200 passed**（三断言：带 sid 出完整 UUID / 出可粘贴命令 / 不带 sid 无 `--session-id`）。
 - **CLI / 透传**：`tools/anyrouter_slot_watch.py --auto-hold-minutes 30 --hold-cooldown 900`；`tools/anyrouter_slot_watchd.py` 同名参数并在 `spawn_watch()` 透传（守护默认起 `--auto-hold-minutes 30`）。
-- **自测**：watch `--selftest` 197/197（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控）；watchd `--selftest` 27/27。
+- **自测**：watch `--selftest` **208/208**（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控 / `--summary` 摘要与截断）；watchd `--selftest` 27/27。
 - **边界**（与 §1.2(4) 的关系）：保活**不假设**站点把坑位绑到 session id 上；它只是「以已过闸的同身份持续发请求」这一**行为层**兜底。§1.2(4) 的 UNVERIFIED 结论不变（那是「机制是否存在于站点侧」），本节的效力仅来自「同一个已过闸身份保持活跃」。
 - **成本**：30 分钟窗口 + 900s 冷却 ⇒ 额外额度消耗**非零但有限**（已登记）。
 - **残余**：① 号池满时保活无解（它不能创造上游供给）；② 若站点将来改为每请求强绑 session，保活会与被探测请求脱钩，须重新标定。

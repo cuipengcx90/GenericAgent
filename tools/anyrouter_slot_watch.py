@@ -1081,6 +1081,75 @@ def _ledger_snippet(r):
     return txt[:160] or None
 
 
+# ---------------------------------------------------------------- 台账摘要（--summary，只读）
+# ★2026-10-04 起因：用户问「一直看你在探 gpt-6，Claude 面怎么没在探？」——
+#   实情是**每轮 8 个名都在探**（含 6 个 claude-*），但台账是 append-only JSONL，
+#   只有「命中 200」或「监控自身故障」才推送 ⇒ 全是 POOL_BUSY 时界面/通知里**看不见 claude 面**。
+#   本函数把「最近 N 轮各模型的判据分布」直接摊开，使覆盖面**可自证**（无需读 JSONL）。
+#   纯只读：不改台账、不推送、不落盘。
+def summarize_ledger(lines=12, path=None):
+    """最近 N 轮各模型判据分布（纯函数式只读，供 --summary 与负控自测）。
+
+    返回 {"ok":True,"rounds":n,"total_rounds":m,"ts_from","ts_to","models":{m:{...}}}
+    或 {"ok":False,"reason":"LEDGER_MISSING"|"NO_ROUNDS","path":p}
+    """
+    p = path or LEDGER_FILE
+    if not os.path.exists(p):
+        return {"ok": False, "reason": "LEDGER_MISSING", "path": p}
+    recs = []
+    with open(p, encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                recs.append(json.loads(ln))
+            except Exception:
+                continue                      # 坏行跳过：摘要绝不因一行损坏而失败
+    rounds = [r for r in recs if isinstance(r, dict) and r.get("results")]
+    if not rounds:
+        return {"ok": False, "reason": "NO_ROUNDS", "path": p}
+    n = max(1, int(lines))
+    tail = rounds[-n:]
+    per = {}
+    for r in tail:
+        ts = r.get("ts")
+        for x in r.get("results") or []:
+            if not isinstance(x, dict):
+                continue
+            m = x.get("model") or "?"
+            d = per.setdefault(m, {"counts": {}, "last_verdict": None, "last_ts": None,
+                                   "last_non_busy": None, "n": 0})
+            v = x.get("verdict") or "?"
+            d["counts"][v] = d["counts"].get(v, 0) + 1
+            d["n"] += 1
+            d["last_verdict"] = v
+            d["last_ts"] = ts
+            if v != "POOL_BUSY":             # 号池满是「预期常态」，不算信号
+                d["last_non_busy"] = {"ts": ts, "verdict": v, "http": x.get("http")}
+    return {"ok": True, "rounds": len(tail), "total_rounds": len(rounds),
+            "ts_from": tail[0].get("ts"), "ts_to": tail[-1].get("ts"),
+            "models": per, "path": p}
+
+
+def render_summary(s):
+    """把 summarize_ledger 的结果渲染成一段人读文本（纯函数）。"""
+    if not s.get("ok"):
+        return "[anyrouter] 台账摘要不可用：%s（%s）" % (s.get("reason"), s.get("path"))
+    per = s["models"]
+    claude = [m for m in per if str(m).startswith("claude")]
+    out = ["[anyrouter] 台账摘要：最近 %d 轮 / 共 %d 轮  %s → %s"
+           % (s["rounds"], s["total_rounds"], s.get("ts_from"), s.get("ts_to")),
+           "  覆盖面：%d 个模型（其中 claude 面 %d 个）" % (len(per), len(claude)),
+           "  %-32s %5s  %s" % ("模型", "轮次", "判据分布 / 末次 / 末次非号池满")]
+    for m, d in per.items():
+        dist = " ".join("%s×%d" % (k, v) for k, v in sorted(d["counts"].items()))
+        lnb = d.get("last_non_busy")
+        lnb_txt = "-" if not lnb else "%s(%s)@%s" % (lnb["verdict"], lnb.get("http"), lnb["ts"])
+        out.append("  %-32s %5d  %s | 末次=%s | %s" % (m, d["n"], dist, d["last_verdict"], lnb_txt))
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------- 姿势自证（--verify-pose）
 # ★2026-10-04 起因：R538 引入「429 快返 = 形状不对」的判据（gate_suspect），但本地抓包逐发计时
 #   证明真 Claude Code 的 9 发请求**同样全是 429@1.5-2.3s**（95KB 完整体）⇒ 该判据属误判。
@@ -1921,6 +1990,51 @@ def selftest():
             {"http": 400, "detail": '{"error":{"message":"invalid codex request"}}'}) or ""),
         True)
 
+    # 9e) ★2026-10-04 --summary：把「最近 N 轮各模型判据分布」摊开，证明覆盖面（含 claude 面）
+    #     而不是靠界面/通知猜。纯只读 ⇒ 负控要覆盖：缺台账 / 全是非轮次行 / 坏行容错 / 截断轮数。
+    import tempfile as _tf
+    _d = _tf.mkdtemp(prefix="anr_summary_")
+    _lp = os.path.join(_d, "ledger.jsonl")
+    _rounds = [
+        {"ts": "t1", "results": [{"model": "claude-opus-4-8", "http": 429, "verdict": "POOL_BUSY"},
+                                 {"model": "gpt-6-astra", "http": 500, "verdict": "POOL_BUSY"}]},
+        {"ts": "t2", "results": [{"model": "claude-opus-4-8", "http": 429, "verdict": "POOL_BUSY"},
+                                 {"model": "gpt-6-astra", "http": 200, "verdict": "AVAILABLE"}]},
+        {"ts": "t3", "results": [{"model": "claude-opus-4-8", "http": 429, "verdict": "POOL_BUSY"},
+                                 {"model": "gpt-6-astra", "http": 500, "verdict": "POOL_BUSY"}]},
+    ]
+    with open(_lp, "w", encoding="utf-8") as _f:
+        for _r in _rounds:
+            _f.write(json.dumps(_r, ensure_ascii=False) + "\n")
+        _f.write("not json at all\n")                       # 坏行必须被跳过
+        _f.write(json.dumps({"ts": "x", "mode": "keepalive"}, ensure_ascii=False) + "\n")
+    _s = summarize_ledger(12, _lp)
+    chk("summary: 轮次计数（只数含 results 的行）", (_s["ok"], _s["rounds"], _s["total_rounds"]),
+        (True, 3, 3))
+    chk("summary: claude 面在覆盖率内且判据分布正确",
+        (_s["models"]["claude-opus-4-8"]["counts"], _s["models"]["claude-opus-4-8"]["last_non_busy"]),
+        ({"POOL_BUSY": 3}, None))
+    chk("summary: 末次非号池满可回读（AVAILABLE@t2）",
+        (_s["models"]["gpt-6-astra"]["counts"],
+         _s["models"]["gpt-6-astra"]["last_non_busy"]["verdict"],
+         _s["models"]["gpt-6-astra"]["last_non_busy"]["ts"]),
+        ({"POOL_BUSY": 2, "AVAILABLE": 1}, "AVAILABLE", "t2"))
+    chk("summary: --summary-lines 截断生效",
+        summarize_ledger(1, _lp)["rounds"], 1)
+    chk("summary: 文本含 claude 名与覆盖面行（人读自证）",
+        ("claude-opus-4-8" in render_summary(_s), "覆盖面：" in render_summary(_s)),
+        (True, True))
+    _miss = summarize_ledger(12, os.path.join(_d, "nope.jsonl"))
+    chk("NC: 台账缺失 -> LEDGER_MISSING（不是静默空摘要）",
+        (_miss["ok"], _miss["reason"]), (False, "LEDGER_MISSING"))
+    _only = os.path.join(_d, "only_meta.jsonl")
+    with open(_only, "w", encoding="utf-8") as _f:
+        _f.write(json.dumps({"ts": "x", "mode": "keepalive"}) + "\n")
+    chk("NC: 无 results 行 -> NO_ROUNDS（别把非轮次记录当探测）",
+        summarize_ledger(12, _only)["reason"], "NO_ROUNDS")
+    chk("NC: 不可用台账的文本不冒充摘要",
+        render_summary(_miss).startswith("[anyrouter] 台账摘要不可用"), True)
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]), sum(1 for c in cases if not c[3])))
@@ -1975,6 +2089,10 @@ def _build_parser():
                          "（默认 0=只报喜不占坑；占坑=用探测同一 session 每 --keepalive-seconds 发 1）")
     ap.add_argument("--hold-cooldown", type=float, default=HOLD_COOLDOWN_S, dest="hold_cooldown",
                     help="两次自动占坑之间的最小间隔秒数（默认 %d；防坑位抖动时反复占用）" % HOLD_COOLDOWN_S)
+    ap.add_argument("--summary", action="store_true",
+                    help="只读台账摘要：最近 N 轮各模型判据分布（含 claude 面覆盖面，零请求零推送）")
+    ap.add_argument("--summary-lines", type=int, default=12, dest="summary_lines",
+                    help="--summary 的回看轮数（默认 12）")
     ap.add_argument("--selftest", action="store_true", help="负控自测")
     return ap
 
@@ -1986,6 +2104,10 @@ def main():
     if getattr(args, "log_hint", None):
         os.environ["GA_ANYROUTER_LOG_HINT"] = str(args.log_hint)
     _apply_state_dir(getattr(args, "state_dir", None))
+    if getattr(args, "summary", False):
+        s = summarize_ledger(getattr(args, "summary_lines", 12))
+        print(render_summary(s))
+        return 0 if s.get("ok") else 2
     raws = getattr(args, "models", None)
     if raws == "__list__":
         r = list_models(_load_key())
