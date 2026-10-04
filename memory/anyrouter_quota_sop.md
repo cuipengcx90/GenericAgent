@@ -166,16 +166,43 @@
 | 请求 | 状态 | 头 | 说明 |
 |---|---|---|---|
 | `GET /login`（页面本体） | **200** | 无拦截头 | 网页文件正常，不是「整站被封」 |
-| `GET /api/status`、`/api/user/self`、`/api/pricing`、`/api/notice`、`/api/models` | **403** | `Server: ESA` + `X-Tengine-Error: denied by http_ratelimit` | 阿里云 ESA 边缘**按出口 IP 限流**，body 是 ESA 的 `403 Forbidden` 页 |
+| `GET /api/status`、`/api/user/self`、`/api/pricing`、`/api/notice`、`/api/models` | **403** | `Server: ESA` + `X-Tengine-Error: denied by http_ratelimit` | 阿里云 ESA 边缘**按访客的频次桶限流**（窗口型，会自愈；跨出口 IP 仍命中，见 §1.5.1），body 是 ESA 的 `403 Forbidden` 页 |
 | `GET /v1/messages` | 404（JSON） | 无拦截头 | `/v1/*` **不被这条规则拦**（只是 GET 不是合法调用） |
-| 异网旁证 `r.jina.ai/https://anyrouter.top/api/status` | **200 + 真 JSON**（公告数据） | — | 接口本身健康 ⇒ 403 是**我们这条出口 IP 的限流桶满了**，非封号、非没额度、非「客户端不是 CC」 |
+| 异网旁证 `r.jina.ai/https://anyrouter.top/api/status` | **200 + 真 JSON**（公告数据） | — | 接口本身健康 ⇒ 403 是**我们这条访问身份上的限流桶满了**（窗口型、会自愈；见 §1.5.1），非封号、非没额度、非「客户端不是 CC」 |
 
 判读铁律：
 
-- **403(`denied by http_ratelimit`) ≠ 封号 ≠ 没额度 ≠ 客户端检测**；它是 CDN 的 per-IP 频次桶（本机出口是 Clash 共享节点，多人共用同一出口 IP）。
+- **403(`denied by http_ratelimit`) ≠ 封号 ≠ 没额度 ≠ 客户端检测**；它是 CDN 的**访客级频次桶（时间窗口型）**：实测**换出口 IP 不解**（美/港/新三节点浏览器均 403、python 侧同刻却 200）、**同一 IP 等窗口过去即自愈**（2026-10-04 实测，见 §1.5.1）。
 - 该 403 只落在 `/api/*`（控制台/用量/定价等前端接口）⇒ **只影响你打开网页看面板**，不影响抢坑：探针走 `/v1/messages`（POST，带 `anthropic-beta: context-1m-2025-08-07`）与 `/v1/responses`，日志里从来只有 `429/500/502`（号池满/上游），**没有出现过 403**。
-- 处置：**换出口 IP 即恢复**（Clash 切节点，或用手机热点打开页面对照）；不换就等桶过期。切完仍 403 才是站点对 `/api` 面的全局收紧，只能等。
+- 处置：**等窗口过期（实测自愈）**；急着看面板可清 `anyrouter.top` 站点 cookie 后重登，或换浏览器/无痕窗口。**换 Clash 节点实测无效**（美/港/新三节点均 403，别再折腾节点）。
 - 另有 `X-Tengine-Error: denied by http_custom`（python 裸请求 `/` 时见）= CDN **自定义规则**拦裸客户端，返回 200 + 4321 B 反爬 JS 挑战页（`acw_sc__v2`）⇒ 与上面的 `http_ratelimit` 是**两条不同规则**，勿混判。
+
+### 1.5.1 决定性 A/B 与排除矩阵（2026-10-04，全部当场实测）
+
+同一时刻、**同一浏览器 tab**（`/console/log`）、同一出口 IP 上做 A/B，直接锁定「限流键 = 访客身份/时间窗口」而非 IP：
+
+| 试验 | 结果 | 排除了什么 |
+|---|---|---|
+| 浏览器 `fetch('/api/status', {credentials:'include'})`（**403 时段**） | **403** + `denied by http_ratelimit` | — |
+| 浏览器 `fetch('/api/status', {credentials:'omit'})`（同刻） | 200 + `denied by http_custom`（反爬挑战页） | 不是路径面无条件封禁；挑战层在限流层之前 |
+| 同 tab 稍后再打 `credentials:'include'` | **200 + 真 JSON（4142 B）** | **同一 IP 同一 cookie 由 403 转 200 ⇒ 时间窗口自愈**，非 IP、非 cookie 值、非账号 |
+| 面板实测（同 tab `innerText` 1169 字符） | 正常渲染：`linuxdo_89322` / `消耗额度: $0.00` / 使用日志表格 | 用户所见 403 已消失，网页已可用 |
+| 浏览器侧出口 IP（`ipwho.is`，带 CORS） | `104.28.165.53`（US / ASN 13335 Cloudflare） | 与 python 侧 **同 IP** ⇒ 先前「浏览器 403、python 200」不是出口 IP 差异 |
+| python 侧出口 IP（代理 / 不走代理） | `104.28.165.53` / `104.28.153.110`（均 CF，ASN 13335） | TUN 下「直连」仍是 Cloudflare IP，禁当真实直连证据（RULE 14） |
+
+排除矩阵（每条都实测过，避免下次重复烧轮次）：
+
+| 假设 | 试验 | 结论 |
+|---|---|---|
+| 账号被封 / 没额度 | 探针链路 `/v1/messages` 全程无 403（只有 429/500/503） | **排除** |
+| 出口 IP 被限流 | Clash 切美/港/新三节点，浏览器 `/api/*` 仍 403 | **排除**（勿再切节点） |
+| UA/头部/Referer | python 带浏览器式全头 → 200 | 排除 |
+| TLS 指纹 | `curl_cffi` impersonate chrome / chrome124 / safari / edge99 → 全 200 | 排除 |
+| 请求量/突发 | 同 cookie 连发 12 发 → 全 200 | 排除 |
+| cookie 值本身是桶键 | 把浏览器 cookie 拿到 python 用 → `http_custom` 挑战页（非 403） | 排除（且说明该 cookie 对 python 侧无效） |
+| 站点对 `/api` 全局收紧 | 同刻 `r.jina.ai/https://anyrouter.top/api/status` → 200 真 JSON；异网访问正常 | 排除 |
+
+**判读铁律（新增）**：见到 `http_ratelimit` 先当**临时窗口桶**处理 —— 不慌、不改配置、不切节点、不动 key；先等（或用另一浏览器/清站点 cookie 重登）。只有「换机器、换网络、换时段后**仍恒 403**」才升级为站点侧收紧。
 
 ## 2. 工具
 
