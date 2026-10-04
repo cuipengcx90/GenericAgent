@@ -20,7 +20,15 @@
   401 / 403 + 令牌无效类      -> KEY_INVALID      令牌无效/被封
   404 + 「不支持所选模型」     -> MODEL_UNSUPPORTED 该名不在 messages 面（走 OpenAI 面）
   500 + 「负载已经达到上限」      -> POOL_BUSY        与 429/503 同一件事（站点自述 api_error，2026-10-04 实测）
+  400 + 「invalid codex request」-> CODEX_SHAPE_REQUIRED 该名只吃 Codex 形状（见下节「两面」）
   其它（超时/DNS/其它 4xx5xx） -> UNKNOWN         不确定（fail-closed，不当成可用）
+
+两面（★形状单一源：探针 = 抢坑 = 实验，同一套客户端形状）
+  messages 面 /v1/messages?beta=true  = Claude Code 形状（system 计费行 + metadata.user_id …）
+  codex   面 /v1/responses            = Codex 形状（include=[reasoning.encrypted_content] + prompt_cache_key）
+  站点按「像不像真客户端」分流：形状不合格一律**秒拒**（CC 面 ~1.1s 429；codex 面 ~1.1s 400
+  invalid codex request）⇒ 形状错 = 假阴性（会把「有坑」读成「没坑」），故形状必须与真身一致，
+  且换形状要改这里一处（face_of/model 面登记表），禁在探针/抢坑/实验里各写一份。
 
 传输层铁律（实测）
   本机 curl_cffi(impersonate=chrome124) 对 anyrouter.top 恒 SSLError 握手失败，
@@ -93,6 +101,24 @@ CC_STAINLESS = {
 }
 BETA = CC_BETA       # 兼容旧自测/文案里的 BETA 引用
 UA = CC_UA
+# ---- Codex 面（/v1/responses）：与 CC 面并列的第二套「客户端形状」（2026-10-04 消融实测）----
+#   本站对 OpenAI 面模型另设「像不像真 Codex」门禁：body 必须**同时**含
+#     include=["reasoning.encrypted_content"]  与  prompt_cache_key（值任意；缺任一即
+#     400 {"code":"invalid_responses_request"} @~1.1s，页面显示 `invalid codex request`）。
+#   请求头无关、tools 无关、input 内容无关 ⇒ 最小放行体 ≈300B（见 build_codex_probe_body）。
+CODEX_PATH = "/v1/responses"
+CODEX_UA = "codex_exec/0.157.1 (Mac OS 26.0.1; arm64) vscode"   # 与门禁无关，照真身抄以免将来加头校验
+CODEX_ORIGINATOR = "codex_exec"
+CODEX_INCLUDE = ["reasoning.encrypted_content"]      # ★门禁必需键 1/2
+CODEX_REQUIRED_KEYS = ("include", "prompt_cache_key")  # ★门禁必需键 2/2
+FACE_MESSAGES = "messages"
+FACE_CODEX = "codex"
+# 面登记表（形状单一源）：默认 messages 面；走 OpenAI 面的模型必须在此登记，
+# 否则探针会拿 CC 形状去打它（实测裸名 gpt-6-astra 走 messages 面恒 404）。
+MODEL_FACE = {
+    "gpt-6-astra": FACE_CODEX,            # 2026-10-04 实测：/v1/responses + codex 形状 ⇒ 过闸（挂满超时）
+    "gpt-6-astra-cc-format": FACE_MESSAGES,
+}
 # 默认探测模型：站点在册、且能代表「坑」的模型（★名字一律不带 [1m] 后缀）
 MODELS = [
     "claude-opus-4-8",          # 2026-10-04 名测：在册（429 POOL_BUSY）；L 站攻略点名的易进名
@@ -101,7 +127,8 @@ MODELS = [
     "claude-opus-4-6",
     "claude-sonnet-4-20250514",
     "claude-haiku-4-5",         # 2026-10-04 名测：在册（429）；社区说「没啥人用」= 候选易进名
-    "gpt-6-astra-cc-format",
+    "gpt-6-astra-cc-format",    # messages 面（官方公告写法）
+    "gpt-6-astra",              # ★2026-10-04 新增：OpenAI/codex 面（探针此前完全没覆盖这一面）
 ]
 
 STATE_DIR = os.path.join(ROOT, "temp/anyrouter_watch")
@@ -126,12 +153,17 @@ CLIENT_REJECTED = "CLIENT_REJECTED"
 KEY_INVALID = "KEY_INVALID"
 UNKNOWN = "UNKNOWN"
 QUEUED = "QUEUED_NO_UPSTREAM"  # 过闸但上游无空闲槽：连接已建立后挂满超时（★≠链路故障、≠没额度）
+LINK_DOWN = "LINK_DOWN"        # ★2026-10-04 补：本机→站点链路不可达（同栈控制探针也拿不到响应）
+                               #   与 QUEUED 的差别是**证据**：QUEUED 要求「同栈控制请求拿到 HTTP 响应」
+                               #   才算「过闸了只是没坑」；拿不到证据一律 LINK_DOWN（fail-closed，
+                               #   不许把「连不上」乐观归因成「在排队」）
 EDGE_BLOCK = "EDGE_BLOCK"  # 403 + 边缘 WAF 页（阿里 ESA）：环境/限流面，非凭据问题
+CODEX_SHAPE_REQUIRED = "CODEX_SHAPE_REQUIRED"  # OpenAI 面形状门禁：400 invalid codex request（缺 include/prompt_cache_key）
 BROKEN = (CLIENT_REJECTED, KEY_INVALID)  # 属「配置/凭据坏了」而非「坑满了」
 
 # ---- 故障面（≠「没坑」）：连续 N 轮都是这些，才算「监控链路本身出问题」并告警 ----
 #   POOL_BUSY / NEED_1M 属正常观测（站点没坑），绝不算故障——否则每轮没坑都吵你一次。
-FAULT_TRANSPORT = "TRANSPORT"        # 全 UNKNOWN（网络/代理/DNS/超时）
+FAULT_TRANSPORT = "TRANSPORT"        # 全 UNKNOWN/LINK_DOWN（网络/代理/DNS/超时）
 FAULT_CREDENTIAL = "CREDENTIAL"      # 全 KEY_INVALID（令牌失效）
 FAULT_CLIENT = "CLIENT"              # 全 CLIENT_REJECTED（UA 白名单被拒）
 FAULT_MODEL_DRIFT = "MODEL_DRIFT"    # 全 MODEL_UNSUPPORTED（模型名不在 messages 面）
@@ -145,7 +177,8 @@ QUEUED_MIN_S = 8.0                   # 传输超时、但从发起到挂满 ≥ 
 
 ICON = {
     AVAILABLE: "✅ 可用（抢到坑）",
-    QUEUED: "🕐 已过闸、上游暂无空闲槽（排队中超时；不是链路故障，也不是没额度）",
+    QUEUED: "🕐 已过闸、上游暂无空闲槽（排队中超时；同栈控制探针已证链路可达）",
+    LINK_DOWN: "🔌 链路不可达（同栈控制探针也拿不到响应）⇒ 网络/代理面问题，不是「没坑」",
     BUSY: "⏳ 非 200（429/503；形状合格后未再出现，多为边缘限流/上游抖动）",
     EDGE_BLOCK: "🛡 被边缘 WAF 拦（403 + 阿里 ESA 页；自动重试）",
     NEED_1M: "⚠️ 需启用 1M 上下文",
@@ -167,6 +200,11 @@ def classify(status, body_text):
         return BUSY
     if status == 400 and ("1m" in low and ("上下文" in text or "context" in low)):
         return NEED_1M
+    if status == 400 and ("invalid codex request" in low or "invalid_responses_request" in low):
+        # ★OpenAI/codex 面形状门禁（2026-10-04 实测）：请求不像真 Codex（缺 include /
+        #   prompt_cache_key）⇒ ~1.1s 秒拒。既不是「没坑」也不是链路故障，是**探针形状不对**
+        #   （截图里那条 `invalid codex request` 即此类）⇒ 交 CODEX_SHAPE_REQUIRED，由探针自愈纠正。
+        return CODEX_SHAPE_REQUIRED
     if status == 403 and ("performance & security" in low or "esa" in low
                           or "<html" in low or "<!doctype html" in low):
         return EDGE_BLOCK   # 边缘 WAF 拦截页 ≠ 令牌问题（实测 2026-10-04）
@@ -197,7 +235,7 @@ def _is_uuid(s):
                           (s or "").strip().lower()))
 
 
-def classify_latency(http, verdict, elapsed_s):
+def classify_latency(http, verdict, elapsed_s, link_ok=None):
     """在 HTTP 判据之上加「延迟维度」（纯函数，供负控自测）。返回 (verdict, latency, queued)。
 
     ★为什么必须有两维：2026-10-04 实测同一形状——被网关瞬时拒时 429/503 恒 ~1.1-1.9s，
@@ -206,13 +244,21 @@ def classify_latency(http, verdict, elapsed_s):
       fast    = ≤FAST_REJECT_S 的 429/503 ⇒ 疑似形状/身份被拒（GATE_REJECT 候选）
       slow    = 其余 429/503（挂了一会儿才回 = 真池满）
       ok      = 200
-      timeout = 传输超时但已连上挂起（≥QUEUED_MIN_S）⇒ queued=True（过闸、无空闲上游）
+      timeout = 传输超时但已连上挂起（≥QUEUED_MIN_S）且链路可达 ⇒ queued=True
+      no-link = 传输超时且同栈控制探针也拿不到响应（link_ok=False）⇒ LINK_DOWN（链路故障）
+    ★link_ok 三态：True=证据表明链路可达 / False=证据表明不可达 / None=未取证（保持旧行为）
     """
     if elapsed_s is None:
         return verdict, "na", False
     if http == 200:
         return verdict, "ok", False
     if http == 0 and verdict == UNKNOWN and elapsed_s >= QUEUED_MIN_S:
+        # ★2026-10-04 补：挂满超时**不再直接**判 QUEUED —— 先要「链路可达」的证据：
+        #   link_ok=False 控制探针也拿不到响应 ⇒ LINK_DOWN（网络/代理面故障，fail-closed）
+        #   link_ok=True  控制探针拿到 HTTP 响应 ⇒ 链路通，超时=上游无空闲槽 ⇒ QUEUED
+        #   link_ok=None  未取证（自测/桩调用）⇒ 保持旧行为 QUEUED，向后兼容
+        if link_ok is False:
+            return LINK_DOWN, "no-link", False
         return QUEUED, "timeout", True
     if http in (429, 503):
         return verdict, ("fast" if elapsed_s <= FAST_REJECT_S else "slow"), False
@@ -266,8 +312,8 @@ def fault_kind(results):
     if any(v in (AVAILABLE, BUSY, NEED_1M, QUEUED) for v in vs):
         # QUEUED = 过闸后上游无空闲槽：链路是通的（否则到不了上游），只是没坑 ⇒ 不是故障。
         return None
-    if all(v == UNKNOWN for v in vs):
-        return FAULT_TRANSPORT
+    if all(v in (UNKNOWN, LINK_DOWN) for v in vs):
+        return FAULT_TRANSPORT   # LINK_DOWN=控制探针也拿不到响应 ⇒ 网络/代理面故障（fail-closed）
     if all(v == KEY_INVALID for v in vs):
         return FAULT_CREDENTIAL
     if all(v == CLIENT_REJECTED for v in vs):
@@ -410,7 +456,7 @@ def overall_rc(results):
         return 2
     if any(r["verdict"] == AVAILABLE for r in results):
         return 1
-    if all(r["verdict"] == UNKNOWN for r in results):
+    if all(r["verdict"] in (UNKNOWN, LINK_DOWN) for r in results):
         return 2
     if all(r["verdict"] == MODEL_UNSUPPORTED for r in results):
         return 2  # 全部模型名都不在 messages 面（站点改面/名单漂移）⇒ 也要人看
@@ -443,8 +489,10 @@ def _load_key():
     return ""
 
 
-def _http_post(url, key, body, timeout=25, read_limit=None):
+def _http_post(url, key, body, timeout=25, read_limit=None, extra_headers=None):
     """POST JSON。★必须 stdlib urllib（curl_cffi 伪装指纹在本站恒 SSLError）。
+
+    extra_headers：覆盖/追加客户端形状头（codex 面用 codex_headers()，见 CODEX_* 常量）。
 
     ★形状（2026-10-04 实测）：Authorization: Bearer（不是 x-api-key）+ CC UA + CC 长 beta +
     x-app: cli + Stainless 头 —— 老形状恒 429，与本函数旧实现等价。
@@ -462,6 +510,8 @@ def _http_post(url, key, body, timeout=25, read_limit=None):
         "x-claude-code-session-id": _cc_session_uuid(key),
     }
     headers.update(CC_STAINLESS)
+    if extra_headers:
+        headers.update(extra_headers)   # codex 面形状头（message 面不传，行为逐字不变）
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -476,30 +526,91 @@ def _http_post(url, key, body, timeout=25, read_limit=None):
         return 0, "transport: %s: %s" % (type(e).__name__, e)
 
 
+def _link_ok(host, timeout=6, get=None):
+    """同栈控制探针：本机→站点能否**拿到 HTTP 响应**（任一状态码都算可达）。
+
+    ★必须走同一客户端栈：本机出网经 Clash 系统代理（urllib 经 _scproxy 自动读系统代理），
+      裸 socket 不受代理管辖，会给出与真实请求相反的证据（假 LINK_DOWN）。
+    ★只用它证「链路在」，站点状态页/反爬挑战页不可作任何状态判据（见 SOP §1）。
+    """
+    g = get or (lambda url, t: urllib.request.urlopen(
+        urllib.request.Request(url, headers={"user-agent": UA}), timeout=t))
+    try:
+        r = g(host + "/api/status", timeout)
+        code = getattr(r, "status", None) or getattr(r, "code", None) or 1
+        try:
+            r.close()
+        except Exception:
+            pass
+        return bool(code)
+    except urllib.error.HTTPError as e:
+        return bool(e.code)          # 4xx/5xx 也是「拿到了响应」⇒ 链路可达
+    except Exception:
+        return False
+
+
 def probe_model(model, key, hosts=None, timeout=60):
-    """单模型探测：按 CC 放行形状打一次 POST /v1/messages?beta=true（体 ≈1KB、stream）。
+    """单模型探测：面/体/头全部由 face_of(model) 决定（★形状单一源，与抢坑同一套形状）。
+
+    messages 面：CC 放行形状 → POST /v1/messages?beta=true（体 ≈1KB、stream）
+    codex   面：Codex 放行形状 → POST /v1/responses（体 ≈300B）
+                —— 缺 include/prompt_cache_key 必被 400 invalid codex request 秒拒（2026-10-04 实测）。
+
+    ★形状自愈：任何面若命中 CODEX_SHAPE_REQUIRED（该名只吃 Codex 形状），就地换 codex 形状
+      重打一次并记 shape_retry=True ⇒ 形状规则再变也不会静默退化成假阴性（探针自己纠正，
+      不需要人去改代码）。
 
     ★只取响应前 256B 判状态码（stream=True 时整段体会一直流到生成完，没必要等）。
     """
-    body = build_probe_body(model)
-    tried = []
-    for host in (hosts or HOSTS):
+    face = face_of(model)
+    tried, shape_retry = [], False
+
+    def attempt(host, face_):
+        path = CODEX_PATH if face_ == FACE_CODEX else CC_PATH
+        if face_ == FACE_CODEX:
+            body, hdrs = build_codex_probe_body(model), codex_headers(key)
+        else:
+            body, hdrs = build_probe_body(model), None
         t0 = time.time()
-        code, text = _http_post(host + CC_PATH, key, body, timeout, read_limit=256)
-        el = time.time() - t0
+        code, text = _http_post(host + path, key, body, timeout, read_limit=256, extra_headers=hdrs)
+        return code, text, time.time() - t0
+
+    hot = {"model": model, "host": "", "elapsed_s": None, "latency": "na",
+           "queued": False, "face": face, "shape_retry": shape_retry}
+
+    for host in (hosts or HOSTS):
+        code, text, el = attempt(host, face)
         if code == 0:
             tried.append(text[:120])
-            v, lat, queued = classify_latency(0, UNKNOWN, el)
-            if queued:
-                return {"model": model, "http": 0, "verdict": v, "detail": text[:200],
-                        "host": host, "elapsed_s": round(el, 1), "latency": lat, "queued": True}
+            lk = _link_ok(host) if el >= QUEUED_MIN_S else None
+            v, lat, queued = classify_latency(0, UNKNOWN, el, link_ok=lk)
+            if queued or v == LINK_DOWN:
+                hot.update({"http": 0, "verdict": v, "detail": text[:200], "host": host,
+                            "elapsed_s": round(el, 1), "latency": lat, "queued": True,
+                            "face": face, "shape_retry": shape_retry})
+                return hot
             continue
         v, lat, queued = classify_latency(code, classify(code, text), el)
-        return {"model": model, "http": code, "verdict": v, "detail": text[:200],
-                "host": host, "elapsed_s": round(el, 1), "latency": lat, "queued": queued}
-    return {"model": model, "http": 0, "verdict": UNKNOWN,
-            "detail": "; ".join(tried)[:200], "host": "", "elapsed_s": None,
-            "latency": "na", "queued": False}
+        if v == CODEX_SHAPE_REQUIRED and face != FACE_CODEX:
+            face, shape_retry = FACE_CODEX, True      # 形状自愈：就地换面重打
+            code, text, el = attempt(host, face)
+            if code == 0:
+                lk = _link_ok(host) if el >= QUEUED_MIN_S else None
+                v, lat, queued = classify_latency(0, UNKNOWN, el, link_ok=lk)
+                if not queued:
+                    tried.append(text[:120])
+                    continue
+                hot.update({"http": 0, "verdict": v, "detail": text[:200], "host": host,
+                            "elapsed_s": round(el, 1), "latency": lat, "queued": True,
+                            "face": face, "shape_retry": shape_retry})
+                return hot
+            v, lat, queued = classify_latency(code, classify(code, text), el)
+        hot.update({"http": code, "verdict": v, "detail": text[:200], "host": host,
+                    "elapsed_s": round(el, 1), "latency": lat, "queued": queued,
+                    "face": face, "shape_retry": shape_retry})
+        return hot
+    hot.update({"http": 0, "verdict": UNKNOWN, "detail": "; ".join(tried)[:200]})
+    return hot
 
 
 def list_models(key=""):
@@ -589,6 +700,48 @@ def cc_meta_user_id(session_id):
     dev = hashlib.sha256(("anyrouter-device|%s" % (session_id or "")).encode()).hexdigest()
     return json.dumps({"device_id": dev, "account_uuid": "", "session_id": session_id},
                       separators=(",", ":"), ensure_ascii=False)
+
+
+def face_of(model):
+    """模型 → 探测面：gpt-* 走 /v1/responses（Codex 面），其余走 /v1/messages（CC 面）。
+
+    ★形状单一源：探测（probe_model）、抢坑（claim）与形状复刻实验脚本共用同一判据，
+      避免再出现「实验通了、探针没通」的分叉。
+    """
+    m = (model or "").strip().lower()
+    if m in MODEL_FACE:
+        return MODEL_FACE[m]          # 显式登记优先（含「同名却走 CC 面」这类反例）
+    return FACE_CODEX if m.startswith("gpt-") else FACE_MESSAGES
+
+
+def codex_headers(key, session_hex=None):
+    """Codex 面请求头（照真身 0.157.1 抓包抄）。本站门禁只看 body，头属预防性对齐。"""
+    sid = _cc_session_uuid(key) if session_hex is None else session_hex
+    return {
+        "user-agent": CODEX_UA,
+        "originator": CODEX_ORIGINATOR,
+        "session-id": sid,
+        "x-client-request-id": _cc_session_uuid(str(sid) + "|req"),
+    }
+
+
+def build_codex_probe_body(model, content="1"):
+    """Codex 面探测体（体 ≈300B）。
+
+    ★形状门禁（2026-10-04 消融实测，真 codex 0.157.1 抓包 + 逐键裁剪反向定位）：
+      必须**同时**含 ``include=["reasoning.encrypted_content"]`` 与 ``prompt_cache_key``（值任意），
+      缺任一 ⇒ 400 invalid_responses_request（页面写作 `invalid codex request`）@~1.1s；
+      与请求头无关，与 tools/input 内容无关。
+    """
+    return json.dumps({
+        "model": model,
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": content}]}],
+        "include": list(CODEX_INCLUDE),
+        "prompt_cache_key": _cc_session_uuid(model + "|probe"),
+        "store": False,
+        "stream": True,
+    }).encode()
 
 
 def build_probe_body(model, content="1"):
@@ -807,9 +960,14 @@ def run_once(args):
     results = probe_models(models, key, timeout=args.timeout) if key else []
     rc = overall_rc(results)
     for r in results:
-        print("[anyrouter] %-28s http=%s %s (%s s/%s)" % (
+        # 面标注：messages 面不加后缀（保持与旧日志逐字一致）；codex 面/形状自愈才打标，
+        # 否则「探针悄悄换了面」在日志里完全不可见（2026-10-04 实测踩到）。
+        _face_tag = ""
+        if r.get("face") and r.get("face") != FACE_MESSAGES:
+            _face_tag = " [face=%s%s]" % (r["face"], " retry" if r.get("shape_retry") else "")
+        print("[anyrouter] %-28s http=%s %s (%s s/%s)%s" % (
             r["model"], r["http"], r["verdict"],
-            "-" if r.get("elapsed_s") is None else r["elapsed_s"], r.get("latency", "na")))
+            "-" if r.get("elapsed_s") is None else r["elapsed_s"], r.get("latency", "na"), _face_tag))
 
     kind = fault_kind(results)
     gate_ctl = ""
@@ -1107,6 +1265,32 @@ def selftest():
     chk("lat: 200 -> ok", classify_latency(200, AVAILABLE, 37.0)[1], "ok")
     chk("lat: 9s+ 传输挂起 -> QUEUED", classify_latency(0, UNKNOWN, 45.0)[0], QUEUED)
     chk("NC: 传输快失败（2s）不算 QUEUED", classify_latency(0, UNKNOWN, 2.0)[0], UNKNOWN)
+    # 9c2) ★2026-10-04 链路证据门：挂满超时必须先证「链路可达」才算 QUEUED
+    chk("lat: 控探针证链路可达 -> 仍 QUEUED",
+        classify_latency(0, UNKNOWN, 45.0, link_ok=True)[0], QUEUED)
+    chk("lat: 控探针拿不到响应 -> LINK_DOWN（不再乐观判 QUEUED）",
+        classify_latency(0, UNKNOWN, 45.0, link_ok=False)[0], LINK_DOWN)
+    chk("NC: link_ok=None 保持旧行为（自测/桩兼容）",
+        classify_latency(0, UNKNOWN, 45.0, link_ok=None)[0], QUEUED)
+    chk("NC: 快失败即便 link_ok=False 也不判 LINK_DOWN",
+        classify_latency(0, UNKNOWN, 2.0, link_ok=False)[0], UNKNOWN)
+    chk("NC: 200 携带 link_ok=False 不改判",
+        classify_latency(200, AVAILABLE, 30.0, link_ok=False)[0], AVAILABLE)
+    chk("fault: 全 LINK_DOWN -> TRANSPORT", fault_kind([{"verdict": LINK_DOWN}]), FAULT_TRANSPORT)
+    chk("rc: 全 LINK_DOWN -> 2", overall_rc([{"verdict": LINK_DOWN}]), 2)
+    chk("NC: LINK_DOWN+QUEUED 混合不算链路故障",
+        fault_kind([{"verdict": LINK_DOWN}, {"verdict": QUEUED}]), None)
+    chk("link: 控探针拿到 HTTP 响应即可达",
+        _link_ok("h", get=lambda u, t: type("R", (), {"status": 432, "close": lambda s: None})()), True)
+
+    def _boom(u, t):
+        raise OSError("boom")
+
+    def _err403(u, t):
+        raise urllib.error.HTTPError("u", 403, "x", None, None)
+
+    chk("link NC: 控探针抛错即不可达", _link_ok("h", get=_boom), False)
+    chk("link: HTTPError(403) 仍算可达（拿到了响应）", _link_ok("h", get=_err403), True)
     chk("NC: classify_latency 不把 200 降级", classify_latency(200, AVAILABLE, 0.5)[0], AVAILABLE)
     chk("fault: 全 BUSY 且全 fast **不再**直接判 GATE_REJECT（需对照证据）",
         fault_kind([{"verdict": BUSY, "latency": "fast"}, {"verdict": BUSY, "latency": "fast"}]),
@@ -1249,6 +1433,66 @@ def selftest():
             os.environ.pop("ANYROUTER_API_KEY", None)
         else:
             os.environ["ANYROUTER_API_KEY"] = _env_old
+
+    # ---- Codex 面（第二套「客户端形状」：/v1/responses）----
+    chk("face: 显式登记优先（gpt-6-astra -> codex）", face_of("gpt-6-astra"), FACE_CODEX)
+    chk("face: 同名反例 cc-format 仍走 messages", face_of("gpt-6-astra-cc-format"), FACE_MESSAGES)
+    chk("face: claude-* 默认 messages", face_of("claude-opus-4-8"), FACE_MESSAGES)
+    chk("face: 未登记 gpt-* 兜底 codex", face_of("gpt-9-future"), FACE_CODEX)
+    chk("NC: 大小写与空格不影响判定", face_of("  GPT-6-Astra "), FACE_CODEX)
+
+    _cb = json.loads(build_codex_probe_body("gpt-6-astra").decode())
+    chk("codex body: 门禁必需键齐（include+prompt_cache_key）",
+        all(k in _cb for k in CODEX_REQUIRED_KEYS), True)
+    chk("codex body: include=reasoning.encrypted_content", _cb["include"], list(CODEX_INCLUDE))
+    chk("NC: 缺 prompt_cache_key 就不是放行形状",
+        all(k in {kk: 1 for kk in _cb if kk != "prompt_cache_key"} for k in CODEX_REQUIRED_KEYS), False)
+    _ch = codex_headers("k")
+    chk("codex 头: originator=codex_exec 且带 session-id",
+        (_ch["originator"], "session-id" in _ch, _is_uuid(_ch["session-id"])), ("codex_exec", True, True))
+
+    chk("classify: 400 invalid codex request -> CODEX_SHAPE_REQUIRED",
+        classify(400, '{"code":"invalid_responses_request","message":"invalid codex request"}'),
+        CODEX_SHAPE_REQUIRED)
+    chk("NC: 普通 400（非 codex 关键词）不误判为形状门禁",
+        classify(400, '{"error":{"message":"prompt too long","type":"invalid_request_error"}}'), UNKNOWN)
+
+    _real_post = globals()["_http_post"]
+    try:
+        calls = []
+
+        def _fake_post(url, key=None, body=None, timeout=0, read_limit=None, extra_headers=None):
+            calls.append({"url": url, "body": json.loads((body or b"{}").decode())})
+            if url.endswith("/v1/messages?beta=true"):
+                return 400, '{"code":"invalid_responses_request","message":"invalid codex request"}'
+            return 200, '{"ok":true}'
+
+        globals()["_http_post"] = _fake_post
+        _r = probe_model("claude-opus-4-8", "k", hosts=["https://x"])
+        chk("自愈: 被 codex 门禁拒后自动换面重打 -> SLOT_AVAILABLE", _r["verdict"], AVAILABLE)
+        chk("自愈: shape_retry 打标且终面=codex", (_r["shape_retry"], _r["face"]), (True, FACE_CODEX))
+        chk("自愈: 第二发确实走 /v1/responses 且带门禁键",
+            (calls[-1]["url"].endswith("/v1/responses"),
+             all(k in calls[-1]["body"] for k in CODEX_REQUIRED_KEYS)), (True, True))
+        chk("NC: 自愈只换一次面（共 2 发）", len(calls), 2)
+
+        calls[:] = []
+        _r2 = probe_model("gpt-6-astra", "k", hosts=["https://x"])
+        chk("NC: codex 面模型首发即命中 -> 不触发自愈",
+            (_r2["shape_retry"], _r2["face"], len(calls)), (False, FACE_CODEX, 1))
+
+        calls[:] = []
+
+        def _fake_post2(url, key=None, body=None, timeout=0, read_limit=None, extra_headers=None):
+            calls.append(url)
+            return 400, '{"code":"invalid_responses_request"}'
+
+        globals()["_http_post"] = _fake_post2
+        _r3 = probe_model("claude-opus-4-8", "k", hosts=["https://x"])
+        chk("NC: 换面后仍被拒 -> 判 CODEX_SHAPE_REQUIRED 且不无限重试",
+            (_r3["verdict"], len(calls)), (CODEX_SHAPE_REQUIRED, 2))
+    finally:
+        globals()["_http_post"] = _real_post
 
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))

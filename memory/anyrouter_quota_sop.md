@@ -9,10 +9,12 @@
 | 200 | 正常 completion | `SLOT_AVAILABLE` | 命中空闲上游 ⇒ 立刻抢用 |
 | 429 / 503 | `{"error":{"message":"Service Unavailable"}}` | `POOL_BUSY` | 号池满，本轮没抢到 |
 | 400 | 「1m 上下文已经全量可用，请启用 1m 上下文后重试」 | `NEED_1M` | 未带 1m beta 头 |
+| 400 | 「invalid codex request」（`code=invalid_responses_request`，~1.1s 瞬拒） | `CODEX_SHAPE_REQUIRED` | 该名只吃 **Codex 形状**（走 `/v1/responses` 且带组合键），见 §1.4 |
 | 404 | 「当前 API 不支持所选模型」 | `MODEL_UNSUPPORTED` | 该名只走 OpenAI 面（需换名，重试无用） |
 | 401 / 403 | 含 `unauthorized client` | `CLIENT_REJECTED` | UA 白名单门禁 |
 | 401 / 403 | 其它 | `KEY_INVALID` | 令牌失效 |
 | 其它 | — | `UNKNOWN` | 判据外，fail-closed |
+| 无响应且 ≥8s | 控制探针也拿不到任何响应 | `LINK_DOWN` | **链路不可达**（网络/代理面故障；fail-closed 计故障、`rc=2`，见 §1.2(3)） |
 
 - **1m 上下文**：请求须带 `anthropic-beta: context-1m-2025-08-07`；Claude Code CLI 侧写成模型名 `claude-opus-4-7[1m]` / `gpt-6-astra-cc-format[1m]`。
 - **传输层**：本机实测 `urllib` 通、`curl_cffi(chrome124)` 对本站 SSLError 握手失败 ⇒ 本工具走 urllib。UA 有白名单（`claude-cli/1.0.0` 可用）。
@@ -84,7 +86,11 @@
 ### （3）新增观测维度与状态
 
 - `elapsed_s` / `latency_class` 落台账：区分「瞬时拒（~1-2s）」与「过闸排队（≥`QUEUED_MIN_S`=8s，直到传输超时）」；
-- `QUEUED_NO_UPSTREAM`：传输超时但已连上并挂满 ≥8s ⇒ **过闸、只是上游无空闲槽**（≠链路故障，≠没额度）；
+- `QUEUED_NO_UPSTREAM`：传输超时但已连上并挂满 ≥8s **且已证链路可达** ⇒ **过闸、只是上游无空闲槽**（≠链路故障，≠没额度）；
+- `LINK_DOWN`（★2026-10-04 补）：传输拿不到响应（`http=0`）且挂满 ≥`QUEUED_MIN_S` 后，**同栈控制探针**
+  （`GET /api/status`，任意状态码都算「拿到了响应」）也拿不到任何响应 ⇒ **链路不可达**（网络/代理面故障，
+  fail-closed：计故障、`rc=2`、进故障通知）。**与 `QUEUED` 的差别只是证据**：拿不出「链路可达」的证据，
+  就不许把「连不上」写成「在排队」；
 - 探测并发化（`--workers`，默认 5）+ `--timeout` 默认 90s（旧值偏短会把「排队」误判成失败）。
 
 ### （4）本节结论之外的仍未证实项
@@ -115,19 +121,41 @@
 - 命中口径：**200 且正文非空**才算抢到（唯一推送条件）；429/503/500「负载已经达到上限」= 号池满，不推送。
 - 会话保活/粘性：5 篇原文 grep 零命中 ⇒ UNVERIFIED，不实现。
 
+## 1.4 ★OpenAI 面模型的「Codex 形状」门禁（2026-10-04，探针已接线）
+
+现象：`gpt-6-astra` 这类**只走 OpenAI 面**的名（在 messages 面 404），拿普通/极简 body 打 `/v1/responses` 会被站点 **400 `invalid codex request`**（`code=invalid_responses_request`，约 1.1 s 瞬拒）；与请求头无关（裸头同样复现）。**它既不是「没额度」也不是「号池满」，而是形状门禁**。
+
+地面真值：隔离 `CODEX_HOME` 跑真 codex 0.157.1 抓包（`temp/anr_codex/real_body.json`，67282 B）⇒ 顶层键 = `model` / `input` / `tool_choice` / `parallel_tool_calls` / `reasoning` / `store` / `stream` / `include` / `prompt_cache_key` / `text` / `client_metadata`；头 = `originator: codex_exec` / `session-id` / `thread-id` / UA。
+
+二分结论：**单独加任一键仍被拒**；极简 body + 这组键 ⇒ 过闸（之后挂满传输超时）。
+
+修法（`tools/anyrouter_slot_watch.py` 已落地）：
+
+- **两套「面」**：`FACE_MESSAGES`（`/v1/messages` + `anthropic-beta: context-1m-2025-08-07`）与 `FACE_CODEX`（`/v1/responses` + 最小过闸体 + codex 头）；
+- `face_of(model)`：`MODEL_FACE` 显式登记优先（`gpt-6-astra`→codex、同名 `gpt-6-astra-cc-format`→messages），未登记 `gpt-*` 兜底 codex，其余 messages；
+- **形状自愈**：任一面命中 `CODEX_SHAPE_REQUIRED` ⇒ 就地换 codex 面重打**一次**（只换一次，防无限重试），响应留痕 `shape_retry`；
+- 新状态 `QUEUED_NO_UPSTREAM` = **过闸但上游无空闲槽**（连接建立后挂满超时，且同栈控制探针已证链路可达；≠链路故障、≠没额度），仍**不推送**；
+- 新状态 `LINK_DOWN` = **链路不可达**（同栈控制探针也拿不到响应）⇒ fail-closed 计故障（`rc=2`、走故障通知），
+  与 `QUEUED` 的差别是**证据**而非耗时：`elapsed_s` 只决定「要不要取证」，取证结果决定判 `QUEUED` 还是 `LINK_DOWN`；
+- ★残余边界（无法在客户端侧区分）：站点把连接**挂住不给响应**（静默丢弃）时控制探针仍能拿到响应 ⇒ 仍判 `QUEUED`。
+
+证据：`--selftest` 119 → 136 → **147 passed / 0 failed**；真站 2026-10-04 `--once --dry-run --models gpt-6-astra,claude-opus-4-8 --timeout 30` ⇒ `gpt-6-astra http=0 QUEUED_NO_UPSTREAM (30.7 s/timeout)`（旧码同刻是 400 瞬拒）、`claude-opus-4-8 http=429 POOL_BUSY (1.6 s/fast)`。
+
+★运维：改判据/名单后**必须重启**（见 §3.3）；本次已按定时同款命令重挂 watchd。
+
 ## 2. 工具
 
 `tools/anyrouter_slot_watch.py`（纯 stdlib + keychain）：
 
 ```bash
-python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（默认 5 个 messages 面模型）
+python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（按名路由到 messages / codex 两面，见 §1.4）
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
 python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
-python3 tools/anyrouter_slot_watch.py --selftest        # 119 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态）
+python3 tools/anyrouter_slot_watch.py --selftest        # 147 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
-- 默认 `MODELS`（7 个，2026-10-04 扩面）：`claude-opus-4-8`、`claude-opus-4-7`、`claude-sonnet-4-5-20250929`、`claude-opus-4-6`、`claude-sonnet-4-20250514`、`claude-haiku-4-5`、`gpt-6-astra-cc-format`（**名单里一律不带 `[1m]`**，1m 只体现在请求头 `anthropic-beta`）；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。扩面依据=2026-10-03 全 17 名标定取 messages 面可用代表名 + 2026-10-04 名测（`claude-opus-4-8`/`claude-haiku-4-5` 均在册=429 POOL_BUSY；`gpt-5.5`/`fable-5` 404 未在册）与 L 站攻略点名的「换 4.8」「haiku 没啥人用」。
+- 默认 `MODELS`（8 个，2026-10-04 扩面）：`claude-opus-4-8`、`claude-opus-4-7`、`claude-sonnet-4-5-20250929`、`claude-opus-4-6`、`claude-sonnet-4-20250514`、`claude-haiku-4-5`、`gpt-6-astra-cc-format`（messages 面）、`gpt-6-astra`（★codex 面，走 `/v1/responses`，见 §1.4）（**名单里一律不带 `[1m]`**，1m 只体现在请求头 `anthropic-beta`）；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。扩面依据=2026-10-03 全 17 名标定取 messages 面可用代表名 + 2026-10-04 名测（`claude-opus-4-8`/`claude-haiku-4-5` 均在册=429 POOL_BUSY；`gpt-5.5`/`fable-5` 404 未在册）与 L 站攻略点名的「换 4.8」「haiku 没啥人用」。
 - 状态：`temp/anyrouter_watch/{state.json,ledger.jsonl,watch.lock}`；推送幂等键=判定态 + 冷却（`--cooldown`，默认 3600s）。
 - **单实例锁**：`watch.lock` 存 pid + `ps -o lstart=` 身份；已有实例在跑则本次直接退出并打印对方 pid/起始时刻（防「僵尸元数据当运行中」误判）。
 - watch 语义：命中即推送但**不退出**，冷却窗内不重复；`--max-minutes` 兜底收尾。
@@ -163,7 +191,7 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 
 ## 3.3 改了名单/判据代码怎么生效（必须重启）+ 干净重启姿势（2026-10-04 实测）
 
-- **运行中的实例不会自动吃到新代码**：watchd 只在启动时拉起**一次**子进程，子进程是长驻 `--watch` 循环 ⇒ 改 `tools/anyrouter_slot_watch.py` 的 `MODELS`/判据后**必须重启**才生效。生效判据=`temp/anyrouter_watch/watch.log` 里「watch 第 N 轮」之后的模型行数（7 名应连续打印 7 行）+ `ledger.jsonl` 末行 `len(results)`。
+- **运行中的实例不会自动吃到新代码**：watchd 只在启动时拉起**一次**子进程，子进程是长驻 `--watch` 循环 ⇒ 改 `tools/anyrouter_slot_watch.py` 的 `MODELS`/判据后**必须重启**才生效。生效判据=`temp/anyrouter_watch/watch.log` 里「watch 第 N 轮」之后的模型行数（8 名应连续打印 8 行；codex 面那行尾带 `[face=codex]`）+ `ledger.jsonl` 末行 `len(results)`。
 - **`bg_task stop` 会留下孤儿探测进程**（实测踩到）：stop 只向 wrapper 的进程组发 SIGTERM，而守护用 `start_new_session` 起探测子进程（自成 pgid）⇒ 守护死了、探测进程仍在跑并**继续持 `watch.lock`**。干净重启四步：
 
   ```bash
@@ -175,6 +203,7 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 
 - 陈旧 `watch.lock`（指向已死 pid）**无需手工删**：新实例按 pid+lstart 判活后自动接管（实测守护 09:36:30 起、09:36:30 首轮即刷新锁为新 pid）。
 - 换名单实例：2026-10-04 `MODELS` 5→7（加 `claude-opus-4-8`/`claude-haiku-4-5`）后按上述姿势重启 ⇒ 首轮 09:36:30 打印 7 行（7/7 POOL_BUSY），硬超时随之为次日 08:35（23h），与次日 08:50 定时接续只留 ~15min 空窗。
+- ★换名单实例 2（同日晚）：`MODELS` 7→8（加 codex 面 `gpt-6-astra`）+ 探针改「按名路由两面」后重启；★两次踩到「孤儿探测进程持锁 ⇒ 新 watchd 只 HOLD_BUSY 不接管、旧码继续跑」⇒按 §3.3 四步姿势（停 watchd → 杀持锁探测 → 起 watchd → 核 `watch.lock` pid=新探测 + `watchd.jsonl` START 事件）才真正生效；生效判据还含「首轮 8 行」与 codex 面行尾 `[face=codex]`。
 
 ## 4. 排错
 
