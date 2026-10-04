@@ -841,6 +841,60 @@ def burst_delay(attempt, base=0.35, cap=2.5, jitter=0.35, rng=None):
 #   为什么必须同 session：坑位是绑 session 的（L 站原方口径「闲置数分钟即被踢」），
 #   换 session 去保活＝替别人占坑，自己那条照样掉。
 HOLD_COOLDOWN_S = 600
+# ---- 「停保活」旗标（2026-10-04 用户问：我已经在用别的客户端了，你还保活不是白烧额度吗？）----
+# 保活跑在别处（后台线程/独立进程），它看不见「你此刻是否在用」⇒给一个显式开关：
+#   `--stop-hold` 写旗标 ⇒ 正在跑的保活最多 HOLD_STOP_STEP_S 秒内收手；已完成的不回补。
+HOLD_STOP_STEP_S = 5.0
+
+
+def _hold_stop_path():
+    return os.path.join(STATE_DIR, "hold.stop")
+
+
+def hold_stop_requested():
+    """是否已请求停保活（`--stop-hold` 写的旗标文件存在）。"""
+    try:
+        return os.path.exists(_hold_stop_path())
+    except Exception:
+        return False
+
+
+def request_hold_stop(reason="manual"):
+    """写停保活旗标（幂等）；返回旗标路径。"""
+    fp = _hold_stop_path()
+    try:
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w") as f:
+            f.write(json.dumps({"ts": beijing_now().isoformat(), "reason": reason}))
+    except Exception:
+        pass
+    return fp
+
+
+def clear_hold_stop():
+    """开始新一轮保活前清旗标（新命中=重新决策）。返回是否真清掉了。"""
+    try:
+        os.unlink(_hold_stop_path())
+        return True
+    except Exception:
+        return False
+
+
+def sleep_with_stop(seconds, step=HOLD_STOP_STEP_S, sleep=None, stop_check=None):
+    """分片睡眠：每 step 秒查一次停旗标 ⇒ `--stop-hold` 最多 step 秒生效。
+
+    返回 True=中途收到停止请求（调用方应立即收手）。
+    """
+    sleep = sleep or time.sleep
+    check = stop_check or hold_stop_requested
+    left = float(seconds)
+    while left > 0:
+        if check():
+            return True
+        d = min(float(step), left)
+        sleep(d)
+        left -= d
+    return bool(check())
 
 
 def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S):
@@ -862,12 +916,14 @@ def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S):
     return avail[0]
 
 
-def hold_slot(model, sid, minutes, seconds, post, sleep, now, log=None, timeout=60):
+def hold_slot(model, sid, minutes, seconds, post, sleep, now, log=None, timeout=60,
+              stop_check=None):
     """占坑保活：每 seconds 发 1 发 keepalive；**非 200 一律当被踢，立即停并返回 False**。
 
     ★口径：只有 200 才算「坑还在」。429/503/传输错 ⇒ 坑已丢（闲置回收/被挤掉），
       继续发只是白烧请求 ⇒ 立刻停（与 run_claim 的保活段同一判据，避免两套口径）。
-    返回 True=保活段正常跑完；False=未启用/被踢。
+    ★2026-10-04：stop_check 为真 ⇒ 立即收手（你已在别的客户端用上了，别白烧请求）。
+    返回 True=保活段正常跑完；False=未启用/被踢/被用户停。
     """
     if not minutes or float(minutes) <= 0:
         return False
@@ -875,7 +931,9 @@ def hold_slot(model, sid, minutes, seconds, post, sleep, now, log=None, timeout=
     end = now() + float(minutes) * 60
     n = 0
     while now() < end:
-        sleep(float(seconds))
+        if sleep_with_stop(seconds, sleep=sleep, stop_check=stop_check):
+            log("[anyrouter] hold: 收到 --stop-hold（多半是你已在用别的客户端），主动停手（已发 %d 发）" % n)
+            return False
         n += 1
         code, _t = post(build_claim_body(model, sid, keepalive=True), timeout)
         act = claim_action(code)
@@ -890,6 +948,8 @@ def start_auto_hold(args, hit, post=None, log=None):
     import threading
     log = log or (lambda s: print(s, flush=True))
     sid = session_id_for(_load_key(), "anyrouter-probe")     # ★与探测同 id（见 build_probe_body）
+    if clear_hold_stop():
+        log("[anyrouter] 新命中 ⇒ 清除上一轮的 --stop-hold 旗标（重新决策）")
     st = _load_state()
     st["hold_active"] = True
     st["hold_since"] = beijing_now().isoformat()
@@ -1037,13 +1097,21 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
         lines.append("   社区口碑：偏贵、慢、智商一般、长对话易 `let me…` 死循环（#22468/#22479/#22525/#22526/#22540）")
         lines.append("   建议：短会话、一次一件事；要高质量可优先等 opus 线或 gpt-6-astra 恢复（本轮 opus-5-5 已收官方通告=不供）。")
     if auto_hold_minutes:
-        lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 打一次最小请求；被踢即停、下次命中重占）。"
+        lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 发一个最小请求；被踢即停、下次命中重占）。"
                      % (("%g" % float(auto_hold_minutes)), int(keepalive_seconds)))
-        lines.append("👉 你直接用即可（客户端 Anthropic messages 端点 + 上面的 beta 头）。")
+        lines.append("👉 怎么用：把客户端指到本站的 Anthropic 兼容端点（/v1/messages）即可。")
+        lines.append("   上面那组 beta 头是 Claude Code 自己会带的，用 CC 不用手配；")
+        lines.append("   用 Pi / 其它客户端按各家填 anthropic base_url，头按各家默认即可。")
+        lines.append("⚠️ 说明（别误会成「给你留了个座位」）：坑位**不绑身份**——站点只看号池有没有空闲上游"
+                     "（实测换 session_id 仍 200）⇒")
+        lines.append("   你不必指定 session，任何客户端在空闲窗口都能进；我这条保活只是"
+                     "「用同一记号持续发最小请求」，用来盯住通路、尽早发现被踢。")
         if sid:
-            lines.append("🔑 已占住的坑位身份 session_id：%s" % sid)
-            lines.append("   想让 Claude Code 沿用这个已保活的坑位：`claude --session-id %s`" % sid)
-            lines.append("   （不指定 session 也照常能用；指定=复用这个正在被保活的身份）")
+            lines.append("🔑 我这条保活的身份记号 session_id：%s" % sid)
+            lines.append("   想在 CC 里也用同一记号（非必需）：`claude --session-id %s`" % sid)
+        lines.append("💡 你已经在用（CC / Pi 等）时它就没用了还费请求：跑 "
+                     "`python3 tools/anyrouter_slot_watch.py --stop-hold` 立刻停（最多 %.0f 秒生效）。"
+                     % HOLD_STOP_STEP_S)
     else:
         lines.append("坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。")
     lines += [
@@ -1946,6 +2014,48 @@ def selftest():
         hold_slot("m1", "sid", 0.05, 0.01, lambda b, timeout=0: (0, "URLError"),
                   lambda s: None, lambda: 0), False)
 
+    # 11b) 停保活开关（★2026-10-04 用户问「我在用别的客户端，你还保活不是白烧吗」）
+    chk("sleep_with_stop: 不拦 -> False", sleep_with_stop(0.01, sleep=lambda s: None,
+                                                         stop_check=lambda: False), False)
+    chk("sleep_with_stop: 中途拦 -> True", sleep_with_stop(1.0, step=0.1, sleep=lambda s: None,
+                                                          stop_check=lambda: True), True)
+    _st3 = {"n": 0}
+
+    def _stop_after_1():
+        _st3["n"] += 1
+        return _st3["n"] > 1          # 第一次问=不拦；之后=停
+    _c3 = []
+    chk("hold: --stop-hold -> 提前停手（False）",
+        hold_slot("m1", "sid", 5.0, 0.01,
+                  lambda b, timeout=0: (_c3.append(b), (200, ""))[1],
+                  lambda s: None, lambda: 0, stop_check=_stop_after_1), False)
+    chk("hold: 停手后不再发（发数<=2）", len(_c3) <= 2, True)
+    _clk = {"t": 0.0}
+    chk("NC: 未请求停 -> 仍照常跑完（不误停）",
+        hold_slot("m1", "sid", 0.02, 0.01, lambda b, timeout=0: (200, ""),
+                  lambda s: _clk.__setitem__("t", _clk["t"] + float(s)), lambda: _clk["t"],
+                  stop_check=lambda: False), True)
+    # 旗标文件往返（沙盒 state-dir，绝不碰真实监控目录）
+    _sd_old = STATE_DIR
+    try:
+        import tempfile as _tf
+        _apply_state_dir(_tf.mkdtemp(prefix="anr_stop_"))
+        chk("stop: 初始无旗标", hold_stop_requested(), False)
+        _fp = request_hold_stop("selftest")
+        chk("stop: 写旗标后为 True", hold_stop_requested(), True)
+        chk("stop: 旗标文件名正确", os.path.basename(_fp), "hold.stop")
+        chk("stop: clear 后回到 False", (clear_hold_stop(), hold_stop_requested()), (True, False))
+        chk("NC: 重复 clear 安全", clear_hold_stop(), False)
+    finally:
+        _apply_state_dir(_sd_old)
+    # 11c) 通知文案说实话（★坑位不绑身份；并给出停机命令）
+    _txt = _build_text([{"model": "m1", "verdict": AVAILABLE, "http": 200}], beijing_now(), "t",
+                       auto_hold_minutes=30, keepalive_seconds=240, sid="sid-abc")
+    chk("text: 明说坑位不绑身份", ("不绑身份" in _txt), True)
+    chk("text: 给出 --stop-hold 停机命令", ("--stop-hold" in _txt), True)
+    chk("NC: 不再声称「已占住的坑位身份」", ("已占住的坑位身份" in _txt), False)
+    chk("text: 仍保留 session 记号（标非必需）", ("claude --session-id sid-abc" in _txt), True)
+
     # 7) 故障面判据（★核心：防「站点没坑」被误报成「监控挂了」）
     chk("fault: 全 BUSY -> None", fault_kind(busy), None)
     chk("NC: BUSY+UNKNOWN 混合 -> None（链路通的就不算故障）",
@@ -2535,6 +2645,9 @@ def _build_parser():
                          "（默认 0=只报喜不占坑；占坑=用探测同一 session 每 --keepalive-seconds 发 1）")
     ap.add_argument("--hold-cooldown", type=float, default=HOLD_COOLDOWN_S, dest="hold_cooldown",
                     help="两次自动占坑之间的最小间隔秒数（默认 %d；防坑位抖动时反复占用）" % HOLD_COOLDOWN_S)
+    ap.add_argument("--stop-hold", action="store_true", dest="stop_hold",
+                    help="立即停掉正在跑的保活（写旗标，保活最多 5 秒内停手）；"
+                         "你自己已经在用别的客户端时用它省请求")
     ap.add_argument("--summary", action="store_true",
                     help="只读台账摘要：最近 N 轮各模型判据分布（含 claude 面覆盖面，零请求零推送）")
     ap.add_argument("--summary-lines", type=int, default=12, dest="summary_lines",
@@ -2550,6 +2663,12 @@ def main():
     if getattr(args, "log_hint", None):
         os.environ["GA_ANYROUTER_LOG_HINT"] = str(args.log_hint)
     _apply_state_dir(getattr(args, "state_dir", None))
+    if getattr(args, "stop_hold", False):
+        fp = request_hold_stop(reason="cli")
+        print("[anyrouter] 已写入停保活旗标：%s"
+              "（正在跑的保活 ≤%.0f 秒内停手；下次命中会自动清除并重新决策）"
+              % (fp, HOLD_STOP_STEP_S))
+        return 0
     if getattr(args, "summary", False):
         s = summarize_ledger(getattr(args, "summary_lines", 12))
         print(render_summary(s))

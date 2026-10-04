@@ -322,7 +322,10 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
 - **保活动作**：后台线程按间隔对同（模型、session）发**真实最小 completion**，把该 session 的活跃窗口撑住 `--auto-hold-minutes`（默认 **30**）分钟；`--hold-cooldown`（默认 **900s**）内不重复开新一轮。
 - **终止**：被踢（非 200：429/503/401…）或窗口到期即停，**绝不无限续期**。
 - **通知文案**：命中推送显式写「**已自动保活 N 分钟**」，并**不再**出现「尽快连着用」这类要人盯的措辞（未开保活时该措辞保留）。
-- **通知里给「怎么用」**（2026-10-04 本轮加）：命中推送**直接印出保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可粘贴的复用命令 `claude --session-id <uuid>`，并注明「不指定 session 也照常能用；指定=复用这个正在被保活的身份」。实现=`_build_text(..., sid=...)` 形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；不传 `sid` 时文本逐字不变。⇒ 收到推送即可原地接上，无需再问「保活的是哪个身份」。自测随之 197 → **200 passed**（三断言：带 sid 出完整 UUID / 出可粘贴命令 / 不带 sid 无 `--session-id`）。
+- **通知里给「怎么用」**（2026-10-04 本轮加；同日订正为「说实话」版）：命中推送印出**保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可粘贴的复用命令 `claude --session-id <uuid>`，但**明确标注「非必需」**，并写清判据：**坑位不绑身份** —— 站点只看号池有没有空闲上游（实测换 `session_id` 仍 200）⇒ 任何客户端在空闲窗口都能进，保活只是「用同一记号持续发最小请求」盯住通路、尽早发现被踢。
+  ⚠️ 因此**不再**出现旧措辞「已占住的坑位身份 / 指定=复用这个正在被保活的身份」（它会把行为层兜底读成「站点给你留了个座位」）。实现=`_build_text(..., sid=...)` 形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；不传 `sid` 时文本逐字不变。自测断言三条：出完整 UUID / 出可粘贴命令 / **不出现**「已占住的坑位身份」。
+- **你已经在用（CC / Pi / 任意客户端）时怎么停：`--stop-hold`（2026-10-04 加）**：保活跑在别处（探测线程 / 独立 `--claim` 进程），它**看不见你此刻是否在用** ⇒ 给显式开关：`python3 tools/anyrouter_slot_watch.py --stop-hold` 写旗标 `temp/anyrouter_watch/hold.stop` ⇒ 正在跑的保活是**分片睡眠**（`HOLD_STOP_STEP_S=5.0`s 步长、`sleep_with_stop()`）⇒ 每 ≤5s 查一次，命中即打日志并收手（**不回补**已发请求）；`start_auto_hold()` 在新一轮命中前 `clear_hold_stop()` ⇒「新命中=重新决策」。沙盒可验：`--state-dir <tmp> --stop-hold`。
+  **实测（本轮真时钟端到端）**：保活跑动中写旗标 ⇒ **0.94s 内停手**（此刻已发 2 发）、`hold_slot` 返回 `False`；CLI `rc=0`、真实状态目录零污染（旗标只落沙盒）。自测计数随本轮功能 **200 → 272 passed**（含 `sleep_with_stop` 两例、`stop_check` 提前停、旗标文件往返五例 + 文案三断言）。
 - **CLI / 透传**：`tools/anyrouter_slot_watch.py --auto-hold-minutes 30 --hold-cooldown 900`；`tools/anyrouter_slot_watchd.py` 同名参数并在 `spawn_watch()` 透传（守护默认起 `--auto-hold-minutes 30`）。
 - **自测**：watch `--selftest` **240/240**（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控 / `--summary` 摘要与截断 / ★随机节奏与长休）；watchd `--selftest` **36/36**（含 spawn 形状自测与负控）。
 - **边界**（与 §1.2(4) 的关系）：保活**不假设**站点把坑位绑到 session id 上；它只是「以已过闸的同身份持续发请求」这一**行为层**兜底。§1.2(4) 的 UNVERIFIED 结论不变（那是「机制是否存在于站点侧」），本节的效力仅来自「同一个已过闸身份保持活跃」。
