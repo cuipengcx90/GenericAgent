@@ -95,10 +95,12 @@ BETA = CC_BETA       # 兼容旧自测/文案里的 BETA 引用
 UA = CC_UA
 # 默认探测模型：站点在册、且能代表「坑」的模型（★名字一律不带 [1m] 后缀）
 MODELS = [
+    "claude-opus-4-8",          # 2026-10-04 名测：在册（429 POOL_BUSY）；L 站攻略点名的易进名
     "claude-opus-4-7",
     "claude-sonnet-4-5-20250929",
     "claude-opus-4-6",
     "claude-sonnet-4-20250514",
+    "claude-haiku-4-5",         # 2026-10-04 名测：在册（429）；社区说「没啥人用」= 候选易进名
     "gpt-6-astra-cc-format",
 ]
 

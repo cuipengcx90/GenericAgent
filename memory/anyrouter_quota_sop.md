@@ -125,7 +125,7 @@ python3 tools/anyrouter_slot_watch.py --selftest        # 119 项负控自测（
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
-- 默认 `MODELS`（5 个，2026-10-03 全 17 名标定后取 messages 面可用的代表性名）：`claude-opus-4-7`、`claude-sonnet-4-5-20250929`、`claude-opus-4-6`、`claude-sonnet-4-20250514`、`gpt-6-astra-cc-format[1m]`；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。
+- 默认 `MODELS`（7 个，2026-10-04 扩面）：`claude-opus-4-8`、`claude-opus-4-7`、`claude-sonnet-4-5-20250929`、`claude-opus-4-6`、`claude-sonnet-4-20250514`、`claude-haiku-4-5`、`gpt-6-astra-cc-format`（**名单里一律不带 `[1m]`**，1m 只体现在请求头 `anthropic-beta`）；`--models a,b` 可临时换名单，`--models`（不带值）=列站点在册模型。扩面依据=2026-10-03 全 17 名标定取 messages 面可用代表名 + 2026-10-04 名测（`claude-opus-4-8`/`claude-haiku-4-5` 均在册=429 POOL_BUSY；`gpt-5.5`/`fable-5` 404 未在册）与 L 站攻略点名的「换 4.8」「haiku 没啥人用」。
 - 状态：`temp/anyrouter_watch/{state.json,ledger.jsonl,watch.lock}`；推送幂等键=判定态 + 冷却（`--cooldown`，默认 3600s）。
 - **单实例锁**：`watch.lock` 存 pid + `ps -o lstart=` 身份；已有实例在跑则本次直接退出并打印对方 pid/起始时刻（防「僵尸元数据当运行中」误判）。
 - watch 语义：命中即推送但**不退出**，冷却窗内不重复；`--max-minutes` 兜底收尾。
