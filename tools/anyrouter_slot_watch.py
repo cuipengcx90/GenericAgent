@@ -880,6 +880,62 @@ def clear_hold_stop():
         return False
 
 
+# ---------------------------------------------------------------- 本地面板联动（2026-10-04）
+# 用户要求「别让我自己跑脚本」⇒ 面板（tools/anyrouter_slot_watchd.py 里的小 HTTP 服务）：
+#   · watchd 把入口写进 <STATE_DIR>/ctl.url（局域网/本机两个入口 + 一次性令牌）
+#   · 面板上能改「保活时长」⇒ 落 <STATE_DIR>/hold.minutes，下一轮探测即生效（不必改命令行）
+PANEL_DEFAULT_PORT = 8766
+HOLD_MINUTES_FILE = "hold.minutes"
+CTL_URL_FILE = "ctl.url"
+
+
+def hold_default_minutes():
+    """面板设置的默认保活分钟数；无/坏文件 ⇒ None（表示沿用命令行/守护参数）。"""
+    try:
+        with open(os.path.join(STATE_DIR, HOLD_MINUTES_FILE)) as f:
+            v = float(json.load(f).get("minutes"))
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def set_hold_default_minutes(minutes):
+    """写面板设置（>0 才接受；返回写入值）。非法值直接抛 ValueError（调用方转 4xx）。"""
+    m = float(minutes)
+    if m <= 0:
+        raise ValueError("minutes must be > 0")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, HOLD_MINUTES_FILE), "w") as f:
+        json.dump({"minutes": m, "ts": beijing_now().isoformat()}, f)
+    return m
+
+
+def effective_auto_hold_minutes(cli_value=0):
+    """面板设置优先于命令行/守护参数（用户不改命令行也能调时长）。"""
+    d = hold_default_minutes()
+    return float(d) if d else float(cli_value or 0)
+
+
+def _ctl_meta():
+    try:
+        with open(os.path.join(STATE_DIR, CTL_URL_FILE)) as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
+
+
+def ctl_url(local=False):
+    """本地面板入口（页面）；无面板 ⇒ None（调用方回落纯命令行提示）。"""
+    d = _ctl_meta()
+    return (d.get("local_url") if local else d.get("url")) or None
+
+
+def ctl_stop_url(local=False):
+    """面板「停止保活」端点（带令牌）；无面板 ⇒ None。"""
+    d = _ctl_meta()
+    return (d.get("stop_local_url") if local else d.get("stop_url")) or None
+
+
 def sleep_with_stop(seconds, step=HOLD_STOP_STEP_S, sleep=None, stop_check=None):
     """分片睡眠：每 step 秒查一次停旗标 ⇒ `--stop-hold` 最多 step 秒生效。
 
@@ -1109,9 +1165,12 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
         if sid:
             lines.append("🔑 我这条保活的身份记号 session_id：%s" % sid)
             lines.append("   想在 CC 里也用同一记号（非必需）：`claude --session-id %s`" % sid)
-        lines.append("💡 你已经在用（CC / Pi 等）时它就没用了还费请求：跑 "
-                     "`python3 tools/anyrouter_slot_watch.py --stop-hold` 立刻停（最多 %.0f 秒生效）。"
-                     % HOLD_STOP_STEP_S)
+        _panel = ctl_url()
+        if _panel:
+            lines.append("🖱 一键停保活（不用敲命令）：打开面板 %s 点「⏹ 停止保活」"
+                         "（飞书卡片上也有同一个按钮）。" % _panel)
+        lines.append("   备用命令行：`python3 tools/anyrouter_slot_watch.py --stop-hold`"
+                     "（同样立刻停，最多 %.0f 秒生效）。" % HOLD_STOP_STEP_S)
     else:
         lines.append("坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。")
     lines += [
@@ -1120,23 +1179,64 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
     return "\n".join(lines)
 
 
-def send_notifications(text, dry_run=False):
-    """双通道推送（飞书私信 + 钉钉群），任一成功即算送达；返回 (ok, detail)。"""
+def build_hold_card(text, panel_url=None, stop_url=None):
+    """飞书交互卡片：带「⏹ 停止保活」按钮（用户 2026-10-04 要求傻瓜化）。
+
+    按钮走飞书卡片的 url 字段 ⇒ 点开本地面板 /stop（带令牌，等价 --stop-hold 旗标）。
+    面板入口缺失时（没起面板）不造按钮，仅回落纯文本 ⇒ 行为与旧版一致。
+    """
+    actions = []
+    if stop_url:
+        actions.append({"tag": "button", "type": "danger",
+                        "text": {"tag": "plain_text", "content": "⏹ 停止保活"}, "url": stop_url})
+    if panel_url:
+        actions.append({"tag": "button", "type": "default",
+                        "text": {"tag": "plain_text", "content": "📊 打开监控面板"}, "url": panel_url})
+    els = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
+    if actions:
+        els.append({"tag": "action", "actions": actions})
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"template": "green",
+                   "title": {"tag": "plain_text", "content": "🎉 anyrouter 抢到坑位（已自动保活）"}},
+        "elements": els,
+    }
+
+
+def send_notifications(text, dry_run=False, card=None):
+    """双通道推送（飞书私信 + 钉钉群），任一成功即算送达；返回 (ok, detail)。
+
+    card 非空 ⇒ 飞书走交互卡片（带按钮）；卡片失败自动回落纯文本，绝不因卡片格式吞通知。
+    """
     if dry_run:
         return True, "dry-run"
     ok = False
     details = []
-    try:
-        sys.path.insert(0, os.path.join(ROOT, "reflect_scripts"))
-        from reflect_common import notify_feishu
-        r = notify_feishu(text)
-        if r:
-            ok = True
-            details.append("feishu:ok")
-        else:
-            details.append("feishu:fail")
-    except Exception as e:
-        details.append("feishu:err(%s)" % e)
+    if card:
+        try:
+            sys.path.insert(0, os.path.join(ROOT, "reflect_scripts"))
+            from reflect_common import send_feishu_card
+            r = send_feishu_card(card)
+            _code = r.get("code") if isinstance(r, dict) else None
+            if _code == 0:
+                ok = True
+                details.append("feishu:card-ok")
+            else:
+                details.append("feishu:card-code=%s" % _code)
+        except Exception as e:
+            details.append("feishu:card-err(%s)" % e)
+    if not ok:
+        try:
+            sys.path.insert(0, os.path.join(ROOT, "reflect_scripts"))
+            from reflect_common import notify_feishu
+            r = notify_feishu(text)
+            if r:
+                ok = True
+                details.append("feishu:ok" if not card else "feishu:text-ok(fallback)")
+            else:
+                details.append("feishu:fail")
+        except Exception as e:
+            details.append("feishu:err(%s)" % e)
     try:
         sys.path.insert(0, os.path.join(ROOT, "reflect_scripts"))
         from notify_dingtalk_group import notify_group
@@ -1586,6 +1686,11 @@ def _note_next_round(sleep_s):
 def run_once(args):
     now_bj = beijing_now()
     st = _load_state()          # ★提前加载：抽样轮转/日预算都写在同一份 state（只加载一次）
+    # ★2026-10-04：面板可改「保活时长」⇒ 每轮都取最新设置覆盖命令行/守护参数
+    _eff_hold = effective_auto_hold_minutes(getattr(args, "auto_hold_minutes", 0))
+    if _eff_hold != float(getattr(args, "auto_hold_minutes", 0) or 0):
+        print("[anyrouter] 保活时长取自面板设置：%g 分钟（覆盖命令行/守护参数）" % _eff_hold, flush=True)
+    args.auto_hold_minutes = _eff_hold
     key = _load_key()
     if not key:
         print("[anyrouter] 无可用密钥（env ANYROUTER_API_KEY / keychain anyrouter_api_key / ~/.config/anyrouter/key）")
@@ -1639,7 +1744,10 @@ def run_once(args):
                            auto_hold_minutes=getattr(args, "auto_hold_minutes", 0),
                            keepalive_seconds=getattr(args, "keepalive_seconds", 240),
                            sid=session_id_for(key, "anyrouter-probe"))
-        pushed, push_detail = send_notifications(text, dry_run=args.dry_run)
+        _card = None
+        if float(getattr(args, "auto_hold_minutes", 0) or 0) > 0:
+            _card = build_hold_card(text, ctl_url(), ctl_stop_url())
+        pushed, push_detail = send_notifications(text, dry_run=args.dry_run, card=_card)
         print("[anyrouter] 推送=%s (%s)" % (pushed, push_detail))
     elif do_push:
         print("[anyrouter] 有可用坑，但未要求推送（--notify 未开）")
@@ -2055,6 +2163,53 @@ def selftest():
     chk("text: 给出 --stop-hold 停机命令", ("--stop-hold" in _txt), True)
     chk("NC: 不再声称「已占住的坑位身份」", ("已占住的坑位身份" in _txt), False)
     chk("text: 仍保留 session 记号（标非必需）", ("claude --session-id sid-abc" in _txt), True)
+    # 11d) 本地面板联动（沙盒 state-dir：绝不碰真实监控目录）
+    _sd_old2 = STATE_DIR
+    try:
+        import tempfile as _tf2
+        _apply_state_dir(_tf2.mkdtemp(prefix="anr_panel_"))
+        chk("panel: 无 ctl.url ⇒ ctl_url()=None", ctl_url(), None)
+        chk("panel: 无设置 ⇒ 沿用命令行时长", effective_auto_hold_minutes(30), 30.0)
+        chk("panel: 写默认时长 15", set_hold_default_minutes(15), 15.0)
+        chk("panel: 设置优先于命令行", effective_auto_hold_minutes(30), 15.0)
+        _bad = False
+        try:
+            set_hold_default_minutes(0)
+        except ValueError:
+            _bad = True
+        chk("NC: 非法时长(0)被拒", _bad, True)
+        chk("NC: 非法时长被拒后未污染设置", hold_default_minutes(), 15.0)
+        import json as _json2
+        with open(os.path.join(STATE_DIR, CTL_URL_FILE), "w") as f:
+            _json2.dump({"url": "http://10.0.0.9:8766/?t=abc",
+                         "local_url": "http://127.0.0.1:8766/?t=abc",
+                         "stop_url": "http://10.0.0.9:8766/stop?t=abc",
+                         "stop_local_url": "http://127.0.0.1:8766/stop?t=abc"}, f)
+        chk("panel: 读到局域网入口", ctl_url(), "http://10.0.0.9:8766/?t=abc")
+        chk("panel: 读到本机入口", ctl_url(local=True), "http://127.0.0.1:8766/?t=abc")
+        chk("panel: 读到停止端点", ctl_stop_url(), "http://10.0.0.9:8766/stop?t=abc")
+        _t2 = _build_text([{"model": "m1", "verdict": AVAILABLE, "http": 200}], beijing_now(), "t",
+                          auto_hold_minutes=30, keepalive_seconds=240, sid="sid-abc")
+        chk("panel: 文案给出一键停面板入口", ("10.0.0.9:8766" in _t2), True)
+        chk("panel: 文案仍留命令行备用（面板挂了也能停）", ("--stop-hold" in _t2), True)
+        _card = build_hold_card(_t2, ctl_url(), ctl_stop_url())
+        _acts = _card["elements"][-1]["actions"]
+        chk("card: 有「停止保活」按钮", any("停止保活" in a["text"]["content"] for a in _acts), True)
+        chk("card: 停止按钮指向 /stop（带令牌）",
+            any(a.get("url", "").endswith("/stop?t=abc") and "停止保活" in a["text"]["content"]
+                for a in _acts), True)
+        chk("card: 另有打开面板按钮", any("关闭" not in a["text"]["content"] and "/?t=abc" in a.get("url", "")
+                                        for a in _acts), True)
+        chk("NC: 无面板 ⇒ 不造按钮（回落纯文本）",
+            build_hold_card("x", None, None)["elements"][-1].get("tag"), "div")
+        chk("NC: 只有面板无停止端点 ⇒ 也不出停止按钮",
+            any("停止保活" in a["text"]["content"]
+                for a in (build_hold_card("x", "http://h/", None)["elements"][-1].get("actions") or [])), False)
+        _call = {"n": 0}
+        chk("card: 干跑不发（dry-run 短路，卡片路径不被触发）",
+            send_notifications("x", dry_run=True, card=_card), (True, "dry-run"))
+    finally:
+        _apply_state_dir(_sd_old2)
 
     # 7) 故障面判据（★核心：防「站点没坑」被误报成「监控挂了」）
     chk("fault: 全 BUSY -> None", fault_kind(busy), None)

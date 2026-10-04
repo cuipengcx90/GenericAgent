@@ -61,6 +61,15 @@ RESTART_BACKOFF = [30, 60, 120, 300, 600]   # 连续重启的退避阶梯（秒�
 BACKOFF_RESET_S = 1800            # 距上次重启超过这么久 ⇒ 退避计数归零
 NOTIFY_DEDUP_S = 1800             # 「同一动作」通知去重窗
 
+# ---- 本地面板（2026-10-04 用户要求「别再让我自己跑脚本」）----
+PANEL_PORT = 8766                 # 面板默认端口（被占则向后试 20 个）
+PANEL_TRIES = 20
+PANEL_BIND = "0.0.0.0"            # 绑全网卡 ⇒ 手机点飞书卡片按钮也能通（令牌门禁）
+HOLD_STOP_FILE = "hold.stop"      # 与 watch.py 同名同义（面板按钮=同一旗标）
+HOLD_MINUTES_FILE = "hold.minutes"
+CTL_URL_FILE = "ctl.url"
+DEFAULT_HOLD_MINUTES = 3.0        # ★用户口径：默认保活 3 分钟（面板可改，别默认占 30 分钟）
+
 
 # ------------------------------------------------------------------ 小工具
 def beijing_now():
@@ -353,6 +362,22 @@ def supervise(args):
     ledger = os.path.join(state_dir, "watchd.jsonl")
     os.makedirs(state_dir, exist_ok=True)
 
+    # ★2026-10-04：默认保活 3 分钟（用户口径）——只在没设置时才播种，绝不覆盖用户改过的值
+    try:
+        _hm_path = os.path.join(state_dir, HOLD_MINUTES_FILE)
+        if not os.path.exists(_hm_path):
+            with open(_hm_path, "w") as f:
+                json.dump({"minutes": DEFAULT_HOLD_MINUTES, "by": "default",
+                           "ts": beijing_now().isoformat()}, f)
+    except Exception:
+        pass
+
+    panel = None
+    if getattr(args, "panel", True) and not args.dry_run and not args.once:
+        panel = start_panel(state_dir, port=getattr(args, "panel_port", None), log=log)
+        if panel:
+            log("面板已起：%s（手机点飞书卡片按钮即可停保活）" % panel["urls"]["url"])
+
     t_start = time.time()
     hard_end = t_start + args.max_hours * 3600 if args.max_hours else None
     child_pid, child_lstart, spawn_ts, child_proc, child_fh = None, None, None, None, None
@@ -470,6 +495,255 @@ def supervise(args):
             child_fh and child_fh.close()
         except Exception:
             pass
+        if panel:
+            stop_panel(panel, state_dir, log=log)
+            log("面板已收（ctl.url 已清）")
+
+
+# ------------------------------------------------------------------ 本地面板
+def _read_json_file(path):
+    """容错读 JSON（也吃 jsonl：取最后一行能解析的）。"""
+    try:
+        with open(path) as f:
+            txt = f.read().strip()
+        try:
+            return json.loads(txt)
+        except Exception:
+            for line in reversed(txt.splitlines()):
+                try:
+                    return json.loads(line)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return None
+
+
+def lan_ip():
+    """本机局域网 IP（UDP connect 不发包）；取不到回落 127.0.0.1。"""
+    try:
+        import socket
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sk.connect(("8.8.8.8", 80))
+            return sk.getsockname()[0]
+        finally:
+            sk.close()
+    except Exception:
+        return "127.0.0.1"
+
+
+def write_ctl_url(state_dir, port, token, log=None, lan=None):
+    """把面板入口写进 <state-dir>/ctl.url（watch.py 侧 ctl_url() 读它，通知/卡片就用它）。"""
+    lan = lan or lan_ip()
+    d = {"port": port, "token": token, "ts": beijing_now().isoformat(),
+         "url": "http://%s:%d/?t=%s" % (lan, port, token),
+         "local_url": "http://127.0.0.1:%d/?t=%s" % (port, token),
+         "stop_url": "http://%s:%d/stop?t=%s" % (lan, port, token),
+         "stop_local_url": "http://127.0.0.1:%d/stop?t=%s" % (port, token)}
+    os.makedirs(state_dir, exist_ok=True)
+    with open(os.path.join(state_dir, CTL_URL_FILE), "w") as f:
+        json.dump(d, f)
+    return d
+
+
+def _esc(x):
+    return (str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _page_shell(title, body):
+    return ("<!doctype html><html lang=zh><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>" + _esc(title) + "</title><style>"
+            "body{font-family:-apple-system,Helvetica,Arial,sans-serif;margin:0;padding:18px;"
+            "background:#0f1115;color:#e8eaed}h1{font-size:20px;margin:0 0 12px}"
+            "p,li{line-height:1.6;font-size:15px}.card{background:#171a21;border:1px solid #262b36;"
+            "border-radius:12px;padding:14px 16px;margin:12px 0}"
+            "a.btn{display:inline-block;background:#2b6cff;color:#fff;text-decoration:none;"
+            "padding:14px 20px;border-radius:10px;margin:6px 8px 6px 0;font-size:16px}"
+            "a.danger{background:#e5484d}a.ghost{background:#2a2f3a}"
+            "code{background:#0b0d11;padding:2px 6px;border-radius:6px;font-size:13px}"
+            "input[type=number]{font-size:16px;padding:10px;width:90px;border-radius:8px;border:1px solid #3a4150;"
+            "background:#0b0d11;color:#e8eaed}"
+            "</style></head><body>" + body + "</body></html>")
+
+
+def _page_home(state_dir, token, log_path=None):
+    st = _read_json_file(os.path.join(state_dir, "state.json")) or {}
+    hold = os.path.exists(os.path.join(state_dir, HOLD_STOP_FILE))
+    hm = _read_json_file(os.path.join(state_dir, HOLD_MINUTES_FILE)) or {}
+    mins = hm.get("minutes")
+    age = ""
+    try:
+        lt = float(st.get("last_ts") or 0)
+        if lt:
+            age = "（%.1f 分钟前）" % ((time.time() - lt) / 60.0)
+    except Exception:
+        pass
+    rows = ["保活：<b>%s</b>" % ("⏹ 已请求停止（下一轮即收手）" if hold else "▶️ 进行中／等待命中"),
+            "保活时长：<b>%s</b>" % (("%g 分钟" % mins) if mins else "未设置（用守护参数）"),
+            "最近一轮：%s%s" % (_esc(st.get("last_ts") or "?"), age)]
+    for k in ("last_verdict", "last_http", "next_round_ts", "hold_claim", "hold_until",
+              "fault_streak", "rounds", "budget_day", "budget_used"):
+        if st.get(k) is not None:
+            rows.append("%s = %s" % (k, _esc(st.get(k))))
+    body = ["<h1>🎯 anyrouter 抢坑监控 · 面板</h1>",
+            "<div class=card>" + "<br>".join(rows) + "</div>",
+            "<div class=card><b>一键操作</b><p>",
+            "<a class=\"btn danger\" href=\"/stop?t=" + token + "\">⏹ 停止保活</a>",
+            "<a class=\"btn ghost\" href=\"/?t=" + token + "\">🔄 刷新</a>",
+            "<a class=\"btn ghost\" href=\"/status?t=" + token + "\">📄 状态 JSON</a>",
+            "<a class=\"btn ghost\" href=\"/log?t=" + token + "\">📜 日志尾部</a>",
+            "</p></div>",
+            "<div class=card><b>保活时长</b><p>点一下即改，下一轮探测生效（默认 %g 分钟）：</p>" % DEFAULT_HOLD_MINUTES,
+            "".join("<a class=\"btn ghost\" href=\"/hold-minutes?m=%g&t=%s\">%g 分钟</a>"
+                    % (m, token, m) for m in (3, 10, 30, 60, 120)),
+            "<form action=\"/hold-minutes\" method=get>"
+            "<input type=hidden name=t value=\"" + token + "\">"
+            "<input type=number name=m min=1 step=1 value=\"" + str(int(mins or DEFAULT_HOLD_MINUTES)) + "\"> "
+            "<button class=\"btn\" type=submit style=\"display:inline-block;background:#2b6cff;color:#fff;"
+            "border:0;padding:14px 20px;border-radius:10px;font-size:16px\">设为该分钟数</button></form></div>",
+            "<div class=card><p>也可以<b>直接在对话里说「停保活」</b>（我立刻给你停），"
+            "或用命令行 <code>python3 tools/anyrouter_slot_watch.py --stop-hold</code>。</p>"
+            "<p>停止是立即生效的：正在跑的保活线程 ≤5 秒收手，新命中会重新决策。</p></div>"]
+    return _page_shell("anyrouter 面板", "".join(body))
+
+
+def _page_ok(msg, token):
+    return _page_shell("anyrouter 面板", "<div class=card><h1>" + _esc(msg) + "</h1>"
+                       "<p><a class=\"btn\" href=\"/?t=" + token + "\">返回面板</a></p></div>")
+
+
+def panel_status(state_dir):
+    st = _read_json_file(os.path.join(state_dir, "state.json")) or {}
+    hm = _read_json_file(os.path.join(state_dir, HOLD_MINUTES_FILE)) or {}
+    led = None
+    try:
+        with open(os.path.join(state_dir, "ledger.jsonl")) as f:
+            for line in f:
+                if line.strip():
+                    led = line.strip()
+    except Exception:
+        pass
+    return {"now": beijing_now().isoformat(),
+            "hold_stop_requested": os.path.exists(os.path.join(state_dir, HOLD_STOP_FILE)),
+            "hold_minutes": hm.get("minutes"),
+            "state": st,
+            "last_ledger": _read_json_file(os.path.join(state_dir, "ledger.jsonl")) if False else led}
+
+
+def panel_handle(path, query, state_dir, token, log_path=None):
+    """面板路由（纯函数式：给定 state_dir/token 出响应体）⇒ 自测可不经网络直接驱动。"""
+    if not token or token not in (query.get("t") or []):
+        return 403, "text/plain", "403 令牌不对：请用通知/卡片里那条带 ?t=… 的完整链接打开。"
+    if path in ("/stop", "/stop/"):
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            with open(os.path.join(state_dir, HOLD_STOP_FILE), "w") as f:
+                json.dump({"ts": beijing_now().isoformat(), "by": "panel",
+                           "ua": (query.get("ua") or [""])[0]}, f)
+        except Exception as e:
+            return 500, "text/plain", "写停止旗标失败：%s" % e
+        return 200, "text/html", _page_ok("⏹ 已请求停止保活（≤5 秒生效）", token)
+    if path in ("/hold-minutes", "/hold-minutes/"):
+        raw = (query.get("m") or [""])[0]
+        try:
+            m = float(raw)
+            if m <= 0 or m > 24 * 60:
+                raise ValueError("out of range")
+        except Exception:
+            return 400, "text/plain", "400 时长不合法：m 必须是 0~1440 分钟的数字（收到 %r）" % raw
+        os.makedirs(state_dir, exist_ok=True)
+        with open(os.path.join(state_dir, HOLD_MINUTES_FILE), "w") as f:
+            json.dump({"minutes": m, "ts": beijing_now().isoformat(), "by": "panel"}, f)
+        return 200, "text/html", _page_ok("✅ 保活时长已设为 %g 分钟（下一轮生效）" % m, token)
+    if path in ("/status", "/status/"):
+        return 200, "application/json", json.dumps(panel_status(state_dir), ensure_ascii=False, indent=2)
+    if path in ("/log", "/log/"):
+        try:
+            n = int((query.get("n") or ["60"])[0] or 60)
+        except Exception:
+            n = 60
+        try:
+            with open(log_path or os.path.join(state_dir, "watch.log")) as f:
+                lines = f.read().splitlines()[-max(1, min(n, 500)):]
+        except Exception as e:
+            lines = ["(读日志失败：%s)" % e]
+        return 200, "text/plain", "\n".join(lines)
+    if path in ("/", "/index.html"):
+        return 200, "text/html", _page_home(state_dir, token, log_path)
+    return 404, "text/plain", "404（可用：/ /stop /hold-minutes /status /log）"
+
+
+def _panel_server(state_dir, port, token, log_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class H(BaseHTTPRequestHandler):
+        server_version = "anyrouter-panel/1.0"
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _go(self):
+            from urllib.parse import urlparse, parse_qs
+            u = urlparse(self.path)
+            q = parse_qs(u.query)
+            try:
+                code, ctype, body = panel_handle(u.path, q, state_dir, token, log_path=log_path)
+            except Exception as e:                        # 面板自身出错也绝不 500 裸栈
+                code, ctype, body = 500, "text/plain", "面板内部错误：%s" % e
+            data = body.encode("utf-8")
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype + "; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                pass
+
+        do_GET = _go
+        do_POST = _go
+
+    return ThreadingHTTPServer((PANEL_BIND, port), H)
+
+
+def start_panel(state_dir, port=None, log=None, token=None, lan=None):
+    """起本地面板；返回 {server, thread, token, port, urls}；起不来返回 None（不阻塞监控）。"""
+    import secrets
+    import threading
+    token = token or secrets.token_hex(8)
+    ports = ([int(port)] if port is not None else []) + list(range(PANEL_PORT, PANEL_PORT + PANEL_TRIES))
+    srv, last = None, None
+    for p in ports:
+        try:
+            srv = _panel_server(state_dir, p, token, os.path.join(state_dir, "watch.log"))
+            break
+        except OSError as e:
+            last = e
+    if srv is None:
+        (log or print)("[面板] 起不来（端口占用？）：%s" % last)
+        return None
+    th = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True)
+    th.start()
+    urls = write_ctl_url(state_dir, srv.server_address[1], token, log=log, lan=lan)
+    return {"server": srv, "thread": th, "token": token, "port": srv.server_address[1], "urls": urls}
+
+
+def stop_panel(info, state_dir=None, log=None):
+    """收面板：关服务 + 删 ctl.url（别把死链留给下一张通知卡片）。"""
+    try:
+        info["server"].shutdown()
+        info["server"].server_close()
+    except Exception:
+        pass
+    try:
+        if state_dir:
+            os.unlink(os.path.join(state_dir, CTL_URL_FILE))
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ 自测
@@ -629,6 +903,75 @@ def selftest():
                         capture_output=True, text=True)
     chk("NC 形状: 坏值必须让子进程报错（证明自测能失败）", r2.returncode != 0, True)
 
+    # 8) ★2026-10-04 面板：令牌门禁 / 一键停旗标 / 保活时长 / 真 HTTP 一发（沙盒 state-dir）
+    def _lj(d, name):
+        try:
+            with open(os.path.join(d, name)) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    _pd = tempfile.mkdtemp(prefix="anr_panel_")
+    chk("面板: 错令牌 ⇒ 403", panel_handle("/", {"t": ["wrong"]}, _pd, "tok")[0], 403)
+    chk("NC 面板: 缺令牌 ⇒ 403（不得裸奔）", panel_handle("/stop", {}, _pd, "tok")[0], 403)
+    chk("NC 面板: 403 时不得写停止旗标（先验令牌后动状态）",
+        os.path.exists(os.path.join(_pd, HOLD_STOP_FILE)), False)
+    _c, _ct, _b = panel_handle("/", {"t": ["tok"]}, _pd, "tok")
+    chk("面板: 首页 200/HTML", (_c, "text/html" in _ct), (200, True))
+    chk("面板: 首页有「停止保活」按钮且链到 /stop", ("/stop?t=tok" in _b) and ("停止保活" in _b), True)
+    chk("面板: 首页有保活时长预设 3 分钟", "/hold-minutes?m=3" in _b, True)
+    chk("面板: 首页提示可对话里说「停保活」", "停保活" in _b, True)
+    _c, _, _ = panel_handle("/stop", {"t": ["tok"]}, _pd, "tok")
+    chk("面板: 一键停 ⇒ 落 hold.stop 旗标",
+        (_c, os.path.exists(os.path.join(_pd, HOLD_STOP_FILE))), (200, True))
+    _c, _, _ = panel_handle("/hold-minutes", {"t": ["tok"], "m": ["7"]}, _pd, "tok")
+    chk("面板: 设保活时长 7 分钟", (_c, _lj(_pd, HOLD_MINUTES_FILE).get("minutes")), (200, 7.0))
+    chk("NC 面板: m=0 拒（400）", panel_handle("/hold-minutes", {"t": ["tok"], "m": ["0"]}, _pd, "tok")[0], 400)
+    chk("NC 面板: m=abc 拒（400）", panel_handle("/hold-minutes", {"t": ["tok"], "m": ["abc"]}, _pd, "tok")[0], 400)
+    chk("NC 面板: m=99999 拒（防自杀式长占）",
+        panel_handle("/hold-minutes", {"t": ["tok"], "m": ["99999"]}, _pd, "tok")[0], 400)
+    chk("NC 面板: 非法值不得覆盖已设时长", _lj(_pd, HOLD_MINUTES_FILE).get("minutes"), 7.0)
+    chk("面板: /status 是 JSON", panel_handle("/status", {"t": ["tok"]}, _pd, "tok")[1], "application/json")
+    chk("面板: 未知路径 404", panel_handle("/nope", {"t": ["tok"]}, _pd, "tok")[0], 404)
+    _u = write_ctl_url(_pd, 8799, "tok", log=lambda m: None, lan="10.0.0.9")
+    chk("面板: ctl.url 写局域网入口", _u["url"], "http://10.0.0.9:8799/?t=tok")
+    chk("面板: ctl.url 写 stop 端点", _u["stop_url"], "http://10.0.0.9:8799/stop?t=tok")
+    _info = start_panel(_pd, port=0, log=lambda m: None)
+    try:
+        import urllib.request as _ur
+        _p = _info["port"]
+        _r = _ur.urlopen("http://127.0.0.1:%d/status?t=%s" % (_p, _info["token"]), timeout=5)
+        chk("面板: 真 HTTP /status 200", _r.status, 200)
+        _badcode = 0
+        try:
+            _ur.urlopen("http://127.0.0.1:%d/status?t=bad" % _p, timeout=5)
+        except Exception as e:
+            _badcode = getattr(e, "code", 0)
+        chk("NC 面板: 真 HTTP 错令牌 ⇒ 403", _badcode, 403)
+        os.unlink(os.path.join(_pd, HOLD_STOP_FILE))
+        _r2 = _ur.urlopen("http://127.0.0.1:%d/stop?t=%s" % (_p, _info["token"]), timeout=5)
+        chk("面板: 真 HTTP 一键停 ⇒ 200 且落旗标",
+            (_r2.status, os.path.exists(os.path.join(_pd, HOLD_STOP_FILE))), (200, True))
+        chk("面板: 真 HTTP /hold-minutes 生效",
+            (_ur.urlopen("http://127.0.0.1:%d/hold-minutes?m=12&t=%s" % (_p, _info["token"]),
+                         timeout=5).status, _lj(_pd, HOLD_MINUTES_FILE).get("minutes")), (200, 12.0))
+    finally:
+        stop_panel(_info, _pd, log=lambda m: None)
+    chk("面板: 退出即清 ctl.url（别把死链留给通知卡片）",
+        os.path.exists(os.path.join(_pd, CTL_URL_FILE)), False)
+    import socket as _sk
+    _occ = _sk.socket()
+    _occ.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+    _occ.bind(("0.0.0.0", _p))
+    _occ.listen(1)
+    try:
+        _i2 = start_panel(_pd, port=_p, log=lambda m: None)
+        chk("NC 面板: 真占住端口 ⇒ 向后试端口而非崩", (_i2 or {}).get("port", _p) != _p, True)
+        chk("NC 面板: 回退后仍写 ctl.url", bool((_i2 or {}).get("urls", {}).get("url")), True)
+        if _i2:
+            stop_panel(_i2, _pd, log=lambda m: None)
+    finally:
+        _occ.close()
+
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
     print("selftest: %d passed, %d failed" % (sum(1 for c in cases if c[3]),
@@ -674,6 +1017,12 @@ def _build_parser():
     ap.add_argument("--backoff", default=None,
                     help="连续重启的退避阶梯（秒，逗号分隔；默认 %s）"
                          % ",".join(str(x) for x in RESTART_BACKOFF))
+    ap.add_argument("--panel", action="store_true", dest="panel", default=True,
+                    help="起本地面板（一键停保活/改保活时长；默认开）")
+    ap.add_argument("--no-panel", action="store_false", dest="panel",
+                    help="不起本地面板（通知里回落命令行提示）")
+    ap.add_argument("--panel-port", type=int, default=None, dest="panel_port",
+                    help="面板端口（默认 %d，被占则向后试 %d 个；0=随机）" % (PANEL_PORT, PANEL_TRIES))
     ap.add_argument("--dry-run", action="store_true", help="只判断不 spawn/不杀")
     ap.add_argument("--once", action="store_true", help="只跑一轮巡检/决策（供演练）")
     ap.add_argument("--hello", action="store_true", help="打印将要执行的动作与预算后退出")
@@ -704,6 +1053,8 @@ def main():
                                                                   STALL_MIN_GRACE_S),
             "state_dir": sd,
             "notify": args.notify,
+            "panel": args.panel,
+            "panel_port": args.panel_port,
             "dry_run": args.dry_run,
         }, ensure_ascii=False, indent=2))
         return 0
