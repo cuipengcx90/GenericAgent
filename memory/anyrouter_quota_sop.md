@@ -157,6 +157,26 @@
 
 ★运维：改判据/名单后**必须重启**（见 §3.3）；本次已按定时同款命令重挂 watchd。
 
+## 1.5 ★「打开网页一直 403」的真实语义（2026-10-04 实测，与抢坑探针无关）
+
+现象：浏览器打开 `anyrouter.top` 页面能显示，但页内满屏 `错误：Request failed with status code 403` / `Failed to load status`。
+
+实测（真浏览器同源 fetch，2026-10-04）：
+
+| 请求 | 状态 | 头 | 说明 |
+|---|---|---|---|
+| `GET /login`（页面本体） | **200** | 无拦截头 | 网页文件正常，不是「整站被封」 |
+| `GET /api/status`、`/api/user/self`、`/api/pricing`、`/api/notice`、`/api/models` | **403** | `Server: ESA` + `X-Tengine-Error: denied by http_ratelimit` | 阿里云 ESA 边缘**按出口 IP 限流**，body 是 ESA 的 `403 Forbidden` 页 |
+| `GET /v1/messages` | 404（JSON） | 无拦截头 | `/v1/*` **不被这条规则拦**（只是 GET 不是合法调用） |
+| 异网旁证 `r.jina.ai/https://anyrouter.top/api/status` | **200 + 真 JSON**（公告数据） | — | 接口本身健康 ⇒ 403 是**我们这条出口 IP 的限流桶满了**，非封号、非没额度、非「客户端不是 CC」 |
+
+判读铁律：
+
+- **403(`denied by http_ratelimit`) ≠ 封号 ≠ 没额度 ≠ 客户端检测**；它是 CDN 的 per-IP 频次桶（本机出口是 Clash 共享节点，多人共用同一出口 IP）。
+- 该 403 只落在 `/api/*`（控制台/用量/定价等前端接口）⇒ **只影响你打开网页看面板**，不影响抢坑：探针走 `/v1/messages`（POST，带 `anthropic-beta: context-1m-2025-08-07`）与 `/v1/responses`，日志里从来只有 `429/500/502`（号池满/上游），**没有出现过 403**。
+- 处置：**换出口 IP 即恢复**（Clash 切节点，或用手机热点打开页面对照）；不换就等桶过期。切完仍 403 才是站点对 `/api` 面的全局收紧，只能等。
+- 另有 `X-Tengine-Error: denied by http_custom`（python 裸请求 `/` 时见）= CDN **自定义规则**拦裸客户端，返回 200 + 4321 B 反爬 JS 挑战页（`acw_sc__v2`）⇒ 与上面的 `http_ratelimit` 是**两条不同规则**，勿混判。
+
 ## 2. 工具
 
 `tools/anyrouter_slot_watch.py`（纯 stdlib + keychain）：
