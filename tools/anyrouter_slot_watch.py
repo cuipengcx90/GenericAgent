@@ -526,6 +526,13 @@ def _http_post(url, key, body, timeout=25, read_limit=None, extra_headers=None):
         return 0, "transport: %s: %s" % (type(e).__name__, e)
 
 
+def _link_tag(lk):
+    """link 证据标记（None=未取证 / ok=控制探针拿到响应 / down=拿不到响应）。"""
+    if lk is None:
+        return ""
+    return " [link=%s]" % ("ok" if lk else "down")
+
+
 def _link_ok(host, timeout=6, get=None):
     """同栈控制探针：本机→站点能否**拿到 HTTP 响应**（任一状态码都算可达）。
 
@@ -585,9 +592,10 @@ def probe_model(model, key, hosts=None, timeout=60):
             lk = _link_ok(host) if el >= QUEUED_MIN_S else None
             v, lat, queued = classify_latency(0, UNKNOWN, el, link_ok=lk)
             if queued or v == LINK_DOWN:
+                # ★queued 必须写真实值：LINK_DOWN 时 queued=False（"在排队"与"连不上"是两件事）
                 hot.update({"http": 0, "verdict": v, "detail": text[:200], "host": host,
-                            "elapsed_s": round(el, 1), "latency": lat, "queued": True,
-                            "face": face, "shape_retry": shape_retry})
+                            "elapsed_s": round(el, 1), "latency": lat, "queued": queued,
+                            "face": face, "shape_retry": shape_retry, "link": _link_tag(lk)})
                 return hot
             continue
         v, lat, queued = classify_latency(code, classify(code, text), el)
@@ -601,8 +609,8 @@ def probe_model(model, key, hosts=None, timeout=60):
                     tried.append(text[:120])
                     continue
                 hot.update({"http": 0, "verdict": v, "detail": text[:200], "host": host,
-                            "elapsed_s": round(el, 1), "latency": lat, "queued": True,
-                            "face": face, "shape_retry": shape_retry})
+                            "elapsed_s": round(el, 1), "latency": lat, "queued": queued,
+                            "face": face, "shape_retry": shape_retry, "link": _link_tag(lk)})
                 return hot
             v, lat, queued = classify_latency(code, classify(code, text), el)
         hot.update({"http": code, "verdict": v, "detail": text[:200], "host": host,
@@ -965,6 +973,10 @@ def run_once(args):
         _face_tag = ""
         if r.get("face") and r.get("face") != FACE_MESSAGES:
             _face_tag = " [face=%s%s]" % (r["face"], " retry" if r.get("shape_retry") else "")
+        # link 证据标记：http=0 的判定到底是「链路不可达」还是「过闸排队」，
+        # 必须写进日志（2026-10-04 实测：QUEUED 与 LINK_DOWN 都源自 http=0，
+        # 不标证据就没法事后复核）。
+        _face_tag += (r.get("link") or "")
         print("[anyrouter] %-28s http=%s %s (%s s/%s)%s" % (
             r["model"], r["http"], r["verdict"],
             "-" if r.get("elapsed_s") is None else r["elapsed_s"], r.get("latency", "na"), _face_tag))
@@ -1282,6 +1294,12 @@ def selftest():
         fault_kind([{"verdict": LINK_DOWN}, {"verdict": QUEUED}]), None)
     chk("link: 控探针拿到 HTTP 响应即可达",
         _link_ok("h", get=lambda u, t: type("R", (), {"status": 432, "close": lambda s: None})()), True)
+    chk("link: 标记 http=0 的证据（ok/down/未取证空）",
+        (_link_tag(True), _link_tag(False), _link_tag(None)), (" [link=ok]", " [link=down]", ""))
+    chk("link: LINK_DOWN 时 queued 必须为 False（证据门与排队互斥）",
+        classify_latency(0, UNKNOWN, 45.0, link_ok=False)[2], False)
+    chk("link: QUEUED 时 queued 必须为 True",
+        classify_latency(0, UNKNOWN, 45.0, link_ok=True)[2], True)
 
     def _boom(u, t):
         raise OSError("boom")

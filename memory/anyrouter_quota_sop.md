@@ -151,7 +151,7 @@
 python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（按名路由到 messages / codex 两面，见 §1.4）
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
 python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
-python3 tools/anyrouter_slot_watch.py --selftest        # 147 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门）
+python3 tools/anyrouter_slot_watch.py --selftest        # 150 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
@@ -192,6 +192,7 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 ## 3.3 改了名单/判据代码怎么生效（必须重启）+ 干净重启姿势（2026-10-04 实测）
 
 - **运行中的实例不会自动吃到新代码**：watchd 只在启动时拉起**一次**子进程，子进程是长驻 `--watch` 循环 ⇒ 改 `tools/anyrouter_slot_watch.py` 的 `MODELS`/判据后**必须重启**才生效。生效判据=`temp/anyrouter_watch/watch.log` 里「watch 第 N 轮」之后的模型行数（8 名应连续打印 8 行；codex 面那行尾带 `[face=codex]`）+ `ledger.jsonl` 末行 `len(results)`。
+- **http=0 的行尾还会带链路证据标记**（2026-10-04 加）：`[link=ok]`=同栈控制探针拿到 HTTP 响应（过闸排队，非我方链路故障）；`[link=down]`=控制探针也拿不到响应 ⇒ 判 `LINK_DOWN`（网络/代理面，rc=2 且走故障通知）；不加=该行耗时 < `QUEUED_MIN_S`(8s) 属快失败，未取证（不标证据就事后没法复核「连不上」与「在排队」）。
 - **`bg_task stop` 会留下孤儿探测进程**（实测踩到）：stop 只向 wrapper 的进程组发 SIGTERM，而守护用 `start_new_session` 起探测子进程（自成 pgid）⇒ 守护死了、探测进程仍在跑并**继续持 `watch.lock`**。干净重启四步：
 
   ```bash
