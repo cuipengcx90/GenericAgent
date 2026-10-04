@@ -159,6 +159,21 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 27 �
 - 故障恢复（再次拿到 POOL_BUSY/可用等正常判定）⇒ 推「已恢复」；
 - 故障文案由 `--log-hint` / 环境变量 `GA_ANYROUTER_LOG_HINT` 可覆盖日志路径（守护启动子进程时自动注入 `watch.log` 路径）。
 
+## 3.3 改了名单/判据代码怎么生效（必须重启）+ 干净重启姿势（2026-10-04 实测）
+
+- **运行中的实例不会自动吃到新代码**：watchd 只在启动时拉起**一次**子进程，子进程是长驻 `--watch` 循环 ⇒ 改 `tools/anyrouter_slot_watch.py` 的 `MODELS`/判据后**必须重启**才生效。生效判据=`temp/anyrouter_watch/watch.log` 里「watch 第 N 轮」之后的模型行数（7 名应连续打印 7 行）+ `ledger.jsonl` 末行 `len(results)`。
+- **`bg_task stop` 会留下孤儿探测进程**（实测踩到）：stop 只向 wrapper 的进程组发 SIGTERM，而守护用 `start_new_session` 起探测子进程（自成 pgid）⇒ 守护死了、探测进程仍在跑并**继续持 `watch.lock`**。干净重启四步：
+
+  ```bash
+  python3 tools/bg_task.py stop --name anyrouter_slot_watchd                    # 1) 停守护
+  ps -eo pid,ppid,pgid,etime,command | grep anyrouter_slot_watch.py | grep -v grep   # 2) 查残留
+  kill -TERM -<pgid>          # 3) 仍有残留则按 pgid 精确停（pgid=该 pid；pid 也在 watch.lock 里）
+  python3 tools/bg_task.py start --name anyrouter_slot_watchd -- /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23   # 4) 重起
+  ```
+
+- 陈旧 `watch.lock`（指向已死 pid）**无需手工删**：新实例按 pid+lstart 判活后自动接管（实测守护 09:36:30 起、09:36:30 首轮即刷新锁为新 pid）。
+- 换名单实例：2026-10-04 `MODELS` 5→7（加 `claude-opus-4-8`/`claude-haiku-4-5`）后按上述姿势重启 ⇒ 首轮 09:36:30 打印 7 行（7/7 POOL_BUSY），硬超时随之为次日 08:35（23h），与次日 08:50 定时接续只留 ~15min 空窗。
+
 ## 4. 排错
 
 - 全 POOL_BUSY 且长期无 200：先查 `/api/log/self` 是否有成功记录；再试换 kind（`gpt-6-astra-cc-format[1m]`）。
