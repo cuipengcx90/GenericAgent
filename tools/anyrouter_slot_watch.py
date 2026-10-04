@@ -1109,6 +1109,39 @@ def _ledger_snippet(r):
     return txt[:160] or None
 
 
+# ---------------------------------------------------------------- 受理阶段（站点日志口径）
+# ★2026-10-04 起因：用户反复问「站点后台日志里只看到 GPT，没看到 Claude 的探测」。
+#   地面真值（用登录态同源读 /api/log/self，最近 600 行 + 今日 148 行）：今日**全部 148 行**
+#   出自本探针令牌 ga-monitor，其中 gpt-6-astra 108 行、gpt-6-astra-cc-format 38 行、
+#   claude-haiku-4-5 仅 2 行（04:38 那两发真被受理并扣费 quota=3），而 claude 系今日实发
+#   ~210 发。⇒ 结论：**站点日志只记「被受理并派发到某个上游账号」的请求**；claude 名当天
+#   几乎全在**入口**被挡回（429/503 + body 无 request id，延迟 ~1.3s），站点根本不落行。
+#   判据（可从响应体本身读出，不需要登录态）：
+#       有 request id ⇒ 站点已受理（日志里会有这行，成功/失败另说）
+#       429/503 且无 request id ⇒ 入口即拒（站点日志不会有这行）
+#   这样「为什么日志里看不到某个模型」就有了机器可读的答案，不必再靠人翻后台。
+STAGE_ADMITTED = "ADMITTED"          # 站点已受理（会落站点日志）
+STAGE_GATE = "GATE_REJECTED"         # 入口即拒（不会落站点日志）
+STAGE_UNKNOWN = "UNKNOWN"            # 传输层未取到判定证据（http=0 等）
+
+
+def classify_stage(http, verdict, body_text):
+    """(http, verdict, 响应体原文) -> 受理阶段。纯函数，供负控自测。
+
+    依据：站点对「已受理」的请求在错误体里带 `request id: <id>`；入口拒绝体形如
+    `{"error":{"message":"Service Unavailable","type":"error"}}`（无 request id）。
+    fail-closed：无证据一律 UNKNOWN，绝不冒充「已受理」。
+    """
+    low = (body_text or "").lower()
+    if http == 200:
+        return STAGE_ADMITTED
+    if "request id" in low or "request_id" in low:
+        return STAGE_ADMITTED
+    if http in (429, 503):
+        return STAGE_GATE
+    return STAGE_UNKNOWN
+
+
 # ---------------------------------------------------------------- 台账摘要（--summary，只读）
 # ★2026-10-04 起因：用户问「一直看你在探 gpt-6，Claude 面怎么没在探？」——
 #   实情是**每轮 8 个名都在探**（含 6 个 claude-*），但台账是 append-only JSONL，
@@ -1147,17 +1180,23 @@ def summarize_ledger(lines=12, path=None):
                 continue
             m = x.get("model") or "?"
             d = per.setdefault(m, {"counts": {}, "last_verdict": None, "last_ts": None,
-                                   "last_non_busy": None, "n": 0})
+                                   "last_non_busy": None, "n": 0, "stages": {}})
             v = x.get("verdict") or "?"
+            _stx = x.get("stage") or STAGE_UNKNOWN      # 老台账无此键 ⇒ UNKNOWN（不冒充）
+            d["stages"][_stx] = d["stages"].get(_stx, 0) + 1
             d["counts"][v] = d["counts"].get(v, 0) + 1
             d["n"] += 1
             d["last_verdict"] = v
             d["last_ts"] = ts
             if v != "POOL_BUSY":             # 号池满是「预期常态」，不算信号
                 d["last_non_busy"] = {"ts": ts, "verdict": v, "http": x.get("http")}
+    stages_all = {}
+    for d in per.values():
+        for k, v in (d.get("stages") or {}).items():
+            stages_all[k] = stages_all.get(k, 0) + v
     return {"ok": True, "rounds": len(tail), "total_rounds": len(rounds),
             "ts_from": tail[0].get("ts"), "ts_to": tail[-1].get("ts"),
-            "models": per, "path": p}
+            "models": per, "stages": stages_all, "path": p}
 
 
 def render_summary(s):
@@ -1170,6 +1209,10 @@ def render_summary(s):
            % (s["rounds"], s["total_rounds"], s.get("ts_from"), s.get("ts_to")),
            "  覆盖面：%d 个模型（其中 claude 面 %d 个）" % (len(per), len(claude)),
            "  %-32s %5s  %s" % ("模型", "轮次", "判据分布 / 末次 / 末次非号池满")]
+    _st = s.get("stages") or {}
+    if _st:
+        out.append("  受理阶段：ADMITTED(站点日志会记)×%d / GATE_REJECTED(站点日志不记)×%d / UNKNOWN×%d"
+                   % (_st.get(STAGE_ADMITTED, 0), _st.get(STAGE_GATE, 0), _st.get(STAGE_UNKNOWN, 0)))
     for m, d in per.items():
         dist = " ".join("%s×%d" % (k, v) for k, v in sorted(d["counts"].items()))
         lnb = d.get("last_non_busy")
@@ -1481,6 +1524,12 @@ def run_once(args):
         # 必须写进日志（2026-10-04 实测：QUEUED 与 LINK_DOWN 都源自 http=0，
         # 不标证据就没法事后复核）。
         _face_tag += (r.get("link") or "")
+        _st = classify_stage(r.get("http"), r.get("verdict"), r.get("detail") or "")
+        if _st == STAGE_GATE:
+            _face_tag += " [gate]"        # 入口即拒：站点日志里不会有这一发
+        elif _st == STAGE_ADMITTED:
+            _face_tag += " [adm]"         # 已被站点受理：站点日志里能找到
+
         print("[anyrouter] %-28s http=%s %s (%s s/%s)%s" % (
             r["model"], r["http"], r["verdict"],
             "-" if r.get("elapsed_s") is None else r["elapsed_s"], r.get("latency", "na"), _face_tag))
@@ -1534,6 +1583,7 @@ def run_once(args):
         rec = {"ts": now_bj.isoformat(), "results": [
             {"model": r["model"], "http": r["http"], "verdict": r["verdict"],
              "snippet": _ledger_snippet(r),      # ★非 200 的网关原文（判「号池满/形状错/未实现」的唯一凭据）
+             "stage": classify_stage(r.get("http"), r.get("verdict"), r.get("detail") or ""),  # ★受理阶段（站点日志口径：ADMITTED 会落站点日志 / GATE_REJECTED 不会）
              "face": r.get("face"), "shape_retry": bool(r.get("shape_retry"))}
             for r in results],
             "rc": rc, "notify": bool(do_push and args.notify), "pushed": pushed,
@@ -2175,6 +2225,42 @@ def selftest():
         "invalid codex request" in (_ledger_snippet(
             {"http": 400, "detail": '{"error":{"message":"invalid codex request"}}'}) or ""),
         True)
+
+    # 9d2) ★2026-10-04 受理阶段判据（=用户「站点后台日志只看到 GPT，看不到 Claude」的机器判据）
+    #      地面真值：站点日志只记「被受理并派发到上游账号」的请求；claude 当天几乎全在入口被挡回。
+    chk("stage: 200 -> ADMITTED",
+        classify_stage(200, AVAILABLE, ""), STAGE_ADMITTED)
+    chk("stage: 429 无 request id（claude 实测体）-> GATE_REJECTED",
+        classify_stage(429, BUSY, '{"error":{"message":"Service Unavailable","type":"error"}}'),
+        STAGE_GATE)
+    chk("stage: 429 带 request id -> ADMITTED（判据优先级：有 id 即已受理）",
+        classify_stage(429, BUSY, "负载已经达到上限，请稍后重试 (request id: 20261004123456789)"),
+        STAGE_ADMITTED)
+    chk("stage: 500 带 request id（gpt-6-astra 站点日志那行）-> ADMITTED",
+        classify_stage(500, BUSY, '{"error":{"message":"请求上游地址失败 (request id: 20261004123)"}}'),
+        STAGE_ADMITTED)
+    chk("NC: 裸 500 无任何证据 -> UNKNOWN（fail-closed，不冒充已受理）",
+        classify_stage(500, UNKNOWN, '{"error":{"message":"oops"}}'), STAGE_UNKNOWN)
+    chk("NC: http=0（传输层）-> UNKNOWN",
+        classify_stage(0, QUEUED, ""), STAGE_UNKNOWN)
+
+    # 9d3) 台账/摘要必须把 stage 带出来（否则「站点日志里有没有这一发」仍不可自证）
+    import tempfile as _tf2, json as _json2
+    _d2 = _tf2.mkdtemp(prefix="anr_stage_")
+    _lp2 = os.path.join(_d2, "ledger.jsonl")
+    with open(_lp2, "w", encoding="utf-8") as _f:
+        _f.write(_json2.dumps({"ts": "t1", "results": [
+            {"model": "claude-opus-4-8", "http": 429, "verdict": "POOL_BUSY", "stage": STAGE_GATE},
+            {"model": "gpt-6-astra", "http": 500, "verdict": "POOL_BUSY", "stage": STAGE_ADMITTED}]}) + "\n")
+        _f.write(_json2.dumps({"ts": "t2", "results": [          # 老台账：无 stage 键
+            {"model": "claude-haiku-4-5", "http": 429, "verdict": "POOL_BUSY"}]}) + "\n")
+    _sum2 = summarize_ledger(lines=12, path=_lp2)
+    chk("summary: 顶层 stages 汇总（ADMITTED=1 / GATE=1 / UNKNOWN=1[老台账不冒充]）",
+        (_sum2["stages"].get(STAGE_ADMITTED), _sum2["stages"].get(STAGE_GATE),
+         _sum2["stages"].get(STAGE_UNKNOWN)), (1, 1, 1))
+    _txt2 = render_summary(_sum2)
+    chk("summary: 渲染出「受理阶段」行且含两个口径词",
+        ("受理阶段" in _txt2 and "ADMITTED" in _txt2 and "GATE_REJECTED" in _txt2), True)
 
     # 9e) ★2026-10-04 --summary：把「最近 N 轮各模型判据分布」摊开，证明覆盖面（含 claude 面）
     #     而不是靠界面/通知猜。纯只读 ⇒ 负控要覆盖：缺台账 / 全是非轮次行 / 坏行容错 / 截断轮数。

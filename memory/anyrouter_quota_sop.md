@@ -213,6 +213,36 @@
 - 与工具判据的关系：社区「没挤上去」=本工具 `POOL_BUSY`（429/503/500+负载上限）；社区常态是「一直 429 / 空回」⇒ **严禁把 429 读成没额度**（本机同刻余额 $6472.10 而 591 发 0 个 200）。
 - 抢坑经验（09-28~10-04 段）：挤/踢按分钟波动（#21309「10:45被踢，10:55挤进来了」）；没有技巧就是重试（#21297「没有技巧都一样硬挤」）；**换名比死磕有效**（#21408 astra 秒进 / #21803 换 gpt-6-astra-cc-format 立马进入）；已绑定上游的老会话更耐挤（#21794「老对话还能用」）；多人同刻报 429 才是站级事故（#22441/#22449）。
 
+## 1.7 ★「站点后台日志只见 GPT、不见 Claude」的机器判据 = 受理阶段 `stage`（2026-10-04）
+
+**用户现象**：站点消费日志里排满 `gpt-6-astra`，几乎看不到任何 `claude-*`；而探针明明每轮都在打 6 个 claude 名。
+
+**根因（口径，非故障）**：站点消费日志只记「**已被受理并派发到上游账号**」的请求。两族在**入口受理层**就分岔了：
+
+| | 实测响应 | request id | 耗时 | 是否落站点日志 |
+|---|---|---|---|---|
+| `claude-*`（messages 面） | 429 | **无** | ~1.5 s | **否**（入口即拒） |
+| `gpt-6-astra*`（codex 面） | 500「负载已经达到上限」/429 | **有** | ~82 s | 是（已受理，上游无槽） |
+
+⇒ 「只见 GPT」= claude 全被挡在入口、gpt 进了通道；**不是漏探、不是 claude 没额度**。
+
+**工具侧落地**（`tools/anyrouter_slot_watch.py`，`--summary` 与台账同一判据）：
+
+- `classify_stage(http, verdict, body)`（纯函数，fail-closed）：
+
+  - `http == 200` ⇒ `ADMITTED`
+  - 响应体含 `request id` / `request_id` ⇒ `ADMITTED`（拿得到 id = 站点已受理）
+  - `http ∈ {429, 503}` 且无 id ⇒ `GATE_REJECTED`（入口即拒，**必然不落站点日志**）
+  - 其余（含 `http=0`、裸 500 无任何证据）⇒ `UNKNOWN`，**绝不冒充已受理**
+
+- 台账每条 result 增 `stage` 键；`--summary` 增「受理阶段：ADMITTED×N / GATE_REJECTED×N / UNKNOWN×N」行；子进程 log 行尾追加 `[gate]` 便于 `grep`。
+- 判读口径：**「站点日志里有这一发」⇔ `stage == ADMITTED`**；`GATE_REJECTED` 的 429/503 只能读成「入口未受理（号池满/限流）」，与 §1.1「429/503 ≠ 没额度」同义。
+- 老台账（改前落盘的行）无 `stage` 键 ⇒ 摘要计入 `UNKNOWN`，不回溯改判。
+
+**实测（2026-10-04 12:36 起新代码生效后首轮）**：`claude-opus-4-6 / opus-4-8 / sonnet-4-20250514 / sonnet-4-5-20250929` 四条 429 全 `GATE_REJECTED`，log 尾标 `[gate]`；摘要行 `ADMITTED×0 / GATE_REJECTED×4 / UNKNOWN×36`。
+
+**自测**：`--selftest` 240 → **248**（新增 8 例，含负控「裸 500 无 request id ⇒ UNKNOWN」「http=0 ⇒ UNKNOWN」）。
+
 ## 2. 工具
 
 `tools/anyrouter_slot_watch.py`（纯 stdlib + keychain）：
