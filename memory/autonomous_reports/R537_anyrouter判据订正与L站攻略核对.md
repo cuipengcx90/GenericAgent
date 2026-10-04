@@ -48,6 +48,9 @@
 
 - 已落地（本轮）：SOP `memory/anyrouter_quota_sop.md` 新增 §1.1（L 站攻略核对 + 判据修正 + 未证实项），
   语料存 `temp/anr_lstation/`。
+- 已落地（本轮）：定时任务 prompt 同批同步 500 语义（`sche_tasks/anyrouter_slot_watch.json` 一处文本），
+  `python3 tools/sche_tasks_lint.py --only anyrouter_slot_watch` ⇒ FAIL 0 / WARN 0 / OK 1，verdict PASS。
+- 待批台账：`temp/pending_decisions/DECISIONS_R537_anyrouter_criteria.md`（D1–D3，均 revers=0）。
 - **代码层：1 项已实现 / 2 项待批**（`tools/anyrouter_slot_watch.py`，同批提交本提交）：
   1. ✅ **已实现**：`classify()` 加前置分支 ⇒ `500` 且 message 含「负载已经达到上限/上限/overload/capacity」归 `POOL_BUSY`；
      反例（裸 `500 Internal Server Error`）仍回落 `UNKNOWN`，selftest 93→**95/95**；
