@@ -593,6 +593,103 @@ def _link_ok(host, timeout=6, get=None):
         return False
 
 
+# ---------------------------------------------------------------- 会话粘性实验（affinity）
+# ★2026-10-04 起因（用户问）：「抢到上游容量之后，靠什么机制让我一直用而不掉线？是 IP？是 session？」
+#   我方台账能证明的只有「同一分钟里有的模型 200、有的 429」＝**按模型渠道的供给侧**；
+#   它证明不了「同一个 session 会被优待」。L 站社区原话（原帖 2496114）点到了机制：
+#     #21794「新开了一个对话，又开始挤了，老对话还能用」
+#     #22238「原对话能用，新对话 429」
+#     #21309「10:45 被踢，10:55 挤进来了」
+#   ⇒ 假设 H1：站点/上游把容量**粘**在会话（session id / 对话）上，同一会话复用更容易命中。
+#   ★这个假设必须用「**同刻**三臂对照」证实或证伪 —— 历史上有过 200 不算证据（号池是波动的，
+#     不同时刻的两次请求比不出因果）。三臂**并发**发出，保证三发看到的是同一时刻的供给侧状态：
+#       臂 A 同 session（现役身份）              —— 基线
+#       臂 B 新 session（另一个 UUID 身份）      —— A 明显更好 ⇒ 支持「会话粘性」
+#       臂 C 同 session + 换正文/换模型          —— C 比 A 差 ⇒ 粘的是「对话」而非 session id
+AFFINITY_ARMS = ("same_sid", "new_sid", "same_sid_new_dialog")
+AFFINITY_COOLDOWN_S = 6 * 3600      # 实验要花真请求，别每轮都做（命中时最多 6h 一次）
+
+
+def build_affinity_probe_body(model, session_hex, content="1"):
+    """粘性实验用请求体：**复用** build_probe_body 的单一形状源，只覆盖 session。
+
+    只换 metadata.user_id 里的 session_id（其余逐字不动）⇒ 三臂之间唯一的自变量就是 session。
+    """
+    b = json.loads(build_probe_body(model, content=content).decode())
+    b["metadata"]["user_id"] = cc_meta_user_id(session_hex)
+    return json.dumps(b, ensure_ascii=False).encode()
+
+
+def affinity_arms(model, key, alt_model=None, sid=None, new_sid=None, dialog_marker="# arm:dialog"):
+    """构造三臂（纯函数：不联网，供负控自测）。返回 {arm: (model, sid, body_text)}。"""
+    base = sid or session_id_for(key, "anyrouter-probe")
+    fresh = new_sid or session_id_for(key + "|affinity-alt", "anyrouter-probe")
+    alt = alt_model or model
+    return {
+        "same_sid": (model, base, build_affinity_probe_body(model, base)),
+        "new_sid": (model, fresh, build_affinity_probe_body(model, fresh)),
+        "same_sid_new_dialog": (alt, base, build_affinity_probe_body(alt, base, content=dialog_marker)),
+    }
+
+
+def affinity_verdict(arm_results):
+    """三臂判读（纯函数）。★铁律：**一轮只作提示，不作结论** —— 号池是波动的。
+
+    只有「三臂同刻且都可辨」时才给倾向；任何一臂传输层失败（http=0）即 NO_DATA（fail-closed，
+    不许把「连不上」读成「没粘性」）。
+    """
+    def av(r):
+        return (r or {}).get("verdict") == AVAILABLE
+    a = arm_results.get("same_sid") or {}
+    b = arm_results.get("new_sid") or {}
+    c = arm_results.get("same_sid_new_dialog") or {}
+    if any((r or {}).get("http") == 0 for r in (a, b, c)):
+        return "NO_DATA", "有臂 http=0（传输层失败）⇒ 本轮作废，禁当证据"
+    if not a and not b and not c:
+        return "NO_DATA", "三臂缺数据 ⇒ 本轮作废"
+    if av(a) and not av(b):
+        return "STICKY", "同 session 通、新 session 不通 ⇒ 支持「会话粘性」（单轮提示，需多轮复现）"
+    if not av(a) and av(b):
+        return "STICKY_INVERTED", "反向：新 session 通、旧 session 不通 ⇒ 与粘性假设相反"
+    if av(a) and av(b):
+        if not av(c):
+            return "DIALOG_BOUND", "同 session 的 A 通、换正文的 C 不通 ⇒ 粘的是「对话上下文」而非 session id"
+        return "SID_IRRELEVANT", "三臂皆通 ⇒ 本轮 session 不是变量（供给侧正有容量）"
+    return "NO_DISCRIMINATION", "三臂皆不通 ⇒ 纯号池满，测不出粘性（属正常观测，不是故障）"
+
+
+def affinity_probe(model, key, timeout=60, hosts=None, alt_model=None, sid=None, new_sid=None,
+                   poster=None):
+    """三臂**同刻并发**打真请求。poster 仅供自测注入（默认走 _http_post，messages 面头=None）。"""
+    host = (hosts or HOSTS)[0]
+    arms = affinity_arms(model, key, alt_model=alt_model, sid=sid, new_sid=new_sid)
+
+    def send(body, to):
+        if poster is not None:
+            return poster(body, to)
+        return _http_post(host + CC_PATH, key, body, to, read_limit=256)
+
+    def one(arm):
+        _m, _s, body = arms[arm]
+        t0 = time.time()
+        code, text = send(body, timeout)
+        try:
+            v = classify(code, text)
+        except Exception:
+            v = UNKNOWN
+        return arm, {"http": code, "verdict": v, "elapsed_s": round(time.time() - t0, 2),
+                     "detail": (" ".join((text or "").split())[:160] or None)}
+
+    from concurrent.futures import ThreadPoolExecutor
+    out = {}
+    with ThreadPoolExecutor(max_workers=len(AFFINITY_ARMS)) as ex:
+        for arm, r in ex.map(one, list(AFFINITY_ARMS)):
+            out[arm] = r
+    v, why = affinity_verdict(out)
+    return {"verdict": v, "why": why, "arms": out, "session": {"current": arms["same_sid"][1],
+                                                              "fresh": arms["new_sid"][1]}}
+
+
 def probe_model(model, key, hosts=None, timeout=60):
     """单模型探测：面/体/头全部由 face_of(model) 决定（★形状单一源，与抢坑同一套形状）。
 
@@ -851,6 +948,14 @@ HOLD_STOP_STEP_S = 5.0
 # 判据：① hold_pid 记的是保活线程所属进程，该进程没了 ⇒ 陈旧；② 或 now 超过 hold_deadline_ts+余量。
 DEFAULT_HOLD_MINUTES = 30          # 未登记 hold_minutes 时的兜底（与 CLI 默认一致）
 HOLD_STALE_SLACK_S = 120           # 超窗余量（keepalive 步长量级内不误判）
+# ---- 保活间隔随机化（★2026-10-04 用户要求：「保活期间也要随机化，不要固定频率，防止被封被检测」）----
+# 为什么取这个区间：社区帖 2496114 的实测口径是「100 秒 1 次能挤进去」（#20904）而「10 分钟 1 次太长、
+# 又被踢」（#21011）⇒ 上界压到 ~300s 内，下界给到 ~100s；区间内**均匀随机**，再叠加小概率长休 ⇒
+# 频次永不固定（固定频次是最容易被站点按规律识别的特征）。与探测侧 R541 的随机化同一思路。
+HOLD_INTERVAL_MIN_S = 100.0        # 基准区间下界（秒）
+HOLD_INTERVAL_MAX_S = 240.0        # 基准区间上界（秒）
+HOLD_LONG_PROB = 0.12              # 每发之间抽一次「长休」的概率
+HOLD_LONG_CAP_S = 300.0            # 长休硬顶（超此丢坑风险明显升高）
 
 
 def _hold_stop_path():
@@ -1042,30 +1147,72 @@ def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S, hold_minutes
     return avail[0]
 
 
+def _hold_next_gap(rng, interval_min, interval_max, long_prob=0.0, long_cap=HOLD_LONG_CAP_S):
+    """下一发 keepalive 的等待秒数（随机）——★防固定频次被识别。
+
+    口径：基准区间 [interval_min, interval_max] 内**均匀随机**；另有 long_prob 概率抽一次
+    「长休」（区间上界 → long_cap 之间随机），使节奏既有短有长、又不会稀疏到丢坑。
+    返回 (gap_seconds, kind)，kind ∈ {"base","long"}（写日志/自测用，可核「确实不是固定值」）。
+    """
+    lo, hi = float(interval_min), float(interval_max)
+    if hi < lo:
+        lo, hi = hi, lo
+    if long_prob > 0 and rng.random() < float(long_prob) and float(long_cap) > hi:
+        return rng.uniform(hi, float(long_cap)), "long"
+    return rng.uniform(lo, hi), "base"
+
+
+def _hold_range_text(interval_min, interval_max):
+    """通知文案里的保活节奏描述：给了随机区间 ⇒ "100–240"，否则 None（回落固定秒数写法）。"""
+    try:
+        lo, hi = float(interval_min or 0), float(interval_max or 0)
+    except Exception:
+        return None
+    if lo > 0 and hi > 0:
+        if hi < lo:
+            lo, hi = hi, lo
+        return "%.0f–%.0f" % (lo, hi)
+    return None
+
+
 def hold_slot(model, sid, minutes, seconds, post, sleep, now, log=None, timeout=60,
-              stop_check=None):
-    """占坑保活：每 seconds 发 1 发 keepalive；**非 200 一律当被踢，立即停并返回 False**。
+              stop_check=None, interval_min=0.0, interval_max=0.0, long_prob=0.0, rng=None):
+    """占坑保活：每 N 秒发 1 发 keepalive；**非 200 一律当被踢，立即停并返回 False**。
 
     ★口径：只有 200 才算「坑还在」。429/503/传输错 ⇒ 坑已丢（闲置回收/被挤掉），
       继续发只是白烧请求 ⇒ 立刻停（与 run_claim 的保活段同一判据，避免两套口径）。
     ★2026-10-04：stop_check 为真 ⇒ 立即收手（你已在别的客户端用上了，别白烧请求）。
+    ★2026-10-04（用户要求「保活也要随机化」）：给了 interval_min/max ⇒ 每发间隔走
+      _hold_next_gap **随机**取（可选 long_prob 抽长休）；不给 ⇒ 回落固定 seconds（旧行为/自测）。
+      每发实际等待都写进日志（含"距上一发 Ns"与收尾的 gaps 汇总）⇒ 事后可核「确实非固定频次」。
     返回 True=保活段正常跑完；False=未启用/被踢/被用户停。
     """
     if not minutes or float(minutes) <= 0:
         return False
     log = log or (lambda s: None)
+    rng = rng or random.Random()
+    randomized = float(interval_min or 0) > 0 and float(interval_max or 0) > 0
     end = now() + float(minutes) * 60
     n = 0
+    gaps = []
     while now() < end:
-        if sleep_with_stop(seconds, sleep=sleep, stop_check=stop_check):
+        if randomized:
+            gap, _kind = _hold_next_gap(rng, interval_min, interval_max, long_prob)
+        else:
+            gap = float(seconds)
+        if sleep_with_stop(gap, sleep=sleep, stop_check=stop_check):
             log("[anyrouter] hold: 收到 --stop-hold（多半是你已在用别的客户端），主动停手（已发 %d 发）" % n)
             return False
         n += 1
+        gaps.append(round(float(gap), 1))
         code, _t = post(build_claim_body(model, sid, keepalive=True), timeout)
         act = claim_action(code)
-        log("[anyrouter] hold #%d model=%s http=%s -> %s" % (n, model, code, act))
+        log("[anyrouter] hold #%d model=%s http=%s -> %s（距上一发 %.0fs）" % (n, model, code, act, float(gap)))
         if act != CLAIM_WON:
             return False
+    if randomized:
+        log("[anyrouter] hold: 保活段结束（共 %d 发；实际间隔 %s 秒 = 随机、非固定频次）"
+            % (n, ",".join("%g" % g for g in gaps)))
     return True
 
 
@@ -1085,14 +1232,23 @@ def start_auto_hold(args, hit, post=None, log=None):
     st["hold_minutes"] = float(args.auto_hold_minutes)
     st["hold_deadline_ts"] = time.time() + float(args.auto_hold_minutes) * 60
     _save_state(st)
-    log("[anyrouter] 命中可用 ⇒ 启动自动占坑保活：model=%s session尾号=%s 时长=%.0f 分钟（每 %.0fs 续一次）"
-        % (hit.get("model"), sid[-12:], float(args.auto_hold_minutes), float(args.keepalive_seconds)))
+    _hmin = float(getattr(args, "hold_interval_min", 0.0) or 0.0)
+    _hmax = float(getattr(args, "hold_interval_max", 0.0) or 0.0)
+    _hlong = float(getattr(args, "hold_long_prob", 0.0) or 0.0)
+    _ka_txt = (("间隔 %.0f–%.0fs 随机、含 %.0f%% 概率长休（≤%.0fs）" % (_hmin, _hmax, _hlong * 100,
+                                                                     HOLD_LONG_CAP_S))
+               if (_hmin > 0 and _hmax > 0) else ("每 %.0fs 固定" % float(args.keepalive_seconds)))
+    log("[anyrouter] 命中可用 ⇒ 启动自动占坑保活：model=%s session尾号=%s 时长=%.0f 分钟（%s；防固定频次被识别）"
+        % (hit.get("model"), sid[-12:], float(args.auto_hold_minutes), _ka_txt))
 
     def _run():
         def _post(body, timeout):
             return _http_post(HOSTS[0] + CC_PATH, _load_key(), body, timeout, read_limit=256)
         ok = hold_slot(hit.get("model"), sid, args.auto_hold_minutes, args.keepalive_seconds,
-                       post or _post, time.sleep, time.time, log=log, timeout=args.timeout)
+                       post or _post, time.sleep, time.time, log=log, timeout=args.timeout,
+                       interval_min=getattr(args, "hold_interval_min", 0.0),
+                       interval_max=getattr(args, "hold_interval_max", 0.0),
+                       long_prob=getattr(args, "hold_long_prob", 0.0))
         st2 = _load_state()
         st2["hold_active"] = False
         st2.pop("hold_pid", None)          # ★清活性标记，避免下一次被误判「还在保活」
@@ -1208,7 +1364,8 @@ def _append_ledger(rec):
         f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=240, sid=None):
+def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=240, sid=None, affinity=None,
+                keepalive_range=None):
     lines = ["🚀 anyrouter 抢到坑了（可以用了）",
              "检测时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S")]
     for r in results:
@@ -1228,8 +1385,10 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
         lines.append("   社区口碑：偏贵、慢、智商一般、长对话易 `let me…` 死循环（#22468/#22479/#22525/#22526/#22540）")
         lines.append("   建议：短会话、一次一件事；要高质量可优先等 opus 线或 gpt-6-astra 恢复（本轮 opus-5-5 已收官方通告=不供）。")
     if auto_hold_minutes:
-        lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 发一个最小请求；被踢即停、下次命中重占）。"
-                     % (("%g" % float(auto_hold_minutes)), int(keepalive_seconds)))
+        _ka_txt = ("每 %s 秒（**随机**，非固定频次）" % keepalive_range) if keepalive_range \
+            else ("每 %s 秒" % int(keepalive_seconds))
+        lines.append("✅ 已自动保活 %s 分钟（后台 %s用**同一 session** 发一个最小请求；被踢即停、下次命中重占）。"
+                     % (("%g" % float(auto_hold_minutes)), _ka_txt))
         lines.append("👉 怎么用：把客户端指到本站的 Anthropic 兼容端点（/v1/messages）即可。")
         lines.append("   上面那组 beta 头是 Claude Code 自己会带的，用 CC 不用手配；")
         lines.append("   用 Pi / 其它客户端按各家填 anthropic base_url，头按各家默认即可。")
@@ -1248,14 +1407,46 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
                      "（同样立刻停，最多 %.0f 秒生效）。" % HOLD_STOP_STEP_S)
     else:
         lines.append("坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。")
+    # ★2026-10-04 会话粘性实验（同刻三臂）：把「到底是不是 session 在起作用」写进通知本身
+    if affinity:
+        lines.append("🧪 会话粘性实验（同刻三发；单轮只作提示、不作结论）：%s"
+                     % affinity.get("verdict"))
+        lines.append("   %s" % affinity.get("why"))
+        _arms = affinity.get("arms") or {}
+        for _k in ("same_sid", "new_sid", "same_sid_new_dialog"):
+            _r = _arms.get(_k)
+            if _r:
+                lines.append("   - %s：http=%s %s %.2fs"
+                             % (_k, _r.get("http"), _r.get("verdict"),
+                                float(_r.get("elapsed_s") or 0)))
     lines += [
         "（触发原因：%s）" % reason,
     ]
     return "\n".join(lines)
 
 
-def build_hold_card(text, panel_url=None, stop_url=None):
+CARD_TITLE_HIT = "🎉 anyrouter 抢到坑位（已自动保活）"
+CARD_TITLE_AVAILABLE = "🎉 anyrouter 抢到坑位（可用，本轮未新起保活）"
+CARD_TITLE_TEST = "🧪 卡片按钮自检（非坑位通知）"
+
+
+def card_title_for(text):
+    """表头按**实情**选（用户 2026-10-04 被「表头像真通知、正文却是自检」的卡绕晕）。
+
+    正文里出现「已自动保活」⇒ 本轮真起了保活；否则（冷却中/已在保活中/未开保活）
+    只写「可用，本轮未新起保活」，绝不冒称已保活。纯函数，供负控自测。
+    """
+    return CARD_TITLE_HIT if "已自动保活" in (text or "") else CARD_TITLE_AVAILABLE
+
+
+def build_hold_card(text, panel_url=None, stop_url=None, title=None, template="green"):
     """飞书交互卡片：带「⏹ 停止保活」按钮（用户 2026-10-04 要求傻瓜化）。
+
+    ★2026-10-04（用户反馈）：自检卡曾复用真实命中卡的表头
+    「🎉 anyrouter 抢到坑位（已自动保活）」⇒ 看着像真通知、正文却是「🧪 自检」，
+    用户被绕晕（「你刚才推过来那个上面那些内容不太对，还是说你只是模拟测试的」）。
+    故表头/配色参数化：真实命中 = 默认（CARD_TITLE_HIT + green）；
+    自检卡 = CARD_TITLE_TEST + orange（一眼可辨，绝不冒充命中）。
 
     两级停止按钮（用户 2026-10-04：要「飞书卡片按钮事件」＋「网页」多种方式）：
       ① 回调按钮 value={"ga_action": "anyrouter_stop_hold"} ⇒ 点击由 fsapp 的
@@ -1278,8 +1469,8 @@ def build_hold_card(text, panel_url=None, stop_url=None):
            {"tag": "action", "actions": actions}]
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"template": "green",
-                   "title": {"tag": "plain_text", "content": "🎉 anyrouter 抢到坑位（已自动保活）"}},
+        "header": {"template": template,
+                   "title": {"tag": "plain_text", "content": title or CARD_TITLE_HIT}},
         "elements": els,
     }
 
@@ -1819,15 +2010,50 @@ def run_once(args):
 
     # --- 1) 抢到坑 → 可用推送 ---
     do_push, reason = should_notify(st, results, now_ts, args.cooldown)
+    # ★2026-10-04 会话粘性实验：**只在真的看到坑**时做（否则纯烧请求），且受冷却约束
+    aff = None
+    if getattr(args, "affinity_probe", False) and any(r.get("verdict") == AVAILABLE for r in results):
+        cd = float(getattr(args, "affinity_cooldown", AFFINITY_COOLDOWN_S) or 0)
+        last_aff = float(st.get("last_affinity_ts") or 0)
+        if now_ts - last_aff >= cd:
+            try:
+                _hit = [r for r in results if r.get("verdict") == AVAILABLE][0]
+                aff = affinity_probe(_hit.get("model") or "",
+                                     _load_key(), timeout=min(int(args.timeout) or 60, 60))
+                v, why = aff.get("verdict"), aff.get("why")
+                print("[anyrouter] affinity %s | %s" % (v, why), flush=True)
+                for _a, _r in sorted(aff.get("arms", {}).items()):
+                    print("[anyrouter]   arm %-20s http=%s %s %.2fs" % (
+                        _a, _r.get("http"), _r.get("verdict"), _r.get("elapsed_s") or 0), flush=True)
+                st["last_affinity_ts"] = now_ts
+                st["last_affinity_verdict"] = v
+                if not getattr(args, "dry_run", False):
+                    try:
+                        _append_ledger({"ts": now_ts and beijing_now().isoformat(), "mode": "affinity",
+                                        "verdict": v, "why": why,
+                                        "session_current": aff.get("session", {}).get("current"),
+                                        "session_fresh": aff.get("session", {}).get("fresh"),
+                                        "arms": aff.get("arms")})
+                    except Exception as _e:
+                        print("[anyrouter] affinity 落账失败(不影响监控): %s" % _e, flush=True)
+            except Exception as _e:
+                print("[anyrouter] affinity 实验异常(不影响监控): %s" % _e, flush=True)
+                aff = None
+        else:
+            print("[anyrouter] affinity 冷却中(%.0fs 前做过) 跳过" % (now_ts - last_aff), flush=True)
     pushed, push_detail = (False, "not_requested")
     if do_push and args.notify:
         text = _build_text(results, now_bj, reason,
                            auto_hold_minutes=getattr(args, "auto_hold_minutes", 0),
                            keepalive_seconds=getattr(args, "keepalive_seconds", 240),
-                           sid=session_id_for(key, "anyrouter-probe"))
+                           sid=session_id_for(key, "anyrouter-probe"),
+                           affinity=aff,
+                           keepalive_range=_hold_range_text(getattr(args, "hold_interval_min", 0.0),
+                                                            getattr(args, "hold_interval_max", 0.0)))
         _card = None
         if float(getattr(args, "auto_hold_minutes", 0) or 0) > 0:
-            _card = build_hold_card(text, ctl_url(), ctl_stop_url())
+            _title = card_title_for(text)
+            _card = build_hold_card(text, ctl_url(), ctl_stop_url(), title=_title)
         pushed, push_detail = send_notifications(text, dry_run=args.dry_run, card=_card)
         print("[anyrouter] 推送=%s (%s)" % (pushed, push_detail))
     elif do_push:
@@ -2190,7 +2416,8 @@ def selftest():
         return _seq.pop(0) if _seq else (200, "")
     chk("hold: 持续200 -> True（保活段跑完）",
         hold_slot("m1", "sid", 0.02, 0.01, _hpost,
-                  lambda s: _hst.__setitem__("t", _hst["t"] + float(s)), lambda: _hst["t"]), True)
+                  lambda s: _hst.__setitem__("t", _hst["t"] + float(s)), lambda: _hst["t"],
+                  stop_check=lambda: False), True)
     chk("hold: 真发了 keepalive（>=1 发）", len(_calls) >= 1, True)
     chk("hold: 保活体是内容 '1'", (b'"content": "1"' in _calls[0]), True)
     # NC：坑位被踢（200 后 503）⇒ 立即停、不得继续发
@@ -2215,11 +2442,133 @@ def selftest():
         hold_slot("m1", "sid", 0.05, 0.01, lambda b, timeout=0: (0, "URLError"),
                   lambda s: None, lambda: 0), False)
 
+    # 11a-2) ★2026-10-04 用户要求：保活间隔随机化（「不要固定频率，防止被封被检测」）
+    chk("hold-gap: 每次取值不同（非固定）",
+        len(set(_hold_next_gap(random.Random(i), 100, 240)[0] for i in range(8))), 8)
+    chk("hold-gap: 值恒落在区间内",
+        all(100 <= _hold_next_gap(random.Random(i), 100, 240)[0] <= 240 for i in range(50)), True)
+    chk("hold-gap: 反向区间不崩（hi<lo 自动交换）",
+        all(5 <= _hold_next_gap(random.Random(i), 40, 5)[0] <= 40 for i in range(20)), True)
+    chk("hold-gap: long_prob=1 -> 恒走长休档且不超硬顶",
+        all(_hold_next_gap(random.Random(i), 100, 240, long_prob=1.0)[1] == "long"
+            and _hold_next_gap(random.Random(i), 100, 240, long_prob=1.0)[0] <= HOLD_LONG_CAP_S
+            for i in range(30)), True)
+    chk("NC: long_prob=0 -> 永不抽长休（老口径不变）",
+        set(_hold_next_gap(random.Random(i), 100, 240, long_prob=0.0)[1] for i in range(50)), {"base"})
+    chk("hold-range-text: 区间 -> '100–240'", _hold_range_text(100, 240), "100–240")
+    chk("NC: 未给区间 -> None（回落固定写法）", _hold_range_text(0, 0), None)
+    chk("NC: 坏值不崩 -> None", _hold_range_text("x", None), None)
+    _hst3 = {"t": 0.0}
+    _gaps_seen = []
+
+    def _hsleep3(s):
+        _gaps_seen.append(float(s))
+        _hst3["t"] += float(s)
+    chk("hold: 随机档跑完（interval_min/max 生效）",
+        hold_slot("m1", "sid", 0.5, 0.01, lambda b, timeout=0: (200, ""), _hsleep3, lambda: _hst3["t"],
+                  interval_min=0.002, interval_max=0.02, long_prob=0.0, rng=random.Random(7)), True)
+    chk("hold: 随机档间隔不全相同（非固定频次）", len(set(_gaps_seen)) > 1, True)
+    chk("hold: 随机档间隔全在区间内",
+        all(0.002 <= g <= 0.02 for g in _gaps_seen), True)
+    chk("hold: 随机档确实发了 keepalive",
+        len(_gaps_seen) >= 5, True)
+    _hst4 = {"t": 0.0}
+    _gaps4 = []
+
+    def _hsleep4(s):
+        _gaps4.append(float(s))
+        _hst4["t"] += float(s)
+    hold_slot("m1", "sid", 0.05, 0.01, lambda b, timeout=0: (200, ""), _hsleep4, lambda: _hst4["t"])
+    chk("NC: 不给区间 -> 仍固定节奏（旧行为逐字不变）", set(_gaps4), {0.01})
+    _hst5 = {"t": 0.0}
+    _st5 = {"n": 0}
+
+    def _stop5():
+        _st5["n"] += 1
+        return _st5["n"] > 1
+    chk("hold: 随机档下 --stop-hold 仍能收手",
+        hold_slot("m1", "sid", 5.0, 0.01, lambda b, timeout=0: (200, ""),
+                  lambda s: _hst5.__setitem__("t", _hst5["t"] + float(s)), lambda: _hst5["t"],
+                  stop_check=_stop5, interval_min=0.01, interval_max=0.05, rng=random.Random(3)), False)
+
     # 11b) 停保活开关（★2026-10-04 用户问「我在用别的客户端，你还保活不是白烧吗」）
     chk("sleep_with_stop: 不拦 -> False", sleep_with_stop(0.01, sleep=lambda s: None,
                                                          stop_check=lambda: False), False)
     chk("sleep_with_stop: 中途拦 -> True", sleep_with_stop(1.0, step=0.1, sleep=lambda s: None,
                                                           stop_check=lambda: True), True)
+
+    # 12) 会话粘性实验（纯函数 + 注入 poster，零网络；★不得依赖现场内容）
+    _arms = affinity_arms("m1", "k1")
+    chk("affinity: 三臂齐", sorted(_arms) == sorted(AFFINITY_ARMS), True)
+    _sid_a, _sid_b = _arms["same_sid"][1], _arms["new_sid"][1]
+    chk("affinity: 新臂 session 与基线不同", _sid_a != _sid_b, True)
+    chk("affinity: 同 session 臂 id 一致", _arms["same_sid_new_dialog"][1] == _sid_a, True)
+    _ja = json.loads(_arms["same_sid"][2].decode())
+    _jb = json.loads(_arms["new_sid"][2].decode())
+    _jc = json.loads(_arms["same_sid_new_dialog"][2].decode())
+    chk("affinity: 体里嵌的 session 就是本臂的",
+        _sid_a in _ja["metadata"]["user_id"] and _sid_b in _jb["metadata"]["user_id"], True)
+    chk("affinity: 换正文臂内容不同",
+        _ja["messages"][0]["content"] != _jc["messages"][0]["content"], True)
+    # ★自变量唯一性：归一化「身份」= session + 由其派生的 device_id（cc_meta_user_id 口径），
+    #   归一后 A/B 其余结构必须逐字相同（否则实验不是单变量，结论无效）。
+    import hashlib as _hl
+
+    def _dev(sid):
+        return _hl.sha256(("anyrouter-device|%s" % sid).encode()).hexdigest()
+    chk("affinity: device_id 确由 session 派生（换身份即换 device）",
+        (_dev(_sid_a) in json.dumps(_ja) and _dev(_sid_b) in json.dumps(_jb)), True)
+    _jax = json.dumps(_ja).replace(_sid_a, "@SID@").replace(_dev(_sid_a), "@DEV@")
+    _jbx = json.dumps(_jb).replace(_sid_b, "@SID@").replace(_dev(_sid_b), "@DEV@")
+    chk("affinity: A/B 仅差身份（session+派生 device 归一后逐字同）", _jax == _jbx, True)
+    chk("NC: 臂体内不含密钥", ("sk-" in json.dumps(_ja)), False)
+
+    def _st(v, http=200):
+        return {"http": http, "verdict": v, "elapsed_s": 0.1}
+    chk("affinity: A通B不通 -> STICKY",
+        affinity_verdict({"same_sid": _st(AVAILABLE), "new_sid": _st(BUSY),
+                          "same_sid_new_dialog": _st(BUSY)})[0], "STICKY")
+    chk("affinity: B通A不通 -> STICKY_INVERTED",
+        affinity_verdict({"same_sid": _st(BUSY), "new_sid": _st(AVAILABLE),
+                          "same_sid_new_dialog": _st(BUSY)})[0], "STICKY_INVERTED")
+    chk("affinity: 同sid通/换正文不通 -> DIALOG_BOUND",
+        affinity_verdict({"same_sid": _st(AVAILABLE), "new_sid": _st(AVAILABLE),
+                          "same_sid_new_dialog": _st(BUSY)})[0], "DIALOG_BOUND")
+    chk("affinity: 全通 -> SID_IRRELEVANT",
+        affinity_verdict({"same_sid": _st(AVAILABLE), "new_sid": _st(AVAILABLE),
+                          "same_sid_new_dialog": _st(AVAILABLE)})[0], "SID_IRRELEVANT")
+    chk("affinity: 全不通 -> NO_DISCRIMINATION（不得当结论）",
+        affinity_verdict({"same_sid": _st(BUSY), "new_sid": _st(BUSY),
+                          "same_sid_new_dialog": _st(BUSY)})[0], "NO_DISCRIMINATION")
+    chk("NC: 任一臂 http=0 -> NO_DATA（fail-closed）",
+        affinity_verdict({"same_sid": _st(AVAILABLE), "new_sid": _st(UNKNOWN, http=0),
+                          "same_sid_new_dialog": _st(AVAILABLE)})[0], "NO_DATA")
+    chk("NC: 缺臂 -> NO_DATA", affinity_verdict({})[0], "NO_DATA")
+
+    def _fake_poster(seq):
+        it = iter(seq)
+        return lambda body, to: next(it)
+    _ap = affinity_probe("m1", "k1", poster=_fake_poster([(200, "{}"), (429, "busy"), (503, "busy")]))
+    chk("affinity: 注入 poster 三臂齐", sorted(_ap["arms"]) == sorted(AFFINITY_ARMS), True)
+    chk("affinity: 注入判读=A通B不通", _ap["verdict"], "STICKY")
+    chk("affinity: 回传当前/新 session", _ap["session"]["current"] != _ap["session"]["fresh"], True)
+    _ap2 = affinity_probe("m1", "k1", poster=_fake_poster([(0, "transport: X"), (200, "{}"), (200, "{}")]))
+    chk("NC: 传输失败 -> NO_DATA", _ap2["verdict"], "NO_DATA")
+
+    # 13) 通知渲染 + CLI 默认（实验默认关，避免白烧请求）
+    _ta = _build_text([{"model": "m1", "verdict": AVAILABLE, "http": 200}], beijing_now(), "t",
+                      affinity={"verdict": "STICKY", "why": "why-x",
+                                "arms": {"same_sid": _st(AVAILABLE), "new_sid": _st(BUSY)}})
+    chk("text: 附粘性实验结论", ("STICKY" in _ta and "why-x" in _ta), True)
+    _tn = _build_text([{"model": "m1", "verdict": AVAILABLE, "http": 200}], beijing_now(), "t")
+    chk("NC: 无实验时不出现该段", ("会话粘性实验" in _tn), False)
+    chk("cli: 粘性实验默认为关", _build_parser().parse_args([]).affinity_probe, False)
+    chk("cli: --affinity-probe 可开",
+        _build_parser().parse_args(["--affinity-probe"]).affinity_probe, True)
+    chk("cli: --no-affinity-probe 显式关",
+        _build_parser().parse_args(["--no-affinity-probe"]).affinity_probe, False)
+    chk("cli: --affinity-cooldown 可覆盖",
+        _build_parser().parse_args(["--affinity-cooldown", "60"]).affinity_cooldown, 60.0)
     _st3 = {"n": 0}
 
     def _stop_after_1():
@@ -2306,6 +2655,21 @@ def selftest():
         _call = {"n": 0}
         chk("card: 干跑不发（dry-run 短路，卡片路径不被触发）",
             send_notifications("x", dry_run=True, card=_card), (True, "dry-run"))
+        # ★2026-10-04（用户反馈「推过来的卡内容不太对，是不是模拟测试」）：
+        #   自检卡曾复用真实命中表头 ⇒ 表头/配色参数化 + 表头按实情选，三处负控锁死。
+        chk("card: 默认表头=真实命中（已自动保活）", build_hold_card("x")["header"]["title"]["content"],
+            CARD_TITLE_HIT)
+        _tc = build_hold_card("x", title=CARD_TITLE_TEST, template="orange")
+        chk("card: 自检卡可用专用表头+配色", (_tc["header"]["title"]["content"], _tc["header"]["template"]),
+            (CARD_TITLE_TEST, "orange"))
+        chk("NC: 自检卡表头不含「抢到坑位」字样（不冒充命中）", "抢到坑位" in CARD_TITLE_TEST, False)
+        chk("NC: 自检卡仍带回调停止按钮（自检的就是这条链路）",
+            any(a.get("value", {}).get("ga_action") == "anyrouter_stop_hold"
+                for a in _tc["elements"][-1]["actions"]), True)
+        chk("title: 正文含保活句 ⇒ 表头写已保活", card_title_for("✅ 已自动保活 30 分钟"), CARD_TITLE_HIT)
+        chk("title: 正文无保活句（冷却/未新起）⇒ 不得冒称已保活",
+            card_title_for("坑位会被踢：闲置数分钟即掉"), CARD_TITLE_AVAILABLE)
+        chk("NC: card_title_for(None) 不炸且判未保活", card_title_for(None), CARD_TITLE_AVAILABLE)
     finally:
         _apply_state_dir(_sd_old2)
 
@@ -2891,6 +3255,14 @@ def _build_parser():
                     help="session id 的标签（同 tag 恒同 id；换 tag 等于换坑位身份）")
     ap.add_argument("--keepalive-seconds", type=float, default=240, dest="keepalive_seconds",
                     help="保活间隔秒数（默认 240；闲置数分钟即被踢）")
+    ap.add_argument("--hold-interval-min", type=float, default=HOLD_INTERVAL_MIN_S, dest="hold_interval_min",
+                    help="★保活间隔下界秒（默认 %g）：与 --hold-interval-max 组成随机区间，防固定频次被识别"
+                         % HOLD_INTERVAL_MIN_S)
+    ap.add_argument("--hold-interval-max", type=float, default=HOLD_INTERVAL_MAX_S, dest="hold_interval_max",
+                    help="★保活间隔上界秒（默认 %g；社区口径 >300s 有丢坑风险）" % HOLD_INTERVAL_MAX_S)
+    ap.add_argument("--hold-long-prob", type=float, default=HOLD_LONG_PROB, dest="hold_long_prob",
+                    help="每发之间抽一次「长休」（上界→%.0fs 随机）的概率（默认 %g）"
+                         % (HOLD_LONG_CAP_S, HOLD_LONG_PROB))
     ap.add_argument("--keepalive-minutes", type=float, default=0, dest="keepalive_minutes",
                     help="抢到后保活多久（默认 0=不保活，只报喜；>0 时按 --keepalive-seconds 定时发 1）")
     ap.add_argument("--auto-hold-minutes", type=float, default=0, dest="auto_hold_minutes",
@@ -2905,6 +3277,14 @@ def _build_parser():
                     help="只读台账摘要：最近 N 轮各模型判据分布（含 claude 面覆盖面，零请求零推送）")
     ap.add_argument("--summary-lines", type=int, default=12, dest="summary_lines",
                     help="--summary 的回看轮数（默认 12）")
+    ap.add_argument("--affinity-probe", dest="affinity_probe", action="store_true",
+                    help="命中后做「会话粘性」同刻三臂实验（同 session/新 session/换正文），"
+                         "结果只作提示：单轮不作结论，用来回答「是不是 session 在起作用」")
+    ap.add_argument("--no-affinity-probe", dest="affinity_probe", action="store_false",
+                    help="关闭粘性实验（默认关；实验要花真请求）")
+    ap.set_defaults(affinity_probe=False)
+    ap.add_argument("--affinity-cooldown", type=float, default=AFFINITY_COOLDOWN_S,
+                    dest="affinity_cooldown", help="粘性实验最小间隔秒（默认 6h）")
     ap.add_argument("--selftest", action="store_true", help="负控自测")
     return ap
 
@@ -2912,7 +3292,20 @@ def _build_parser():
 def main():
     args = _build_parser().parse_args()
     if args.selftest:
-        return selftest()
+        # ★2026-10-04（实测踩到）：自测必须与**现场状态**隔离——你在飞书点过「⏹ 停止保活」后
+        #   真实 state 目录里留了 hold.stop 旗标，导致 hold_slot 自测零发、整轮 247 例全红，
+        #   看着像工具坏了其实是「自测绑现场」（RULE25）。这里统一把 STATE_DIR 换到临时沙盒，
+        #   自测内部的沙盒块（stop/panel/summary）仍照常层层保存/还原。
+        import tempfile as _tfi
+        import shutil as _shi
+        _iso_old = STATE_DIR
+        _iso_dir = _tfi.mkdtemp(prefix="anr_selftest_")
+        _apply_state_dir(_iso_dir)
+        try:
+            return selftest()
+        finally:
+            _apply_state_dir(_iso_old)
+            _shi.rmtree(_iso_dir, ignore_errors=True)
     if getattr(args, "log_hint", None):
         os.environ["GA_ANYROUTER_LOG_HINT"] = str(args.log_hint)
     _apply_state_dir(getattr(args, "state_dir", None))

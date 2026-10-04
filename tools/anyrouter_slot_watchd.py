@@ -266,6 +266,10 @@ def child_argv(args, minutes_left):
     if getattr(args, "auto_hold_minutes", 0):
         argv += ["--auto-hold-minutes", str(args.auto_hold_minutes),
                  "--hold-cooldown", str(getattr(args, "hold_cooldown", 0) or 0)]
+        # ★2026-10-04：保活节奏随机化（用户要求「别固定频率，防被检测」）⇒ 透传给子进程
+        argv += ["--hold-interval-min", str(getattr(args, "hold_interval_min", 0) or 0),
+                 "--hold-interval-max", str(getattr(args, "hold_interval_max", 0) or 0),
+                 "--hold-long-prob", str(getattr(args, "hold_long_prob", 0) or 0)]
     if getattr(args, "state_dir", None):
         argv += ["--state-dir", args.state_dir]
     if minutes_left:
@@ -279,27 +283,6 @@ def spawn_watch(args, minutes_left, child_log):
         argv = list(args.child_cmd)
     else:
         argv = child_argv(args, minutes_left)
-        if args.notify:
-            argv.append("--notify")
-        # ★2026-10-04：随机节奏优先——给了区间就透传（不给则回落固定 --interval 旧行为）
-        if getattr(args, "interval_min", 0) and getattr(args, "interval_max", 0):
-            argv += ["--interval-min", str(args.interval_min),
-                     "--interval-max", str(args.interval_max)]
-        else:
-            argv += ["--interval", str(args.interval)]
-        if getattr(args, "sample", None) is not None:
-            argv += ["--sample", str(args.sample)]
-        argv += ["--cooldown", str(args.cooldown),
-                 "--fault-streak", str(args.fault_streak),
-                 "--fault-cooldown", str(args.fault_cooldown)]
-        # ★自动占坑（2026-10-04 用户要求）：命中可用即用探测同 session 抢下并保活，确保「能直接用」
-        if getattr(args, "auto_hold_minutes", 0):
-            argv += ["--auto-hold-minutes", str(args.auto_hold_minutes),
-                     "--hold-cooldown", str(getattr(args, "hold_cooldown", 0) or 0)]
-        if args.state_dir:
-            argv += ["--state-dir", args.state_dir]
-        if minutes_left:
-            argv += ["--max-minutes", str(int(minutes_left))]
     os.makedirs(os.path.dirname(child_log), exist_ok=True)
     logf = open(child_log, "a", buffering=1)
     _env = dict(os.environ, PYTHONUNBUFFERED="1")
@@ -970,7 +953,8 @@ def selftest():
     _a = _A()
     for k, v in (("notify", True), ("interval", 60), ("interval_min", 300.0), ("interval_max", 600.0),
                  ("sample", 4), ("cooldown", 21600), ("fault_streak", 3), ("fault_cooldown", 21600),
-                 ("auto_hold_minutes", 30.0), ("hold_cooldown", 900.0), ("state_dir", tmp)):
+                 ("auto_hold_minutes", 30.0), ("hold_cooldown", 900.0), ("state_dir", tmp),
+                 ("hold_interval_min", 100.0), ("hold_interval_max", 240.0), ("hold_long_prob", 0.12)):
         setattr(_a, k, v)
     base = child_argv(_a, 60)[2:]                      # 去掉解释器，只要参数
     r1 = subprocess.run([sys.executable, WATCH] + base + ["--help"],
@@ -982,6 +966,20 @@ def selftest():
     r2 = subprocess.run([sys.executable, WATCH] + bad + ["--help"],
                         capture_output=True, text=True)
     chk("NC 形状: 坏值必须让子进程报错（证明自测能失败）", r2.returncode != 0, True)
+    # 7b) ★2026-10-04 保活随机化透传：开了 auto-hold ⇒ 三个节奏参数必须到子进程（否则保活回落固定频次）
+    for _f in ("--hold-interval-min", "--hold-interval-max", "--hold-long-prob"):
+        chk("形状: auto-hold 透传 %s" % _f, _f in base, True)
+    chk("形状: 透传保活区间值", (base[base.index("--hold-interval-min") + 1],
+                            base[base.index("--hold-interval-max") + 1]), ("100.0", "240.0"))
+    # NC：不开 auto-hold 时不得混入保活参数（否则子进程按默认值乱保活）
+    _b2 = _A()
+    for k, v in (("notify", True), ("interval", 60), ("interval_min", 300.0), ("interval_max", 600.0),
+                 ("sample", 4), ("cooldown", 21600), ("fault_streak", 3), ("fault_cooldown", 21600),
+                 ("auto_hold_minutes", 0), ("hold_cooldown", 900.0), ("state_dir", tmp),
+                 ("hold_interval_min", 100.0), ("hold_interval_max", 240.0), ("hold_long_prob", 0.12)):
+        setattr(_b2, k, v)
+    _b2argv = child_argv(_b2, 60)[2:]
+    chk("NC 形状: 未开保活 ⇒ 零保活参数", [x for x in _b2argv if x.startswith("--hold")], [])
 
     # 8) ★2026-10-04 面板：令牌门禁 / 一键停旗标 / 保活时长 / 真 HTTP 一发（沙盒 state-dir）
     def _lj(d, name):
@@ -1174,6 +1172,12 @@ def _build_parser():
                          "（默认 0=只报喜不占坑；占坑=用探测同一 session 定时发 1）")
     ap.add_argument("--hold-cooldown", type=float, default=900.0, dest="hold_cooldown",
                     help="转发给子进程：两次自动占坑之间的最小间隔秒（默认 900）")
+    ap.add_argument("--hold-interval-min", type=float, default=100.0, dest="hold_interval_min",
+                    help="转发给子进程：保活间隔下界秒（默认 100；与 max 组成随机区间⇒非固定频次）")
+    ap.add_argument("--hold-interval-max", type=float, default=240.0, dest="hold_interval_max",
+                    help="转发给子进程：保活间隔上界秒（默认 240）")
+    ap.add_argument("--hold-long-prob", type=float, default=0.12, dest="hold_long_prob",
+                    help="转发给子进程：每发之间抽「长休」的概率（默认 0.12）")
     ap.add_argument("--state-dir", default=None, help="状态目录（演练/隔离用）")
     ap.add_argument("--log", default=None, help="守护日志路径（默认 <state-dir>/watchd.log）")
     ap.add_argument("--child-cmd", default=None,
@@ -1214,6 +1218,7 @@ def main():
             "check_every": args.check_every,
             "auto_hold_minutes": args.auto_hold_minutes,
             "hold_cooldown": args.hold_cooldown,
+            "hold_interval": [args.hold_interval_min, args.hold_interval_max, args.hold_long_prob],
             "max_hours": args.max_hours,
             "stall_rule": "now - last_ts > max(%ds×%.1f, %ds)" % (args.interval, args.stall_factor,
                                                                   STALL_MIN_GRACE_S),
