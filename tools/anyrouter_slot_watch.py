@@ -1257,19 +1257,25 @@ def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=
 def build_hold_card(text, panel_url=None, stop_url=None):
     """飞书交互卡片：带「⏹ 停止保活」按钮（用户 2026-10-04 要求傻瓜化）。
 
-    按钮走飞书卡片的 url 字段 ⇒ 点开本地面板 /stop（带令牌，等价 --stop-hold 旗标）。
-    面板入口缺失时（没起面板）不造按钮，仅回落纯文本 ⇒ 行为与旧版一致。
+    两级停止按钮（用户 2026-10-04：要「飞书卡片按钮事件」＋「网页」多种方式）：
+      ① 回调按钮 value={"ga_action": "anyrouter_stop_hold"} ⇒ 点击由 fsapp 的
+         card.action.trigger 受理（frontends/fsapp.py::_handle_anyrouter_stop_hold）
+         写 hold.stop 旗标，不用开网页、不用敲命令（首选）；
+      ② 网页兜底 url=stop_url（面板 /stop 带令牌）⇒ 回调通道不可用时仍能停。
+    ① 恒在（不依赖面板）；没起面板时只少 ②。
+    卡片整体发失败时由 send_notifications 回落纯文本 ⇒ 绝不因卡片格式吞通知。
     """
-    actions = []
+    actions = [{"tag": "button", "type": "danger",
+                "text": {"tag": "plain_text", "content": "⏹ 停止保活"},
+                "value": {"ga_action": "anyrouter_stop_hold"}}]
     if stop_url:
-        actions.append({"tag": "button", "type": "danger",
-                        "text": {"tag": "plain_text", "content": "⏹ 停止保活"}, "url": stop_url})
+        actions.append({"tag": "button", "type": "default",
+                        "text": {"tag": "plain_text", "content": "⏹ 停止保活(网页)"}, "url": stop_url})
     if panel_url:
         actions.append({"tag": "button", "type": "default",
                         "text": {"tag": "plain_text", "content": "📊 打开监控面板"}, "url": panel_url})
-    els = [{"tag": "div", "text": {"tag": "lark_md", "content": text}}]
-    if actions:
-        els.append({"tag": "action", "actions": actions})
+    els = [{"tag": "div", "text": {"tag": "lark_md", "content": text}},
+           {"tag": "action", "actions": actions}]
     return {
         "config": {"wide_screen_mode": True},
         "header": {"template": "green",
@@ -2282,15 +2288,20 @@ def selftest():
         _card = build_hold_card(_t2, ctl_url(), ctl_stop_url())
         _acts = _card["elements"][-1]["actions"]
         chk("card: 有「停止保活」按钮", any("停止保活" in a["text"]["content"] for a in _acts), True)
-        chk("card: 停止按钮指向 /stop（带令牌）",
+        chk("card: 回调按钮带 ga_action（飞书卡片事件，不依赖面板）",
+            any(a.get("value", {}).get("ga_action") == "anyrouter_stop_hold" for a in _acts), True)
+        chk("card: 另有网页兜底按钮指向 /stop（带令牌）",
             any(a.get("url", "").endswith("/stop?t=abc") and "停止保活" in a["text"]["content"]
                 for a in _acts), True)
         chk("card: 另有打开面板按钮", any("关闭" not in a["text"]["content"] and "/?t=abc" in a.get("url", "")
                                         for a in _acts), True)
-        chk("NC: 无面板 ⇒ 不造按钮（回落纯文本）",
-            build_hold_card("x", None, None)["elements"][-1].get("tag"), "div")
-        chk("NC: 只有面板无停止端点 ⇒ 也不出停止按钮",
-            any("停止保活" in a["text"]["content"]
+        _nc_card = build_hold_card("x", None, None)
+        chk("NC: 无面板 ⇒ 仍出回调按钮（不依赖面板）",
+            _nc_card["elements"][-1].get("tag"), "action")
+        chk("NC: 无面板 ⇒ 不出现任何 url 按钮",
+            any("url" in a for a in (_nc_card["elements"][-1].get("actions") or [])), False)
+        chk("NC: 只有面板无停止端点 ⇒ 不出网页停止按钮",
+            any(a.get("url", "").endswith("/stop")
                 for a in (build_hold_card("x", "http://h/", None)["elements"][-1].get("actions") or [])), False)
         _call = {"n": 0}
         chk("card: 干跑不发（dry-run 短路，卡片路径不被触发）",

@@ -816,12 +816,52 @@ def _make_task_hook(card, done_event, on_final):
         except Exception as e:
             print(f"[fs hook] error: {e}")
     return hook
+ANYROUTER_HOLD_STOP_REL = os.path.join("temp", "anyrouter_watch", "hold.stop")
+
+
+def _handle_anyrouter_stop_hold(data):
+    """受理 anyrouter 保活卡片上的「⏹ 停止保活」按钮：写旗标 + 回执。
+
+    卡片由 tools/anyrouter_slot_watch.py 用**同一个飞书应用**（mykeys.fs_app_id）发出，
+    所以按钮点击的 card.action.trigger 会回到这里（与 ask 候选按钮同一回调通道）。
+    受理判据与消息入口一致：非 PUBLIC_ACCESS 时只认 ALLOWED_USERS。
+    写旗标与 `--stop-hold` 完全等价（temp/anyrouter_watch/hold.stop）⇒ 在跑的保活 ≤5s 收手。
+    """
+    try:
+        operator = getattr(getattr(data.event, 'operator', None), 'open_id', None)
+        if not PUBLIC_ACCESS and operator not in ALLOWED_USERS:
+            print(f"[fs hold] 点击未受理(未授权): {operator}")
+            return
+        fp = os.path.join(PROJECT_ROOT, ANYROUTER_HOLD_STOP_REL)
+        os.makedirs(os.path.dirname(fp), exist_ok=True)
+        with open(fp, "w") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "reason": "feishu_card", "by": operator or ""},
+                               ensure_ascii=False))
+        print(f"[fs hold] 已受理停止保活: operator={operator} flag={fp}")
+        ctx = getattr(data.event, 'context', None)
+        chat_id = getattr(ctx, 'open_chat_id', None)
+        rid, rtype = (chat_id, "chat_id") if chat_id else (operator, "open_id")
+        if rid:
+            try:
+                send_message(rid, "⏹ 已受理：anyrouter 保活即将收手（旗标已写，≤5 秒）。",
+                             msg_type="text", receive_id_type=rtype)
+            except Exception as e:
+                print(f"[fs hold] 回执失败(不影响停止): {e}")
+    except Exception as e:
+        print(f"[fs hold] error: {e}")
+
+
 def handle_card_action(data):
     """卡片按钮回调：翻页，以及 ask_user 候选选择。"""
     try:
         v = data.event.action.value or {}
         if isinstance(v, str):
             v = json.loads(v or '{}')
+        # anyrouter 保活卡片（不带 ga_card，独立受理）：⏹ 停止保活
+        if v.get('ga_action') == 'anyrouter_stop_hold':
+            _handle_anyrouter_stop_hold(data)
+            return
         card = _TaskCard._registry.get(v.get('ga_card'))
         if not card:
             return
