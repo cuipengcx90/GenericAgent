@@ -39,6 +39,7 @@ import ast
 import io
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -535,18 +536,55 @@ def _read_json_file(path):
     return None
 
 
+def _pick_lan_from_ifconfig(txt, udp_ip=None):
+    """从 ifconfig 文本里挑真 LAN 私网 IP；失败回落 udp_ip（再剔假 IP），最后 127.0.0.1。
+
+    ★2026-10-04 真事故：lan_ip() 原来只做 UDP connect("8.8.8.8")，而本机 Clash TUN
+    接管路由 ⇒ getsockname() 恒得假 IP 198.18.0.1 ⇒ 写进 ctl.url 的「局域网入口」
+    手机根本连不上（面板真身 200 在 192.168.1.13:8766）。故改为 ifconfig 优先、
+    显式剔除 Clash 假网段 198.18/198.19（同 output_archive_sop 已知坑）。
+    """
+    ips = []
+    for m in re.finditer(r"inet (\d+\.\d+\.\d+\.\d+)", txt or ""):
+        ip = m.group(1)
+        if ip.startswith("127.") or ip.startswith("169.254."):
+            continue                                   # 回环 / 链路本地
+        if ip.startswith("198.18.") or ip.startswith("198.19."):
+            continue                                   # Clash TUN 假网段
+        if (ip.startswith("192.168.") or ip.startswith("10.")
+                or re.match(r"172\.(1[6-9]|2[0-9]|3[01])\.", ip)):
+            ips.append(ip)
+    if ips:
+        for ip in ips:                                 # 家用 Wi-Fi 常见 192.168 优先
+            if ip.startswith("192.168."):
+                return ip
+        return ips[0]
+    udp = str(udp_ip or "")
+    if udp and not (udp.startswith("198.18.") or udp.startswith("198.19.")) and not udp.startswith("127."):
+        return udp
+    return "127.0.0.1"
+
+
 def lan_ip():
-    """本机局域网 IP（UDP connect 不发包）；取不到回落 127.0.0.1。"""
+    """本机真实局域网 IP：ifconfig 私网地址优先（剔 Clash 假 IP 198.18/198.19），
+    再回落 UDP 探测，最后 127.0.0.1。"""
+    txt = ""
+    try:
+        txt = subprocess.run(["/sbin/ifconfig"], capture_output=True, text=True, timeout=5).stdout or ""
+    except Exception:
+        txt = ""
+    udp = None
     try:
         import socket
         sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sk.connect(("8.8.8.8", 80))
-            return sk.getsockname()[0]
+            udp = sk.getsockname()[0]
         finally:
             sk.close()
     except Exception:
-        return "127.0.0.1"
+        udp = None
+    return _pick_lan_from_ifconfig(txt, udp)
 
 
 def write_ctl_url(state_dir, port, token, log=None, lan=None):
@@ -1037,6 +1075,28 @@ def selftest():
                 "    def log(msg):\n        pass\n")
     chk("NC 面板序: 旧写法（先调面板后定义 log）必须判 False",
         _panel_seq_ok(_src_bad), False)
+
+    # §10 局域网入口选择：真 LAN 优先、Clash TUN 假 IP 必剔（2026-10-04 真事故）
+    _ifc = ("lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n"
+            "        inet 127.0.0.1 netmask 0xff000000\n"
+            "utun6: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1420\n"
+            "        inet 198.18.0.1 --> 198.18.0.1 netmask 0xfffff800\n"
+            "en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+            "        inet 192.168.1.13 netmask 0xffffff00 broadcast 192.168.1.255\n")
+    chk("LAN: 有真 LAN + TUN 假 IP ⇒ 取 192.168.1.13（不取 198.18.0.1）",
+        _pick_lan_from_ifconfig(_ifc), "192.168.1.13")
+    chk("LAN: 无真 LAN(仅 TUN) ⇒ 回落 127.0.0.1 而非假 IP",
+        _pick_lan_from_ifconfig(_ifc.split("en0")[0], "198.18.0.1"), "127.0.0.1")
+    chk("NC LAN: 只有 10.x ⇒ 取它", _pick_lan_from_ifconfig("        inet 10.0.0.9 x"), "10.0.0.9")
+    chk("NC LAN: 172.20 属私网 ⇒ 取它", _pick_lan_from_ifconfig("        inet 172.20.5.5 x"), "172.20.5.5")
+    chk("NC LAN: 172.32 非私网 ⇒ 不取（回落 127）",
+        _pick_lan_from_ifconfig("        inet 172.32.1.1 x", "198.18.0.1"), "127.0.0.1")
+    chk("NC LAN: 169.254 链路本地 ⇒ 不取",
+        _pick_lan_from_ifconfig("        inet 169.254.3.4 x", None), "127.0.0.1")
+    chk("NC LAN: 空 ifconfig 但 UDP 有真值 ⇒ 用 UDP",
+        _pick_lan_from_ifconfig("", "192.168.1.77"), "192.168.1.77")
+    chk("LAN: 真机 lan_ip() 不得是 Clash 假 IP 198.18/198.19",
+        lan_ip().startswith("198.18.") or lan_ip().startswith("198.19."), False)
 
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
