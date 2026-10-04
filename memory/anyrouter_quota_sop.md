@@ -46,6 +46,52 @@
 
 ★未证实项（禁止当机制写入/实现）：网上流传的「统一或保活 session id」「定时发内容 `1` 保温」在本轮抓取的 5 篇原文中 grep **零命中**（`session id`/`保活`/`粘性` 全 MISS）⇒ 标记 UNVERIFIED，不采纳。
 
+
+## 1.2 ★探针根因订正：`session_id` 形态门禁 + 「快返」语义（2026-10-04 晚间实测）
+
+**这一条推翻 10-03 起的全部探测结论**，凡引用旧台账（`temp/anyrouter_watch/ledger.jsonl`）里
+10-04 之前的 429/503 读数，一律先按本节重判。
+
+### （1）门禁落在 `session_id` 形态上，不在号池
+
+`metadata.user_id` 是 CC 客户端自己拼的字符串，站点只看里面 `session_id` 那一段的**形态**：
+
+- 真 CC 的值 = **UUID**（36 字符 `8-4-4-4-12`）；**任意** uuid4 都过闸（3/3 走上游、挂满传输超时）；
+- 旧实现自造的 `user_<32hex>_account__session_<uuid>`（91 字符长串）**恒被瞬时拒**（429 @1.9s），与号池有没有空闲上游无关；
+- `device_id` / `account_uuid` 都**不是**门禁（真 CC 的 `account_uuid` 同样是空串）。
+
+⇒ 单变量 6 发对照见 `temp/anr_truth/truth5_*.jsonl`（probe5）与 `temp/anr_truth/probe7*.jsonl`（ABBA 交错复验：同模型
+`gpt-6-astra-cc-format`，uuid 形 2/2 走上游、旧形 2/2 快返 429）。
+
+**后果（当时有多严重）**：本工具 `build_probe_body()` / `build_claim_body()` 一直走 `session_id_for()` 自造长串，
+故自 10-03 落地起**所有** 429/503 都是「身份被拒」的**假阴性**，不是「号池满」——10-04 当天台账 648 次 503 +
+173 次 429 全是这个 bug 的产物，抢坑路径同样结构性死。
+
+**修法**：`session_id_for()` 改 `uuid5(NAMESPACE_URL, "anyrouter|<sha256(key)>|<tag>")` —— 既满足 UUID 形态，
+又对 (key, tag) 确定 ⇒ 跨进程/跨轮稳定，抢坑与后续保活能复用同一坑位身份；key 只进 sha256，不落盘明文。
+
+### （2）「快返 429」不再单独构成故障判据（GATE_REJECT 收紧）
+
+旧逻辑见「全模型都在极短耗时内被拒」⇒ 判 `GATE_REJECT`（配置/形状坏了）⇒ 发告警。实测反例：`claude-opus-4-7`
+在 uuid5 / 旧自造 / 真 dump uid 三种身份下**都是 1.1s 快返**⇒快返本身**证不出**身份被拒。
+
+现判据：全快返**只有**在「对照探针」（真 CC 身份，即 UUID 形）**同样**快返时才判 `GATE_REJECT`；对照探针能走上游
+（挂满超时）⇒ 快返属**真号池态**，照旧归 `POOL_BUSY`。对照身份来源按优先级：环境变量
+`ANR_GATE_CONTROL_UID_JSON` → 本机真 CC dump（`/tmp/anr_proxy_dump/000_req.json`）；显式设
+`ANR_GATE_CONTROL_UID_JSON=none|off|0` 可禁用对照（无对照 ⇒ 该维度判 `unknown`，**不得**凭空升级为
+`GATE_REJECT`，fail-closed 只体现在「不冤枉站点」方向）。
+
+### （3）新增观测维度与状态
+
+- `elapsed_s` / `latency_class` 落台账：区分「瞬时拒（~1-2s）」与「过闸排队（≥`QUEUED_MIN_S`=8s，直到传输超时）」；
+- `QUEUED_NO_UPSTREAM`：传输超时但已连上并挂满 ≥8s ⇒ **过闸、只是上游无空闲槽**（≠链路故障，≠没额度）；
+- 探测并发化（`--workers`，默认 5）+ `--timeout` 默认 90s（旧值偏短会把「排队」误判成失败）。
+
+### （4）本节结论之外的仍未证实项
+
+「session id 保活 / 粘性」在 5 篇 L 站原文里 **0 命中**（见 §1.1）= **UNVERIFIED 不采纳**：uuid5 只是满足形态门禁
+并保持稳定，不代表站点真的把号池坑位绑到该 id 上。
+
 ## 2. 工具
 
 `tools/anyrouter_slot_watch.py`（纯 stdlib + keychain）：
@@ -54,7 +100,7 @@
 python3 tools/anyrouter_slot_watch.py --once            # 单轮探测（默认 5 个 messages 面模型）
 python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私信 + 钉钉群
 python3 tools/anyrouter_slot_watch.py --watch --notify --interval 300 --cooldown 21600 --max-minutes 1380
-python3 tools/anyrouter_slot_watch.py --selftest        # 37 项负控自测
+python3 tools/anyrouter_slot_watch.py --selftest        # 119 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。

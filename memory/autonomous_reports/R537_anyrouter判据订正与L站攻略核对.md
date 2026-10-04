@@ -72,3 +72,46 @@
 
 - 引文回源：SOP §1.1 与本报告引号内容逐字来自 `temp/anr_lstation/`（grep 命中，校验器自测含 MISS 负控）。
 - 未证实项的反向断言：`session id`/`保活`/`粘性` 在该语料中 MISS（若将来命中，须重开该议题）。
+
+## 8. 复测订正（2026-10-04 晚）：探针自伤的根因 = `session_id` 形态被网关切掉
+
+本节推翻了 §1.1 之后的**全部探测读数**，是本次真正值钱的发现。
+
+### 8.1 根因（单变量对照，铁证）
+
+同一最小形状，只换 `metadata.user_id` 里的 `session_id` 一段：
+
+| 形态 | 结果（`temp/anr_truth/truth5_*.jsonl`） |
+|---|---|
+| 真 CC dump 的 uid | 2/2 传输超时、挂满 61.3s / 60.6s（= 过闸、走上游排队） |
+| 任意 uuid4（`only_sess_uuid` / `sess_uuid2`） | 2/2 传输超时 60.7s / 60.6s（同上） |
+| 旧实现自造 91 字符长串（`only_dev_real`，**只有 session 是旧形**） | 1/1 `429` @ **1.9s**、`{"error":{"message":"Service Unavailable"...}}` |
+
+ABBA 交错复验（`temp/anr_truth/truth7_20261004_092409.jsonl`，同模型 `gpt-6-astra-cc-format`）：
+`P1_uuid` 超时 12.6s → `P2_old` 429 @1.1s → `P3_old` 429 @1.1s → `P4_uuid` 超时 12.6s
+—— 形态效应**与顺序无关**，正是单变量对照该有的样子。
+
+⇒ 网关门禁落在 `session_id` **是不是 UUID 形**上；`device_id` / `account_uuid` 都不是门禁（真 CC 的
+`account_uuid` 同样是空串）。「快返 429」是**身份被拒**，不是号池态。
+
+### 8.2 影响面
+
+`build_probe_body()` / `build_claim_body()` 一直走 `session_id_for()` 自造长串 ⇒ 自本工具 10-03 落地起，
+**每一次探测都被自己的身份格式拒掉**：当日台账 648 次 503 + 173 次 429 全是该 bug 的产物（不是「没坑」，
+更不是「没额度」）；抢坑宣称路径同样结构性死。
+
+### 8.3 修法与判据收紧（已落盘，selftest 95→119）
+
+1. `session_id_for()` → `uuid5(NAMESPACE_URL, "anyrouter|<sha256(key)>|<tag>")`：满足 UUID 形态且对
+   (key,tag) 确定 ⇒ 跨进程/跨轮稳定（抢坑与保活复用同一身份）；key 只进 sha256，不落盘明文。
+2. 「全模型快返」不再单独构成 `GATE_REJECT`：必须有**对照探针**（真 UUID 形身份）**同样**快返才判；对照能走上游
+   ⇒ 快返归 `POOL_BUSY`（真号池态）。对照身份取 `ANR_GATE_CONTROL_UID_JSON` → 本机真 CC dump；无对照 ⇒ 该维度
+   `unknown`，**不得**凭空升级为 `GATE_REJECT`（`ANR_GATE_CONTROL_UID_JSON=none|off|0` 可显式禁用）。
+3. 新增 `elapsed_s` / `latency_class` 落台账 + `QUEUED_NO_UPSTREAM`（传输超时但已连上并挂满 ≥8s ⇒ 过闸、上游无空闲槽）；
+   `--timeout` 默认 90s、`--workers` 默认 5。
+
+### 8.4 与 §1.1 的关系（不要把两件事混起来）
+
+§1.1 讲的是**站点语义**（429/503/500 都属「号池供给态」，非没额度）——修正后仍然成立；
+本节讲的是**我方探针自伤**（身份格式非法 ⇒ 连站点的号池都没碰到）。两者叠加才解释得通「明明有额度却全 429」。
+`session id` 保活/粘性仍属 UNVERIFIED（5 篇原文 0 命中），uuid5 只是**满足门禁 + 保持稳定**，不代表站点真的绑定坑位。

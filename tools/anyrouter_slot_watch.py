@@ -123,6 +123,7 @@ MODEL_UNSUPPORTED = "MODEL_UNSUPPORTED"
 CLIENT_REJECTED = "CLIENT_REJECTED"
 KEY_INVALID = "KEY_INVALID"
 UNKNOWN = "UNKNOWN"
+QUEUED = "QUEUED_NO_UPSTREAM"  # 过闸但上游无空闲槽：连接已建立后挂满超时（★≠链路故障、≠没额度）
 EDGE_BLOCK = "EDGE_BLOCK"  # 403 + 边缘 WAF 页（阿里 ESA）：环境/限流面，非凭据问题
 BROKEN = (CLIENT_REJECTED, KEY_INVALID)  # 属「配置/凭据坏了」而非「坑满了」
 
@@ -136,9 +137,13 @@ FAULT_EDGE = "EDGE_BLOCK"            # 全 EDGE_BLOCK（被边缘 WAF 拦）
 FAULT_NO_KEY = "NO_KEY"              # 本机取不到 key
 FAULT_STREAK = 3                     # 连续 3 轮（默认 5min/轮 ≈ 15min）才告警，防抖
 FAULT_NOTIFY_COOLDOWN_S = 6 * 3600   # 故障持续时，最多每 6h 提醒一次
+FAULT_GATE_REJECT = "GATE_REJECT"    # 全 BUSY 且**全部瞬时快返** ⇒ 探针自身形状/身份被网关拒（假阴性）
+FAST_REJECT_S = 3.0                  # 429/503 快返阈值（秒）：≤该值 = 网关瞬时拒，没进上游
+QUEUED_MIN_S = 8.0                   # 传输超时、但从发起到挂满 ≥ 该秒数 ⇒ 判「过闸后无空闲上游」
 
 ICON = {
     AVAILABLE: "✅ 可用（抢到坑）",
+    QUEUED: "🕐 已过闸、上游暂无空闲槽（排队中超时；不是链路故障，也不是没额度）",
     BUSY: "⏳ 非 200（429/503；形状合格后未再出现，多为边缘限流/上游抖动）",
     EDGE_BLOCK: "🛡 被边缘 WAF 拦（403 + 阿里 ESA 页；自动重试）",
     NEED_1M: "⚠️ 需启用 1M 上下文",
@@ -183,6 +188,35 @@ def classify(status, body_text):
     return UNKNOWN
 
 
+def _is_uuid(s):
+    """是否形如 8-4-4-4-12 的十六进制 UUID（站点 session_id 放行门禁的形态判据）。"""
+    import re as _re
+    return bool(_re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                          (s or "").strip().lower()))
+
+
+def classify_latency(http, verdict, elapsed_s):
+    """在 HTTP 判据之上加「延迟维度」（纯函数，供负控自测）。返回 (verdict, latency, queued)。
+
+    ★为什么必须有两维：2026-10-04 实测同一形状——被网关瞬时拒时 429/503 恒 ~1.1-1.9s，
+    真过闸走上游的请求恒 30-70s（挂着等生成）⇒ 只看状态码会把「被自己的形状门拒掉」
+    与「号池满」混为一谈（本工具因此假阴性一整段，台账里 648×503+173×429 全属此）。
+      fast    = ≤FAST_REJECT_S 的 429/503 ⇒ 疑似形状/身份被拒（GATE_REJECT 候选）
+      slow    = 其余 429/503（挂了一会儿才回 = 真池满）
+      ok      = 200
+      timeout = 传输超时但已连上挂起（≥QUEUED_MIN_S）⇒ queued=True（过闸、无空闲上游）
+    """
+    if elapsed_s is None:
+        return verdict, "na", False
+    if http == 200:
+        return verdict, "ok", False
+    if http == 0 and verdict == UNKNOWN and elapsed_s >= QUEUED_MIN_S:
+        return QUEUED, "timeout", True
+    if http in (429, 503):
+        return verdict, ("fast" if elapsed_s <= FAST_REJECT_S else "slow"), False
+    return verdict, "na", False
+
+
 def beijing_now():
     return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
 
@@ -219,7 +253,16 @@ def fault_kind(results):
     if not results:
         return FAULT_NO_KEY
     vs = [r.get("verdict") for r in results]
-    if any(v in (AVAILABLE, BUSY, NEED_1M) for v in vs):
+    lats = [r.get("latency") for r in results]
+    if all(v == BUSY for v in vs) and lats and all(l == "fast" for l in lats):
+        # ★2026-10-04 实测订正：全 BUSY 且全快返**不足以**判「探针形状被拒」——
+        #   同刻用真 CC 身份（dump uid）打 claude 系同样 1.1s 快返（truth6_*.jsonl），
+        #   说明快返既可能是形状被拒、也可能是网关侧供给态。
+        #   ⇒ 此处**不再**直接判故障；升级判据见 gate_suspect() + gate_control_probe()
+        #     （只有在「对照身份能过闸、我方不能」的对照证据下才升 GATE_REJECT）。
+        return None
+    if any(v in (AVAILABLE, BUSY, NEED_1M, QUEUED) for v in vs):
+        # QUEUED = 过闸后上游无空闲槽：链路是通的（否则到不了上游），只是没坑 ⇒ 不是故障。
         return None
     if all(v == UNKNOWN for v in vs):
         return FAULT_TRANSPORT
@@ -232,6 +275,82 @@ def fault_kind(results):
     if all(v == MODEL_UNSUPPORTED for v in vs):
         return FAULT_MODEL_DRIFT
     return None
+
+
+def gate_suspect(results):
+    """全 BUSY 且全部瞬时快返 ⇒ 「我方身份/形状可能被拒」的**候选**（纯函数，不等于判决）。
+
+    升级为 FAULT_GATE_REJECT 必须再拿到对照证据（见 gate_control_probe）：
+    有人能过闸而我方不能，才说明是探针自身的问题。
+    """
+    if not results:
+        return False
+    vs = [r.get("verdict") for r in results]
+    lats = [r.get("latency") for r in results]
+    return bool(vs and all(v == BUSY for v in vs) and lats and all(l == "fast" for l in lats))
+
+
+def _gate_control_uid():
+    """可选对照身份：真 Claude Code 抓包里的 metadata.user_id（不存在则 None）。
+
+    查找顺序：env ANR_GATE_CONTROL_UID_JSON > temp/anyrouter_watch/cc_control_uid.json
+              > /tmp/anr_proxy_dump/000_req.json（临时抓包，易失）。
+    """
+    cands = []
+    envp = os.environ.get("ANR_GATE_CONTROL_UID_JSON")
+    if envp:
+        if envp.strip().lower() in ("none", "off", "0", ""):
+            return None          # 显式禁用对照（运维开关/自测用）
+        cands.append(envp)
+    cands.append(os.path.join(STATE_DIR, "cc_control_uid.json"))
+    cands.append("/tmp/anr_proxy_dump/000_req.json")
+    for c in cands:
+        try:
+            if not os.path.exists(c):
+                continue
+            obj = json.load(open(c, encoding="utf-8"))
+            if isinstance(obj, dict) and "body" in obj:
+                obj = obj["body"]
+            raw = (obj.get("metadata") or {}).get("user_id") if isinstance(obj, dict) else None
+            if not raw:
+                continue
+            uid = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(uid, dict) and uid.get("session_id"):
+                return uid
+        except Exception:
+            continue
+    return None
+
+
+def gate_control_probe(key, model, timeout=20, post=None):
+    """对照探针（判 GATE_REJECT 的**唯一**证据通道）。
+
+    返回 "unavailable" / "pass"（对照能过闸：200 或挂满超时=走上游）/ "reject"（对照也快返）。
+    """
+    uid = _gate_control_uid()
+    if not uid:
+        return "unavailable"
+    post = post or _http_post
+    body = build_probe_body(model)
+    o = json.loads(body.decode())
+    o["metadata"]["user_id"] = json.dumps(uid, separators=(",", ":"))
+    b = json.dumps(o).encode()
+    t0 = time.time()
+    try:
+        st, txt = post(HOSTS[0] + CC_PATH, key, b, timeout)
+    except Exception:
+        st, txt = 0, ""
+    el = time.time() - t0
+    # 语义（★不调 classify_latency：它吃的是 (http, verdict, elapsed) 三元序，此处直接判更稳）
+    #   pass   = 对照身份**没被网关拒**：200，或传输层挂满超时/异常（连拒绝响应都没拿到）
+    #   reject = 拿到 429/503 且瞬回 ⇒ 对照也被形状门拒
+    if st == 200:
+        return "pass"
+    if st in (429, 503) and el <= FAST_REJECT_S:
+        return "reject"
+    if st == 0:
+        return "pass"
+    return "unknown"
 
 
 def should_notify_fault(state, kind, now_ts, streak, need_streak=FAULT_STREAK,
@@ -256,6 +375,7 @@ def _build_fault_text(kind, results, now_bj, streak):
         FAULT_EDGE: "被边缘 WAF 拦截（403 + 阿里 ESA 页；多为限流，稍后自动恢复）",
         FAULT_MODEL_DRIFT: "在册模型名全部 404（站点可能改了 API 面）",
         FAULT_NO_KEY: "本机取不到 key（keychain/env/文件均无）",
+        FAULT_GATE_REJECT: "探针身份被网关拒（我方全快返，而**对照身份能过闸**）",
     }.get(kind, kind)
     lines = ["⚠️ anyrouter 抢坑监控自身异常（不是「没坑」）",
              "时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S"),
@@ -264,8 +384,10 @@ def _build_fault_text(kind, results, now_bj, streak):
         lines.append("- %s：http=%s %s" % (r.get("model", "?"), r.get("http"), r.get("verdict")))
     lines += [
         "",
-        "区别：429/503=号池忙（正常，没坑）；本条=探测链路/凭据本身坏了，"
-        "脚本会自动重试，不需要你操作；若持续超过 12h 再人工看一眼。",
+        "区别：429/503=号池忙（正常，没坑）；本条=%s，"
+        "脚本会自动重试，不需要你操作；若持续超过 12h 再人工看一眼。"
+        % ("探针形状/身份被网关拒（速返），非号池满——需修会话形状"
+           if kind == FAULT_GATE_REJECT else "探测链路/凭据本身坏了"),
         "日志：%s" % _log_hint(),
         "（自动重试中：%s）" % kind,
     ]
@@ -294,6 +416,8 @@ def overall_rc(results):
         return 2
     if all(r["verdict"] in BROKEN for r in results):
         return 2
+    if all(r["verdict"] == QUEUED for r in results):
+        return 0  # 过闸但没坑：等价「池满」，不是链路故障
     return 0
 
 
@@ -358,14 +482,22 @@ def probe_model(model, key, hosts=None, timeout=60):
     body = build_probe_body(model)
     tried = []
     for host in (hosts or HOSTS):
+        t0 = time.time()
         code, text = _http_post(host + CC_PATH, key, body, timeout, read_limit=256)
+        el = time.time() - t0
         if code == 0:
             tried.append(text[:120])
+            v, lat, queued = classify_latency(0, UNKNOWN, el)
+            if queued:
+                return {"model": model, "http": 0, "verdict": v, "detail": text[:200],
+                        "host": host, "elapsed_s": round(el, 1), "latency": lat, "queued": True}
             continue
-        return {"model": model, "http": code, "verdict": classify(code, text),
-                "detail": text[:200], "host": host}
+        v, lat, queued = classify_latency(code, classify(code, text), el)
+        return {"model": model, "http": code, "verdict": v, "detail": text[:200],
+                "host": host, "elapsed_s": round(el, 1), "latency": lat, "queued": queued}
     return {"model": model, "http": 0, "verdict": UNKNOWN,
-            "detail": "; ".join(tried)[:200], "host": ""}
+            "detail": "; ".join(tried)[:200], "host": "", "elapsed_s": None,
+            "latency": "na", "queued": False}
 
 
 def list_models(key=""):
@@ -414,14 +546,19 @@ def claim_action(status):
 def session_id_for(key, tag="anyrouter-slot"):
     """固定 session id：跨进程/跨轮稳定（同 key+tag 恒等），供站点把坑位绑到一个会话上。
 
-    形态仿 Claude Code：``user_<32hex>_account__session_<uuid>``。
+    ★2026-10-04 铁证（6 发单变量对照，temp/anr_truth/truth5_*.jsonl）：网关门禁落在
+    ``session_id`` 的**形态**上——必须是一个 UUID（36 字符 8-4-4-4-12）。任意 uuid4 都过闸
+    （3/3 走上游并挂满超时），而旧实现自造的 ``user_<32hex>_account__session_<uuid>``（91 字符）
+    恒被瞬时拒（429 @1.9s，与号池有没有空闲上游无关）⇒ 那是**假阴性**，不是「没抢到坑」。
+    ``device_id`` / ``account_uuid`` 都不是门禁（真 CC 的 account_uuid 同样是空串）。
+
+    取 uuid5 派生：既满足 UUID 形态，又对 (key,tag) 确定 ⇒ 抢坑/保活能复用同一坑位身份。
     key 只参与 sha256，不落盘明文。
     """
     import hashlib
     import uuid
-    h = hashlib.sha256(("anyrouter|%s" % (key or "")).encode()).hexdigest()[:32]
-    sid = uuid.uuid5(uuid.NAMESPACE_URL, "anyrouter|%s|%s" % (h, tag))
-    return "user_%s_account__session_%s" % (h, sid)
+    h = hashlib.sha256(("anyrouter|%s" % (key or "")).encode()).hexdigest()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, "anyrouter|%s|%s" % (h, tag)))
 
 
 def _cc_session_uuid(key):
@@ -440,6 +577,11 @@ def cc_meta_user_id(session_id):
       C 正控（ab 脚本 sys2_meta16 同形）      -> **200**
     即网关门禁落在「metadata.user_id 是不是一个内嵌 JSON 串」上，裸串恒被
     判为不合格形状而快返 429（与号池有没有空闲上游无关）。
+
+    ★2026-10-04 追加铁证（6 发单变量，**订正上文**）：上面三发同时换了两个变量
+      （JSON 串 vs 裸串、session_id 长串 vs UUID）。分量级复测证明真正卡住的是
+      **session_id 的 UUID 形态**——把本函数里的 ``session_id`` 换成 UUID 后同一形状
+      3/3 走上游（挂满超时）；device_id/account_uuid 均非门禁。
     """
     import hashlib
     dev = hashlib.sha256(("anyrouter-device|%s" % (session_id or "")).encode()).hexdigest()
@@ -639,18 +781,43 @@ def send_notifications(text, dry_run=False):
 
 
 # ---------------------------------------------------------------- 主流程
+def probe_models(models, key, timeout=90, workers=5):
+    """并行探测多个模型（纯为控轮次耗时）。
+
+    ★2026-10-04：形状修对后，真过闸的请求会挂满超时（实测 200 恒 ~37s、排队态 60s+）⇒
+    串行 5 个会把一轮拉到 300s+，与 --interval（现役 300s）打结；并发后一轮≈单个耗时。
+    """
+    ms = list(models)
+    if len(ms) <= 1:
+        return [probe_model(m, key, timeout=timeout) for m in ms]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(workers, len(ms))) as ex:
+        futs = [ex.submit(probe_model, m, key, timeout=timeout) for m in ms]
+        return [f.result() for f in futs]
+
+
 def run_once(args):
     now_bj = beijing_now()
     key = _load_key()
     if not key:
         print("[anyrouter] 无可用密钥（env ANYROUTER_API_KEY / keychain anyrouter_api_key / ~/.config/anyrouter/key）")
     models = args.model_list or MODELS
-    results = [probe_model(m, key, timeout=args.timeout) for m in models] if key else []
+    results = probe_models(models, key, timeout=args.timeout) if key else []
     rc = overall_rc(results)
     for r in results:
-        print("[anyrouter] %-28s http=%s %s" % (r["model"], r["http"], r["verdict"]))
+        print("[anyrouter] %-28s http=%s %s (%s s/%s)" % (
+            r["model"], r["http"], r["verdict"],
+            "-" if r.get("elapsed_s") is None else r["elapsed_s"], r.get("latency", "na")))
 
     kind = fault_kind(results)
+    gate_ctl = ""
+    if kind is None and key and gate_suspect(results):
+        # 全快返：拿对照身份验一下，只有「对照能过闸而我方不能」才判探针被拒
+        gate_ctl = gate_control_probe(key, results[0].get("model") or MODELS[0],
+                                      timeout=min(20, int(getattr(args, "timeout", 20) or 20)))
+        print("[anyrouter] 全量瞬时快返（≤%ss）→ 对照身份判定：%s" % (FAST_REJECT_S, gate_ctl))
+        if gate_ctl == "pass":
+            kind = FAULT_GATE_REJECT
     now_ts = time.time()
     st = _load_state()
 
@@ -690,7 +857,10 @@ def run_once(args):
             {"model": r["model"], "http": r["http"], "verdict": r["verdict"]} for r in results],
             "rc": rc, "notify": bool(do_push and args.notify), "pushed": pushed,
             "reason": reason, "fault": kind or "", "fault_streak": streak,
-            "fault_notify": f_reason}
+            "fault_notify": f_reason,
+            "gate_control": gate_ctl, "gate_suspect": bool(gate_suspect(results)),
+            "latency": [r.get("latency") for r in results],
+            "elapsed_s": [r.get("elapsed_s") for r in results]}
         _append_ledger(rec)
         st["last_ts"] = rec["ts"]
         st["last_verdict"] = AVAILABLE if rc == 1 else (
@@ -926,6 +1096,56 @@ def selftest():
     else:
         os.environ["GA_ANYROUTER_LOG_HINT"] = _old_hint
 
+    # 9c) ★2026-10-04 会话形状 + 延迟维度（本轮假阴性根因：形状被拒 ≠ 号池满）
+    _sid_probe = session_id_for("sk-test-1", "tagA")
+    chk("NC: session 不再是自造长串（旧形 hard-reject）", _sid_probe.startswith("user_"), False)
+    chk("lat: 429 快返 -> fast", classify_latency(429, BUSY, 1.2)[1], "fast")
+    chk("lat: 503 快返 -> fast", classify_latency(503, BUSY, 1.9)[1], "fast")
+    chk("lat: 503 慢返 -> slow", classify_latency(503, BUSY, 12.0)[1], "slow")
+    chk("lat: 200 -> ok", classify_latency(200, AVAILABLE, 37.0)[1], "ok")
+    chk("lat: 9s+ 传输挂起 -> QUEUED", classify_latency(0, UNKNOWN, 45.0)[0], QUEUED)
+    chk("NC: 传输快失败（2s）不算 QUEUED", classify_latency(0, UNKNOWN, 2.0)[0], UNKNOWN)
+    chk("NC: classify_latency 不把 200 降级", classify_latency(200, AVAILABLE, 0.5)[0], AVAILABLE)
+    chk("fault: 全 BUSY 且全 fast **不再**直接判 GATE_REJECT（需对照证据）",
+        fault_kind([{"verdict": BUSY, "latency": "fast"}, {"verdict": BUSY, "latency": "fast"}]),
+        None)
+    chk("fault: 全快返 ⇒ gate_suspect() 为真（候选）",
+        gate_suspect([{"verdict": BUSY, "latency": "fast"}, {"verdict": BUSY, "latency": "fast"}]), True)
+    chk("NC: 有一发 slow ⇒ 非候选",
+        gate_suspect([{"verdict": BUSY, "latency": "fast"}, {"verdict": BUSY, "latency": "slow"}]), False)
+    chk("NC: 有一发 QUEUED ⇒ 非候选（已过闸）",
+        gate_suspect([{"verdict": BUSY, "latency": "fast"}, {"verdict": QUEUED, "latency": "timeout"}]), False)
+    _ck = _load_key() or "sk-dummy"
+    _uid = {"device_id": "d", "account_uuid": "", "session_id": "11111111-2222-3333-4444-555555555555"}
+    import tempfile as _tf
+    _tfdir = _tf.mkdtemp()
+    _cf = os.path.join(_tfdir, "cc_control_uid.json")
+    json.dump(_uid, open(_cf, "w"))
+    os.environ["ANR_GATE_CONTROL_UID_JSON"] = _cf
+    chk("gate control: 对照 200 ⇒ pass",
+        gate_control_probe(_ck, "m", post=lambda *a, **k: (200, '{"x":1}')), "pass")
+    chk("NC: 对照 401（同一 key 也认不出）⇒ unknown（不硬判）",
+        gate_control_probe(_ck, "m", post=lambda *a, **k: (401, "unauthorized client")), "unknown")
+    chk("gate control: 对照挂满超时（走上游）⇒ pass",
+        gate_control_probe(_ck, "m", timeout=1, post=lambda *a, **k: (0, "TimeoutError")), "pass")
+    chk("gate control: 对照也快返 ⇒ reject",
+        gate_control_probe(_ck, "m", post=lambda *a, **k: (429, "{}")), "reject")
+    os.environ["ANR_GATE_CONTROL_UID_JSON"] = "none"     # 显式禁用对照身份
+    chk("NC: 无对照身份 ⇒ unavailable（不得凭空判 GATE_REJECT）",
+        gate_control_probe(_ck, "m"), "unavailable")
+    os.environ.pop("ANR_GATE_CONTROL_UID_JSON", None)
+    chk("NC: 全 BUSY 但慢返 -> 非故障（真池满）",
+        fault_kind([{"verdict": BUSY, "latency": "slow"}]), None)
+    chk("NC: BUSY 无 latency（旧台账记录）-> 非故障",
+        fault_kind([{"verdict": BUSY}]), None)
+    chk("fault: QUEUED 属正常观测（不是链路故障）", fault_kind([{"verdict": QUEUED}]), None)
+    chk("rc: 全 QUEUED -> 0（没坑，非故障）", overall_rc([{"verdict": QUEUED}]), 0)
+    chk("meta: user_id 内嵌 session_id 亦为 UUID 形",
+        _is_uuid(json.loads(cc_meta_user_id(_sid_probe))["session_id"]), True)
+    chk("icon: QUEUED 有中文图标可读", bool(ICON.get(QUEUED)), True)
+    chk("fault text: GATE_REJECT 文案点名「非号池满」",
+        "非号池满" in _build_fault_text(FAULT_GATE_REJECT, [], beijing_now(), 3), True)
+
     # 10) 抢坑（claim）：判据映射 / 身份稳定 / 退避 / 真重发（注入假 post，全程离线）
     chk("claim: 200 -> WON", claim_action(200), CLAIM_WON)
     chk("claim: 429 -> CONTINUE", claim_action(429), CLAIM_CONTINUE)
@@ -942,7 +1162,7 @@ def selftest():
     chk("session: 同 key+tag 恒等", session_id_for("sk-test-1", "tagA"), sid)
     chk("NC: 换 key 变 id", session_id_for("sk-test-2", "tagA") == sid, False)
     chk("NC: 换 tag 变 id", session_id_for("sk-test-1", "tagB") == sid, False)
-    chk("session: CC 形态", sid.startswith("user_") and "_account__session_" in sid, True)
+    chk("session: 形态=UUID（36 字符 8-4-4-4-12，站点放行门禁）", _is_uuid(sid), True)
     chk("NC: session 不含明文 key", "sk-test" in sid, False)
 
     b_ping = json.loads(build_claim_body("m1", sid).decode())
@@ -1045,7 +1265,8 @@ def _build_parser():
                     help="--watch 硬超时分钟数（默认 0=不设上限）")
     ap.add_argument("--notify", action="store_true", help="抢到坑时推送通知")
     ap.add_argument("--dry-run", action="store_true", help="不落盘不推送（只打印）")
-    ap.add_argument("--timeout", type=int, default=25, help="单次请求超时秒数（默认 25）")
+    ap.add_argument("--timeout", type=int, default=90,
+                    help="单次请求超时秒数（默认 90；★形状修对后真请求恒 ~37-70s，25 会把可用信号切掉）")
     ap.add_argument("--cooldown", type=int, default=NOTIFY_COOLDOWN_S,
                     help="同状态重复推送最小间隔秒数（默认 3600）")
     ap.add_argument("--models", nargs="?", const="__list__", default=None,
