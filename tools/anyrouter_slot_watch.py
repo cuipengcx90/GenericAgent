@@ -959,6 +959,24 @@ def probe_models(models, key, timeout=90, workers=5):
         return [f.result() for f in futs]
 
 
+def _ledger_snippet(r):
+    """非 200 时保留「网关原文片段」；200 一律 None（不把生成正文写进台账）。纯函数，供负控自测。
+
+    ★2026-10-04 起因：站点消费日志里同一批请求写着「请求上游地址失败 / invalid codex request /
+      not implemented」，而**我方台账只存 http+verdict**（detail 在内存里被落账丢掉）⇒
+      事后只能靠用户截图才能区分「号池满」「形状不对」「网关未实现」。判据：
+        429/503         -> 号池满（正常观测，别慌）
+        400 invalid     -> 探针形状不对（可自愈）
+        500 上游失败     -> 站点供给侧
+        not implemented -> 网关未实现
+      没有原文时这三者在我方侧长得一模一样（都是 400/500 + UNKNOWN/POOL_BUSY）。
+    """
+    if r.get("http") == 200:
+        return None
+    txt = " ".join((r.get("detail") or "").split())
+    return txt[:160] or None
+
+
 def run_once(args):
     now_bj = beijing_now()
     key = _load_key()
@@ -1026,7 +1044,10 @@ def run_once(args):
 
     if not args.dry_run:
         rec = {"ts": now_bj.isoformat(), "results": [
-            {"model": r["model"], "http": r["http"], "verdict": r["verdict"]} for r in results],
+            {"model": r["model"], "http": r["http"], "verdict": r["verdict"],
+             "snippet": _ledger_snippet(r),      # ★非 200 的网关原文（判「号池满/形状错/未实现」的唯一凭据）
+             "face": r.get("face"), "shape_retry": bool(r.get("shape_retry"))}
+            for r in results],
             "rc": rc, "notify": bool(do_push and args.notify), "pushed": pushed,
             "reason": reason, "fault": kind or "", "fault_streak": streak,
             "fault_notify": f_reason,
@@ -1511,6 +1532,29 @@ def selftest():
             (_r3["verdict"], len(calls)), (CODEX_SHAPE_REQUIRED, 2))
     finally:
         globals()["_http_post"] = _real_post
+
+    # 9d) ★2026-10-04 网关原文落账：站点消费日志能看见「请求上游地址失败 / invalid codex request /
+    #     not implemented」，而我方台账原先只存 http+verdict ⇒ 三类失败在本地长得一样，
+    #     只能靠用户截图才能分「号池满 / 形状不对 / 网关未实现」。判据：
+    #       200 ⇒ None（绝不把生成正文写进台账）
+    #       非 200 ⇒ detail 空白归一后 ≤160 字
+    #       无 detail / 全空白 ⇒ None（别造假证据）
+    chk("snippet: 200 -> None（不落生成正文）",
+        _ledger_snippet({"http": 200, "detail": "hello world"}), None)
+    chk("snippet: 429 原文保留",
+        _ledger_snippet({"http": 429, "detail": "号池满：当前分组无可用渠道"}),
+        "号池满：当前分组无可用渠道")
+    chk("snippet: 空白归一 + 截断 160",
+        (_ledger_snippet({"http": 400, "detail": "a" * 300}),
+         len(_ledger_snippet({"http": 400, "detail": "x\n\n  y\tz"}))),
+        ("a" * 160, 5))
+    chk("NC: 无 detail / 全空白 -> None",
+        (_ledger_snippet({"http": 500}), _ledger_snippet({"http": 503, "detail": "  \n "})),
+        (None, None))
+    chk("snippet: 形状错误可回读（站点日志那三类失败的本地判据）",
+        "invalid codex request" in (_ledger_snippet(
+            {"http": 400, "detail": '{"error":{"message":"invalid codex request"}}'}) or ""),
+        True)
 
     for name, got, want, good in cases:
         print("%s %s: got=%r want=%r" % ("PASS" if good else "FAIL", name, got, want))
