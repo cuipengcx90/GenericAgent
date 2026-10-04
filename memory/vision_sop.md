@@ -21,6 +21,9 @@ ask_vision(image_input, prompt="详细描述这张图片的内容",
            backend='claude',   # 'claude'(default) | 'openai'
            timeout=60,
            max_pixels=1_440_000)
+# backend 配置实测(并入上游 96be945 的记录): 'openai' 默认走 native_oai_config0(xAI，使用配置内代理)；
+# 旧配置 native_oai_config15 曾返回 HTTP 503；备用 native_oai_config_fr113 曾实测识图成功
+# 上游版本另有 'modelscope' | 'auto' 两个 backend 名(本机 vision_utils 未验证)
 # 返回 str：成功为模型回复，失败为 'Error: ...'
 ```
 
