@@ -257,7 +257,7 @@ python3 tools/anyrouter_slot_watch.py --once --notify   # 命中即推飞书私�
 python3 tools/anyrouter_slot_watch.py --watch --notify --cooldown 21600 --max-minutes 1380   # 随机节奏（默认 300–600s/轮，见 §3.5）
 python3 tools/anyrouter_slot_watch.py --verify-pose     # 姿势自证：探针体 vs 真 CC 体同刻对照（--pose-n 控制发数）
 python3 tools/anyrouter_slot_watch.py --summary          # 只读台账摘要：最近 N 轮各模型判据分布 + claude 面覆盖（零请求/零推送）
-python3 tools/anyrouter_slot_watch.py --selftest        # 240 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记/--summary 摘要/★随机节奏与长休）
+python3 tools/anyrouter_slot_watch.py --selftest        # 272 项负控自测（2026-10-04 扩充：session 形态/延迟分级/对照闸门/队列态/Codex 面门禁/链路证据门与 link 标记/--summary 摘要/★随机节奏与长休）
 ```
 
 - 退出码：`1`=有可用（抢到）/ `0`=全 POOL_BUSY / `2`=其它（全 UNKNOWN / 全 MODEL_UNSUPPORTED / KEY_INVALID 等，fail-closed）。
@@ -309,8 +309,10 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
   python3 tools/bg_task.py start --name anyrouter_slot_watchd -- /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23   # 4) 重起
   ```
 
+- **自测卡死会留下 98% CPU 孤儿**（2026-10-04 现场发现，R542）：自测里若有 `while`/时钟不推进造成的死循环，进程会打印不了汇总也退不出（`state=R`、`PPID=1`）⇒ 排查 `ps -o pid,ppid,state,%cpu,time,command -ax | grep 'anyrouter_slot_watch.py --selftest' | grep -v grep`，命中即按 pid 精确 `kill -TERM`；现行自测**全档 0.1s 退出**（272 项），若跑出自测进程久留即代码回归，须当场查死循环（本例根因=测试用例 `now` 恒为 0）。
 - 陈旧 `watch.lock`（指向已死 pid）**无需手工删**：新实例按 pid+lstart 判活后自动接管（实测守护 09:36:30 起、09:36:30 首轮即刷新锁为新 pid）。
 - 换名单实例：2026-10-04 `MODELS` 5→7（加 `claude-opus-4-8`/`claude-haiku-4-5`）后按上述姿势重启 ⇒ 首轮 09:36:30 打印 7 行（7/7 POOL_BUSY），硬超时随之为次日 08:35（23h），与次日 08:50 定时接续只留 ~15min 空窗。
+- ★实例 3（2026-10-04 13:19，`--stop-hold` 上线后按 §3.3 四步重启使新码生效）：停 watchd（`bg_task stop` 留孤儿探测 34658 持锁）→ 精确 `kill -TERM 34658` → `bg_task start ... --max-hours 23 --auto-hold-minutes 30 --interval-min 300 --interval-max 600` ⇒ 守护 pid 69349 / 探测 pid 69351、`watch.lock` pid=69351、`watchd.jsonl` 追加 `START`(13:19:25)、`watch.log` 首轮 2 行（`claude-fable-5-1-reversed` 200 SLOT_AVAILABLE、`claude-opus-5-5` 400 MODEL_NOTICE）、下一轮 355s ⇒ 生效确认。
 - ★换名单实例 2（同日晚）：`MODELS` 7→8（加 codex 面 `gpt-6-astra`）+ 探针改「按名路由两面」后重启；★两次踩到「孤儿探测进程持锁 ⇒ 新 watchd 只 HOLD_BUSY 不接管、旧码继续跑」⇒按 §3.3 四步姿势（停 watchd → 杀持锁探测 → 起 watchd → 核 `watch.lock` pid=新探测 + `watchd.jsonl` START 事件）才真正生效；生效判据还含「首轮 8 行」与 codex 面行尾 `[face=codex]`。
 
 ## 3.4 命中即自动抢坑 + 保活 30 分钟（2026-10-04 加装）
@@ -324,10 +326,10 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
 - **通知文案**：命中推送显式写「**已自动保活 N 分钟**」，并**不再**出现「尽快连着用」这类要人盯的措辞（未开保活时该措辞保留）。
 - **通知里给「怎么用」**（2026-10-04 本轮加；同日订正为「说实话」版）：命中推送印出**保活所用身份的完整 `session_id`**（uuid5，key/tag 派生）+ 一行可粘贴的复用命令 `claude --session-id <uuid>`，但**明确标注「非必需」**，并写清判据：**坑位不绑身份** —— 站点只看号池有没有空闲上游（实测换 `session_id` 仍 200）⇒ 任何客户端在空闲窗口都能进，保活只是「用同一记号持续发最小请求」盯住通路、尽早发现被踢。
   ⚠️ 因此**不再**出现旧措辞「已占住的坑位身份 / 指定=复用这个正在被保活的身份」（它会把行为层兜底读成「站点给你留了个座位」）。实现=`_build_text(..., sid=...)` 形参 + `run_once()` 传 `session_id_for(key, "anyrouter-probe")`；不传 `sid` 时文本逐字不变。自测断言三条：出完整 UUID / 出可粘贴命令 / **不出现**「已占住的坑位身份」。
-- **你已经在用（CC / Pi / 任意客户端）时怎么停：`--stop-hold`（2026-10-04 加）**：保活跑在别处（探测线程 / 独立 `--claim` 进程），它**看不见你此刻是否在用** ⇒ 给显式开关：`python3 tools/anyrouter_slot_watch.py --stop-hold` 写旗标 `temp/anyrouter_watch/hold.stop` ⇒ 正在跑的保活是**分片睡眠**（`HOLD_STOP_STEP_S=5.0`s 步长、`sleep_with_stop()`）⇒ 每 ≤5s 查一次，命中即打日志并收手（**不回补**已发请求）；`start_auto_hold()` 在新一轮命中前 `clear_hold_stop()` ⇒「新命中=重新决策」。沙盒可验：`--state-dir <tmp> --stop-hold`。
+- **你已经在用（CC / Pi / 任意客户端）时怎么停：`--stop-hold`（2026-10-04 加）**：保活跑在别处（探测线程 / 独立 `--claim` 进程），它**看不见你此刻是否在用** ⇒ 给显式开关：`python3 tools/anyrouter_slot_watch.py --stop-hold` 写旗标 `temp/anyrouter_watch/hold.stop` ⇒ 正在跑的保活是**分片睡眠**（`HOLD_STOP_STEP_S=5.0`s 步长、`sleep_with_stop()`）⇒ 每 ≤5s 查一次，命中即打日志并收手（**不回补**已发请求）；`start_auto_hold()` 在新一轮命中前 `clear_hold_stop()` ⇒「新命中=重新决策」。**恢复自动保活**有两种：等下一轮真命中（自动清旗标）或在不想等时手动 `rm temp/anyrouter_watch/hold.stop`（下次命中即照常自动保活）。沙盒可验：`--state-dir <tmp> --stop-hold`。
   **实测（本轮真时钟端到端）**：保活跑动中写旗标 ⇒ **0.94s 内停手**（此刻已发 2 发）、`hold_slot` 返回 `False`；CLI `rc=0`、真实状态目录零污染（旗标只落沙盒）。自测计数随本轮功能 **200 → 272 passed**（含 `sleep_with_stop` 两例、`stop_check` 提前停、旗标文件往返五例 + 文案三断言）。
 - **CLI / 透传**：`tools/anyrouter_slot_watch.py --auto-hold-minutes 30 --hold-cooldown 900`；`tools/anyrouter_slot_watchd.py` 同名参数并在 `spawn_watch()` 透传（守护默认起 `--auto-hold-minutes 30`）。
-- **自测**：watch `--selftest` **240/240**（含被踢即停 / 零发 / `minutes=0` 关闭 / 脏值负控 / `--summary` 摘要与截断 / ★随机节奏与长休）；watchd `--selftest` **36/36**（含 spawn 形状自测与负控）。
+- **自测**：watch `--selftest` **272/272**（240 项基线 + 本轮保活手动停：`sleep_with_stop` 两例 / `stop_check` 提前停 / 旗标文件往返五例 / 文案三断言）；watchd `--selftest` **36/36**（含 spawn 形状自测与负控）。
 - **边界**（与 §1.2(4) 的关系）：保活**不假设**站点把坑位绑到 session id 上；它只是「以已过闸的同身份持续发请求」这一**行为层**兜底。§1.2(4) 的 UNVERIFIED 结论不变（那是「机制是否存在于站点侧」），本节的效力仅来自「同一个已过闸身份保持活跃」。
 - **成本**：30 分钟窗口 + 900s 冷却 ⇒ 额外额度消耗**非零但有限**（已登记）。
 - **残余**：① 号池满时保活无解（它不能创造上游供给）；② 若站点将来改为每请求强绑 session，保活会与被探测请求脱钩，须重新标定。
@@ -347,7 +349,7 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
 - **成本（含长休算期望）**：轮间隔均值 450s，叠加 12%×[3,6] 长休后 **E[睡眠]=0.88×450+0.12×450×4.5≈639s**，加轮内耗时（实测单轮 5–95s）⇒ **约 120–130 轮/天 × 4 请求 ≈ 500 发/天**（`--max-per-day 800` 兜底）；对 LLM 仍是零 token。
 - **实测锚点（2026-10-04 12:25 起的新码）**：第 1 轮 4 发（429/429/429/500，轮内 4.8/1.8/6.8/84.7s 并发≤3），结束后 `state.next_sleep_s=582`（落在 300–600 区间内）⇒ 随机节拍生效。
 - **何时该改成固定**：短窗盯守（想在人守着的 30 分钟内提高命中率）才临时 `--interval 60`；长期默认一律走随机。
-- **自测**：随机节奏的区间/长休/错峰/抽样/日预算各有断言（watch 240 项内），另有一条「spawn argv 可被解析」形状自测（watchd 36 项内，含坏值负控）。
+- **自测**：随机节奏的区间/长休/错峰/抽样/日预算各有断言（watch 272 项内），另有一条「spawn argv 可被解析」形状自测（watchd 36 项内，含坏值负控）。
 - **跨进程参数坑（实测）**：`str(300.0)` 透传给声明为 `type=int` 的子进程 ⇒ argparse 直接报错、子进程秒退、守护空转。故 watch 侧 `--interval-min/max` 已改 `type=float`（内部 `int()` 转换），并加了形状自测把这类错误钉死在 CI 前。
 
 ## 4. 排错
