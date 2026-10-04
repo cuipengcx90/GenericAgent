@@ -804,6 +804,92 @@ def burst_delay(attempt, base=0.35, cap=2.5, jitter=0.35, rng=None):
     return d * (1.0 + jitter * (2.0 * r.random() - 1.0))
 
 
+# ---------------------------------------------------------------- 自动占坑保活（--auto-hold-minutes）
+# ★2026-10-04 用户要求：「接上自动抢坑 + 抢到后保活 30 分钟，确保我能直接用」。
+#   语义：watch 每轮探测；**一旦某模型 200（= 有坑、能用）**，立刻用**探测所用的同一个 session**
+#   发 keepalive（内容 "1"）把坑位占住，默认拍 30 分钟；期间不阻塞探测循环（后台线程）。
+#   为什么必须同 session：坑位是绑 session 的（L 站原方口径「闲置数分钟即被踢」），
+#   换 session 去保活＝替别人占坑，自己那条照样掉。
+HOLD_COOLDOWN_S = 600
+
+
+def should_auto_hold(results, state, now, cooldown=HOLD_COOLDOWN_S):
+    """命中可用且不在保活中/冷却内 → 返回该可用结果（dict），否则 None。纯函数，供负控自测。
+
+    ★负控口径：全 BUSY / 空结果 / 已在保活（hold_active）/ 距上次保活不足 cooldown ⇒ 一律 None。
+    """
+    avail = [r for r in (results or []) if r.get("verdict") == AVAILABLE]
+    if not avail:
+        return None
+    if state.get("hold_active"):
+        return None
+    try:
+        ts = float(state.get("last_hold_ts") or 0)
+    except Exception:
+        ts = 0.0
+    if (now - ts) < float(cooldown):
+        return None
+    return avail[0]
+
+
+def hold_slot(model, sid, minutes, seconds, post, sleep, now, log=None, timeout=60):
+    """占坑保活：每 seconds 发 1 发 keepalive；**非 200 一律当被踢，立即停并返回 False**。
+
+    ★口径：只有 200 才算「坑还在」。429/503/传输错 ⇒ 坑已丢（闲置回收/被挤掉），
+      继续发只是白烧请求 ⇒ 立刻停（与 run_claim 的保活段同一判据，避免两套口径）。
+    返回 True=保活段正常跑完；False=未启用/被踢。
+    """
+    if not minutes or float(minutes) <= 0:
+        return False
+    log = log or (lambda s: None)
+    end = now() + float(minutes) * 60
+    n = 0
+    while now() < end:
+        sleep(float(seconds))
+        n += 1
+        code, _t = post(build_claim_body(model, sid, keepalive=True), timeout)
+        act = claim_action(code)
+        log("[anyrouter] hold #%d model=%s http=%s -> %s" % (n, model, code, act))
+        if act != CLAIM_WON:
+            return False
+    return True
+
+
+def start_auto_hold(args, hit, post=None, log=None):
+    """后台线程：命中可用 ⇒ 同 session 占坑保活（state 置 hold_active，结束回写）。返回线程。"""
+    import threading
+    log = log or (lambda s: print(s, flush=True))
+    sid = session_id_for(_load_key(), "anyrouter-probe")     # ★与探测同 id（见 build_probe_body）
+    st = _load_state()
+    st["hold_active"] = True
+    st["hold_since"] = beijing_now().isoformat()
+    st["hold_model"] = hit.get("model")
+    _save_state(st)
+    log("[anyrouter] 命中可用 ⇒ 启动自动占坑保活：model=%s session尾号=%s 时长=%.0f 分钟（每 %.0fs 续一次）"
+        % (hit.get("model"), sid[-12:], float(args.auto_hold_minutes), float(args.keepalive_seconds)))
+
+    def _run():
+        def _post(body, timeout):
+            return _http_post(HOSTS[0] + CC_PATH, _load_key(), body, timeout, read_limit=256)
+        ok = hold_slot(hit.get("model"), sid, args.auto_hold_minutes, args.keepalive_seconds,
+                       post or _post, time.sleep, time.time, log=log, timeout=args.timeout)
+        st2 = _load_state()
+        st2["hold_active"] = False
+        st2["last_hold_ts"] = time.time()
+        st2["last_hold_ok"] = bool(ok)
+        _save_state(st2)
+        try:
+            _append_ledger({"ts": beijing_now().isoformat(), "mode": "auto_hold",
+                            "model": hit.get("model"), "session": sid[-12:],
+                            "minutes": float(args.auto_hold_minutes), "ok": bool(ok)})
+        except Exception:
+            pass
+        log("[anyrouter] 自动占坑结束：%s" % ("保活段跑完（坑位仍在）" if ok else "被踢/中断"))
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return t
+
+
 def run_claim(args, post=None, sleep=None, notify=None, now=None):
     """抢坑主流程：爆满立即重发 → 命中即通知 → 同 session 保活。
 
@@ -901,7 +987,7 @@ def _append_ledger(rec):
         f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _build_text(results, now_bj, reason):
+def _build_text(results, now_bj, reason, auto_hold_minutes=0, keepalive_seconds=240):
     lines = ["🚀 anyrouter 抢到坑了（可以用了）",
              "检测时间：%s（北京时间）" % now_bj.strftime("%Y-%m-%d %H:%M:%S")]
     for r in results:
@@ -913,7 +999,14 @@ def _build_text(results, now_bj, reason):
         % ("200"),
         "提示：客户端走 Anthropic messages 端点并带 anthropic-beta: %s；" % BETA,
         "      Claude Code 里可用 `claude --model 'gpt-6-astra-cc-format[1m]'`（官方公告写法）。",
-        "坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。",
+    ]
+    if auto_hold_minutes:
+        lines.append("✅ 已自动保活 %s 分钟（后台每 %s 秒用**同一 session** 打一次最小请求；被踢即停、下次命中重占）。"
+                     % (("%g" % float(auto_hold_minutes)), int(keepalive_seconds)))
+        lines.append("👉 你直接用即可（客户端 Anthropic messages 端点 + 上面的 beta 头）。")
+    else:
+        lines.append("坑位会被踢：闲置数分钟即掉，命中后请尽快连着用。")
+    lines += [
         "（触发原因：%s）" % reason,
     ]
     return "\n".join(lines)
@@ -1169,7 +1262,9 @@ def run_once(args):
     do_push, reason = should_notify(st, results, now_ts, args.cooldown)
     pushed, push_detail = (False, "not_requested")
     if do_push and args.notify:
-        text = _build_text(results, now_bj, reason)
+        text = _build_text(results, now_bj, reason,
+                           auto_hold_minutes=getattr(args, "auto_hold_minutes", 0),
+                           keepalive_seconds=getattr(args, "keepalive_seconds", 240))
         pushed, push_detail = send_notifications(text, dry_run=args.dry_run)
         print("[anyrouter] 推送=%s (%s)" % (pushed, push_detail))
     elif do_push:
@@ -1229,6 +1324,7 @@ def run_once(args):
             st["fault_active"] = False
             st["fault_announced"] = False
         _save_state(st)
+    setattr(args, "_last_results", results)     # 供 watch 的自动占坑判据取用（只读派生，不改判据）
     return rc
 
 
@@ -1311,6 +1407,17 @@ def run_watch(args):
                     print("[anyrouter] watch: 本轮已推送可用提醒（冷却内不重复），继续监控")
             if rc == 1 and not args.notify and rounds == 1:
                 print("[anyrouter] watch: 已抢到坑（--notify 未开，仅提示）")
+            # ★自动占坑（--auto-hold-minutes>0）：本轮命中可用 ⇒ 用**探测同 session**后台保活，
+            #   不阻塞下一轮探测；冷却/已在保活中由 should_auto_hold 拦掉（防反复占用）。
+            if getattr(args, "auto_hold_minutes", 0):
+                try:
+                    _hit = should_auto_hold(getattr(args, "_last_results", None), _load_state(),
+                                            time.time(), getattr(args, "hold_cooldown", HOLD_COOLDOWN_S))
+                    if _hit:
+                        start_auto_hold(args, _hit)
+                except Exception as _e:      # 占坑失败绝不致死监控循环
+                    print("[anyrouter] watch: 自动占坑启动异常（已忽略）: %s: %s"
+                          % (type(_e).__name__, _e), flush=True)
             if hard_end and beijing_now() >= hard_end:
                 print("[anyrouter] watch: 达到 --max-minutes 上限，退出（共 %d 轮）" % rounds)
                 return 0 if rc != 1 else 1
@@ -1429,12 +1536,63 @@ def selftest():
     chk("text: 有可用行", ICON[AVAILABLE] in txt, True)
     chk("text: 含 beta", BETA in txt, True)
     chk("NC: text 不含密钥/ip", ("sk-" in txt), False)
+    _txh = _build_text(avail, beijing_now(), "state_changed", auto_hold_minutes=30, keepalive_seconds=20)
+    chk("text: 自动保活提示", ("已自动保活 30 分钟" in _txh), True)
+    chk("NC: 保活时不提示'尽快连着用'", ("尽快连着用" in _txh), False)
+    chk("NC: 未开保活时仍提示被踢", ("尽快连着用" in txt), True)
     # 6) 状态键
     chk("state keys", sorted(["last_ts", "last_verdict", "last_rc"]),
         sorted(["last_ts", "last_verdict", "last_rc"]))
     chk("NC: MODELS 均为非空 str", all(isinstance(m, str) and m for m in MODELS), True)
     chk("MODELS 扩面 >=5", len(MODELS) >= 5, True)
     chk("NC: MODELS 无重复", len(set(MODELS)) == len(MODELS), True)
+
+    # 11) 自动占坑（--auto-hold-minutes）：★2026-10-04 用户要求「接上自动抢坑 + 抢到后保活 30 分钟」
+    _av = [{"model": "m1", "verdict": AVAILABLE, "http": 200}]
+    _bs = [{"model": "m1", "verdict": BUSY, "http": 429}]
+    chk("hold: 命中可用 -> 触发", (should_auto_hold(_av, {}, 1000) or {}).get("model"), "m1")
+    chk("NC: 全 BUSY -> 不触发", should_auto_hold(_bs, {}, 1000), None)
+    chk("NC: 空结果 -> 不触发", should_auto_hold([], {}, 1000), None)
+    chk("NC: None 结果 -> 不触发", should_auto_hold(None, {}, 1000), None)
+    chk("NC: 保活中 -> 不重复触发", should_auto_hold(_av, {"hold_active": True}, 1000), None)
+    chk("NC: 冷却内 -> 不触发", should_auto_hold(_av, {"last_hold_ts": 990}, 1000, 600), None)
+    chk("冷却已过 -> 触发", (should_auto_hold(_av, {"last_hold_ts": 300}, 1000, 600) or {}).get("model"), "m1")
+    chk("NC: last_hold_ts 脏值 -> 不崩且触发",
+        (should_auto_hold(_av, {"last_hold_ts": "x"}, 1000, 600) or {}).get("model"), "m1")
+    # hold_slot 状态机（注入 post/sleep/now，零网络）
+    _hst = {"t": 0.0}
+    _seq = [(200, ""), (200, ""), (200, "")]
+    _calls = []
+
+    def _hpost(b, timeout=0):
+        _calls.append(b)
+        return _seq.pop(0) if _seq else (200, "")
+    chk("hold: 持续200 -> True（保活段跑完）",
+        hold_slot("m1", "sid", 0.02, 0.01, _hpost,
+                  lambda s: _hst.__setitem__("t", _hst["t"] + float(s)), lambda: _hst["t"]), True)
+    chk("hold: 真发了 keepalive（>=1 发）", len(_calls) >= 1, True)
+    chk("hold: 保活体是内容 '1'", (b'"content": "1"' in _calls[0]), True)
+    # NC：坑位被踢（200 后 503）⇒ 立即停、不得继续发
+    _hst2 = {"t": 0.0}
+    _seq2 = [(200, ""), (503, ""), (200, "")]
+    _c2 = []
+
+    def _hpost2(b, timeout=0):
+        _c2.append(b)
+        return _seq2.pop(0) if _seq2 else (200, "")
+    chk("NC: 200 后 503 -> False（被踢即停）",
+        hold_slot("m1", "sid", 0.05, 0.01, _hpost2,
+                  lambda s: _hst2.__setitem__("t", _hst2["t"] + float(s)), lambda: _hst2["t"]), False)
+    chk("NC: 被踢后不再发（发数恰 2）", len(_c2), 2)
+    chk("NC: minutes=0 -> False",
+        hold_slot("m1", "sid", 0, 0.01, lambda b, timeout=0: (_c2.append(b), (200, ""))[1],
+                  lambda s: None, lambda: 0), False)
+    chk("NC: minutes=0 零发", len(_c2), 2)
+    chk("NC: 首发 429 -> False（不把池满当在保活）",
+        hold_slot("m1", "sid", 0.05, 0.01, lambda b, timeout=0: (429, ""), lambda s: None, lambda: 0), False)
+    chk("NC: 首发传输错 -> False",
+        hold_slot("m1", "sid", 0.05, 0.01, lambda b, timeout=0: (0, "URLError"),
+                  lambda s: None, lambda: 0), False)
 
     # 7) 故障面判据（★核心：防「站点没坑」被误报成「监控挂了」）
     chk("fault: 全 BUSY -> None", fault_kind(busy), None)
@@ -1801,6 +1959,11 @@ def _build_parser():
                     help="保活间隔秒数（默认 240；闲置数分钟即被踢）")
     ap.add_argument("--keepalive-minutes", type=float, default=0, dest="keepalive_minutes",
                     help="抢到后保活多久（默认 0=不保活，只报喜；>0 时按 --keepalive-seconds 定时发 1）")
+    ap.add_argument("--auto-hold-minutes", type=float, default=0, dest="auto_hold_minutes",
+                    help="watch 模式下：探测命中可用（200）即**自动占坑保活**该 session N 分钟"
+                         "（默认 0=只报喜不占坑；占坑=用探测同一 session 每 --keepalive-seconds 发 1）")
+    ap.add_argument("--hold-cooldown", type=float, default=HOLD_COOLDOWN_S, dest="hold_cooldown",
+                    help="两次自动占坑之间的最小间隔秒数（默认 %d；防坑位抖动时反复占用）" % HOLD_COOLDOWN_S)
     ap.add_argument("--selftest", action="store_true", help="负控自测")
     return ap
 

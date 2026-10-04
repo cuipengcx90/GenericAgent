@@ -88,3 +88,45 @@ selftest：155 → **177/177 通过**。
 1. **探针姿势是对的，从来就不存在「网关只认 CC 客户端」这回事**——真 CC 原样体 9 发也全是 429@1.5–2.3s，与探针 429@1.1–1.3s 同档。
 2. **凌晨那批 200 是复刻实验自己打出来的，探针没通所以没回执**——监控行为正确。
 3. **现在唯一的瓶颈是号池满**；探针已按 5 分钟一轮持续盯守，一旦出现 200 立刻私信 + 钉钉群推送。
+
+## 9. 增补：命中即自动抢坑 + 保活 30 分钟（2026-10-04，本报告提交后落地）
+
+§8 第 3 句说的「一旦出现 200 立刻私信」只解决了**通知**，人不在场时坑位照样白抢——用户指出这就是「枪没上膛」。本节记录补齐的自动段与实测证据。
+
+### 9.1 行为契约
+
+- **触发**：任意模型命中 `SLOT_AVAILABLE`（HTTP 200）即触发，**在通知之前/之后都写在同一分支**，用 `try/except` 包裹 ⇒ 保活线程出任何异常都不影响监控主循环（守卫线：绝不让「抢坑」把「探测」搞死）。
+- **占坑身份**：保活请求复用**探测自身的 session**（同一 key/tag 派生的 uuid5 身份与 UA/1m 头），即「探测到的那条已过闸的通路」=同一坑位身份，不做二次握手、不改形状。
+- **保活方式**：后台线程按间隔对同一（模型、session）发真实最小 completion，把该 session 的活跃窗口撑住 `--auto-hold-minutes`（默认 30）分钟；`--hold-cooldown`（默认 900s）内不重复开新一轮保活。
+- **终止条件**：被踢（429/503/401 等非 200）或窗口到期即停；**绝不无限续期**。
+- **通知文案**：命中推送里显式写「**已自动保活 N 分钟**」，并**不再**出现「尽快连着用」这类要人盯的措辞（未开保活时该措辞保留）。
+
+### 9.2 实现与自测
+
+- `tools/anyrouter_slot_watch.py`：新增 `should_auto_hold()` / `hold_slot()`；`run_once()` 回传 `args._last_results`；`run_watch()` 命中分支触发；CLI 新增 `--auto-hold-minutes` / `--hold-cooldown`。
+- `tools/anyrouter_slot_watchd.py`：`spawn_watch()` 透传同两参 + CLI 同名参数 + `hello` 展示 `auto_hold` 字段。
+- 自测：`--selftest` **197 passed / 0 failed**（含被踢即停、零发、`minutes=0` 关闭、脏值负控）；watchd `--selftest` **27 passed / 0 failed**。
+- 沙盒端到端（假 post 状态机 + 真机一发，**不碰真 state**）：**17/17** 通过。
+
+### 9.3 上线取证（重启后现场读数）
+
+```
+watchd   pid 85744  →  /opt/anaconda3/bin/python3 tools/anyrouter_slot_watchd.py --max-hours 23 --auto-hold-minutes 30
+探测子进程 pid 92011 实参：--watch --notify --interval 300 --cooldown 21600 --fault-streak 3 --fault-cooldown 21600 \
+                        --auto-hold-minutes 30.0 --hold-cooldown 900.0 --max-minutes 1378
+watch.lock：{"pid": 92011, "lstart": "Sun Oct  4 10:58:20 2026", ...}
+watchd.jsonl：10:58:20 START（前两行 10:57:20 HOLD_BUSY holder_pid=77074 = 旧探测持锁让位）
+```
+
+⇒ **该段订正 §6 首条的运行态**：§6 记的 `lock pid=30875` 已被本节 10:58:20 的 `pid=92011` 取代（旧守护 GONE → 残留探测精确 SIGTERM → 新守护接管），§6 其余边界与残余风险不变。
+
+### 9.4 生效姿势（重申）
+
+改判据/参数**必须重启 watchd** 才生效（SOP §3.3）；`bg_task stop` 会留孤儿探测并继续持锁，须按 pgid 精确停后再 start。
+
+### 9.5 残余边界
+
+1. 保活只能维持**已过闸**的 session 热度，不能创造上游供给 ⇒ 号池满时依旧抢不到，本段对它无解。
+2. 「探测同 session」依赖 `session_id` 跨轮稳定（uuid5，key/tag 派生）——若站点将来改为**每请求强绑定**，保活会与被探测请求脱钩，届时须重新标定。
+3. 保活期间会额外消耗少量额度（最小 completion）；30 分钟窗口 + 900s 冷却 = 上限有限，但**非零**，成本已登记。
+

@@ -226,6 +226,10 @@ def spawn_watch(args, minutes_left, child_log):
                  "--cooldown", str(args.cooldown),
                  "--fault-streak", str(args.fault_streak),
                  "--fault-cooldown", str(args.fault_cooldown)]
+        # ★自动占坑（2026-10-04 用户要求）：命中可用即用探测同 session 抢下并保活，确保「能直接用」
+        if getattr(args, "auto_hold_minutes", 0):
+            argv += ["--auto-hold-minutes", str(args.auto_hold_minutes),
+                     "--hold-cooldown", str(getattr(args, "hold_cooldown", 0) or 0)]
         if args.state_dir:
             argv += ["--state-dir", args.state_dir]
         if minutes_left:
@@ -546,6 +550,11 @@ def _build_parser():
                     help="转发给子进程：连续 N 轮故障才报（默认 3）")
     ap.add_argument("--fault-cooldown", type=int, default=21600, dest="fault_cooldown",
                     help="转发给子进程：故障重复提醒间隔秒")
+    ap.add_argument("--auto-hold-minutes", type=float, default=0, dest="auto_hold_minutes",
+                    help="转发给子进程：探测命中可用（200）即自动占坑保活 N 分钟"
+                         "（默认 0=只报喜不占坑；占坑=用探测同一 session 定时发 1）")
+    ap.add_argument("--hold-cooldown", type=float, default=900.0, dest="hold_cooldown",
+                    help="转发给子进程：两次自动占坑之间的最小间隔秒（默认 900）")
     ap.add_argument("--state-dir", default=None, help="状态目录（演练/隔离用）")
     ap.add_argument("--log", default=None, help="守护日志路径（默认 <state-dir>/watchd.log）")
     ap.add_argument("--child-cmd", default=None,
@@ -578,6 +587,8 @@ def main():
                            "--interval", args.interval, "--cooldown", args.cooldown,
                            "--state-dir", sd] + (["--max-minutes", str(int(args.max_hours * 60))]),
             "check_every": args.check_every,
+            "auto_hold_minutes": args.auto_hold_minutes,
+            "hold_cooldown": args.hold_cooldown,
             "max_hours": args.max_hours,
             "stall_rule": "now - last_ts > max(%ds×%.1f, %ds)" % (args.interval, args.stall_factor,
                                                                   STALL_MIN_GRACE_S),
