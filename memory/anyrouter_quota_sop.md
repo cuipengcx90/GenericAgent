@@ -352,14 +352,23 @@ python3 tools/anyrouter_slot_watchd.py --selftest                         # 36 �
 - **自测**：随机节奏的区间/长休/错峰/抽样/日预算各有断言（watch 272 项内），另有一条「spawn argv 可被解析」形状自测（watchd 36 项内，含坏值负控）。
 - **跨进程参数坑（实测）**：`str(300.0)` 透传给声明为 `type=int` 的子进程 ⇒ argparse 直接报错、子进程秒退、守护空转。故 watch 侧 `--interval-min/max` 已改 `type=float`（内部 `int()` 转换），并加了形状自测把这类错误钉死在 CI 前。
 
-## 3.6 「一键停止保活」面板与飞书按钮（傻瓜化，2026-10-04 加装）
+## 3.6 「一键停止保活」三入口（傻瓜化，2026-10-04 加装；同日加卡片回调）
 
-保活跑起来后，人不需要碰命令行就能停 —— 两条入口都指向同一个「写 `hold.stop` 旗标」的动作（旗标被保活循环的分片睡眠以 ≤5s 步长轮询，~1s 内收手）：
+保活跑起来后，人不需要碰命令行就能停 —— **三条入口都收敛到同一个动作**：写 `hold.stop` 旗标（保活循环的分片睡眠以 ≤5s 步长轮询，实测 ~1s 收手）：
 
 | 入口 | 形态 | 说明 |
 |---|---|---|
-| **飞书卡片按钮** | 卡片上的红色「⏹ 停止保活」按钮 | 命中 200 时随「已自动保活 N 分钟」的通知一起发；按钮 URL 就是 `ctl.url` 里的 `stop_url`，手机点一下即可 |
-| **本地面板** | `http://<LAN-IP>:8766/?t=<token>` | 面板首页同样有「停止保活」和「延长保活（hold-minutes）」；`local_url` 供本机、`url` 供手机（自动取真实 LAN IP，避开 Clash TUN 假 IP 198.18.x） |
+| ① **飞书卡片按钮（回调，首选）** | 卡片上的红色「⏹ 停止保活」 | 命中 200 时随「已自动保活 N 分钟」的通知一起发。按钮是**卡片回调**（`value={"ga_action":"anyrouter_stop_hold"}`）⇒ 点击由 fsapp 的 `card.action.trigger` 受理、**不开网页不敲命令**，回执私信「⏹ 已受理…」。不依赖面板是否起、令牌是什么 |
+| ② **飞书卡片按钮（网页兜底）** | 同卡片上的「⏹ 停止保活(网页)」 | 就是 `ctl.url` 的 `stop_url`（带令牌）；回调通道不可用（fsapp 没跑/事件订阅异常）时仍能停 |
+| ③ **本地面板** | `http://<LAN-IP>:8766/?t=<token>` | 面板首页有「停止保活」和「延长保活（hold-minutes）」；`local_url` 供本机、`url` 供手机（自动取真实 LAN IP，避开 Clash TUN 假 IP 198.18.x） |
+| （口头）| 跟 GA 说一句「停止保活」 | 等价 `--stop-hold`，由会话执行 |
+
+**①的实现与部署要点（2026-10-04 实测）**：
+- 卡片由 `reflect_common.send_feishu_card` 用 `mykeys.fs_app_id` 发出 —— **与 fsapp 是同一个飞书应用**，所以按钮回调天然回到 fsapp 已注册的 `register_p2_card_action_trigger(handle_card_action)`（`frontends/fsapp.py:1100`）；不需要新建事件订阅。
+- fsapp 侧补丁：`handle_card_action` 在查 `_TaskCard._registry` **之前**先拦 `v["ga_action"] == "anyrouter_stop_hold"` ⇒ 调 `_handle_anyrouter_stop_hold`（写旗标 + 回执；鉴权与消息入口同源：非 `PUBLIC_ACCESS` 时只认 `ALLOWED_USERS`）。
+- 卡片侧补丁：`build_hold_card` 的回调按钮**恒定存在**（不再依赖面板），网页按钮降为兜底 ⇒ 没起面板时只少一个按钮。
+- **★改 fsapp 必重启才生效**：`launchctl kickstart -k gui/501/com.cuip.feishu-agent`。注意 **GA 会话进程就住在 fsapp 的进程组里**（实测 PGID=fsapp pid）⇒ 当场 kickstart 会连自己一起杀、打断正在回答的消息。正确姿势：用 `tools/bg_task.py`（内部 `start_new_session=True`）起 `temp/fsapp_restart_later.py --delay <秒>`，它睡够后 `kickstart -k`、等新 pid 起来，再发一张「🧪 按钮自检卡」让人点验证；撤销=落 `temp/fsapp_restart_later.cancel`（或跟 GA 说一句）。
+- 桩单测（不启动 fsapp，从源码 `ast` 抽真函数 + 桩依赖）：7/7 —— dispatch 命中/非本按钮不误触发/字符串 value 也认/授权者写旗标+回执 chat_id/未授权不写且不回执/重复点击幂等。
 
 - **去哪拿这两个 URL**：`temp/anyrouter_watch/ctl.url`（JSON：`port/token/url/local_url/stop_url/stop_local_url`）。**不是** `panel.json`；用错文件名会 curl 出 403（无令牌 = 403，这是门禁设计不是故障）。
 - **★令牌持久化（本日修复）**：令牌存在 `temp/anyrouter_watch/panel.token`（0600），`start_panel` 优先读它、坏了才重新生成。此前每次重启守护都新发令牌 ⇒ **上一张卡片上的按钮立刻变 403 死链**；现在同 state-dir 跨重启令牌稳定，卡片按钮长期有效。
