@@ -8,13 +8,24 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
   零 LLM token：纯 HTTP 打 TMWebDriver 桥（http://127.0.0.1:18766/link），
   复用已登录 linux.do 的浏览器 tab（与 tools/dpdomain_renew.py 同款零依赖桥）。
 
-只读铁律（不可违反）:
+架构（2026-10-05 用户定稿，五个 SOP 同一入口路由）:
+  等级检测（本守护内，每天 1 次、时刻随机）＝**路由入口**；
+  缺什么补什么、缺几项补几项（多命中并行，非 if-else 单分支）：
+    浏览类  → 本守护自己按随机节奏只读浏览（本文件即浏览 SOP 的执行面）
+    回复类  → 排队 pending_acts.reply，由 tools/linuxdo_acts.py 按 reply 档随机节奏执行
+    送赞类  → 排队 pending_acts.like，同上（like 档）
+    获赞不足 → 用户口径：优先自己发帖（获赞概率高），其次在别人帖下回帖 ⇒ earn 桶：
+              有已批准草稿则发帖（post 档：日≤1、间隔≥24h、周≤3），否则并入回帖排队
+    其余（访问天数/活跃程度/登录/举报/禁言/封禁）→ 只能人工，仅私信提示
+  五个 SOP 均可由「提示词」单独唤醒（不设定点任务）；守护本身由保活任务零站点维持。
+
+只读边界（本守护自身）:
   零发帖 / 零回复 / 零点赞 / 零关注 / 零领奖；不模拟登录（封号风险）。
+  写操作（回复/点赞/发帖）只经 tools/linuxdo_acts.py 执行，且必经等级路由或提示词显式触发。
 
 能推进的 TL3 项（浏览是只读行为，2026-10-03 实测缺口=浏览帖子 12571/20000）:
   - 浏览话题 / 浏览帖子：进帖 + 深翻楼层即涨
   - 访问天数：只能用户本人真实登录日积月累，本守护不代刷
-  - 回复话题 / 点赞类：属发帖红线（linuxdo_trust_level_sop），不自动做
 
 判停（按页面标记，禁数值机械比较 —— SOP 红线，上限类指标天然规避）:
   connect 页: 解析 class token（unmet 优先，剔 .tl3-bar-fill 进度条）→ 待完成=unmet 数
@@ -108,8 +119,8 @@ except Exception:                           # 内核缺席 ⇒ 回退本地兜�
 #   回复类 → 回帖执行器 tools/linuxdo_acts.py（排队后由 acts 自己的随机段执行，与等级检查时刻解耦）；
 #   送赞类 → 点赞执行器（同上，独立 cap/节奏）；
 #   其余（获赞/访问天数/活跃程度/登录/举报/禁言/封禁）只能人工，只通知不代操作。
-MANUAL_NAME_HINTS = ("获赞", "访问天数", "活跃程度", "登录", "举报", "禁言", "封禁",
-                     "获赞数", "被赞")
+MANUAL_NAME_HINTS = ("访问天数", "活跃程度", "登录", "举报", "禁言", "封禁")
+EARN_KINDS = ("获赞",)          # 获赞不足：用户口径=优先自己发帖，其次到别人帖下回帖
 BROWSE_KINDS = ("浏览话题", "浏览帖子", "浏览", "阅读")
 REPLY_KINDS = ("回复话题", "回复帖子", "回复")
 LIKE_KINDS = ("点赞", "送赞")
@@ -504,10 +515,14 @@ def _map_connect_names(items):
 
 
 def classify_pending(lvl):
-    """未达标项分四路：browse/reply/like 可自动补；manual 须人工；unknown fail-safe 也通知。"""
+    """未达标项分五路：browse/reply/like/earn 可自动补；manual 须人工；unknown fail-safe 也通知。
+
+    多命中语义（用户口径）：一轮等级检查里**每一项**独立入桶 ⇒ 同时缺 N 项就同时走 N 条路，
+    不是 if-else 单分支。
+    """
     items = lvl.get("items") or []
     names = _map_connect_names(items)
-    manual, auto, unknown, reply, like = [], [], [], [], []
+    manual, auto, unknown, reply, like, earn = [], [], [], [], [], []
     for i, it in enumerate(items):
         if not _item_unmet(it):
             continue
@@ -519,12 +534,14 @@ def classify_pending(lvl):
             reply.append(rec)
         elif any(k in nm for k in LIKE_KINDS):
             like.append(rec)
+        elif any(k in nm for k in EARN_KINDS):
+            earn.append(rec)
         elif any(k in nm for k in MANUAL_NAME_HINTS):
             manual.append(rec)
         else:
             unknown.append(rec)
     return {"manual": manual, "auto": auto, "unknown": unknown,
-            "reply": reply, "like": like}
+            "reply": reply, "like": like, "earn": earn}
 
 
 def _deficit(rec, cap):
@@ -537,11 +554,39 @@ def _deficit(rec, cap):
     return max(1, min(int(cap), n if n > 0 else 1))
 
 
+def _load_post_draft():
+    """取一份待发草稿（temp/linuxdo_post_drafts/*.json，最早的优先）。
+
+    草稿格式：{"title":..., "raw":..., "category":int, "tags":"AI,求助"}
+    没有草稿 ⇒ 返回 None（获赞类缺项此时改走回帖路径，绝不自己编内容发帖）。
+    """
+    try:
+        d = os.path.join(BASE, "linuxdo_post_drafts")
+        if not os.path.isdir(d):
+            return None
+        files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+        for fn in files:
+            try:
+                with open(os.path.join(d, fn), "r", encoding="utf-8") as fh:
+                    j = json.load(fh)
+                if j.get("title") and j.get("raw"):
+                    j["_file"] = fn
+                    return j
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def queue_pending_from_route(st, route):
-    """把「回复类/送赞类」欠项排进 pending_acts（不立即执行）。
+    """把「回复类/送赞类/获赞类」欠项排进 pending_acts（不立即执行）。
 
     关键设计：排队与执行解耦 —— 等级检查即时排队，实际动作由 linuxdo_acts 的
     随机段/随机间隔决定，避免「检查完就动手」形成固定时刻特征。
+
+    获赞类（用户口径）：优先自己发帖（获赞概率高）⇒ 有草稿排 post；
+    无草稿则改走回帖（回帖同样可能被赞），并留痕说明，绝不自己编内容发帖。
     """
     pa = st.setdefault("pending_acts", {})
     added = {}
@@ -551,24 +596,44 @@ def queue_pending_from_route(st, route):
             n = _deficit(rec, cap)
             pa[kind] = max(int(pa.get(kind) or 0), n)
             added[kind] = pa[kind]
+    if route.get("earn"):
+        names = [r.get("name") for r in (route.get("earn") or [])]
+        draft = _load_post_draft()
+        if draft:
+            pa["post"] = 1
+            pa["post_src"] = "level_route"
+            added["post"] = 1
+            log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "QUEUED_POST",
+                                         "reason": "获赞不足(有草稿)",
+                                         "items": names, "draft": draft.get("_file")})
+        else:
+            need = max(int(pa.get("reply") or 0), 1)
+            pa["reply"] = min(QUEUE_REPLY_MAX, need)
+            added["reply"] = pa["reply"]
+            log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "QUEUED_REPLY_FOR_EARN",
+                                         "reason": "获赞不足(无草稿⇒改回帖)",
+                                         "items": names})
     if added:
         pa["ts"] = time.time()
-        pa["src"] = "level_route"
+        pa["src"] = pa.get("src") or "level_route"
         save_state(st)
         log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "QUEUED",
                                      "queued": added,
-                                     "items": [r.get("name") for kk in ("reply", "like")
+                                     "items": [r.get("name") for kk in ("reply", "like", "earn")
                                                for r in (route.get(kk) or [])]})
     return added
 
 
 def maybe_run_pending_acts(st, session, apply_=True):
-    """按 acts 内核的随机节奏执行排队中的回帖/点赞（每轮最多各 1 条）。
+    """按 acts 内核的随机节奏执行排队中的回帖/点赞/发帖（每轮每类最多 1 条）。
 
     返回 dict（有多少条执行成功/被跳过）。失败一律留痕，不改 pending，也不抛。
+    发帖（post）仅由「获赞不足 + 存在草稿」路由而来，其日/周/间隔上限由 acts 的
+    act_post 自行裁决（日≤1、间隔≥24h、周≤3），这里不做二次判断。
     """
     pa = st.get("pending_acts") or {}
-    if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)):
+    if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)
+            or int(pa.get("post") or 0)):
         return {}
     last = float(pa.get("last_run_ts") or 0)
     gap = random.uniform(*ACTS_ROUND_GAP)
@@ -606,13 +671,43 @@ def maybe_run_pending_acts(st, session, apply_=True):
                 out[kind] = "DONE:%d" % len(ok)
             else:
                 out[kind] = "NOOP"
+        if int(pa.get("post") or 0) > 0:           # 获赞不足路由来的发帖（须有草稿）
+            draft = _load_post_draft()
+            if not draft:
+                pa["post"] = 0
+                out["post"] = "SKIP:NO_DRAFT"
+            else:
+                try:
+                    res_p = A.act_post(ast_, session, draft.get("title"), draft.get("raw"),
+                                       int(draft.get("category") or 4),
+                                       str(draft.get("tags") or ""),
+                                       apply_=apply_, log=lambda *a, **k: None)
+                except Exception as e:
+                    log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "ERROR",
+                                                 "kind": "post", "note": repr(e)[:200]})
+                    res_p = None
+                if not res_p or res_p.get("skip"):
+                    out["post"] = "SKIP:%s" % (res_p or {}).get("why")
+                elif (res_p.get("items") or [{}])[0].get("status") in ("POSTED",):
+                    pa["post"] = 0
+                    pa.pop("post_src", None)
+                    out["post"] = "DONE:1"
+                    try:                            # 草稿用后归档，避免重复发
+                        src = os.path.join(BASE, "linuxdo_post_drafts", draft["_file"])
+                        dst = os.path.join(BASE, "linuxdo_post_drafts", "used_" + draft["_file"])
+                        os.rename(src, dst)
+                    except Exception:
+                        pass
+                else:
+                    out["post"] = "NOOP"
         st["pending_acts"] = pa
         pa["last_run_ts"] = time.time()
-        if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)):
+        if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)
+                or int(pa.get("post") or 0)):
             pa["done_ts"] = time.time()
         save_state(st)
         log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "RUN", "result": out,
-                                     "left": {k: int(pa.get(k) or 0) for k in ("reply", "like")}})
+                                     "left": {k: int(pa.get(k) or 0) for k in ("reply", "like", "post")}})
     except Exception as e:
         log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "IMPORT_ERROR",
                                      "note": repr(e)[:200]})
@@ -1074,16 +1169,18 @@ def watch(args):
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
             return RC_OK
-        # 缺项路由：浏览类走浏览 SOP 自补；回复/送赞类排队给 acts 随机节奏执行；其余只通知
+        # 缺项路由：浏览类走浏览 SOP 自补；回复/送赞/获赞类排队给 acts 随机节奏执行；其余只通知
         route = classify_pending(lvl)
-        if route["manual"] or route["unknown"] or route.get("reply") or route.get("like"):
-            print("[%s] 缺项路由：须人工 %s / 未识别 %s / 自动补 %s / 排队回帖 %s / 排队点赞 %s" % (
+        if (route["manual"] or route["unknown"] or route.get("reply")
+                or route.get("like") or route.get("earn")):
+            print("[%s] 缺项路由：须人工 %s / 未识别 %s / 自动补 %s / 排队回帖 %s / 排队点赞 %s / 排队发帖 %s" % (
                 now_str(), [it.get("name") for it in route["manual"]],
                 [it.get("name") for it in route["unknown"]],
                 [it.get("name") for it in route["auto"]],
                 [it.get("name") for it in route.get("reply") or []],
-                [it.get("name") for it in route.get("like") or []]), flush=True)
-        if route.get("reply") or route.get("like"):
+                [it.get("name") for it in route.get("like") or []],
+                [it.get("name") for it in route.get("earn") or []]), flush=True)
+        if route.get("reply") or route.get("like") or route.get("earn"):
             queued = queue_pending_from_route(st, route)
             print("[%s] 已排队自动补足（等 acts 随机段执行，不即刻动手）：%s" % (now_str(), queued), flush=True)
         if route["manual"] or route["unknown"]:
@@ -1096,7 +1193,7 @@ def watch(args):
             if _r:
                 print("[%s] 浏览已到量，仍按随机节奏补做排队动作：%s（剩余 %s）" % (
                     now_str(), _r, {k: int((st.get("pending_acts") or {}).get(k) or 0)
-                                    for k in ("reply", "like")}), flush=True)
+                                    for k in ("reply", "like", "post")}), flush=True)
             time.sleep(3600)
             continue
         if (time.time() - start) / 60 >= args.max_session_min:
@@ -1120,7 +1217,7 @@ def watch(args):
         if _ra:
             print("[%s] 排队动作执行：%s（剩余 %s）" % (
                 now_str(), _ra, {k: int((st.get("pending_acts") or {}).get(k) or 0)
-                                 for k in ("reply", "like")}), flush=True)
+                                 for k in ("reply", "like", "post")}), flush=True)
         done, skipped = browse_batch(session, st, batch=args.batch)
         print("[%s] batch done=%d skipped=%d total_browsed=%d" % (now_str(), done, skipped, st.get("browsed_total", 0)), flush=True)
         # 候选抓取失败时留了诊断 ⇒ 先判是不是风控（HTTP 429/403 / 封禁文案）
@@ -1306,6 +1403,42 @@ def _selftest_impl():
     _r5 = classify_pending({"items": _ci5})
     if len(_r5["unknown"]) != 1:
         fails.append("T6c5 短表(不可映射)应落 unknown: %s" % _r5)
+    cases += 1
+    # T6c6 获赞类缺项 + 存在草稿 ⇒ 排 post（发帖由 acts.act_post 自裁日/周上限）
+    _stp = {"pending_acts": {}}
+    _ddir = os.path.join(BASE, "linuxdo_post_drafts")
+    os.makedirs(_ddir, exist_ok=True)
+    with open(os.path.join(_ddir, "d1.json"), "w", encoding="utf-8") as fh:
+        json.dump({"title": "t", "raw": "r", "category": 4, "tags": "AI"}, fh)
+    _addp = queue_pending_from_route(_stp, {"earn": [{"name": "获赞"}]})
+    if _addp.get("post") != 1 or _stp["pending_acts"].get("post") != 1 or \
+       _stp["pending_acts"].get("post_src") != "level_route":
+        fails.append("T6c6 获赞缺项+有草稿应排 post: %s / %s" % (_addp, _stp.get("pending_acts")))
+    cases += 1
+    # T6c7 负控：获赞缺项但**无草稿** ⇒ 绝不排 post（不许自己编内容），改走回帖并留痕
+    os.remove(os.path.join(_ddir, "d1.json"))
+    _stp2 = {"pending_acts": {}}
+    _addp2 = queue_pending_from_route(_stp2, {"earn": [{"name": "获赞"}]})
+    if _addp2.get("post") or _stp2["pending_acts"].get("post") or \
+       _stp2["pending_acts"].get("reply", 0) < 1:
+        fails.append("T6c7 无草稿仍排 post（会编造内容）: %s / %s" % (_addp2, _stp2.get("pending_acts")))
+    cases += 1
+    # T6c8 负控：无获赞缺项 ⇒ 不得排队 post（不许无中生有）
+    _stp3 = {"pending_acts": {}}
+    if queue_pending_from_route(_stp3, {"reply": [], "like": [], "earn": []}) or \
+       _stp3["pending_acts"].get("post"):
+        fails.append("T6c8 无获赞缺项却排 post: %s" % _stp3["pending_acts"])
+    cases += 1
+    # T6c9 多缺项并行（用户口径：一个不够走一个，多个不够走多个）
+    with open(os.path.join(_ddir, "d2.json"), "w", encoding="utf-8") as fh:
+        json.dump({"title": "t2", "raw": "r2"}, fh)
+    _stm = {"pending_acts": {}}
+    _addm = queue_pending_from_route(_stm, {"reply": [{"name": "回复话题", "cur": 8, "req": 10}],
+                                            "like": [{"name": "点赞", "cur": 22, "req": 30}],
+                                            "earn": [{"name": "获赞"}],
+                                            "auto": [{"name": "浏览话题"}]})
+    if set(["reply", "like", "post"]) - set(_addm.keys()):
+        fails.append("T6c9 多缺项未并行排队: %s" % _addm)
     cases += 1
     # T6b 等级前置检查节奏（2026-10-05 用户要求：每天 1 次、错峰、不要固定时刻打站点）
     if not (0 < LEVEL_CHECK_GAP[0] < LEVEL_CHECK_GAP[1] <= 24 * 3600):

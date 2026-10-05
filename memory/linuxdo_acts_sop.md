@@ -12,14 +12,16 @@
 |---|---|---|---|---|
 | 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1–3 次、间隔 5–11h 随机 | 零动作，仅读等级卡 |
 | 浏览 | 补量（缺「已读帖子/浏览比例」时） | daemon `browse_batch` | daemon 自动，或提示词触发（拉起 daemon） | cap 140–180（日抖） |
-| 回帖 | 补量（缺「回复话题数」时） | `tools/linuxdo_acts.py` reply | 提示词 / sche_tasks / 等级路由排队 | cap 6（±2 抖） |
+| 回帖 | 补量（缺「回复话题数」时） | `tools/linuxdo_acts.py` reply | **等级路由排队**（daemon 随机消费）/ 提示词 | cap 6（±2 抖） |
 | 点赞 | 补量（缺「获赞/送赞」时） | `tools/linuxdo_acts.py` like | 同上 | cap 12（±4 抖） |
-| 发帖 | 主动产出（极低频） | `tools/linuxdo_acts.py` post | 仅人工/明确指令触发 | cap 1 |
+| 发帖 | 补量（缺「获赞」且有草稿时） | `tools/linuxdo_acts.py` post | 等级路由排队（无草稿不排）/ 提示词 | cap 1 |
 
-**路由规则（等级检测为前置）**：
-- 未达标项按类分流：浏览类 → daemon 自补；回复类 → 回帖执行器；送赞类 → 点赞执行器；无法归类 → 只通知人工（脚本绝不代操作）。
-- 排队与执行**解耦**：等级检查那一刻只往 `state.pending_acts` 排队（`queue_pending_from_route`），真正动手由 daemon 在随机时刻取用（每轮最多各 1 条）。
+**路由规则（等级检测为前置，2026-10-05 订正版）**：
+- **等级检测是唯一的前置入口**：只有它读站点等级卡，读出的缺项按类分流（一次可命中多项，**多缺项并行排队、互不阻塞**）。
+- 分流表（`classify_pending` 五桶）：`browse` 类（已读帖子/浏览比例）→ daemon `browse_batch` **自补**；`reply` 类（回复话题数）→ 排 `pending_acts.reply`；`like` 类（送赞）→ 排 `pending_acts.like`；`earn` 类（获赞，站点无机器通道）→ **有草稿**则排 `pending_acts.post`（`post_src=level_route`），**无草稿**则退化为排 `reply`（多写多被赞）；`manual` 类（无法归类）→ 只发私信，脚本绝不代操作。
+- 排队与执行**解耦**：等级检查那一刻只往 `state.pending_acts` 排队（`queue_pending_from_route`），真正动手由 daemon 在随机时刻取用（每轮每类最多 1 条），每类成败原因落 `acts_log.jsonl`（如 `SKIP:NO_DRAFT`）。
 - 等级达标 ⇒ 不排队 ⇒ 不看帖、不回帖（用户原话：「正常的话不需要回帖，也不需要浏览帖子」）。
+- ★**禁止定点唤醒动作**：「浏览/回帖/点赞/发帖」四个动作**没有**各自的定时任务（2026-10-05 用户纠正，四个 `sche_tasks/linuxdo_acts_*.json` 已删除）。它们的发生时刻只有两个来源：①等级路由排队后由 daemon 在随机段内消费；②用户提示词临时触发。任何「到点就动站点」的入口都属违规实现。
 
 ## 二、随机内核（单一源 `tools/linuxdo_antidetect.py`）
 
@@ -40,23 +42,20 @@
 - 占锁输出 `{"skip": true, "why": "LOCKED_BUSY"}`、**rc=0**（非错误，禁止重试）。
 - daemon 执行排队动作时同样持锁（tag `daemon-acts`），`try/finally` 释放；冲突落 `temp/linuxdo_browse_daemon/acts_log.jsonl` 的 `LOCK_BUSY`。
 
-## 四、触发面（三种，任选其一）
+## 四、触发面（只有两种，2026-10-05 订正）
 
-1. **提示词触发**（用户随口说「刷会儿帖子」「回两条」）：读 `memory/linuxdo_browse_sop.md` / `linuxdo_reply_sop.md`，或直接调用执行器。
-2. **sche_tasks 定时**（各动作独立任务，见下）——任务只做「触发 + 查 due」，**不在固定时刻真的动手**：不在随机段内 `due=false` 就静默结束。
-3. **等级路由自动**（daemon 内）——只在等级缺项时才发生。
+1. **等级路由自动**（唯一常规路径）：daemon 内每天随机 1–3 次读等级卡 ⇒ 缺项按类**并行**排队 ⇒ 随机段内消费。等级达标则不排、不做任何动作。
+2. **提示词触发**（用户随口说「刷会儿帖子」「回两条」「发个帖」）：会话内直接调执行器（见 §五），单动作内部同样走拟人层。
 
-已建定时任务（`sche_tasks/`，prompt 头均带 GA_ROOT 锚定行）：
+> ★**不存在「定时唤醒动作」这一层**（订正 2026-10-05）：`sche_tasks/linuxdo_acts_{browse,reply,like,post}.json` 四个定点任务**已删除**——它们等于「到点就动站点」，是被检测特征，且与「等级检测为前置路由」的设计冲突。
+>
+> 现存唯一与 L 站相关的定时任务：
 
 | 文件 | 时刻 | 作用 |
 |---|---|---|
-| `linuxdo_trust_level_check.json` | 09:30 | 只读保活 + 兜底拉起 daemon（**零站点访问**） |
-| `linuxdo_acts_browse.json` | 12:40 | 确保浏览守护在跑（浏览动作由 daemon 随机执行） |
-| `linuxdo_acts_reply.json` | 11:20 | 回帖触发（due 判定 + `--apply`，后台起） |
-| `linuxdo_acts_like.json` | 15:40 | 点赞触发 |
-| `linuxdo_acts_post.json` | 20:10 | 发帖触发（日限 1，默认不 due） |
+| `linuxdo_trust_level_check.json` | 09:30 | **纯本地保活**：①`linuxdo_daemon_watchd.py ensure` 每日重新武装看门狗；②查守护在不在跑，不在则拉起；③`linuxdo_browse_daemon.py status` 记录本地 state。**零站点访问、不触发任何动作**（prompt 内明文禁止 web_scan/web_execute_js 与改随机参数）。 |
 
-> 时刻本身固定不是问题——**动作发生的时刻**由随机内核决定；但如果某动作长期在固定时刻真的发出请求，视为内核失效，须查 `due` 输出。
+> 这个任务的固定时刻本身不构成风险（它不产生任何站点请求）；真正会被判定的「动作发生时刻」由随机内核独占决定。
 
 ## 五、执行器 CLI 速查
 
@@ -101,9 +100,9 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - `python3 tools/linuxdo_humanize.py --selftest`（25/25）。
 - `python3 tools/linuxdo_antidetect.py --selftest`（56/56，含 T27 跨层自洽）。
 - `python3 tools/linuxdo_acts.py --selftest`（52/52；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d；自测把 state/lock/通知全部重定向到沙箱）。
-- `python3 tools/linuxdo_browse_daemon.py --selftest`（24/24；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线）。
+- `python3 tools/linuxdo_browse_daemon.py --selftest`（28/28；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线 + 等级路由 T6c6–T6c9：earn 有草稿排 post / 无草稿绝不排 post / 无缺项不排 / 多缺项并行）。
 - `python3 tools/linuxdo_daemon_watchd.py --selftest`（25/25，零站点流量）。
-- `python3 tools/sche_tasks_lint.py --only linuxdo_acts_reply,linuxdo_acts_like,linuxdo_acts_post,linuxdo_acts_browse` ⇒ FAIL 0。
+- `python3 tools/sche_tasks_lint.py --only linuxdo_trust_level_check` ⇒ FAIL 0（四个动作任务已删；该器会扫全量 `sche_tasks/`）。
 - 判活：`python3 tools/linuxdo_daemon_watchd.py status`（watchd/daemon 两 pid + last_browse）；`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
 
 ## 九、浏览守护看门狗（进程级自愈，零站点流量）
@@ -116,7 +115,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - 三件事：① 探活——守护进程不在 ⇒ 用 `tools/bg_task.py start --name linuxdo_browse -- python3 tools/linuxdo_browse_daemon.py watch` 拉起（幂等）；② 停滞——活动窗内超过 `STALL_S`（3h）无浏览产出（`browse_log.jsonl` 无新增 DONE）⇒ 判卡死并重启；③ 留痕 + 告警——事件写 `temp/linuxdo_watch/watchd.jsonl`，重启/恢复各发一次飞书私信（冷却 `NOTIFY_COOLDOWN_H`=6h，连续重启失败 `FAIL_STREAK_NOTIFY`=3 次再告警并继续重试）。
 - 节奏参数（`--interval` 类）只影响**巡检**频率（`CHECK_INTERVAL`=60s），**绝不改动**日限/静默窗/休息日/段间隔——那些仍由 `linuxdo_antidetect` 内核独占决定；本器只重启进程，不重排行为。
 - 防抖：两次重启最小间隔 `RESTART_MIN_GAP`=300s；单实例锁 `temp/linuxdo_watch/watchd.lock`。
-- 长驻上限 `DEFAULT_MAX_HOURS`=26h：**由每日入口重新武装**（`sche_tasks/linuxdo_acts_browse.json` 步骤 0 调 `ensure`），与 anyrouter watchd 同模式——避免"永久僵尸守护"。
+- 长驻上限 `DEFAULT_MAX_HOURS`=26h：**由每日入口重新武装**（`sche_tasks/linuxdo_trust_level_check.json` 步骤 0 调 `ensure`；2026-10-05 前挂在 `linuxdo_acts_browse.json`，该文件已删除），与 anyrouter watchd 同模式——避免"永久僵尸守护"。
 - 判活（人看）：`python3 tools/linuxdo_daemon_watchd.py status` 应同时给出 watchd 与 daemon 两个 pid、`last_browse` 时间；`browse_log` 新增 DONE 或 `state.daily` 增长才是守护真在干活（`bg_task` 日志 0 字节 ≠ 没跑）。
 - ★铁律：自测必须走沙箱（T16 断言自测前后**本器三件自有产物**指纹逐字相同），**禁绑现场内容**（曾因把 daemon 持续写入的 `browse_log.jsonl` 纳入生产指纹 ⇒ 恒假红）。
 
@@ -127,6 +126,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 3. **探针/监控与主账号同身份**：本案（anyrouter）探针 key = 用户 Pi 同一账号 key，3 天 1244 发全记主账号。**监控动作必须独立身份**（见 `anti_detection_sop.md`）。
 4. **合成事件当成真人事件 / 开关本身是坏设计**：JS 注入的 `mousemove/keydown` 带 `isTrusted=false`，采集端一行即可辨认 ⇒ 注入不是「更像人」而是「多一个可疑信号」。**2026-10-05 用户裁决：写死关**（`PAGE_EVENTS_ENABLED = False` 源码常量），`--page-events` 与 `LJQ_PAGE_EVENTS_ON` 保留但已失效（负控：置 env=1 也打不开）。★教训=「默认关 + 开关」等于把风险留给未来的自己，凡是己方认定不该开的能力，直接删掉开关而不是留后门。
 5. **固定节奏**：10-04 0–13 点恒定 300s 一轮，随机化滞后 1.5 天 ⇒ 封号后补的随机化属「事后」，规范要求**从第一版起**就随机。
+6. **「定点唤醒动作」=架构级错误**（2026-10-05 用户纠正）：曾给浏览/回帖/点赞/发帖各建一个 `sche_tasks` 定点任务（12:40/11:20/15:40/20:10），虽写成「只查 due 不真动手」，但① 与「等级检测为前置路由」的设计冲突（动作该由缺项驱动，不是由时钟驱动）；② 一旦 `due` 判定有偏差或随机内核失效，就退化为「每天固定时刻发请求」——正是被封的特征。**四个任务已删除**，动作只有「等级路由排队 → daemon 随机消费」与「用户提示词临时触发」两条路。★判据：任何新加的 L 站入口，若它在固定时刻可能发出站点请求，即违规。
 
 ## 尾注
 - 站点侧浏览器操作细则（标签页/CF/登录态）见 `memory/linuxdo_browse_sop.md`、`memory/linuxdo_reply_sop.md`、`memory/linuxdo_trust_level_sop.md`。

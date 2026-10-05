@@ -1,7 +1,0 @@
-{
-  "schedule": "11:20",
-  "repeat": "daily",
-  "enabled": true,
-  "max_delay_hours": 8,
-  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\nL站动作执行器触发（回帖/回复类补量）。\n\n【本任务只做一次「触发」，不做站点动作的决策】——真正的执行时刻与频次由 tools/linuxdo_antidetect.py 的随机内核决定（多段切分/日限抖动/静默窗/休息日/随机间隔）。你**禁止**为了「确认有没有做事」去 web_scan/web_execute_js 打开 linux.do。\n1) 先查是否到期（纯本地判定，零站点请求）：\n   `python3 tools/linuxdo_acts.py due`\n   若该项 `\"due\": false` ⇒ 直接静默结束（报告里写 due=false 与 eta 即可，不发通知）。\n2) 到期才执行，且必须后台起（单次可达数分钟，前台会超时被判失败）：\n   `python3 tools/bg_task.py start --name ldo_acts_reply -- python3 tools/linuxdo_acts.py run reply --apply`\n   然后轮询 `python3 tools/bg_task.py status --name ldo_acts_reply` 直到非 RUNNING（每轮只查一次状态，禁阻塞 sleep）。\n   注意：默认是 dry-run，**必须带 --apply** 才会真发。\n3) 若输出 `{{\"skip\": true, \"why\": \"LOCKED_BUSY\"}}` ⇒ 另一个执行器（守护/其它任务）正持锁，属正常互斥，静默结束，勿重试。\n4) 若输出 risk_gate 命中（BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED）⇒ 立即停止该项动作，飞书私信告知用户原始原因，禁止重试。\n5) 报告写进 done 回执：due 判定、执行条数、成功/跳过原因、以及当天该项 done_today/cap。\n\n6) 通道：仅用飞书私信（notify_channels_sop），禁钉钉群刷屏。\n"
-}
