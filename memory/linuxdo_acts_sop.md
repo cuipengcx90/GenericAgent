@@ -93,7 +93,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - 点赞：读帖后有 `SKIP_AFTER_READ` 犹豫分支（不一定点），避免「见帖必赞」的机器特征。
 - 发帖：先 `preface_` 闲逛几帖（禁「进站即发」），写作过程中有分段停顿再提交。
 - 睡眠出口唯一：`_sleep()`，受 `LJQ_HUMANIZE_MAX_SLEEP`（默认 90s）截断 ⇒ 长休**永不挂住守护**；`dry` 或 `LJQ_HUMANIZE_OFF=1` 时一律不睡（自测/预览零等待）。
-- 页面级合成事件（`PAGE_EVENTS_JS` = 真滚动 + 滚轮 + 同级读焦点 `mousemove` + 合成 `keydown`）**已写死关闭**（`PAGE_EVENTS_ENABLED = False`，源码常量，2026-10-05 用户裁决）：JS 注入事件 `isTrusted=false`，对校验信任位的采集端无效、还会凭空多出可疑事件；`--page-events` / `LJQ_PAGE_EVENTS_ON` 保留为兼容参数但**已失效**（负控 T50c：置 env=1 也打不开）。若将来要做「可信输入」，唯一可行路径是 **CDP `Input.dispatchMouseEvent`**（实测 `isTrusted=true`，见 `temp/ljq_cdptest/FINDING_cdp_input.md`），但那属另一层实现，不在 `--page-events` 里。
+- 页面级合成事件（`PAGE_EVENTS_JS` = 真滚动 + 滚轮 + 同级读焦点 `mousemove` + 合成 `keydown`）**已写死关闭**（`PAGE_EVENTS_ENABLED = False`，源码常量，2026-10-05 用户裁决）：JS 注入事件 `isTrusted=false`，对校验信任位的采集端无效、还会凭空多出可疑事件；`--page-events` / `LJQ_PAGE_EVENTS_ON` 保留为兼容参数但**已失效**（负控 T50c：置 env=1 也打不开）。若将来要做「可信输入」，唯一可行路径是 **CDP `Input.dispatchMouseEvent`**（实测 `isTrusted=true`，见 `temp/ljq_cdptest/FINDINGS.md`），但那属另一层实现，不在 `--page-events` 里。
 - 业界对照与缺口清单见 `temp/ljq_anti_detection_survey.md`（TLS/浏览器指纹/IP 声誉由「走真实 Chrome + 家宽」天然覆盖）。
 
 ## 八、自测与验收
