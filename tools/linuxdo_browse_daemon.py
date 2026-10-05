@@ -293,6 +293,13 @@ def check_level(session, timeout=40):
     res = run_js(session["id"], CONNECT_JS, timeout=timeout)
     lvl = parse_connect_dom(res)
     if lvl:
+        # ★(2026-10-05) 读完必须还原主站：否则守护把唯一的 linux.do 标签页变成 connect 页,
+        #   下一轮 pick_session 再也找不到可浏览的标签 ⇒ 自毁供应、永久 batch done=0
+        try:
+            run_js(session["id"], "location.href='https://linux.do/'", timeout=20)
+            time.sleep(6)
+        except Exception as e:
+            print("[warn] check_level 还原主站失败: %s" % str(e)[:120], flush=True)
         return lvl, "connect"
     # 2) 回落首页等级卡
     run_js(session["id"], "location.href='https://linux.do/'", timeout=20)

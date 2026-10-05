@@ -115,3 +115,15 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
 - 能推进项边界：浏览只推进「浏览话题/浏览帖子」；**访问天数靠真实登录日积月累**（不可代刷）；回复话题/点赞类=发帖红线，守护不自动做
 - `--selftest` 离线自测 6/6（含上限类指标 ✓ 不得误判未达标、unmet 子串陷阱、桥缺失 fail-closed）
 - rc：0=满足停 / 1=缺口仍在但批结束 / 2=桥不可达或无 linux.do tab / 3=两路判不了等级（CF 双卡或登录失效，需人工）
+
+### 2026-10-05 现场缺陷修复：check_level 自毁 linux.do 标签（已修·已实证）
+
+- **症状**：守护长驻后每批 `batch done=0`（日志 `RC_NO_SESSION_RETRY` / `batch done=0`），等级卡数值不动。
+- **根因（守护自身）**：`check_level()` 把 `pick_session` 选中的标签**导航到 connect.linux.do** 读等级、读完不还原；而 `watch` 每轮开头与每批结束都调 `check_level` ⇒ 每轮把唯一的 linux.do 标签变成 connect 页 ⇒ 下一轮 `pick_session`（要求 url 含 `linux.do` 且不含 `//connect.`）再也选不到标签 = 自毁供应。旁证：窗口一度出现 3 个 connect.linux.do 标签（AppleScript 独立核验），自建标签被逐轮吞掉；当时的 `/latest.json` 403/404 也是此因（标签已在 connect 子域，Discourse 环境/CSRF 不对），**不是 CF 封禁 JSON 端点**。
+- **修法**（`tools/linuxdo_browse_daemon.py`）：connect 读取成功后先 `run_js` 还原 `location.href='https://linux.do/'` + `sleep 6` 再 return。备份 `temp/ldo_daemon_backup_20261005_094920.py`（md5 `5fc0e9fcff72cb34ba8174230e846949`）。
+- **实证**：重启守护后 `browse_log.jsonl` 连出 `DONE`（09:53:36 id 2982690 DEEP / 09:57:38 id 2983258 …），节奏 ≈4 min/帖。
+- **运维要点**：
+  - 长驻依赖**一个后台（非活动）的普通 linux.do 标签**。建标签用 AppleScript `make new tab at end of tabs of w with properties {URL:"https://linux.do/latest"}`（**必须带容器 `of w`**，缺则报 `-1728`）；**不要用 `open location`**（会把标签变前台 visible，被前台保护跳过），建完也不要切 active。
+  - 判活只看两处：`temp/linuxdo_browse_daemon/browse_log.jsonl` 新增 `DONE` 行 + `state.json` 的 `daily/browsed_total` 增长。**`temp/bg_task/logs/ldo_watch.log` 常为 0 字节**（`bg_task start` 会截断，脚本按批才写）⇒ 空日志 ≠ 没在跑。
+  - 出现 `RC_NO_SESSION` 先查标签是否被吞（`get_all_sessions`），补建后台标签即可，不必重启守护。
+- **★期望值（防误判「没效果」）**：帖子读数按 Discourse 100 天滚动窗计，**会自然回落**——实测 07:39→09:45 两小时 12950→12921（当时尚未开始浏览）⇒ 判「涨没涨」须以 ≥30–60min 尺度对照浏览速率，勿看几分钟的抖动。按 ≈4min/帖（10–25 帖/帖）估毛增速 2000–3500 帖/天（含静默窗与休息），扣回落（百帖/天量级）后净增约 2000–3000 帖/天 ⇒ 7000 量级缺口约需 2–3 天（估算，以等级卡实测为准）。
