@@ -85,6 +85,25 @@ SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
 FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
 LATEST_PAGE_MAX = 9
 
+# ---- 风控保险丝（2026-10-05 用户要求：借 anyrouter 被封教训）-----------------
+# anyrouter 教训三条：①高频自动请求累积 → 封号；②把异常当常态（429/503 当"供给态"
+# 一路重试，直到 403「用户已被封禁」才发现）；③无自动告警，靠人偶然看见。
+# 这里对应：任何风控信号一律 记 state + 飞书私信 + 长暂停，绝不静默硬撞。
+RISK_PAUSE = (3600, 7200)        # 命中单次风控信号 → 暂停 60–120min
+RISK_ESCALATE_N = 3              # 同类信号当日累计 ≥3 ⇒ 当日停止浏览 + 强制告警
+RISK_ALERT_COOLDOWN_H = 6        # 同类告警最小间隔（小时），避免刷屏
+RISK_TEXT_HINTS = (
+    # 顺序=优先级：封禁 > CF 挑战 > 限流 > 登录失效
+    ("BANNED", r"已被?封禁|账号被封|封号|account suspended|user has been banned|you are banned"),
+    ("CF_CHALLENGE", r"Just a moment|cf-chl|Attention Required|Cloudflare|安全验证|人机验证|请稍候"),
+    ("RATE_LIMIT", r"Too Many Requests|请求过于频繁|操作过于频繁|rate limit exceeded"),
+    ("LOGIN_REQUIRED", r"not_logged_in|请先登录|需要登录|你要登录|Sign Up|Log In"),
+)
+# 强信号=必须长暂停 + 告警；CF_CHALLENGE 常见且多半自愈 ⇒ 只做轻量计数（避免误伤成小时级停机）
+RISK_STRONG = ("BANNED", "RATE_LIMIT", "FORBIDDEN", "LOGIN_REQUIRED")
+REST_DAY_P = 1.0 / 7.0           # 随机休息日：平均每周 1 天完全不浏览（降总量+拟人）
+REST_MIN_GAP_DAYS = 3            # 两次休息日至少间隔 3 天（不连休）
+
 
 def _bridge(payload, timeout=90):
     req = urllib.request.Request(
@@ -217,6 +236,120 @@ def log_jsonl(name, obj):
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
 
+# ---------------------------------------------------------------- 风控保险丝
+# 2026-10-05：借 anyrouter 被封教训——异常绝不静默吞掉，一律落账 + 告警 + 暂停。
+def notify(text):
+    """飞书私信告警（复用 GA 既有通道；失败不致命，但必须留痕）。"""
+    try:
+        rs = os.path.join(GA_ROOT, "reflect_scripts")
+        if rs not in sys.path:
+            sys.path.insert(0, rs)
+        from reflect_common import notify_feishu  # type: ignore
+        notify_feishu(text)
+        return True
+    except Exception as e:
+        print("[warn] 风控告警推送失败: %s" % str(e)[:160], flush=True)
+        return False
+
+
+def risk_kind_from_http(status):
+    """HTTP 状态码 → 风控类别（None=非风控信号）。"""
+    if status == 429:
+        return "RATE_LIMIT"
+    if status == 403:
+        return "FORBIDDEN"
+    if status == 401:
+        return "LOGIN_REQUIRED"
+    return None
+
+
+def risk_kind_from_text(txt):
+    """页面文本 → 风控类别。只认强特征，宁漏不误（避免把技术帖里的数字当信号）。"""
+    t = (txt or "")[:4000]
+    if not t:
+        return None
+    for kind, pat in RISK_TEXT_HINTS:
+        if re.search(pat, t, re.I):
+            return kind
+    return None
+
+
+def note_risk(st, kind, detail=""):
+    """记风控信号 + 去重告警 + 当日计数。返回 (count_today, alert_sent)。"""
+    t = today()
+    day = st.setdefault("risk", {}).setdefault("days", {}).setdefault(t, {})
+    day[kind] = int(day.get(kind, 0)) + 1
+    count = day[kind]
+    st["risk"]["last"] = {"ts": now_str(), "kind": kind,
+                          "detail": str(detail)[:300], "count_today": count}
+    log_jsonl("risk_log.jsonl", {"ts": now_str(), "st": "RISK", "kind": kind,
+                                 "detail": str(detail)[:300], "count_today": count})
+    esc = count >= RISK_ESCALATE_N
+    alerts = st.setdefault("risk_alert", {})
+    key = "%s:%s" % (kind, t)
+    due = True
+    try:
+        if alerts.get(key):
+            due = (time.time() - float(alerts[key])) >= RISK_ALERT_COOLDOWN_H * 3600
+    except Exception:
+        due = True
+    if esc or due:
+        alerts[key] = time.time()
+        notify("⚠️ linux.do 浏览守护·风控信号\n"
+               "类型：%s\n"
+               "今日同类第 %d 次%s\n"
+               "详情：%s\n"
+               "动作：暂停浏览 %d–%d 分钟（绝不硬撞）\n"
+               "时间：%s" % (kind, count, "（已升级：当日停止）" if esc else "",
+                           str(detail)[:200],
+                           RISK_PAUSE[0] // 60, RISK_PAUSE[1] // 60, now_str()))
+        save_state(st)
+        return count, True
+    save_state(st)
+    return count, False
+
+
+def handle_risk(st, kind, detail=""):
+    """记信号 →（达阈值则当日停，否则长暂停）→ 返回 True 表示该 continue。"""
+    cnt, _ = note_risk(st, kind, detail)
+    if cnt >= RISK_ESCALATE_N:
+        st["risk_stop_day"] = today()
+        save_state(st)
+        print("[%s] 风控升级 %s x%d → 当日停止浏览" % (now_str(), kind, cnt), flush=True)
+        return True
+    pause = random.uniform(*RISK_PAUSE)
+    print("[%s] 风控信号 %s → 暂停 %.0f 分钟" % (now_str(), kind, pause / 60), flush=True)
+    time.sleep(pause)
+    return True
+
+
+def rest_day_today(st):
+    """随机休息日：平均每 7 天 1 天完全不浏览（降总量 + 拟人）。判一次即落盘。"""
+    t = today()
+    rd = st.setdefault("rest_days", {})
+    if t in rd:
+        return bool(rd[t])
+    days = sorted(rd.keys())
+    if days:
+        try:
+            last = dt.datetime.strptime(days[-1], "%Y-%m-%d").date()
+            if (dt.datetime.now().date() - last).days < REST_MIN_GAP_DAYS:
+                rd[t] = False
+                save_state(st)
+                return False
+        except Exception:
+            pass
+    v = random.random() < REST_DAY_P
+    rd[t] = v
+    for k in sorted(rd.keys())[:-60]:
+        rd.pop(k, None)
+    save_state(st)
+    if v:
+        log_jsonl("rest_log.jsonl", {"ts": now_str(), "st": "REST_DAY",
+                                     "note": "今日随机休息，零浏览"})
+    return v
+
+
 def quiet_window_check(now=None):
     """在静默窗(01:00–07:30)内返回 True。"""
     now = now or dt.datetime.now()
@@ -333,7 +466,8 @@ def check_level(session, timeout=40):
     txt = res.get("t", "") if isinstance(res, dict) else ""
     lvl = parse_home_card(txt)
     if lvl is None:
-        return None, "connect 与首页卡都判不了（CF 双卡或登录失效）"
+        k = risk_kind_from_text(txt)
+        return None, ("connect 与首页卡都判不了（CF 双卡或登录失效）" + (" [risk=%s]" % k if k else ""))
     # 头部对账：head_pending 与解析 pending 若同时存在且矛盾 → 以解析为准但记 note
     note = "home_card"
     if lvl["head_pending"] is not None and lvl["head_pending"] != lvl["pending"]:
@@ -357,11 +491,21 @@ LATEST_JS = r"""
 """
 
 
+LAST_FETCH_DIAG = {}
+
+
 def fetch_candidates(session, page):
     code = LATEST_JS.replace("__PAGE__", str(int(page)))
     res = run_js(session["id"], code, timeout=30)
     if isinstance(res, dict) and res.get("ok"):
         return res.get("topics") or []
+    # 失败：留下诊断（供风控保险丝判 HTTP 429/403 等）
+    if isinstance(res, dict):
+        LAST_FETCH_DIAG.update({"ts": now_str(), "page": page, "status": res.get("status"),
+                                "diag": "page=%s status=%s err=%s" % (page, res.get("status"), str(res.get("err"))[:120])})
+    else:
+        LAST_FETCH_DIAG.update({"ts": now_str(), "page": page, "status": None,
+                                "diag": "page=%s raw=%s" % (page, str(res)[:120])})
     return []
 
 
@@ -466,6 +610,7 @@ def browse_one(session, tid, state):
 
 def browse_batch(session, st, batch=25):
     """浏览一批。返回 (done, skipped)"""
+    LAST_FETCH_DIAG.clear()
     done = skipped = 0
     loiter_n = random.randint(*LOITER_P_LIST)
     pages = random.sample(range(0, LATEST_PAGE_MAX + 1), min(LATEST_PAGE_MAX + 1, 4))
@@ -528,6 +673,16 @@ def watch(args):
     front_none = 0      # 前台探测连续失败
     front_true_cnt = 0  # 前台 True 连续次数（探测失真自检日志用）
     while True:
+        # 风控升级后当日停止（只长睡，不再发请求）
+        if st.get("risk_stop_day") == today():
+            print("[%s] 风控升级后当日停止浏览，睡 1h 复查" % now_str(), flush=True)
+            time.sleep(3600)
+            continue
+        # 随机休息日：平均每周 1 天完全不浏览（降总量 + 拟人）
+        if rest_day_today(st):
+            print("[%s] 今日为随机休息日，全天不浏览" % now_str(), flush=True)
+            time.sleep(3600)
+            continue
         if quiet_window_check():
             print("[%s] 静默窗内，睡 30min" % now_str(), flush=True)
             time.sleep(1800)
@@ -553,6 +708,13 @@ def watch(args):
         sess_fails = 0
         lvl, src = check_level(session)
         if lvl is None:
+            m = re.search(r"\[risk=([A-Z_]+)\]", src or "")
+            rk = m.group(1) if m else None
+            if rk in RISK_STRONG:
+                handle_risk(st, rk, "check_level: %s" % src)
+                continue
+            if rk:
+                note_risk(st, rk, "check_level: %s" % src)   # CF 挑战等：留痕+计数，不改原重试口径
             lvl_fails += 1
             if lvl_fails >= SESS_RETRY_MAX:
                 print("[%s] RC_UNJUDGEABLE: %s（连续 %d 次判级失败，退出）" % (now_str(), src, lvl_fails), flush=True)
@@ -592,6 +754,18 @@ def watch(args):
             continue
         done, skipped = browse_batch(session, st, batch=args.batch)
         print("[%s] batch done=%d skipped=%d total_browsed=%d" % (now_str(), done, skipped, st.get("browsed_total", 0)), flush=True)
+        # 候选抓取失败时留了诊断 ⇒ 先判是不是风控（HTTP 429/403 / 封禁文案）
+        diag = LAST_FETCH_DIAG.get("diag")
+        if diag:
+            rk = risk_kind_from_http(LAST_FETCH_DIAG.get("status")) or risk_kind_from_text(diag)
+            if rk in RISK_STRONG:
+                handle_risk(st, rk, diag)
+                continue
+            if rk:
+                note_risk(st, rk, diag)
+            else:
+                log_jsonl("risk_log.jsonl", {"ts": now_str(), "st": "INFO", "kind": "FETCH_FAIL",
+                                             "detail": str(diag)[:300]})
         if done == 0 and skipped == 0:
             print("[%s] 无可用候选（候选全重/接口异常），睡 10min 重试" % now_str(), flush=True)
             time.sleep(600)
@@ -644,6 +818,8 @@ def main(argv=None):
 # ---------------------------------------------------------------- selftest
 def selftest():
     fails = []
+    cases = 0
+    cases += 1
     # T1 首页卡解析：混合 ✓/○，含上限类「被举报 0/5」标 ✓ —— 不得算未达标
     sample = "✓ 访问天数 81\n/\n50\n✓ 浏览话题 582\n/\n500\n○ 已读帖子 12571\n/\n20000\n✓ 被举报帖子 0\n/\n5\n✓ 被禁言 0\n/\n0\n○ 回复 8\n/\n10\n○ 2 待完成"
     lvl = parse_home_card(sample)
@@ -651,9 +827,11 @@ def selftest():
         fails.append("T1 home_card 解析错: %s" % (lvl,))
     if lvl and lvl["head_pending"] != 2:
         fails.append("T1 head_pending 错: %s" % lvl["head_pending"])
+    cases += 1
     # T1n 负控：上限类(当前值 0 < 门槛 5)标 ✓ —— 数值机械比较会误报，页面标记法不误报
     if lvl and any(it["name"].find("被举报") >= 0 and it["mark"] == "○" for it in lvl["items"]):
         fails.append("T1n 上限类被误判未达标(子串陷阱): %s" % [it for it in lvl["items"] if "被举报" in it["name"]])
+    cases += 1
     # T2 connect DOM：class token 判定 + tl3-bar-fill 剔除 + 'unmet' 子串陷阱
     fake = {"met": 10, "unmet": 2, "items": []}
     lvl2 = parse_connect_dom(fake)
@@ -662,20 +840,24 @@ def selftest():
     bad = {"ok": False, "error": "x"}
     if parse_connect_dom(bad) is not None:
         fails.append("T2n 坏响应未拒")
+    cases += 1
     # T2n2 'unmet' 含 'met' 子串 —— 判据必须 isMet = has('met') && !has('unmet')
     cls_test = "tl3-ring-circle unmet"
     isMet = ("met" in cls_test.split()) and ("unmet" not in cls_test.split())
     if isMet:
         fails.append("T2n2 unmet 子串陷阱未挡")
+    cases += 1
     # T3 静默窗
     if not quiet_window_check(dt.datetime(2026, 10, 5, 3, 0)) or quiet_window_check(dt.datetime(2026, 10, 5, 9, 0)):
         fails.append("T3 静默窗判断错")
+    cases += 1
     # T4 daily cap / 间隔参数边界
     st = {"daily": {today(): DAILY_CAP_DEFAULT}}
     if daily_count(st) < DAILY_CAP_DEFAULT:
         fails.append("T4 daily cap 错")
     if not (0 < GAP_RANGE[0] < GAP_RANGE[1] <= GAP_LONG_RANGE[0] < GAP_LONG_RANGE[1]):
         fails.append("T4 间隔区间边界错")
+    cases += 1
     # T5 桥缺失 fail-closed：指向不可达端口
     global BRIDGE
     old = BRIDGE
@@ -687,11 +869,13 @@ def selftest():
         pass
     finally:
         BRIDGE = old
+    cases += 1
     # T6 防检测参数齐全
     for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):
         v = globals().get(name)
         if not v:
             fails.append("T6 %s 缺失" % name)
+    cases += 1
     # T7 前台保护三态 + 断链重试常量边界
     s, w = front_decision(True, 0)
     if not s or "前台" not in w:
@@ -709,6 +893,7 @@ def selftest():
         fails.append("T7n SESS_RETRY 常量边界错")
     if not ("hasFocus" in FRONT_JS and "visibilityState" in FRONT_JS and "JSON.stringify" in FRONT_JS):
         fails.append("T7n FRONT_JS 形状缺关键 token")
+    cases += 1
     # T8 cap 抖动 / T9 晨抖（纯函数断言，传局部 dict，不触真 state）
     cst = {"cap": {}}
     c1 = daily_cap_today(cst, 250)
@@ -730,11 +915,72 @@ def selftest():
         fails.append("T9 已存晨抖未直接返回")
     if not (isinstance(MORNING_JITTER, tuple) and MORNING_JITTER[0] == 0 and MORNING_JITTER[1] > 0):
         fails.append("T9 晨抖常量形状错")
+    cases += 1
+    # T10 风控判据：HTTP 码 / 页面文本（正例 + 负控）
+    if (risk_kind_from_http(429), risk_kind_from_http(403), risk_kind_from_http(401)) != ("RATE_LIMIT", "FORBIDDEN", "LOGIN_REQUIRED"):
+        fails.append("T10 HTTP 风控码映射错")
+    if risk_kind_from_http(200) is not None or risk_kind_from_http(404) is not None:
+        fails.append("T10n 非风控码被误判为风控")
+    if risk_kind_from_text("Just a moment...") != "CF_CHALLENGE":
+        fails.append("T10 CF 挑战未识别")
+    if risk_kind_from_text("您的账号已被封禁") != "BANNED":
+        fails.append("T10 封禁文案未识别")
+    if risk_kind_from_text("今天聊了 429 次，很有趣") is not None:
+        fails.append("T10n 普通文本被误判为风控（数字/口语不算信号）")
+    if not (set(RISK_STRONG) <= (set(k for k, _ in RISK_TEXT_HINTS) | {"FORBIDDEN"})):
+        fails.append("T10n RISK_STRONG 含未定义类别")
+    if "CF_CHALLENGE" in RISK_STRONG:
+        fails.append("T10n CF 挑战列入强信号会误伤成长暂停")
+    cases += 1
+    # T11/T12 风控链路：stub 通知/落盘（绝不真发飞书）+ 零暂停
+    # 验证 计数 → 首次告警 → 冷却窗口内去重 → 达阈值升级当日停
+    global notify, save_state, log_jsonl, RISK_PAUSE
+    sent = []
+    _old = (notify, save_state, log_jsonl, RISK_PAUSE)
+    notify = lambda text: (sent.append(text), True)[1]
+    save_state = lambda st: None
+    log_jsonl = lambda name, obj: None
+    RISK_PAUSE = (0, 0)
+    try:
+        rst = {}
+        c1, a1 = note_risk(rst, "RATE_LIMIT", "http 429")
+        c2, a2 = note_risk(rst, "RATE_LIMIT", "http 429")
+        if (c1, c2) != (1, 2) or not a1 or a2:
+            fails.append("T11 计数/告警去重错: %s/%s/%s/%s" % (c1, c2, a1, a2))
+        if len(sent) != 1 or "RATE_LIMIT" not in sent[0]:
+            fails.append("T11 首次告警缺失或冷却窗口失效: n=%d" % len(sent))
+        c3, _ = note_risk(rst, "RATE_LIMIT", "http 429")
+        if c3 != RISK_ESCALATE_N:
+            fails.append("T11 升级计数错: %s" % c3)
+        if rst.get("risk", {}).get("last", {}).get("count_today") != RISK_ESCALATE_N:
+            fails.append("T11 risk.last 未留痕")
+        hst = {}
+        for _ in range(RISK_ESCALATE_N):
+            if handle_risk(hst, "BANNED", "账号被封") is not True:
+                fails.append("T12 handle_risk 未返回 True")
+        if hst.get("risk_stop_day") != today():
+            fails.append("T12 达阈值未写当日停止标记（会继续硬撞）")
+        if not any("BANNED" in s for s in sent):
+            fails.append("T12 风控告警未发出")
+        if not any("暂停" in s for s in sent):
+            fails.append("T12 告警正文缺动作说明")
+    finally:
+        notify, save_state, log_jsonl, RISK_PAUSE = _old
+    cases += 1
+    # T13 休息日：幂等 + 最小间隔（不连休）+ 常量边界
+    st13 = {"rest_days": {}}
+    if rest_day_today(st13) != rest_day_today(st13):
+        fails.append("T13 休息日判定不幂等（同 st 二次结果不同）")
+    yd = (dt.datetime.strptime(today(), "%Y-%m-%d").date() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+    if rest_day_today({"rest_days": {yd: True}}):
+        fails.append("T13 最小间隔未生效（可连休）")
+    if not (0 < REST_DAY_P <= 0.5 and REST_MIN_GAP_DAYS >= 2):
+        fails.append("T13 休息日常量边界错")
     if fails:
         for f in fails:
             print("FAIL " + f)
         return RC_SELFTEST
-    print("selftest 9/9 PASS")
+    print("selftest %d/%d PASS" % (cases, cases))
     return RC_OK
 
 
