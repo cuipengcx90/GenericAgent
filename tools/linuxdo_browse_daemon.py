@@ -68,12 +68,18 @@ SCROLL_AMP = (300, 440)
 BOTTOM_STAY = (70, 84)       # 底部驻留秒——跨 Discourse ~60s timings flush 周期（2026-10-05 实测根因）
 ROLLBACK_STEPS = 10          # 回滚给每楼二次 tick 机会
 LOITER_P_LIST = (2, 4)
+LIGHT_P = 0.30              # 30% 浅读（刷到不感兴趣划走型）：每帖都读到底=机器味（2026-10-05 反检测审查）
+LIGHT_STEPS = (4, 6)
+LIGHT_DWELL = (15, 30)      # 浅读驻留秒
 BATCH_DEFAULT = 25
 DAILY_CAP_DEFAULT = 120
 SESSION_MIN_DEFAULT = 90
 SESSION_REST = (1800, 3600)
 QUIET_WINDOW = (1, 0, 7, 30)          # 01:00–07:30 静默
 INTER_BATCH_GAP = (300, 900)
+SESS_RETRY_MAX = 6                      # pick_session/判级连续失败达上限才退出（断链重试≈1h+）
+SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
+FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
 LATEST_PAGE_MAX = 9
 
 
@@ -123,13 +129,44 @@ def run_js(session_id, code, timeout=60):
     return raw
 
 
+FRONT_JS = ("(function(){var v=(document.visibilityState==='visible');"
+            "var f=!!(document.hasFocus&&document.hasFocus());"
+            "return JSON.stringify({visible:v,focused:f,front:v})})()")
+
+
+def tab_is_front(session):
+    """linux.do tab 是否可见（用户可能正在看）。
+
+    front 判据 = visibilityState==='visible'：分屏/焦点在终端但屏幕可见也算前台，
+    宁可错跳绝不抢用户正在看的 tab。探测失败返回 None（fail-closed 由调用方定）。
+    """
+    try:
+        res = run_js(session["id"], FRONT_JS, timeout=15)
+    except Exception:
+        return None
+    if isinstance(res, dict) and "front" in res:
+        return bool(res["front"])
+    return None
+
+
+def front_decision(front, none_cnt):
+    """返回 (skip: bool, why: str)。None 且连续失败未达容忍 ⇒ fail-closed 跳过。"""
+    if front is True:
+        return True, "用户在前台看 linux.do，跳过本轮浏览"
+    if front is None:
+        if none_cnt < FRONT_NONE_TOLERANCE:
+            return True, "前台探测失败(fail-closed %d/%d)，跳过本轮浏览" % (none_cnt + 1, FRONT_NONE_TOLERANCE)
+        return False, "前台探测连续失败 %d 次，按后台继续(fail-open)" % none_cnt
+    return False, "tab 后台，正常浏览"
+
+
 def pick_session(prefer=None, timeout=20):
     """挑一个真正位于 linux.do 的会话；找不到返回 (None, 诊断串)。"""
     sessions = list_sessions(timeout=timeout)
     if not sessions:
         return None, "浏览器桥无任何会话（Chrome 未运行 / 扩展未连接 / 驱动未启动？）"
     cands = [s for s in sessions if prefer and s["id"] == str(prefer)]
-    cands += [s for s in sessions if HINT in (s["url"] or "")]
+    cands += [s for s in sessions if HINT in (s["url"] or "") and "//connect." not in (s["url"] or "")]
     seen, ordered = set(), []
     for s in cands:
         if s["id"] not in seen:
@@ -141,7 +178,9 @@ def pick_session(prefer=None, timeout=20):
     for s in ordered:
         probe = run_js(s["id"], "(()=>location.host)()", timeout=15)
         host = probe.get("raw") if isinstance(probe, dict) else probe
-        if isinstance(host, str) and HINT in host:
+        # 精确 host 判定：connect.linux.do 也含 "linux.do" 子串但无 Discourse 环境
+        # （2026-10-05 实测误选 connect Error 页 tab → routeTo 永远 need_loc）
+        if isinstance(host, str) and host.strip().lower() in ("linux.do", "www.linux.do"):
             return s, ""
     return None, "候选标签页 %s 均不在 %s（可能已被导航走）" % ([s["id"] for s in ordered], HINT)
 
@@ -300,6 +339,35 @@ def fetch_candidates(session, page):
 ROUTE_JS = r"""
 (async () => {
   const tid='__TID__'; let how=null;
+  // ── 记账解锁三件套（2026-10-05 R558 实锤：后台 tab IntersectionObserver/rAF 停→
+  //    screen-track 零 timings POST→服务端 last_read 不动→浏览帖子计数不涨）。
+  //    修法=①按 DOM 真实楼层喂 _onscreen ②dispatch scroll 解锁 tick 的 180s 无滚动早退闸
+  //    ③1.5s interval 驱动 tick（后台节流 ≈1Hz 仍有效，实测已验证）。
+  //    幂等：interval 挂 window 跨帖存活；整页导航兜底后重新注入。
+  try {
+    const c = window.Discourse && window.Discourse.__container__;
+    const t = c && c.lookup && c.lookup('service:screen-track');
+    if (t && !window.__tmUnlockOn) {
+      window.__tmUnlockOn = true;
+      window.__tmUnlock = () => {
+        try {
+          if (!t._topicId) return;
+          const nums = [];
+          document.querySelectorAll('.topic-post[data-post-number]').forEach(e => {
+            const n = parseInt(e.getAttribute('data-post-number'));
+            if (n > 0) nums.push(n);
+          });
+          if (nums.length) {
+            t.set('_onscreen', [...new Set(nums)]);
+            window.dispatchEvent(new Event('scroll'));
+          }
+        } catch(e){}
+      };
+      window.__tmInterval = setInterval(() => {
+        try { window.__tmUnlock(); if (t.tick) t.tick(); } catch(e){}
+      }, 1500);
+    }
+  } catch(e){}
   try { const m=window.require('discourse/lib/url');
     if (m && m.default && m.default.routeTo){ m.default.routeTo('/t/topic/'+tid); how='REQ'; } } catch(e){}
   if (!how) return JSON.stringify({need_loc:true});
@@ -332,20 +400,37 @@ LOITER_JS = r"""
 
 
 def browse_one(session, tid, state):
-    steps = random.randint(*SCROLL_STEPS)
-    dtms = int(random.uniform(*SCROLL_DT) * 1000)
-    amp = random.randint(*SCROLL_AMP)
-    stay = int(random.uniform(*BOTTOM_STAY) * 1000)
-    rb = ROLLBACK_STEPS
+    # 深浅分层：真人不是每帖都读到底——约三成是「刷到划走」型浅读（快滚大屏幅、不回滚、短驻留）
+    light = random.random() < LIGHT_P
+    if light:
+        steps = random.randint(*LIGHT_STEPS)
+        dtms = int(random.uniform(0.25, 0.5) * 1000)
+        amp = random.randint(520, 760)
+        stay = int(random.uniform(*LIGHT_DWELL) * 1000)
+        rb = 0
+    else:
+        steps = random.randint(*SCROLL_STEPS)
+        dtms = int(random.uniform(*SCROLL_DT) * 1000)
+        amp = random.randint(*SCROLL_AMP)
+        stay = int(random.uniform(*BOTTOM_STAY) * 1000)
+        rb = ROLLBACK_STEPS
     code = ROUTE_JS.replace("__TID__", str(tid)).replace("__STEPS__", str(steps)).replace("__DTMS__", str(dtms)).replace("__AMP__", str(amp)).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
     res = run_js(session["id"], code, timeout=max(150, steps * 3 + stay // 1000 + 30))
     ok = isinstance(res, dict) and not res.get("need_loc") and not res.get("fail")
     if isinstance(res, dict) and res.get("need_loc"):
+        # 兜底整页导航仅允许在主站 tab 上做：connect.linux.do 等子域无 Discourse，
+        # 导航只会造出 Error 页并顶掉等级检查 tab（2026-10-05 实测踩坑）。
+        h = run_js(session["id"], "(()=>location.host)()", timeout=15)
+        host = h.get("raw") if isinstance(h, dict) else h
+        if not (isinstance(host, str) and host.strip().lower() in ("linux.do", "www.linux.do")):
+            return False, {"fail": "non-linuxdo-tab:%s" % host}
         run_js(session["id"], "location.href='/t/topic/%s'" % tid, timeout=20)  # 整页直达兜底
         time.sleep(6)
         res2 = run_js(session["id"], code, timeout=max(150, steps * 3 + stay // 1000 + 30))
         ok = isinstance(res2, dict) and not res2.get("fail")
         res = res2
+    if isinstance(res, dict):
+        res["mode"] = "LIGHT" if light else "DEEP"
     return ok, res
 
 
@@ -361,6 +446,16 @@ def browse_batch(session, st, batch=25):
     seen = set(st.get("seen_ids", []))
     cand = [c for c in cand if c.get("id") and int(c["id"]) not in seen]
     random.shuffle(cand)
+    # 分类偏好加权：真人会「进一个板块连看」，均匀跳遍全站分类=机器味
+    by_cat = {}
+    for c in cand:
+        by_cat.setdefault(c.get("cat"), []).append(c)
+    if len(by_cat) >= 3 and batch >= 8:
+        pref_cats = set(random.sample(sorted(by_cat, key=str), min(3, len(by_cat) - 1)))
+        pref_pool = [c for c in cand if c.get("cat") in pref_cats]
+        other_pool = [c for c in cand if c.get("cat") not in pref_cats]
+        n_pref = min(len(pref_pool), max(2, int(batch * 0.6)))
+        cand = pref_pool[:n_pref] + other_pool
     for i, c in enumerate(cand):
         if i >= batch:
             break
@@ -372,7 +467,9 @@ def browse_batch(session, st, batch=25):
         ok, res = browse_one(session, tid, st)
         title = (res.get("title", "") if isinstance(res, dict) else "")[:36]
         log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "DONE" if ok else "FAIL",
-                                       "id": tid, "cat": c.get("cat"), "title": title, "posts": res.get("posts") if isinstance(res, dict) else None})
+                                       "id": tid, "cat": c.get("cat"), "title": title,
+                                       "posts": res.get("posts") if isinstance(res, dict) else None,
+                                       "mode": res.get("mode") if isinstance(res, dict) else None})
         if ok:
             done += 1
             seen.add(int(tid))
@@ -396,6 +493,10 @@ def now_str():
 def watch(args):
     st = load_state()
     start = time.time()
+    sess_fails = 0      # pick_session 连续失败（断链重试）
+    lvl_fails = 0       # check_level 连续失败
+    front_none = 0      # 前台探测连续失败
+    front_true_cnt = 0  # 前台 True 连续次数（探测失真自检日志用）
     while True:
         if quiet_window_check():
             print("[%s] 静默窗内，睡 30min" % now_str(), flush=True)
@@ -403,13 +504,26 @@ def watch(args):
             continue
         session, note = pick_session()
         if not session:
-            print("[%s] RC_NO_SESSION: %s" % (now_str(), note), flush=True)
-            return RC_NO_SESSION
+            sess_fails += 1
+            if sess_fails >= SESS_RETRY_MAX:
+                print("[%s] RC_NO_SESSION: %s（连续 %d 次断链，退出）" % (now_str(), note, sess_fails), flush=True)
+                return RC_NO_SESSION
+            wait = random.uniform(*SESS_RETRY_SLEEP)
+            print("[%s] RC_NO_SESSION_RETRY: %s（%d/%d，睡 %.0fmin 后重试）" % (now_str(), note, sess_fails, SESS_RETRY_MAX, wait / 60), flush=True)
+            time.sleep(wait)
+            continue
+        sess_fails = 0
         lvl, src = check_level(session)
         if lvl is None:
-            print("[%s] RC_UNJUDGEABLE: %s" % (now_str(), src), flush=True)
-            log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "UNJUDGEABLE", "note": src})
-            return RC_UNJUDGEABLE
+            lvl_fails += 1
+            if lvl_fails >= SESS_RETRY_MAX:
+                print("[%s] RC_UNJUDGEABLE: %s（连续 %d 次判级失败，退出）" % (now_str(), src, lvl_fails), flush=True)
+                log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "UNJUDGEABLE", "note": src})
+                return RC_UNJUDGEABLE
+            print("[%s] RC_UNJUDGEABLE_RETRY: %s（%d/%d，睡后重试）" % (now_str(), src, lvl_fails, SESS_RETRY_MAX), flush=True)
+            time.sleep(random.uniform(*SESS_RETRY_SLEEP))
+            continue
+        lvl_fails = 0
         log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "OK", "source": src,
                                       "met": lvl.get("met"), "pending": lvl.get("pending"), "items": lvl.get("items")})
         st["level"] = {"ts": now_str(), "met": lvl.get("met"), "pending": lvl.get("pending")}
@@ -426,6 +540,17 @@ def watch(args):
             print("[%s] 单段运行满 %.0fmin，休息 %.0fmin" % (now_str(), args.max_session_min, rest / 60), flush=True)
             time.sleep(rest)
             start = time.time()
+        # 用户前台保护：tab 可见即视为用户在看，绝不抢（宁停勿扰；fail-closed 起步）
+        front = tab_is_front(session)
+        skip, why = front_decision(front, front_none)
+        front_none = front_none + 1 if front is None else 0
+        front_true_cnt = front_true_cnt + 1 if front is True else 0
+        if front_true_cnt == 12:
+            print("[%s] ⚠ 前台连续 %d 次为 True——若持续请人工核查探测是否失真" % (now_str(), front_true_cnt), flush=True)
+        if skip:
+            print("[%s] %s，睡 5min" % (now_str(), why), flush=True)
+            time.sleep(300)
+            continue
         done, skipped = browse_batch(session, st, batch=args.batch)
         print("[%s] batch done=%d skipped=%d total_browsed=%d" % (now_str(), done, skipped, st.get("browsed_total", 0)), flush=True)
         if done == 0 and skipped == 0:
@@ -456,7 +581,7 @@ def main(argv=None):
                           "quiet_now": quiet_window_check()}, ensure_ascii=False, indent=1))
         return RC_OK
     session, note = pick_session(prefer=args.tab_id)
-    if not session:
+    if not session and args.cmd != "watch":
         print("RC_NO_SESSION: %s" % note)
         return RC_NO_SESSION
     st = load_state()
@@ -524,15 +649,32 @@ def selftest():
     finally:
         BRIDGE = old
     # T6 防检测参数齐全
-    for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP"):
+    for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):
         v = globals().get(name)
         if not v:
             fails.append("T6 %s 缺失" % name)
+    # T7 前台保护三态 + 断链重试常量边界
+    s, w = front_decision(True, 0)
+    if not s or "前台" not in w:
+        fails.append("T7 front True 未跳过: %s" % w)
+    s2, _ = front_decision(False, 0)
+    if s2:
+        fails.append("T7 front False 不应跳过")
+    s3, _ = front_decision(None, 0)
+    if not s3:
+        fails.append("T7 None 容忍内应 fail-closed 跳过")
+    s4, _ = front_decision(None, FRONT_NONE_TOLERANCE)
+    if s4:
+        fails.append("T7 None 达容忍上限应放行(fail-open)")
+    if not (SESS_RETRY_MAX >= 2 and 0 < SESS_RETRY_SLEEP[0] < SESS_RETRY_SLEEP[1]):
+        fails.append("T7n SESS_RETRY 常量边界错")
+    if not ("hasFocus" in FRONT_JS and "visibilityState" in FRONT_JS and "JSON.stringify" in FRONT_JS):
+        fails.append("T7n FRONT_JS 形状缺关键 token")
     if fails:
         for f in fails:
             print("FAIL " + f)
         return RC_SELFTEST
-    print("selftest 6/6 PASS")
+    print("selftest 7/7 PASS")
     return RC_OK
 
 

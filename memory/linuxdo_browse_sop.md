@@ -65,3 +65,10 @@ return JSON.stringify({fail:true,now:location.pathname});
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
 - 防检测（后台版在单任务版之上再拉稀）：帖间 90–240s（25% 概率 240–420s）+ 深翻步数随机 + 每批随机 2–4 次只逛列表页不进帖 + `--daily-cap` 每日话题上限 + 单段 90min 后休息 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
+
+## 反检测审查强化（2026-10-05）
+
+- **深浅分层**：真人不是每帖都读到底。daemon `browse_one` 已内置 `LIGHT_P=0.30` 浅读分支（快滚 4–6 屏、步速 0.25–0.5s、驻留 15–30s、不回滚），其余 70% 沿用深读慢滚+底驻；`browse_log.jsonl` 每行带 `mode=LIGHT/DEEP` 字段。
+- **判读口径**：浅读帖照样计入浏览话题数（主指标不受损），但 posts_read（楼数）偏少——这是预期行为不是漏报，勿当故障修。
+- **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
+- 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
