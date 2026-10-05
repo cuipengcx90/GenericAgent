@@ -31,6 +31,8 @@
 
 ## 已建定时监测
 `../sche_tasks/linuxdo_trust_level_check.json`：每天09:30检查一次，**已符合则完全静默不通知**；不符合才私信列出具体哪几项+当前值/门槛值+差距，且仅提醒不代操作(不自动发帖/点赞)。检查用新开独立tab(不覆盖用户已有tab)，用完关闭不留痕。
+**★固定时刻风险与改造建议(2026-10-05 实测)**：scheduler(`reflect/scheduler.py:140-149`)**到点即跑、无任何随机**（该任务的 `max_delay_hours: 6` 语义=「超过 09:30+6h 就 SKIP」的过期窗口，**不是**随机延迟）⇒ 机器开机时每天约 **09:30 准点**命中一次，构成固定节奏特征。而 `tools/linuxdo_browse_daemon.py` 长驻守护**每日已顺带读等级卡**（`temp/linuxdo_browse_daemon/level_log.jsonl`，2026-10-05 实测有 07:32/09:36/09:45/09:50/11:43 等条）⇒ 本 sche_tasks 任务与之**冗余**。建议（待用户批准）：停用本任务、等级判读交 daemon；若保留兜底则降频（如每 3 天）并接受准点特征。通则见 `memory/anti_detection_sop.md`。
+
 
 ## ⚠️ connect.linux.do 被 Cloudflare 卡死时的备用检查入口(2026-09-21 实测)
 现象：`connect.linux.do` 顶层导航必定停在 CF managed challenge(title「请稍候…」，hidden `cf-turnstile-response` 恒为空)。
