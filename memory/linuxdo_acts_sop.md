@@ -93,7 +93,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - 点赞：读帖后有 `SKIP_AFTER_READ` 犹豫分支（不一定点），避免「见帖必赞」的机器特征。
 - 发帖：先 `preface_` 闲逛几帖（禁「进站即发」），写作过程中有分段停顿再提交。
 - 睡眠出口唯一：`_sleep()`，受 `LJQ_HUMANIZE_MAX_SLEEP`（默认 90s）截断 ⇒ 长休**永不挂住守护**；`dry` 或 `LJQ_HUMANIZE_OFF=1` 时一律不睡（自测/预览零等待）。
-- 页面级合成事件（`PAGE_EVENTS_JS` = 真滚动 + 滚轮 + 同级读焦点 `mousemove` + 合成 `keydown`）**默认关闭**：CDP 注入事件 `isTrusted=false`，对校验信任位的采集端无效、还会凭空多出可疑事件。仅当显式 `--page-events`（或 `LJQ_PAGE_EVENTS_ON=1`）才注入，属自担风险的弱信号补强；四个动作均已接线（源码级 + 桩 `run_js` 行为级双证据）。
+- 页面级合成事件（`PAGE_EVENTS_JS` = 真滚动 + 滚轮 + 同级读焦点 `mousemove` + 合成 `keydown`）**已写死关闭**（`PAGE_EVENTS_ENABLED = False`，源码常量，2026-10-05 用户裁决）：JS 注入事件 `isTrusted=false`，对校验信任位的采集端无效、还会凭空多出可疑事件；`--page-events` / `LJQ_PAGE_EVENTS_ON` 保留为兼容参数但**已失效**（负控 T50c：置 env=1 也打不开）。若将来要做「可信输入」，唯一可行路径是 **CDP `Input.dispatchMouseEvent`**（实测 `isTrusted=true`，见 `temp/ljq_cdptest/FINDING_cdp_input.md`），但那属另一层实现，不在 `--page-events` 里。
 - 业界对照与缺口清单见 `temp/ljq_anti_detection_survey.md`（TLS/浏览器指纹/IP 声誉由「走真实 Chrome + 家宽」天然覆盖）。
 
 ## 八、自测与验收
@@ -110,7 +110,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 1. **自测写生产状态**：`linuxdo_browse_daemon.py --selftest` 曾把生产 `state.json` 覆盖成仅 `rest_days`（66B）⇒ 守护 `KeyError: 'daily'` 无声退出，表象像「站点封号」。修法：`_selftest_impl` 走 tempfile 沙箱 + 断言自测前后生产 state 指纹逐字相同。
 2. **等级检查后不自还原标签页**：把唯一 linux.do 标签导航到 connect 后不返回 ⇒ 下一轮 daemon 无供应、`done=0`，曾被误判为 CF 封禁。修法：读完 connect 立刻 `location.href='https://linux.do/'` + 等 6s。
 3. **探针/监控与主账号同身份**：本案（anyrouter）探针 key = 用户 Pi 同一账号 key，3 天 1244 发全记主账号。**监控动作必须独立身份**（见 `anti_detection_sop.md`）。
-4. **合成事件当成真人事件**：CDP 注入的 `mousemove/keydown` 带 `isTrusted=false`，采集端一行即可辨认 ⇒ 注入不是「更像人」而是「多一个可疑信号」。默认关，仅在明确知情时开启（`--page-events`）。
+4. **合成事件当成真人事件 / 开关本身是坏设计**：JS 注入的 `mousemove/keydown` 带 `isTrusted=false`，采集端一行即可辨认 ⇒ 注入不是「更像人」而是「多一个可疑信号」。**2026-10-05 用户裁决：写死关**（`PAGE_EVENTS_ENABLED = False` 源码常量），`--page-events` 与 `LJQ_PAGE_EVENTS_ON` 保留但已失效（负控：置 env=1 也打不开）。★教训=「默认关 + 开关」等于把风险留给未来的自己，凡是己方认定不该开的能力，直接删掉开关而不是留后门。
 5. **固定节奏**：10-04 0–13 点恒定 300s 一轮，随机化滞后 1.5 天 ⇒ 封号后补的随机化属「事后」，规范要求**从第一版起**就随机。
 
 ## 尾注

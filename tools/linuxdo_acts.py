@@ -54,11 +54,12 @@ BASE = os.path.join(GA_ROOT, "temp", "linuxdo_acts")
 # 拟人停留上限：单次睡眠不得超过该值（防长休把守护/CI 挂住；env 可调）
 HUMANIZE_MAX_SLEEP = float(os.environ.get("LJQ_HUMANIZE_MAX_SLEEP") or 90.0)
 HUMANIZE_OFF = os.environ.get("LJQ_HUMANIZE_OFF") == "1"
-# 页面级合成事件开关：**默认关**。原因=CDP 注入事件 isTrusted=false，
-# 对校验信任位的采集端无效、且凭空多出可疑事件；仅在显式 --page-events /
-# LJQ_PAGE_EVENTS_ON=1 时启用（弱信号补强，需自担风险）。
-PAGE_EVENTS_ON = os.environ.get("LJQ_PAGE_EVENTS_ON", "").strip().lower() not in (
-    "", "0", "false", "no")
+# 页面级合成事件：**写死关闭**（2026-10-05 用户裁决「关吧，就默认关吧」）。
+# 原因=JS 合成事件 isTrusted=false，任何采集端一行即可辨认，注入不是「更像人」
+# 而是「多一个可疑信号」。env LJQ_PAGE_EVENTS_ON / --page-events 保留但已失效
+# （只做兼容与留痕，不再有能打开它的通路）。真可信输入须走 CDP Input.*（见
+# temp/ljq_cdptest/FINDINGS.md 实测：isTrusted=true），与本节无关。
+PAGE_EVENTS_ENABLED = False
 
 
 def _sleep(sec, log=None, tag="", dry=False):
@@ -121,7 +122,7 @@ def page_events(session, kind, n_chars=0, log=None, dry=False, tag=""):
     """在真实页面派发「滚动 + 合成键鼠事件」——fetch 直调不会产生任何 UI 事件，
     这是拟人层的**弱信号补强**（真实滚动会改变视口；键鼠是 isTrusted=false 的合成事件）。
     best-effort：任何异常都不影响动作本身。返回 {events, scrollY} 或 None。"""
-    if not PAGE_EVENTS_ON or dry or HUMANIZE_OFF or hu is None or not session:
+    if not PAGE_EVENTS_ENABLED or dry or HUMANIZE_OFF or hu is None or not session:
         return None
     try:
         dwell = (hu.pose(kind, n_chars or 800) or {}).get("read_dwell") or 0.0
@@ -1001,7 +1002,7 @@ def _selftest_impl(tmpdir):
         all(t in PAGE_EVENTS_JS for t in ("scrollTo", "mousemove", "KeyboardEvent",
                                           "__STEPS__", "__MOVES__", "__KEYS__")))
     _hu2 = globals().get("hu")
-    _pe_on = globals().get("PAGE_EVENTS_ON")
+    _pe_on = globals().get("PAGE_EVENTS_ENABLED")
     try:
         calls = []
 
@@ -1011,11 +1012,22 @@ def _selftest_impl(tmpdir):
         _real_run = globals()["bd"].run_js
         globals()["bd"].run_js = lambda sid, code, timeout=30: (
             calls.append(code), {"ok": True, "events": 7})[1]
-        # 默认关（负控）：未显式开启时绝不注入
-        globals()["PAGE_EVENTS_ON"] = False
-        chk("T50c 默认关(未开启时不注入页面事件)",
-            page_events(_Sess(id="t"), "like", 1200, log=None) is None and not calls)
-        globals()["PAGE_EVENTS_ON"] = True
+        # 写死关（负控）：生产常量恒 False，且 env 也无力打开
+        chk("T50c 写死关(生产常量 False 且不注入)",
+            globals()["PAGE_EVENTS_ENABLED"] is False and not os.environ.get("LJQ_PAGE_EVENTS_ON")
+            and page_events(_Sess(id="t"), "like", 1200, log=None) is None and not calls)
+        _oe = os.environ.get("LJQ_PAGE_EVENTS_ON")
+        os.environ["LJQ_PAGE_EVENTS_ON"] = "1"
+        try:
+            chk("T50e 负控(env 置 1 也打不开页面事件)",
+                globals()["PAGE_EVENTS_ENABLED"] is False and not calls
+                and page_events(_Sess(id="t"), "like", 1200, log=None) is None)
+        finally:
+            if _oe is None:
+                os.environ.pop("LJQ_PAGE_EVENTS_ON", None)
+            else:
+                os.environ["LJQ_PAGE_EVENTS_ON"] = _oe
+        globals()["PAGE_EVENTS_ENABLED"] = True
         pe = page_events(_Sess(id="t"), "like", 1200, log=None)
         chk("T49 开启后非 dry 真发且回读计数",
             bool(calls) and pe and pe.get("events") == 7
@@ -1033,11 +1045,12 @@ def _selftest_impl(tmpdir):
     finally:
         globals()["bd"].run_js = _real_run
         globals()["hu"] = _hu2
-        globals()["PAGE_EVENTS_ON"] = _pe_on
+        globals()["PAGE_EVENTS_ENABLED"] = _pe_on
     src2 = open(os.path.abspath(__file__), "r", encoding="utf-8").read()
-    chk("T50d CLI 有 --page-events 且默认关语义写明",
-        "--page-events" in src2 and 'LJQ_PAGE_EVENTS_ON' in src2
-        and "PAGE_EVENTS_ON = os.environ" in src2)
+    _old_tok = "PAGE_EVENTS" + "_ON = os.environ"   # 拼接构造：避免断言自身构成命中
+    chk("T50d CLI 有 --page-events 且写死关语义写明",
+        "--page-events" in src2 and "PAGE_EVENTS_ENABLED = False" in src2
+        and _old_tok not in src2)
 
     passed = sum(1 for _, c in checks if c)
     print("selftest %d/%d PASS" % (passed, len(checks)))
@@ -1110,10 +1123,12 @@ def main(argv=None):
     ap.add_argument("--apply", action="store_true", help="真正发送（默认 dry-run）")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--page-events", action="store_true", dest="page_events",
-                    help="启用页面级合成事件注入（默认关；isTrusted=false，收益有限）")
+                    help="[已废弃/空转] 页面级合成事件写死关闭（isTrusted=false 反成可疑信号）")
     a = ap.parse_args(argv)
     if getattr(a, "page_events", False):
-        globals()["PAGE_EVENTS_ON"] = True
+        print("[deprecated] --page-events 已写死关闭，本次调用不注入任何页面事件；"
+              "需要可信输入请用 CDP Input.*（见 temp/ljq_cdptest/FINDINGS.md）",
+              file=sys.stderr)
 
     if a.selftest:
         return selftest()
