@@ -121,7 +121,8 @@ CF 类故障的"已试手段+根因+备用入口"应写进当日执行报告(如
 - **症状**：守护长驻后每批 `batch done=0`（日志 `RC_NO_SESSION_RETRY` / `batch done=0`），等级卡数值不动。
 - **根因（守护自身）**：`check_level()` 把 `pick_session` 选中的标签**导航到 connect.linux.do** 读等级、读完不还原；而 `watch` 每轮开头与每批结束都调 `check_level` ⇒ 每轮把唯一的 linux.do 标签变成 connect 页 ⇒ 下一轮 `pick_session`（要求 url 含 `linux.do` 且不含 `//connect.`）再也选不到标签 = 自毁供应。旁证：窗口一度出现 3 个 connect.linux.do 标签（AppleScript 独立核验），自建标签被逐轮吞掉；当时的 `/latest.json` 403/404 也是此因（标签已在 connect 子域，Discourse 环境/CSRF 不对），**不是 CF 封禁 JSON 端点**。
 - **修法**（`tools/linuxdo_browse_daemon.py`）：connect 读取成功后先 `run_js` 还原 `location.href='https://linux.do/'` + `sleep 6` 再 return。备份 `temp/ldo_daemon_backup_20261005_094920.py`（md5 `5fc0e9fcff72cb34ba8174230e846949`）。
-- **实证**：重启守护后 `browse_log.jsonl` 连出 `DONE`（09:53:36 id 2982690 DEEP / 09:57:38 id 2983258 …），节奏 ≈4 min/帖。
+- **实证**：重启守护后 `browse_log.jsonl` 连出 `DONE`（09:53:36 id 2982690 DEEP / 09:57:38 id 2983258 / 10:03:14 id 2983628 …），节奏 ≈4 min/帖。
+- **★核验配方（判「浏览是否真入账」勿只看卡片）**：在 linux.do 标签内同源 `fetch('/t/<id>.json')` 读 `last_read_post_number` ⇔ 楼层数；2026-10-05 实测 2982661 7/7、2982690 16/16、2983258 9/9、2983085 1/1 全读满 ⇒ 服务端确已入账（Discourse 只记 `POST /topics/timings` 上报过的楼层）。等级卡数值有服务端结算滞后，短时不动 ≠ 无效。完整记录见 `temp/ldo_browse_tabfix_20261005.md`。
 - **运维要点**：
   - 长驻依赖**一个后台（非活动）的普通 linux.do 标签**。建标签用 AppleScript `make new tab at end of tabs of w with properties {URL:"https://linux.do/latest"}`（**必须带容器 `of w`**，缺则报 `-1728`）；**不要用 `open location`**（会把标签变前台 visible，被前台保护跳过），建完也不要切 active。
   - 判活只看两处：`temp/linuxdo_browse_daemon/browse_log.jsonl` 新增 `DONE` 行 + `state.json` 的 `daily/browsed_total` 增长。**`temp/bg_task/logs/ldo_watch.log` 常为 0 字节**（`bg_task start` 会截断，脚本按批才写）⇒ 空日志 ≠ 没在跑。
