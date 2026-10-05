@@ -58,6 +58,47 @@ BODY_MIN, BODY_MAX = 180, 1200
 
 
 # ---------------------------------------------------------------- 素材
+def browse_inspiration(log_path=None, limit=12, max_age_h=72.0):
+    """从浏览台账取「最近社区在聊什么」→ 注入选题 prompt 的灵感段（只读、零站点）。
+
+    返回 (文本, 条数)；台账不存在/读不到一律返回 ("", 0) ⇒ forge 照常跑（灵感只是加分项）。
+    """
+    try:
+        import linuxdo_prefs as P                 # type: ignore
+    except Exception:
+        return "", 0
+    browse_log = log_path or getattr(P, "BROWSE_LOG_DEFAULT", None)
+    if not browse_log or not os.path.exists(browse_log):
+        return "", 0
+    try:
+        rows = P.read_browse_titles(browse_log, limit=int(limit), max_age_h=max_age_h)
+    except Exception:
+        return "", 0
+    items = []
+    for r in rows or []:
+        t = (r.get("title") or "").strip()
+        if len(t) < 6:
+            continue
+        cat = str(r.get("cat") if r.get("cat") is not None else "").strip()
+        items.append("· %s%s" % (t, ("（%s）" % cat) if cat else ""))
+    if not items:
+        return "", 0
+    txt = ("社区最近在聊（只是气口参考，别抄标题、别硬蹭）：\n"
+           + "\n".join(items) + "\n")
+    return txt, len(items)
+
+
+def _draft_prov(path):
+    """读草稿文件里的 provenance（自测用；路径为空/不可读返回 {}）。"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("provenance") or {}
+    except Exception:
+        return {}
+
+
 def pick_material(paths=None, exclude_ids=(), rng=None, now=None):
     """挑一条真实素材 → {path, text, sha, mtime}；找不到返回 None。"""
     rng = rng or random
@@ -129,11 +170,12 @@ TOPIC_PROMPT = """你是 linux.do 社区的一个普通用户（不是客服、�
 下面是我最近折腾过的一段真实记录（节选）：
 
 {material}
-
+{inspire}
 请想出 **3 个**适合发帖分享的角度，要求：
 - 每个角度都真的来自上面这段记录，不许编造任何未出现的经历、数字或结论；
 - 是「踩坑/复盘/对比/顺手发现」这类社区爱看的小切口，不要教程腔、不要大而全；
 - 标题口语化、有信息量，不超过 {tmax} 字，不要用「浅谈/详解/指南/一站式」这类词。
+- 若下面给了「社区最近在聊」，可以顺着这个气口选切口，但**不是抄别人的帖子**，内容仍必须来自上面那段记录；蹭不上就别硬蹭。
 
 只输出 JSON 数组，形如
 [{{"title": "...", "angle": "...", "quote": "原文里最能撑住这个角度的一句"}}]
@@ -321,7 +363,7 @@ def _notify(text):
 # ---------------------------------------------------------------- 主流程
 def forge(material_path=None, dry_run=False, draft_dir=DRAFT_DIR, ledger=LEDGER,
           gen=None, notify=False, max_per_day=MAX_PER_DAY, rng=None, now=None,
-          category=CATEGORY_DEFAULT, tags=None):
+          category=CATEGORY_DEFAULT, tags=None, inspire=True, inspire_log=None):
     """锻造一条草稿。返回 dict（ok/why/draft_path/title/score...）。"""
     gen = gen or _codex_gen
     rng = rng or random
@@ -346,8 +388,10 @@ def forge(material_path=None, dry_run=False, draft_dir=DRAFT_DIR, ledger=LEDGER,
         return {"ok": False, "why": "NO_MATERIAL"}
 
     excerpt = material_excerpt(mat["text"])
+    ins_txt, ins_n = browse_inspiration(inspire_log) if inspire else ("", 0)
     topics = parse_topics(gen(TOPIC_PROMPT.format(material=excerpt,
-                                                  tmax=TITLE_MAX))[0])
+                                                  tmax=TITLE_MAX,
+                                                  inspire=ins_txt))[0])
     if not topics:
         append_ledger({"ok": False, "why": "NO_TOPIC", "day": day,
                        "material_sha": mat["sha"], "material": mat["path"]}, ledger)
@@ -395,6 +439,7 @@ def forge(material_path=None, dry_run=False, draft_dir=DRAFT_DIR, ledger=LEDGER,
 
     prov = {"material": mat["path"], "material_sha": mat["sha"],
             "material_reused": reused,
+            "inspire_n": ins_n,
             "quote": picked.get("quote", "")[:200], "generator": "codex",
             "deai_score": gate.get("score")}
     res = {"ok": True, "title": picked["title"], "body": body,
@@ -524,6 +569,58 @@ def selftest():
         ck(_similar("试了三次才把超时调对", "试了三次才把超时调整对") , "T18 相似度正控")
         ck(not _similar("抓取超时", "前端样式重构"), "T19 相似度负控")
 
+        # 灵感源（浏览台账 → 选题 prompt）
+        bpath = os.path.join(td, "browse_log.jsonl")
+        with open(bpath, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"st": "DONE", "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "title": "折腾了一晚上终于把开机自启弄干净了", "cat": "develop"},
+                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"st": "OPEN", "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "title": "这条不算因为状态不是完成态啊啊", "cat": "develop"},
+                               ensure_ascii=False) + "\n")
+            f.write(json.dumps({"st": "DONE", "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "title": "太短", "cat": "develop"}, ensure_ascii=False) + "\n")
+        txt, n = browse_inspiration(log_path=bpath, limit=12, max_age_h=72)
+        ck(n == 1 and "开机自启" in txt, "T21 灵感段只收完成态长标题 (%d)" % n)
+        ck("这条不算" not in txt and "太短" not in txt, "T22 负控：未完成/过短标题不入灵感")
+        ck(browse_inspiration(log_path=os.path.join(td, "nope.jsonl")) == ("", 0),
+           "T23 负控：台账缺失时静默空串（不炸）")
+
+        # 灵感注入：浏览台账 → 选题 prompt（sentinel 断言，不绑模板字面量）
+        seen = []
+        g3 = _fake_gen({"bodies": [human_body]})
+
+        def gw(prompt, _g=g3, _s=seen):
+            if "请想出" in prompt:
+                _s.append(prompt)
+            return _g(prompt)
+
+        r8 = forge(material_path=mat, draft_dir=os.path.join(td, "d3"),
+                   ledger=os.path.join(td, "l3.jsonl"), gen=gw,
+                   inspire=True, inspire_log=bpath, rng=random.Random(3))
+        ck(r8.get("ok") and seen and "开机自启" in seen[-1],
+           "T24 inspire=True 时灵感送进选题 prompt")
+        ck(r8.get("ok") and _draft_prov(r8.get("draft_path")).get("inspire_n") == 1,
+           "T25 provenance 记录 inspire_n=1")
+
+        seen2 = []
+        g4 = _fake_gen({"bodies": [human_body]})
+
+        def gw2(prompt, _g=g4, _s=seen2):
+            if "请想出" in prompt:
+                _s.append(prompt)
+            return _g(prompt)
+
+        r9 = forge(material_path=mat, draft_dir=os.path.join(td, "d4"),
+                   ledger=os.path.join(td, "l4b.jsonl"), gen=gw2,
+                   inspire=False, inspire_log=bpath, rng=random.Random(4))
+        ck(r9.get("ok") and seen2 and "开机自启" not in seen2[-1],
+           "T26 inspire=False 时灵感不入 prompt")
+        ck(_draft_prov(r9.get("draft_path")).get("inspire_n") == 0,
+           "T27 provenance 记录 inspire_n=0")
+
+
+
         # 生产状态零写入自证：所有路径都在沙箱
         ck(not os.path.exists(DRAFT_DIR) or True, "T20 生产草稿目录未被自测触碰")
 
@@ -544,6 +641,8 @@ def main(argv=None):
     ap.add_argument("--max-per-day", type=int, default=MAX_PER_DAY)
     ap.add_argument("--notify", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-inspire", action="store_true",
+                    help="不注入「社区最近在聊」灵感段（默认注入，只读本地浏览台账）")
     args = ap.parse_args(argv)
 
     if args.cmd == "selftest":
@@ -558,6 +657,7 @@ def main(argv=None):
     m = args.material[0] if args.material else None
     r = forge(material_path=m, dry_run=args.dry_run, notify=args.notify,
               max_per_day=args.max_per_day, category=args.category,
+              inspire=not args.no_inspire,
               tags=[t.strip() for t in args.tags.split(",") if t.strip()])
     print(json.dumps(r, ensure_ascii=False, indent=2))
     return 0 if r.get("ok") else 1

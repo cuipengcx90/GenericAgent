@@ -182,6 +182,21 @@ python3 tools/linuxdo_post_forge.py forge --notify           # 落草稿 + 私�
 - 「等级检测 → 缺项路由 → 五动作」链条不变（§一/§四）；本节只补「**produce 一份人味草稿**」这一环。
 - 锻造是**低频**行为（日级冷却）⇒ 仍满足「任何自动化流量禁固定时刻 + 固定间隔」的铁律：锻造时刻由 daemon 的随机段决定，没有独立定时任务。
 
+### 11.6 选题灵感来源：浏览过的帖子（2026-10-06 新增）
+
+- **实现**：`browse_inspiration()`（`tools/linuxdo_post_forge.py`）复用对象偏好模块的 `read_browse_titles()`，从**浏览台账**（默认路径 `temp/linuxdo_browse_daemon/browse_log.jsonl` = `linuxdo_prefs.BROWSE_LOG_DEFAULT`，勿与旧名混写）取最近 **72h 内浏览过的帖子标题（≤12 条）**，作为 `{inspire}` 段注入选题 prompt（`TOPIC_PROMPT`）。
+- **零站点**：只读本地 jsonl，不发任何请求；台账缺失/不可读一律 `("", 0)` 且 forge 照常跑（灵感只是加分项，绝不因它失败）。
+- **★边界（防洗稿）**：浏览标题**只作气口/切口参考，不作素材本体**——正文仍必须来自真实素材正文（`provenance.material` + `material_sha` 不变），prompt 里已明文写「可以顺着这个气口选切口，但不是抄别人的帖子，内容仍必须来自上面那段记录；蹭不上就别硬蹭」。
+- **可追溯**：草稿 `provenance` 新增 `inspire_n`（当次注入的灵感条数；0 = 未用灵感），与 `material_reused` 并列。`--no-inspire` 可关，默认开。
+- **实测（2026-10-06）**：读真台账得 12 条（形如「测了下重置后日区 pro 的额度（20）」）；`selftest` **28 checks / 0 failed**（T21–T27 用 sentinel 探针断言「灵感段只在 inspire=True 时入 prompt」+ 读草稿文件断言 `inspire_n` 1/0）。
+
+### 11.7 回访自己帖（revisit）的接线口径（2026-10-06 定案）
+
+- **能力已存在**：`tools/linuxdo_acts.py act_revisit()` 回访自己发过的帖、只读**新楼层**（进度记 `state.revisit[str(tid)].last_num`，幂等；`revisit_due()` 守最小间隔），默认 dry-run，`--apply` 才真动。
+- **触发面与五动作一致**：①提示词临时触发（`python3 tools/linuxdo_acts.py revisit --max 1`）；②daemon 随机段内消费。**不新增任何独立定时任务**（守 §一「禁定点唤醒」铁律）。
+- **不做无条件周期回访**：不给 daemon 加「每隔 N 小时必回访一次」的循环——那等于给站点制造新的规律流量。**发帖后也不会自动标记回访**（`act_post()` 不写 `revisit.last_ts`，避免「一发帖就必然产生一批回访流量」这种可预测耦合）；想回访时显式 `python3 tools/linuxdo_acts.py revisit --max 1 --now --apply`（`--now` 把 `revisit.last_ts` 置 0 以越过 6h 最小间隔），否则就等下次有需要时再读。
+- 结论：revisit 属「有需要才用」的备用动作，不进入等级缺项路由（等级指标不含回访），不改变 §一 的分流表。
+
 ## 尾注
 - 站点侧浏览器操作细则（标签页/CF/登录态）见 `memory/linuxdo_browse_sop.md`、`memory/linuxdo_reply_sop.md`、`memory/linuxdo_trust_level_sop.md`。
 - 对外分享镜像（更新 2026-10-05）：OB 知识库已建页 `60 Wiki/topics/linuxdo-anti-detection-system.md`（结构化条目，mature），方案全文备份在 `30 Areas/research/linuxdo/2026-10-05 linux.do 全动作防检测体系（方案全文）.md`；vault 提交 `5efb5e2`（vault=`~/develop/obsidian-note`，无远端只本地 commit）。改本 SOP 涉及的机制/参数后，须同批回填该 OB 页与全文备份，避免两处口径漂移。

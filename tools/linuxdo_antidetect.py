@@ -310,10 +310,12 @@ def next_wait(st, now_ts, kind, done_today=0, rng=None):
         s2 = day_segments(nd, kind)
         return max(60.0, s2[0]["start"] - now_ts + rng.uniform(0, 900)), "wait_next_day_first_segment"
     if why == "quiet_window":
+        # quiet = (静默起-时, 静默起-分, 静默止-时, 静默止-分) —— 与 quiet_now() 同口径。
+        # ★2026-10-06 修：原实现把 4 元组当 2 元组解包 ⇒ 凌晨真跑必 ValueError（见 selftest T23b 负控）。
         p = profile(kind)
-        qa, qb = p["quiet"] if p.get("quiet", (0, 0, 0, 0))[0] else (0, 0)
+        _qh, _qm, eh, em = p["quiet"]
         nowdt = dt.datetime.fromtimestamp(now_ts)
-        end = nowdt.replace(hour=int(qb), minute=0, second=0, microsecond=0)
+        end = nowdt.replace(hour=int(eh), minute=int(em), second=0, microsecond=0)
         if end <= nowdt:
             end += dt.timedelta(days=1)
         return max(60.0, (end - nowdt).total_seconds() + rng.uniform(0, 1800)), "wait_quiet_end"
@@ -538,6 +540,13 @@ def _selftest():
     st8 = {"cap": {}, "rest": {"browse": {_day_of(now): True}}, "jitter": {}}
     w3, why3 = next_wait(st8, now, "browse", 0)
     chk("T21c next_wait 休息日仍给正等待", w3 > 0)
+    # T21d/T21e 静默窗分支（regression：quiet 4 元组曾被按 2 元组解包 ⇒ 01:00-07:30 调用即崩）
+    tq = _ts("2026-10-06", 3.0)   # 03:00 ∈ quiet(01:00-07:30)
+    tq2 = _ts("2026-10-06", 8.0)  # 08:00 ∉ quiet
+    wq, whyq = next_wait(st7, tq, "browse", 0)
+    chk("T21d 静默窗内给正等待", wq > 0 and whyq == "wait_quiet_end")
+    chk("T21e 静默窗右边界外不走该分支",
+        quiet_now(dt.datetime(2026, 10, 6, 8, 0), "browse") is False)
     # T22 负控：next_wait 不得返回非数/零（模拟坏 profile）
     bad_w = -1.0
     chk("T22 负控(零/负等待可被抓)", not (bad_w > 0))

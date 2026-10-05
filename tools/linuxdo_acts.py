@@ -45,6 +45,10 @@ if GA_ROOT not in sys.path:
 
 import linuxdo_antidetect as ad          # noqa: E402  统一随机化内核
 import linuxdo_browse_daemon as bd       # noqa: E402  桥接 / 会话 / 风控 / 通知
+try:
+    import linuxdo_prefs as pf            # noqa: E402  对象偏好（板块兴趣/作者关系）
+except Exception:                          # pragma: no cover  缺件不阻塞动作
+    pf = None
 try:                                     # noqa: E402
     import linuxdo_humanize as hu        # 拟人层（动手前后干什么）
 except Exception:                        # pragma: no cover
@@ -229,6 +233,7 @@ def load_state(path=None):
     st.setdefault("rest", {})            # 内核：rest[kind][day]
     st.setdefault("jitter", {})          # 内核：jitter[kind][day]
     st.setdefault("post_history", [])    # 发帖历史 [{ts, id, title}]
+    st.setdefault("revisit", {})         # 回访进度 {"last_ts":…, "<tid>": {"last_num":…}}
     st.setdefault("risk", {})            # risk[kind][day_count]
     st.setdefault("risk_log", [])
     st.setdefault("pause_until", 0.0)
@@ -563,9 +568,68 @@ def fetch_candidates(session, pages=3):
     return out
 
 
+SELF_USER = None       # 本账号用户名（首次读到即缓存；用于过滤自己楼层）
+_PREFS_CACHE = {}      # 进程内偏好模型缓存（每次动作取一次即可）
+
+
+def fetch_self_user(session):
+    """探本账号用户名（用于过滤自己的楼层）；失败返回 None，绝不阻塞动作。"""
+    global SELF_USER
+    if SELF_USER:
+        return SELF_USER
+    js = ("(async()=>{try{const r=await fetch('/session/current.json',"
+          "{credentials:'include',cache:'no-store'});const j=await r.json();"
+          "return JSON.stringify({u:(j&&j.current_user&&j.current_user.username)||null});}"
+          "}catch(e){return JSON.stringify({u:null});}})()")
+    try:
+        res = bd.run_js(session["id"], js, timeout=25)
+        u = (res or {}).get("u") if isinstance(res, dict) else None
+        if u:
+            SELF_USER = str(u)
+    except Exception:
+        pass
+    return SELF_USER
+
+
+def prefs_model(now=None):
+    """取偏好模型；缺件/异常返回 None（动作照跑，只少一层加权）。"""
+    if not pf:
+        return None
+    try:
+        return pf.load_model(now=now)
+    except Exception:
+        return None
+
+
+def prefs_rank_topics(cands, model, want, action="reply"):
+    """按偏好给候选话题加权排序；缺模型/异常按原序返回（fail-open）。"""
+    cands = [c for c in (cands or []) if isinstance(c, dict)]
+    if not want or not cands:
+        return []
+    if not pf or not model:
+        return [{"cand": c, "why": "no_model"} for c in cands[:want]]
+    try:
+        picks = pf.pick_topics(cands, model, action=action, n=want)
+        return [{"cand": c, "why": w} for c, w in picks]
+    except Exception:
+        return [{"cand": c, "why": "fallback"} for c in cands[:want]]
+
+
+def prefs_note_interaction(action, user=None, topic=None, post=None, cat=None,
+                           cat_label=None, model=None):
+    """把一次真实互动写进偏好台账；失败静默（偏好只是加分项，不得阻塞动作）。"""
+    if not pf:
+        return
+    try:
+        pf.record(action, user=user, topic=topic, post=post, cat=cat,
+                  cat_label=(cat_label or (pf.label_of(model, cat) if model else None)))
+    except Exception:
+        pass
+
+
 def pick_reply_targets(session, st, want=2):
-    """从最新帖里挑适合回的：有楼层、非自己、未回过、体量适中、偏技术/问答类。"""
-    got, skip = [], 0
+    """挑适合回的话题：未回过、非抽奖广告，再按偏好模型加权（板块兴趣/作者关系/同日去重）。"""
+    pool, skip = [], 0
     done = done_key_set(st, "reply")
     for t in fetch_candidates(session, pages=3):
         tid = str(t.get("id"))
@@ -575,11 +639,15 @@ def pick_reply_targets(session, st, want=2):
         title = t.get("title") or ""
         if re.search(r"(抽奖|拼车|广告|推广|出售|代购)", title):
             continue
-        got.append({"id": t.get("id"), "title": title, "posts": t.get("posts")})
-        if len(got) >= want * 3:
+        pool.append({"id": t.get("id"), "title": title, "posts": t.get("posts"),
+                     "cat": t.get("cat")})
+        if len(pool) >= want * 6:
             break
-    random.shuffle(got)
-    return got[:want], skip
+    random.shuffle(pool)
+    model = prefs_model()
+    ranked = prefs_rank_topics(pool, model, want, action="reply")
+    got = [dict(r["cand"], why=r["why"]) for r in ranked]
+    return got, skip
 
 
 # ------------------------------------------------------------------ 动作：回帖
@@ -628,7 +696,8 @@ def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=No
             continue
         _txt = "".join((p.get("text") or "") for p in (tinfo.get("posts") or []))
         item = {"topic": t["id"], "title": tinfo.get("title"), "text": vr,
-                "pose": humanize_pose("reply", len(_txt)), "read_chars": len(_txt)}
+                "pose": humanize_pose("reply", len(_txt)), "read_chars": len(_txt),
+                "pref_why": t.get("why")}
         if dry:
             item["status"] = "DRY_RUN"
             res["items"].append(item)
@@ -641,6 +710,11 @@ def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=No
         if ok2:
             mark_done(st, "reply", t["id"])
             cnt = bump(st, "reply")
+            _m = prefs_model()
+            _posts = tinfo.get("posts") or []
+            prefs_note_interaction("reply", user=(_posts[0].get("user") if _posts else None),
+                                   topic=t["id"], post=(r2 or {}).get("id"),
+                                   cat=(t.get("cat") or tinfo.get("cat")), model=_m)
             item.update({"status": "POSTED", "post_id": (r2 or {}).get("id"), "n_today": cnt})
             log("[reply] ✅ topic=%s post=%s %s" % (t["id"], (r2 or {}).get("id"), vr[:40]))
             item["wrap_s"] = humanize_wrap("reply", log=log)
@@ -699,10 +773,21 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
         if not cand_posts:
             res["items"].append({"topic": tid, "status": "NO_TARGET"})
             continue
-        # 点赞目标偏好：主楼之后的楼层（1-5 楼区间更像真人随手赞）
+        # 点赞目标偏好：先按「2-8 楼随手赞」缩小池子，再用偏好模型选作者（熟人/陌生人 + 同日去重）
         pool = [p for p in cand_posts if 2 <= int(p.get("num") or 1) <= 8] or cand_posts
-        target = random.choice(pool)
+        _m = prefs_model()
+        why = "no_model"
+        target = None
+        if pf and _m:
+            try:
+                target, why = pf.pick_floor(pool, _m, action="like",
+                                            self_user=fetch_self_user(session))
+            except Exception:
+                target, why = None, "fallback"
+        if target is None:
+            target, why = random.choice(pool), why
         item = {"topic": tid, "post": target.get("id"), "num": target.get("num"),
+                "user": target.get("user"), "pref_why": why,
                 "pose": pose, "read_dwell": (pose or {}).get("read_dwell")}
         if hu and hu.decision_skip("like"):          # 读了不赞 = 真人常态（不计入 cap）
             item["status"] = "SKIP_AFTER_READ"
@@ -720,6 +805,10 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
         if ok2:
             mark_done(st, "like", target["id"])
             cnt = bump(st, "like")
+            prefs_note_interaction("like", user=target.get("user"), topic=tid,
+                                   post=target.get("id"),
+                                   cat=(tinfo.get("cat") or tinfo.get("category_id")),
+                                   model=_m)
             item.update({"status": "LIKED", "n_today": cnt})
             log("[like] ✅ topic=%s post=%s" % (tid, target.get("id")))
             item["wrap_s"] = humanize_wrap("like", log=log)
@@ -735,6 +824,177 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
             gap = ad.gap_seconds("like")
             log("[like] 间隔 %.0fs" % gap)
             time.sleep(gap)
+    save_state(st)
+    return res
+
+
+# ------------------------------------------------------------------ 动作：回访自己的帖子
+REVISIT_MIN_GAP_S = 6 * 3600      # 同一轮回访之间的最小间隔（防「盯帖」：真人不会每几分钟回看一次）
+REVISIT_DAILY_MAX = 3             # 每天最多回访几个自己的帖（以只读为主，仍设上限）
+REVISIT_LIKE_P = 0.4             # 看到新回复时点赞的概率（真人不会条条都赞）
+
+
+def revisit_own_posts(st, limit=3):
+    """最近发过的自己的帖（state.post_history 优先，回落 prefs.own_posts）。只读。"""
+    out, seen = [], set()
+    for h in reversed((st.get("post_history") or [])[-10:]):
+        tid = h.get("id")
+        if tid and str(tid) not in seen:
+            seen.add(str(tid)); out.append({"id": int(tid), "title": h.get("title")})
+    if len(out) < limit and pf:
+        try:
+            for it in reversed(list(pf.own_posts() or [])[-10:]):
+                tid = it.get("id")
+                if tid and str(tid) not in seen:
+                    seen.add(str(tid)); out.append({"id": int(tid), "title": it.get("title")})
+        except Exception:
+            pass
+    return out[:limit]
+
+
+def revisit_new_posts(tinfo, last_num, self_user=None):
+    """挑出「比我上次看到的新回复」：合并 posts/latest 两窗口→去重→剔自己→按楼层升序。"""
+    pool = list(tinfo.get("posts") or []) + list(tinfo.get("latest") or [])
+    mx = max([int(x.get("num") or 0) for x in pool] or [0])
+    out, seen = [], set()
+    for x in pool:
+        num = int(x.get("num") or 0)
+        if num <= int(last_num or 0):
+            continue
+        pid = x.get("id")
+        if pid in seen:
+            continue
+        if self_user and str(x.get("user")) == str(self_user):
+            continue
+        seen.add(pid); out.append(x)
+    out.sort(key=lambda x: int(x.get("num") or 0))
+    return out, mx
+
+
+def revisit_due(st, now=None, min_gap_s=REVISIT_MIN_GAP_S):
+    """回访是否到期：无固定时刻（由 daemon 随机段/提示词决定），只在最近没做过时放行。"""
+    now = now or time.time()
+    rv = st.get("revisit") or {}
+    last = float(rv.get("last_ts") or 0)
+    if last and now - last < min_gap_s:
+        return False, "too_soon(%.1fh)" % ((now - last) / 3600.0)
+    if int(rv.get("n_day_%s" % bd.today()) or 0) >= REVISIT_DAILY_MAX:
+        return False, "daily_max"
+    return True, "ok"
+
+
+def act_revisit(st, session, max_n=1, apply_=False, dry_run=None, topic_id=None,
+                like_prob=REVISIT_LIKE_P, log=print):
+    """回访自己发过的帖：读新回复（**不自动回帖**，回复仍由等级路由/提示词决定），
+    并按概率给其中一条新回复点赞（真人形态：看一眼、偶尔赞一条）。
+
+    幂等：进度记在 state["revisit"][str(tid)]["last_num"]，下次只读更新的楼层。
+    """
+    dry = (not apply_) if dry_run is None else dry_run
+    day = bd.today()
+    now_ts = time.time()
+    res = {"kind": "revisit", "dry_run": dry, "items": []}
+    okg, whg = risk_gate(st, "revisit")
+    if not okg:
+        res["blocked"] = whg
+        return res
+    if not topic_id:
+        okd, whyd = revisit_due(st, now_ts)
+        if not okd:
+            res["skip"] = whyd
+            return res
+    rv = st.setdefault("revisit", {})
+    own = ([{"id": int(topic_id)}] if topic_id else revisit_own_posts(st, limit=max(1, max_n)))
+    if not own:
+        res["skip"] = "no_own_post"
+        return res
+    my = fetch_self_user(session)
+    model = prefs_model()
+    n_new_total = 0
+    for h in own[:max_n]:
+        tid = int(h["id"])
+        rec = rv.setdefault(str(tid), {"last_num": 0})
+        ok, tinfo, why, rk = read_topic(session, tid)
+        if not ok:
+            if rk:
+                res["risk"] = risk_note(st, "revisit", why)
+                break
+            res["items"].append({"topic": tid, "status": "READ_FAIL", "why": why})
+            continue
+        _txt = "".join((x.get("text") or "") for x in
+                       (list(tinfo.get("posts") or []) + list(tinfo.get("latest") or [])))
+        pose = humanize_read("browse", len(_txt), log=log, dry=dry, tag="[revisit] 阅读")
+        fresh, mx = revisit_new_posts(tinfo, rec.get("last_num"), my)
+        item = {"topic": tid, "title": tinfo.get("title"),
+                "posts_count": tinfo.get("posts_count"),
+                "last_num": int(rec.get("last_num") or 0), "max_num": mx,
+                "n_new": len(fresh), "pose": pose,
+                "new": [{"num": x.get("num"), "user": x.get("user"),
+                         "text": (x.get("text") or "")[:80]} for x in fresh[:5]]}
+        rec["last_num"] = max(int(rec.get("last_num") or 0), mx)
+        rec["last_ts"] = now_ts
+        rv["last_ts"] = now_ts
+        rv["n_day_%s" % day] = int(rv.get("n_day_%s" % day) or 0) + 1
+        n_new_total += len(fresh)
+        if fresh:
+            prefs_note_interaction("revisit", user=fresh[-1].get("user"), topic=tid,
+                                   cat=(tinfo.get("cat") or tinfo.get("category_id")),
+                                   model=model)
+        # 回访点赞：只在新回复里挑一条，且走同一偏好模型（熟人优先）+ 当日上限
+        if fresh and random.random() < like_prob:
+            kw = {}
+            if hu:
+                try:
+                    kw["skip"] = hu.decision_skip("like")
+                except Exception:
+                    kw["skip"] = False
+            if not kw.get("skip"):
+                pool, why2 = list(fresh), "no_model"
+                if pf and model:
+                    try:
+                        t2, why2 = pf.pick_floor(pool, model, action="like", self_user=my)
+                    except Exception:
+                        t2, why2 = None, "fallback"
+                else:
+                    t2 = None
+                if t2 is None:
+                    t2, why2 = random.choice(pool), why2
+                if str(t2.get("id")) in done_key_set(st, "like") or \
+                        count_today(st, "like", day) >= ad.cap_today(st, day, "like"):
+                    item["like"] = {"status": "SKIP_CAP_OR_DONE", "post": t2.get("id")}
+                else:
+                    item["page"] = page_events(session, "like", len(_txt), log=log,
+                                               dry=dry, tag="[revisit] 页面")
+                    if dry:
+                        item["like"] = {"status": "DRY_RUN", "post": t2.get("id"),
+                                        "user": t2.get("user"), "pref_why": why2}
+                    else:
+                        r2 = post_like(session, t2.get("id"))
+                        ok2, why3, rk2 = classify_result(r2)
+                        if ok2:
+                            mark_done(st, "like", t2.get("id"))
+                            cnt = bump(st, "like")
+                            prefs_note_interaction("like", user=t2.get("user"), topic=tid,
+                                                   post=t2.get("id"),
+                                                   cat=(tinfo.get("cat") or tinfo.get("category_id")),
+                                                   model=model)
+                            item["like"] = {"status": "LIKED", "post": t2.get("id"),
+                                            "user": t2.get("user"), "n_today": cnt,
+                                            "pref_why": why2,
+                                            "wrap_s": humanize_wrap("like", log=log)}
+                            log("[revisit] ✅ topic=%s post=%s 已赞" % (tid, t2.get("id")))
+                        else:
+                            item["like"] = {"status": "LIKE_FAIL", "why": why3}
+                            if rk2:
+                                res["risk"] = risk_note(st, "revisit", why3)
+                                save_state(st)
+                                return res
+        res["items"].append(item)
+        if len(own) > 1 and h is not own[-1]:
+            gap = ad.gap_seconds("like")
+            log("[revisit] 帖间间隔 %.0fs" % gap)
+            time.sleep(gap)
+    res["n_new_total"] = n_new_total
     save_state(st)
     return res
 
@@ -772,6 +1032,11 @@ def act_post(st, session, title, raw, category, tags, apply_=False, dry_run=None
         bump(st, "post")
         st["post_history"].append({"ts": now_ts, "id": tid, "title": title})
         mark_done(st, "post", tid)
+        if pf:      # 落 own_posts.jsonl：回访（revisit）与「发帖看板块偏好」都读它
+            try:
+                pf.record_own_post(tid, title=title, cat=category, ts=now_ts)
+            except Exception:
+                pass
         res.update({"status": "POSTED", "topic_id": tid,
                     "wrap_s": humanize_wrap("post", log=log)})
     else:
@@ -822,11 +1087,29 @@ def cmd_run(args):
         r = act_reply(st, session, max_n=args.max, apply_=args.apply)
     elif args.kind == "like":
         r = act_like(st, session, max_n=args.max, apply_=args.apply)
+    elif args.kind == "revisit":
+        r = act_revisit(st, session, max_n=args.max, apply_=args.apply,
+                        topic_id=args.topic, like_prob=args.like_prob)
     else:
         print(json.dumps({"skip": True, "kind": "post",
                           "why": "post 需显式 --title/--raw/--category/--tags，用 `post` 子命令"},
                          ensure_ascii=False))
         return 2
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_revisit(args):
+    st = load_state()
+    if args.topic:      # 显式指定帖时不看冷却（人工触发语义）
+        st.setdefault("revisit", {})["last_ts"] = 0
+    session, diag = get_session(args.tab)
+    if not session:
+        print(json.dumps({"skip": True, "kind": "revisit", "why": "no_session",
+                          "diag": diag}, ensure_ascii=False))
+        return 2
+    r = act_revisit(st, session, max_n=args.max, apply_=args.apply,
+                    topic_id=args.topic, like_prob=args.like_prob)
     print(json.dumps(r, ensure_ascii=False, indent=2))
     return 0
 
@@ -944,9 +1227,16 @@ def _selftest_impl(tmpdir):
 
     # 入口判定与内核联动（沙箱）
     stz = load_state(os.path.join(tmpdir, "s4.json"))
-    now = time.time()
+    # ★自测禁绑现场（2026-10-06）：固定白天时刻，否则凌晨 01:00-07:30 跑会落到静默窗分支，
+    # 结果随「跑测试的钟点」而变（曾因此把 antidetect 的 quiet 解包缺陷掩盖数日）。
+    now = time.mktime(time.strptime("2026-10-06 15:00:00", "%Y-%m-%d %H:%M:%S"))
     w, ww = ad.next_wait(stz, now, "reply", 0)
     chk("T23 next_wait 正数", w > 0)
+    # T23b 负控：静默窗分支必须真能算完（历史缺陷：quiet 4 元组被当 2 元组解包 ⇒ ValueError）
+    qn = time.mktime(time.strptime("2026-10-06 03:00:00", "%Y-%m-%d %H:%M:%S"))
+    wq, wwq = ad.next_wait(stz, qn, "reply", 0)
+    chk("T23b 静默窗分支 wait_quiet_end 且时长合理",
+        wwq == "wait_quiet_end" and 60 < wq <= 12 * 3600)
     okd, whyd = ad.due_now(stz, now, "reply", 0)
     chk("T24 due_now 可判", isinstance(okd, bool) and isinstance(whyd, str))
     chk("T25 发帖间隔门", ad.post_interval_ok(stz, now)[0] is True)
@@ -1087,6 +1377,87 @@ def _selftest_impl(tmpdir):
         and _old_tok not in src2)
 
     passed = sum(1 for _, c in checks if c)
+    # ---------------- 回访（revisit）----------------
+    chk("T51 非周期档(revisit 不进 due/cap 的 KINDS)", "revisit" not in KINDS)
+    _posts = [{"id": 1, "num": 1, "user": "me", "text": "楼主"},
+              {"id": 2, "num": 2, "user": "alice", "text": "a"},
+              {"id": 3, "num": 3, "user": "bob", "text": "b"}]
+    # latest 窗口与 posts 窗口重叠（Discourse 实际形态）⇒ 同 id 必须只算一次
+    fresh, mx = revisit_new_posts({"posts": _posts[1:], "latest": _posts[2:]}, 1, "me")
+    chk("T52 新回复=去重+剔自己+按楼层升序",
+        [x["id"] for x in fresh] == [2, 3] and mx == 3)
+    f2, _ = revisit_new_posts({"posts": _posts, "latest": []}, 3, "me")
+    chk("T53 负控(无更新则 0 条)", f2 == [])
+    _s5 = load_state(os.path.join(tmpdir, "s5.json"))
+    _pd = os.environ.get("LJQ_PREFS_DIR")
+    os.environ["LJQ_PREFS_DIR"] = os.path.join(tmpdir, "prefs")
+    _hu_ds = globals()["hu"].decision_skip if globals().get("hu") else None
+    if _hu_ds is not None:
+        # 拟人层的「读了不赞」是随机量(p=0.22)⇒自测里必须钉死,否则用例假红
+        globals()["hu"].decision_skip = lambda *a, **k: False
+    try:
+        chk("T54 首次回访到期", revisit_due(_s5)[0] is True)
+        _s5["revisit"] = {"last_ts": time.time()}
+        _ok, _why = revisit_due(_s5)
+        chk("T55 负控(冷却期内不到期)", _ok is False and "too_soon" in _why)
+        _s5["revisit"] = {"last_ts": 0}
+        _s5["post_history"] = [{"ts": time.time(), "id": 7, "title": "t"}]
+        _ran = []
+
+        def _rv_js(sid, code, timeout=30):
+            if "/session/current.json" in code:
+                _ran.append("self")
+                return {"u": "me"}
+            _ran.append("read")
+            return {"ok": True, "id": 7, "title": "t", "posts_count": 3,
+                    "cat": 4, "posts": [{"id": 70, "num": 1, "user": "me", "text": "hi"}],
+                    "latest": [{"id": 71, "num": 2, "user": "alice", "text": "new"},
+                               {"id": 72, "num": 3, "user": "bob", "text": "new2"}]}
+        _orig_run = globals()["bd"].run_js
+        globals()["bd"].run_js = _rv_js
+        try:
+            r = act_revisit(_s5, {"id": "tab1"}, max_n=1, dry_run=True,
+                            like_prob=1.0, log=None)
+        finally:
+            globals()["bd"].run_js = _orig_run
+        _it = (r.get("items") or [{}])[0]
+        chk("T56 回访读到 2 条新回复且进度推进到 3",
+            r.get("n_new_total") == 2 and _it.get("last_num") == 0
+            and _it.get("max_num") == 3 and _s5["revisit"]["7"]["last_num"] == 3)
+        chk("T57 dry-run 下点赞只算不点", (_it.get("like") or {}).get("status") == "DRY_RUN")
+        _s5["revisit"]["last_ts"] = 0
+        _s5["revisit"]["7"] = {"last_num": 3}
+        globals()["bd"].run_js = _rv_js
+        try:
+            r2 = act_revisit(_s5, {"id": "tab1"}, max_n=1, dry_run=True,
+                             like_prob=1.0, log=None)
+        finally:
+            globals()["bd"].run_js = _orig_run
+        _it2 = (r2.get("items") or [{}])[0]
+        chk("T58 幂等(已读过的楼层不重复读)",
+            r2.get("n_new_total") == 0 and "like" not in _it2)
+        q = {}
+        globals()["bd"].run_js = _rv_js
+        try:
+            r3 = act_revisit(_s5, {"id": "tab1"}, max_n=1, dry_run=True, log=None)
+        finally:
+            globals()["bd"].run_js = _orig_run
+        chk("T59 负控(冷却期内 skip 且不打站点)", r3.get("skip", "").startswith("too_soon"))
+        src3 = open(os.path.abspath(__file__), "r", encoding="utf-8").read()
+        chk("T60 CLI/派发已接 revisit(且锁集合含它)",
+            'choices=["due", "run", "reply-one", "like-one", "post", "revisit",' in src3
+            and 'a.cmd == "revisit"' in src3 and '"post", "revisit")' in src3)
+        chk("T61 发帖成功才落 own_posts(供回访定位)",
+            "pf.record_own_post(" in src3 and 'setdefault("revisit", {})' in src3)
+    finally:
+        if _hu_ds is not None:
+            globals()["hu"].decision_skip = _hu_ds
+        if _pd is None:
+            os.environ.pop("LJQ_PREFS_DIR", None)
+        else:
+            os.environ["LJQ_PREFS_DIR"] = _pd
+
+    passed = sum(1 for _, c in checks if c)   # 本块之后新增用例 ⇒ 结算前重算
     print("selftest %d/%d PASS" % (passed, len(checks)))
     return 0 if passed == len(checks) else 1
 
@@ -1133,6 +1504,8 @@ def dispatch(a):
         if not a.topic:
             print("usage: like-one --topic N [--post M]"); return 2
         return cmd_like_one(a)
+    if a.cmd == "revisit":
+        return cmd_revisit(a)
     if a.cmd == "post":
         if not (a.title and a.raw):
             print("usage: post --title ... --raw ... --category N --tags a,b"); return 2
@@ -1143,7 +1516,8 @@ def dispatch(a):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="L站互动动作执行器（回帖/点赞/发帖）")
     ap.add_argument("cmd", nargs="?", default="due",
-                    choices=["due", "run", "reply-one", "like-one", "post", "state", "profiles"])
+                    choices=["due", "run", "reply-one", "like-one", "post", "revisit",
+                             "state", "profiles"])
     ap.add_argument("kind", nargs="?", choices=list(KINDS))
     ap.add_argument("--max", type=int, default=2)
     ap.add_argument("--topic", type=int)
@@ -1154,6 +1528,8 @@ def main(argv=None):
     ap.add_argument("--tags", default="")
     ap.add_argument("--tab", default=None)
     ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--like-prob", type=float, default=REVISIT_LIKE_P, dest="like_prob",
+                    help="回访时给新回复点赞的概率（默认 %.2f）" % REVISIT_LIKE_P)
     ap.add_argument("--apply", action="store_true", help="真正发送（默认 dry-run）")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--page-events", action="store_true", dest="page_events",
@@ -1166,7 +1542,7 @@ def main(argv=None):
 
     if a.selftest:
         return selftest()
-    if a.cmd in ("run", "reply-one", "like-one", "post"):
+    if a.cmd in ("run", "reply-one", "like-one", "post", "revisit"):
         tok = acquire_lock("cli-%s" % a.cmd)
         if not tok:
             # 与 daemon（浏览循环 / 排队补动作）互斥：拿到不到锁就安静退出，绝不并发抢标签
