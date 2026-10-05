@@ -43,6 +43,7 @@
 ## 报告写法（避免重复踩坑）
 - dashboard 同时给**全量 / 业务型 / 心跳型**三行；趋势表附**心跳占比**列；跨期比较只用业务型。
 - 告警段必须显式写"字段缺失/阈值口径"这类**沉默盲区**，不能只抄脚本的 `alerts=[]`。
+- **`metrics` 的 `wow_biz` 口径未公开、勿引单点百分比**（2026-10-05 实测）：工具报 `wow_biz=-1.1` / `biz30=11.27` / `biz_drop=1.1`，而按 `scan` 序列独立复算 7 vs 前 7（09-29→10-05 = 11.14/日 vs 09-22→09-28 = 12.29/日）= **-9.3%**，同一天同口径相差 8.2 个百分点 ⇒ 判读一律回到 `biz_drop` 与「业务/日」绝对值。另：脚本自报 `wow_pct` 是 `mean7 vs mean_prev7` 的**全量**口径，与 R497 内核 `wow_all`（同日 +9.6%）也不同源，三套数字**互不可推**。
 - 该任务**无推送要求**，不要额外发通知。
 
 ## R5 常驻告警（2026-09-29 起实测，待批修复）
@@ -50,4 +51,5 @@
 - 根因：`tools/roi_task_class.json` 的 `generated_at=2026-09-29T02:11:53` / `last_date=2026-09-28` 早于该任务首份回执 ⇒ **注册表未随新增任务刷新**（非业务退化、非来源不明产出）。
 - 工具面无写入入口：`tools/roi_task_class.py` 仅 `classify` / `names` / `audit` / `selftest` / `proof` 五个子命令（`_mk_registry` 是内部构造器）⇒ **重生成属 R497 生产端接线待批范围**（`temp/pending_decisions/DECISIONS_R497_roi_calibration.md`），注册表是仓内文件，改前须请示。
 - 判读口径：修复前每日报告须显式写明「R5 FIRES = 注册表过期，非业务异常」，并同时给出该任务按业务口径计入的数值（勿因 unclass 就漏算）。
+- **连续期与名单口径（2026-10-05 实测）**：`backtest` R5 = `fires=7/134 (5.2%) first=2026-09-29 last=2026-10-05` ⇒ 自 09-29 起**连续 7 天**命中；当日 unclass 3 个（`agentrouter_quota_am`/`gcp_cost_watch`/`smyze_stock_watch`），10-04 为 5 个（多 `anyrouter_slot_watch`——长驻 watch 当日无 done 回执即不计）。`scan` 的 `unclass` 列**无 `unclass_names` 字段**（值为 None），名单只能读 `unclass` 列表本身，勿指望按名字段。
 - 复跑判据：注册表重生成后 `tools/roi_calibration.py scan` 的 `unclass7` 应回 0、R5 转未触发。
