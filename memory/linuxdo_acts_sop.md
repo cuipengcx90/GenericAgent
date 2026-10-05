@@ -71,6 +71,9 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 ```
 
 - 现役接口（实测）：回帖 `POST /posts.json {topic_id, raw}` + `X-CSRF-Token`；点赞 `POST /post_actions.json {id, post_action_type_id: 2}`；发帖 `POST /posts.json {title, raw, category, tags}`；成功判据只有响应里的 `id`。
+- **两种触发语义（2026-10-05 实测确认，勿混）**：
+  - `run <kind>` = 定时/守护路径，**受随机段约束**（不在段内返回 `out_of_segment(...)` + `eta`，rc=0 不是错误）；
+  - `<kind>-one`（`reply-one`/`like-one`）与 `post` = **人工指定路径**，不走段判定（`post` 仍受 `post_interval_ok` 日间隔 + cap 1 约束），所以用户临时要求「回这条」「点个赞」「发个帖」可以直接用。
 - 长任务（单次可达数分钟）必须后台起：`python3 tools/bg_task.py start --name ldo_acts_reply -- python3 tools/linuxdo_acts.py run reply --apply`，随后 `bg_task.py status --name ...` 轮询（**禁 sleep 阻塞**，见 RULE 15）。
 
 ## 六、风控保险丝（不可绕过）
