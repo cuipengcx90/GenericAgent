@@ -146,6 +146,8 @@ function getLikeCount(post) {
 - 备选：`/user_actions.json?username=xtc0809&filter=5&offset=0&limit=40`（filter=5 = 该用户创建的主题）。
 - ⚠️ `https://linux.do/u/<name>/activity/topics.json` **不是**有效 API（返回 HTML，解析后 `user_actions` 为空），别用。
 - ⚠️ Google `site:linux.do/t/topic "人工智能技术日报"` 结果严重滞后，只能兜底。
+- ★发布时刻窗口与「当日尚未发布」的处置（2026-10-05 实测沉淀）：近 6 期发布时刻=北京 01:53 / 01:57 / 04:24 / 02:52 / 04:29 / 02:33（**均早于 10:00 定时窗口**），另 26-09-27 期为例外（北京 19:13）=少数期白天发布。**判据**：全量标题列表按 `created_at` 倒序，标题正则匹配当日 `-YY-MM-DD` **命中 0 条** ∧ 最新一期已在 OB 归档 ⇒ 判「当日尚未发布」，**静默收尾**（不写 OB / 不提交 / 不推送），不等待、不改用 Google、不刷分类页；次日 10:00 定时任务会按同一入口补采该期（无需本次强行驻留）。
+- ★同日实测：`search.json` 的 CF 拦截是**间歇性**的（同 tab 首轮 403 → 稍后重发即 200；页面为挑战态而非 `not_logged_in`）⇒ 首轮 403 先按三态判序复测一次 + 落 HTML 搜索页兜底，别在单一通道连打（IP 级 429 风险）；另 `/latest.json` 最新 30 主题可作「最新一期是否存在」的第二旁证（日报通常不在其中，命中=0 属正常，勿据此判已发布）。
 
 ### 限流与 429（重要）
 - linux.do 在密集请求后会进入 **Cloudflare IP 级 429**：页面顶部返回 `Just a moment...`。特征：**浏览器 fetch 与 curl_cffi（各 impersonate 版本、各 UA）同时 429** → 是 IP 限流而非指纹问题，换指纹/加代理都无用。
