@@ -30,7 +30,8 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
   - --batch 默认 20 帖/批；--daily-cap 每日话题上限（默认 160，每日 ±20 内随机定一次）
   - 静默窗结束后随机晨抖 0–60min 再开工（防每天准点开工的机械特征）
   - --max-session-min 单段运行上限（默认 110min），跑满休息 25–53min 再继续
-  - 静默窗默认 01:00–07:30 不浏览（只整点查一次等级）
+  - 静默窗默认 01:00–07:30 不浏览、不查等级
+  - 等级前置检查节流：每天 1–3 次、时刻随机（LEVEL_CHECK_GAP 5–11h，2026-10-05 用户要求）
 
 用法:
   python3 tools/linuxdo_browse_daemon.py status            # 只读：state+最近等级
@@ -82,6 +83,25 @@ SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入�
 SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
 MORNING_JITTER = (0, 3600)  # 静默窗结束后随机延迟 0–60min 再开工——真人不会每天准点开始
 QUIET_WINDOW = (1, 0, 7, 30)          # 01:00–07:30 静默
+# 等级前置检查节流（2026-10-05 用户要求）：不再每轮都读等级卡 —— 每天 1–3 次、时刻随机。
+# 「不满足 ⇒ 浏览补足」的路由语义不变；两次检查之间沿用上次判定继续补足。
+LEVEL_CHECK_GAP = (5 * 3600, 11 * 3600)
+# 缺项路由：等级卡未达标项分两类 —— 能自动补的（浏览类）走浏览 SOP 自动做；
+# 不能自动的（回复/点赞/获赞/访问天数/上限类）一律只通知人，绝不代操作（发帖点赞=红线）。
+MANUAL_NAME_HINTS = ("回复", "点赞", "送赞", "获赞", "访问天数", "活跃程度", "登录",
+                    "举报", "禁言", "封禁")
+BROWSE_KINDS = ("浏览话题", "浏览帖子", "浏览", "阅读")
+# connect 页两条路径结构不同：connect=({met:bool,name:'当前/门槛'}，无指标名)；首页卡=({mark, name, cur, req})。
+# connect 实测固定 12 项顺序（2026-10-05 level_log.jsonl）⇒ 仅当这些项的**门槛值全部吻合**才启用顺序映射，
+# 否则一律按「未识别」处理（fail-safe：只通知人，绝不误判为可自动补）。
+CONNECT_ITEM_MAP = (
+    (0, 50, "访问天数"),
+    (1, 500, "浏览话题"),
+    (2, 20000, "浏览帖子"),
+    (3, 10, "回复话题"),
+    (4, 30, "点赞"),
+    (5, 20, "获赞"),
+)
 INTER_BATCH_GAP = (420, 900)
 SESS_RETRY_MAX = 6                      # pick_session/判级连续失败达上限才退出（断链重试≈1h+）
 SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
@@ -368,6 +388,88 @@ def quiet_window_check(now=None):
     qh, qm, eh, em = QUIET_WINDOW
     t = now.hour * 60 + now.minute
     return (qh * 60 + qm) <= t < (eh * 60 + em)
+
+
+def _ts_str(ts):
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).strftime("%m-%d %H:%M")
+    except Exception:
+        return "?"
+
+
+def level_check_due(st, now_ts=None):
+    """等级前置检查是否到期。无历史判定 / 缺 next_ts ⇒ 保守必查（绝不永久沿用旧判定）。"""
+    now_ts = time.time() if now_ts is None else now_ts
+    if not st.get("level"):
+        return True
+    return (st.get("level_next_ts") or 0) <= now_ts
+
+
+def _item_unmet(it):
+    """未达标判定：兼容两路径（connect=met 布尔；首页卡=mark ✓/○）。"""
+    if "met" in it:
+        return it.get("met") is False
+    return it.get("mark") == "○"
+
+
+def _req_of(it):
+    """门槛值：首页卡=int req；connect=从 '13171/ 20000' 解析。"""
+    if isinstance(it.get("req"), int):
+        return it["req"]
+    m = re.search(r"/\s*(\d+)", str(it.get("name") or ""))
+    return int(m.group(1)) if m else None
+
+
+def _map_connect_names(items):
+    """connect 项按实测顺序且门槛值全部吻合 ⇒ {idx: 指标名}；否则 None（不可信，不映射）。"""
+    if len(items) < len(CONNECT_ITEM_MAP):
+        return None
+    names = {}
+    for idx, req, name in CONNECT_ITEM_MAP:
+        if _req_of(items[idx]) != req:
+            return None
+        names[idx] = name
+    return names
+
+
+def classify_pending(lvl):
+    """未达标项分「可自动补(浏览类)」/「须人工」/「未识别(fail-safe 也通知)」。"""
+    items = lvl.get("items") or []
+    names = _map_connect_names(items)
+    manual, auto, unknown = [], [], []
+    for i, it in enumerate(items):
+        if not _item_unmet(it):
+            continue
+        nm = (names or {}).get(i) or str(it.get("name") or "")
+        rec = {"name": nm, "cur": it.get("cur"), "req": _req_of(it)}
+        if any(k in nm for k in BROWSE_KINDS):
+            auto.append(rec)
+        elif any(k in nm for k in MANUAL_NAME_HINTS):
+            manual.append(rec)
+        else:
+            unknown.append(rec)
+    return {"manual": manual, "auto": auto, "unknown": unknown}
+
+
+def maybe_notify_manual(st, route):
+    """须人工项：每天最多提醒一次（幂等，避免刷屏）。"""
+    if not (route.get("manual") or route.get("unknown")):
+        return False
+    if st.get("route_notified") == today():
+        return False
+    lines = ["【L站 TL3 前置检查】以下未达标项需人工处理（脚本不代操作）："]
+    for it in route.get("manual") or []:
+        lines.append("· %s %s/%s" % (it.get("name"), it.get("cur"), it.get("req")))
+    for it in route.get("unknown") or []:
+        lines.append("· [未能识别指标名] %s" % (it.get("name"),))
+    if route.get("auto"):
+        lines.append("（浏览类缺项已由后台随机节奏自动补足：%s）" % "、".join(
+            str(it.get("name")) for it in route["auto"]))
+    lines.append("提示：回复/点赞需本人操作（自动化=发帖点赞红线）；访问天数只能靠本人持续登录。")
+    notify("\n".join(lines))
+    st["route_notified"] = today()
+    save_state(st)
+    return True
 
 
 def daily_count(st):
@@ -718,7 +820,14 @@ def watch(args):
             time.sleep(wait)
             continue
         sess_fails = 0
-        lvl, src = check_level(session)
+        if level_check_due(st):
+            lvl, src = check_level(session)
+        else:
+            lvl = {"pending": int(st["level"].get("pending") or 1), "met": st["level"].get("met")}
+            src = "throttled"
+            print("[%s] 等级前置检查节流中（下次 %s），沿用上次判定 pending=%s 继续补足" % (
+                now_str(), _ts_str(st.get("level_next_ts")), lvl["pending"]), flush=True)
+            lvl_fails = 0
         if lvl is None:
             m = re.search(r"\[risk=([A-Z_]+)\]", src or "")
             rk = m.group(1) if m else None
@@ -739,10 +848,20 @@ def watch(args):
         log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "OK", "source": src,
                                       "met": lvl.get("met"), "pending": lvl.get("pending"), "items": lvl.get("items")})
         st["level"] = {"ts": now_str(), "met": lvl.get("met"), "pending": lvl.get("pending")}
+        st["level_next_ts"] = time.time() + random.uniform(*LEVEL_CHECK_GAP)
         save_state(st)
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
             return RC_OK
+        # 缺项路由：可自动补的（浏览类）继续走浏览 SOP；须人工的只通知（幂等，每天≤1次）
+        route = classify_pending(lvl)
+        if route["manual"] or route["unknown"]:
+            print("[%s] 缺项路由：须人工 %s / 未识别 %s / 自动补 %s" % (
+                now_str(), [it.get("name") for it in route["manual"]],
+                [it.get("name") for it in route["unknown"]],
+                [it.get("name") for it in route["auto"]]), flush=True)
+            if maybe_notify_manual(st, route):
+                print("[%s] 已私信提醒须人工项（今日首次）" % now_str(), flush=True)
         cap_today = daily_cap_today(st, args.daily_cap)
         if daily_count(st) >= cap_today:
             print("[%s] 今日已达 daily-cap=%d（base=%d，每日随机定一次），睡到明天" % (now_str(), cap_today, args.daily_cap), flush=True)
@@ -881,6 +1000,60 @@ def _selftest_impl():
         pass
     finally:
         BRIDGE = old
+    cases += 1
+    # T6c 缺项路由分类（两路径兼容）——connect 形态（met+值文本，门槛吻合⇒顺序映射生效）
+    _ci = [{"met": True, "name": "81/ 50"}, {"met": True, "name": "598/ 500"},
+           {"met": False, "name": "13171/ 20000"}, {"met": True, "name": "32/ 10"},
+           {"met": True, "name": "75/ 30"}, {"met": True, "name": "49/ 20"},
+           {"met": True, "name": "11/ 7"}, {"met": True, "name": "48/ 5"},
+           {"met": True, "name": "被举报帖子\n 0 / 5"}, {"met": True, "name": "举报用户\n 0 / 5"},
+           {"met": True, "name": "被禁言 0"}, {"met": True, "name": "被封禁 0"}]
+    _r = classify_pending({"items": _ci})
+    if [it["name"] for it in _r["auto"]] != ["浏览帖子"] or _r["manual"] or _r["unknown"]:
+        fails.append("T6c connect 形态：浏览帖子应归自动补且无人工项: %s" % _r)
+    cases += 1
+    # T6c2 回复类未达标（idx3 门槛吻合⇒映射出「回复话题」）⇒ 须人工
+    _ci2 = [dict(x) for x in _ci]; _ci2[3] = {"met": False, "name": "8/ 10"}
+    _r2 = classify_pending({"items": _ci2})
+    if [it["name"] for it in _r2["manual"]] != ["回复话题"]:
+        fails.append("T6c2 回复类应归须人工: %s" % _r2)
+    cases += 1
+    # T6c3 负控：门槛值被改（idx1 req 600）⇒ 顺序不可信 ⇒ 未达标项必须落 unknown（不得误判 auto）
+    _ci3 = [dict(x) for x in _ci]; _ci3[1] = {"met": False, "name": "598/ 600"}
+    _r3 = classify_pending({"items": _ci3})
+    if _r3["auto"] or [it["name"] for it in _r3["unknown"]] != ["598/ 600", "13171/ 20000"]:
+        fails.append("T6c3 门槛失配必须全部转 unknown: %s" % _r3)
+    cases += 1
+    # T6c4 首页卡形态（mark/cur/req，name=指标名）
+    _hc = {"items": [{"mark": "○", "name": "浏览话题", "cur": 100, "req": 500},
+                     {"mark": "○", "name": "回复话题", "cur": 8, "req": 10},
+                     {"mark": "✓", "name": "点赞", "cur": 30, "req": 30},
+                     {"mark": "○", "name": "访问天数", "cur": 40, "req": 50}]}
+    _r4 = classify_pending(_hc)
+    if [it["name"] for it in _r4["auto"]] != ["浏览话题"] or \
+       sorted(it["name"] for it in _r4["manual"]) != ["回复话题", "访问天数"]:
+        fails.append("T6c4 首页卡形态分类错: %s" % _r4)
+    if any(it["name"] == "点赞" for it in _r4["manual"] + _r4["auto"] + _r4["unknown"]):
+        fails.append("T6c4 已达标项(✓)不应进入路由")
+    cases += 1
+    # T6c5 负控：unknown 不得静默 —— 必须进通知面
+    _ci5 = [{"met": False, "name": "13171/ 20000"}]
+    _r5 = classify_pending({"items": _ci5})
+    if len(_r5["unknown"]) != 1:
+        fails.append("T6c5 短表(不可映射)应落 unknown: %s" % _r5)
+    cases += 1
+    # T6b 等级前置检查节流（2026-10-05 用户要求：不要固定时刻/固定频率打站点）
+    if not (0 < LEVEL_CHECK_GAP[0] < LEVEL_CHECK_GAP[1] <= 12 * 3600):
+        fails.append("T6b LEVEL_CHECK_GAP 区间不合理: %s" % (LEVEL_CHECK_GAP,))
+    if not level_check_due({}):
+        fails.append("T6b 首次（无 level 记录）应到期必查")
+    if not level_check_due({"level": {"pending": 1}}):
+        fails.append("T6b 有 level 但缺 level_next_ts 应保守必查")
+    _n0 = time.time()
+    if level_check_due({"level": {"pending": 1}, "level_next_ts": _n0 + 3600}):
+        fails.append("T6b 节流窗内不应重复检查")
+    if not level_check_due({"level": {"pending": 1}, "level_next_ts": _n0 - 1}):
+        fails.append("T6b 已到期应再查")
     cases += 1
     # T6 防检测参数齐全
     for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):

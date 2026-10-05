@@ -68,3 +68,7 @@ return JSON.stringify({status: res.status, id: j.id, errors: j.errors||null});
 2. **回帖比浏览多一步「读内容」**：跳过阅读步直接回 = 文案必然空泛，等于水贴，宁可 SKIP 该帖。
 3. 锁帖未发现就 POST：看响应 status/errors 原文判断，勿把 403 全当登录失效。
 4. 收尾禁止「看起来发了」：成功条数只认响应 `j.id`，逐条落 log.jsonl。
+
+## 被路由调用（2026-10-05）
+等级前置检查若发现「回复」类缺项，会私信提醒（**脚本不代操作**，见 `memory/linuxdo_trust_level_sop.md` 的缺项路由）。
+本 SOP 仅由会话内人工/受控触发执行：条间 240–600s 随机、日≤10、单任务≤5，遇 429/403/BANNED 立即停当日。

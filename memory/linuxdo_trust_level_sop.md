@@ -31,7 +31,16 @@
 
 ## 已建定时监测
 `../sche_tasks/linuxdo_trust_level_check.json`：每天09:30检查一次，**已符合则完全静默不通知**；不符合才私信列出具体哪几项+当前值/门槛值+差距，且仅提醒不代操作(不自动发帖/点赞)。检查用新开独立tab(不覆盖用户已有tab)，用完关闭不留痕。
-**★固定时刻风险与改造建议(2026-10-05 实测)**：scheduler(`reflect/scheduler.py:140-149`)**到点即跑、无任何随机**（该任务的 `max_delay_hours: 6` 语义=「超过 09:30+6h 就 SKIP」的过期窗口，**不是**随机延迟）⇒ 机器开机时每天约 **09:30 准点**命中一次，构成固定节奏特征。而 `tools/linuxdo_browse_daemon.py` 长驻守护**每日已顺带读等级卡**（`temp/linuxdo_browse_daemon/level_log.jsonl`，2026-10-05 实测有 07:32/09:36/09:45/09:50/11:43 等条）⇒ 本 sche_tasks 任务与之**冗余**。建议（待用户批准）：停用本任务、等级判读交 daemon；若保留兜底则降频（如每 3 天）并接受准点特征。通则见 `memory/anti_detection_sop.md`。
+**★前置→路由架构（2026-10-05 落地，用户定义）**：等级检查是**前置**而非独立任务——正常情况（pending=0）什么都不做；一旦某项不满足，按**缺项**路由到对应 SOP：
+- 浏览类缺项（浏览话题/浏览帖子/已读帖子）→ 浏览 SOP（`tools/linuxdo_browse_daemon.py` 自动补，只读）
+- 回复类缺项 → 回帖 SOP（`memory/linuxdo_reply_sop.md`；自动化回复=发帖红线，**只私信通知人**，脚本不代操作）
+- 点赞/获赞/访问天数 → 无法代刷，只通知人
+实现=daemon 的 `classify_pending()`（`MANUAL_KINDS` 正则分类）+ `maybe_notify_manual()`（每天最多 1 次私信，幂等键 `state.route_notified`）。
+**随机化铁律**（见 `memory/anti_detection_sop.md`）：三环节各自独立随机，且**从第一版起就随机**——
+- 等级检查：daemon 内 `LEVEL_CHECK_GAP=(5h,11h)` 随机间隔（每天 1–3 次，**不再是 09:30 准点**）
+- 浏览：daemon 随机节奏（日上限抖动/晨间抖动/静默窗/帖间随机）
+- 回帖：仅会话内手触发，条间 240–600s 随机、日≤10
+**调度口径**：`sche_tasks/linuxdo_trust_level_check.json` 已改为**零站点流量的保活+兜底**任务（只 `pgrep` 查守护 + 读本地 state + 必要时用 bg_task 拉起守护），不再直接访问站点——固定时刻的自动化站点访问本身就是被检测特征（scheduler `reflect/scheduler.py:140-149` 到点即跑、无随机；`max_delay_hours` 是过期窗口非随机延迟）。
 
 
 ## ⚠️ connect.linux.do 被 Cloudflare 卡死时的备用检查入口(2026-09-21 实测)

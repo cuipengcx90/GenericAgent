@@ -100,3 +100,8 @@ return JSON.stringify({fail:true,now:location.pathname});
 - **自测/金丝雀禁写生产状态**：任何带副作用的函数（save_state/落盘台账/发通知）在自测里必须走沙箱 `BASE`/隔离 `--state`，且自测结束**用指纹断言生产侧零变化**——「测试全绿」不能只证明管道通，还要证明它没污染现场（RULES#25 的同族）。
 - **守护判活别只看日志尾部**：`bg_task` 的 stdout 常 0 字节（输出不落该文件），权威判据是 `browse_log.jsonl` 新增 `DONE` 行 + `state.json` 的 `daily` 增长。
 - 判「站点封了」之前先查本地 state 完整性（键是否齐、字节数是否异常小），别把自家自杀当成平台故障。
+
+## 缺项路由（2026-10-05：由等级前置检查驱动）
+`memory/linuxdo_trust_level_sop.md` 的等级卡判读若出现**浏览类缺项**（浏览话题/浏览帖子/已读帖子），即路由到本 SOP 的 daemon 自动补足（只读，随机节奏）；
+**须人工的项**（回复/点赞/获赞/访问天数）由 daemon 私信通知（每天≤1 次，幂等），本 SOP 不代操作。
+路由实现=daemon `classify_pending()`/`maybe_notify_manual()`（`MANUAL_KINDS` 正则）。
