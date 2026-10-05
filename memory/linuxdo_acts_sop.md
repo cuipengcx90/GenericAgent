@@ -102,10 +102,25 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - `python3 tools/linuxdo_antidetect.py --selftest`（56/56，含 T27 跨层自洽）。
 - `python3 tools/linuxdo_acts.py --selftest`（52/52；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d；自测把 state/lock/通知全部重定向到沙箱）。
 - `python3 tools/linuxdo_browse_daemon.py --selftest`（24/24；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线）。
+- `python3 tools/linuxdo_daemon_watchd.py --selftest`（25/25，零站点流量）。
 - `python3 tools/sche_tasks_lint.py --only linuxdo_acts_reply,linuxdo_acts_like,linuxdo_acts_post,linuxdo_acts_browse` ⇒ FAIL 0。
-- 判活：`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
+- 判活：`python3 tools/linuxdo_daemon_watchd.py status`（watchd/daemon 两 pid + last_browse）；`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
 
-## 九、历史坑（禁再犯）
+## 九、浏览守护看门狗（进程级自愈，零站点流量）
+
+问题：`linuxdo_browse_daemon.py` 是长驻守护（承担浏览 + 等级前置 + 缺项路由），进程一死只能等下一个定时入口（09:30 / 12:40）才被拉起 ⇒ 最长空窗约 21h，期间浏览/等级/排队动作全停摆，且**用户看不见**（静默失效）。
+
+解决：`tools/linuxdo_daemon_watchd.py`（零站点请求、零 LLM token、只读本地进程表与日志）：
+
+- 子命令：`ensure`（兜底入口，已在跑则原样返回）/ `run [--max-hours 26]` / `status` / `--selftest`（25/25 绿）。
+- 三件事：① 探活——守护进程不在 ⇒ 用 `tools/bg_task.py start --name linuxdo_browse -- python3 tools/linuxdo_browse_daemon.py watch` 拉起（幂等）；② 停滞——活动窗内超过 `STALL_S`（3h）无浏览产出（`browse_log.jsonl` 无新增 DONE）⇒ 判卡死并重启；③ 留痕 + 告警——事件写 `temp/linuxdo_watch/watchd.jsonl`，重启/恢复各发一次飞书私信（冷却 `NOTIFY_COOLDOWN_H`=6h，连续重启失败 `FAIL_STREAK_NOTIFY`=3 次再告警并继续重试）。
+- 节奏参数（`--interval` 类）只影响**巡检**频率（`CHECK_INTERVAL`=60s），**绝不改动**日限/静默窗/休息日/段间隔——那些仍由 `linuxdo_antidetect` 内核独占决定；本器只重启进程，不重排行为。
+- 防抖：两次重启最小间隔 `RESTART_MIN_GAP`=300s；单实例锁 `temp/linuxdo_watch/watchd.lock`。
+- 长驻上限 `DEFAULT_MAX_HOURS`=26h：**由每日入口重新武装**（`sche_tasks/linuxdo_acts_browse.json` 步骤 0 调 `ensure`），与 anyrouter watchd 同模式——避免"永久僵尸守护"。
+- 判活（人看）：`python3 tools/linuxdo_daemon_watchd.py status` 应同时给出 watchd 与 daemon 两个 pid、`last_browse` 时间；`browse_log` 新增 DONE 或 `state.daily` 增长才是守护真在干活（`bg_task` 日志 0 字节 ≠ 没跑）。
+- ★铁律：自测必须走沙箱（T16 断言自测前后**本器三件自有产物**指纹逐字相同），**禁绑现场内容**（曾因把 daemon 持续写入的 `browse_log.jsonl` 纳入生产指纹 ⇒ 恒假红）。
+
+## 十、历史坑（禁再犯）
 
 1. **自测写生产状态**：`linuxdo_browse_daemon.py --selftest` 曾把生产 `state.json` 覆盖成仅 `rest_days`（66B）⇒ 守护 `KeyError: 'daily'` 无声退出，表象像「站点封号」。修法：`_selftest_impl` 走 tempfile 沙箱 + 断言自测前后生产 state 指纹逐字相同。
 2. **等级检查后不自还原标签页**：把唯一 linux.do 标签导航到 connect 后不返回 ⇒ 下一轮 daemon 无供应、`done=0`，曾被误判为 CF 封禁。修法：读完 connect 立刻 `location.href='https://linux.do/'` + 等 6s。
