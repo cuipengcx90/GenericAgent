@@ -45,9 +45,102 @@ if GA_ROOT not in sys.path:
 
 import linuxdo_antidetect as ad          # noqa: E402  统一随机化内核
 import linuxdo_browse_daemon as bd       # noqa: E402  桥接 / 会话 / 风控 / 通知
+try:                                     # noqa: E402
+    import linuxdo_humanize as hu        # 拟人层（动手前后干什么）
+except Exception:                        # pragma: no cover
+    hu = None
 
 BASE = os.path.join(GA_ROOT, "temp", "linuxdo_acts")
+# 拟人停留上限：单次睡眠不得超过该值（防长休把守护/CI 挂住；env 可调）
+HUMANIZE_MAX_SLEEP = float(os.environ.get("LJQ_HUMANIZE_MAX_SLEEP") or 90.0)
+HUMANIZE_OFF = os.environ.get("LJQ_HUMANIZE_OFF") == "1"
+# 页面级合成事件开关：**默认关**。原因=CDP 注入事件 isTrusted=false，
+# 对校验信任位的采集端无效、且凭空多出可疑事件；仅在显式 --page-events /
+# LJQ_PAGE_EVENTS_ON=1 时启用（弱信号补强，需自担风险）。
+PAGE_EVENTS_ON = os.environ.get("LJQ_PAGE_EVENTS_ON", "").strip().lower() not in (
+    "", "0", "false", "no")
 
+
+def _sleep(sec, log=None, tag="", dry=False):
+    """唯一的拟人睡眠出口：dry/关闭时不睡；超上限时截断并留痕。"""
+    sec = float(sec or 0.0)
+    if dry or HUMANIZE_OFF or sec <= 0:
+        return 0.0
+    if sec > HUMANIZE_MAX_SLEEP:
+        if log:
+            log("%s 拟人停留 %.1fs 超上限，截断为 %.1fs" % (tag, sec, HUMANIZE_MAX_SLEEP))
+        sec = HUMANIZE_MAX_SLEEP
+    if log:
+        log("%s 拟人停留 %.1fs" % (tag, sec))
+    time.sleep(sec)
+    return sec
+
+
+def humanize_pose(kind, n_chars):
+    """一次动作的拟人姿势摘要（无拟人层时返回 None）。"""
+    return hu.pose(kind, n_chars) if hu else None
+
+
+def humanize_read(kind, n_chars, log=None, dry=False, tag=""):
+    """先读后动：按文本长度驻留（真人不固定 sleep）。返回姿势 dict 或 None。"""
+    if not hu:
+        return None
+    pose = hu.pose(kind, n_chars)
+    _sleep(pose.get("read_dwell"), log, tag or "[%s] 阅读" % kind, dry)
+    return pose
+
+
+def humanize_typing(text, log=None, dry=False, tag="[reply]", kind="reply"):
+    """回帖打字：逐字延迟 + 标点停顿 + 思考停顿（只模拟时长，不逐键注入）。"""
+    if not hu:
+        return None
+    plan = hu.typing_plan(text or "", kind=kind)
+    total = hu.typing_total(plan)
+    _sleep(total, log, tag + " 打字", dry)
+    return {"chars": len(text or ""), "typing_s": total, "chunks": len(plan)}
+
+
+def humanize_write(kind, text, log=None, dry=False):
+    """发帖/长文：分段写作停顿（段间长停顿）。"""
+    if not hu:
+        return None
+    plan = hu.write_plan(text or "")
+    total = sum(float(p.get("pause") or 0.0) for p in plan)
+    _sleep(total, log, "[post] 写作停顿", dry)
+    return {"segments": len(plan), "write_s": round(total, 1)}
+
+
+def humanize_wrap(kind, log=None, dry=False):
+    """动作后收尾停留（真人不会动作完立刻关）。"""
+    if not hu:
+        return 0.0
+    return _sleep(hu.wrap_up_seconds(kind), log, "[%s] 收尾" % kind, dry)
+
+
+def page_events(session, kind, n_chars=0, log=None, dry=False, tag=""):
+    """在真实页面派发「滚动 + 合成键鼠事件」——fetch 直调不会产生任何 UI 事件，
+    这是拟人层的**弱信号补强**（真实滚动会改变视口；键鼠是 isTrusted=false 的合成事件）。
+    best-effort：任何异常都不影响动作本身。返回 {events, scrollY} 或 None。"""
+    if not PAGE_EVENTS_ON or dry or HUMANIZE_OFF or hu is None or not session:
+        return None
+    try:
+        dwell = (hu.pose(kind, n_chars or 800) or {}).get("read_dwell") or 0.0
+        plan = hu.scroll_plan(n_chars or 800, dwell, kind=kind) or []
+        steps = max(1, min(12, len(plan)))
+        moves = max(3, min(14, steps * 2))
+        keys = min(12, max(4, int(len(str(n_chars)))) if kind in ("reply", "post") else 0)
+        code = (PAGE_EVENTS_JS.replace("__STEPS__", str(steps))
+                .replace("__MOVES__", str(moves)).replace("__KEYS__", str(keys)))
+        res = bd.run_js(session["id"], code, timeout=60)
+        out = res if isinstance(res, dict) else {}
+        if log:
+            log("%s 页面行为注入 scrolls=%d moves=%d keys=%d events=%s"
+                % (tag or "[%s]" % kind, steps, moves, keys, out.get("events")))
+        return out or None
+    except Exception as e:
+        if log:
+            log("%s 页面行为注入失败(忽略) %s" % (tag or "[%s]" % kind, str(e)[:120]))
+        return None
 
 def state_path():
     """状态文件落点：env LJQ_ACTS_STATE 可重定向（自测/金丝雀用），默认生产 BASE。"""
@@ -234,10 +327,12 @@ READ_TOPIC_JS = r"""
       .replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
       .replace(/\s+/g,' ').trim();
     const ps = (j.post_stream && j.post_stream.posts) || [];
+    const pick = p => ({id:p.id, num:p.post_number, user:p.username,
+      text: strip(p.cooked).slice(0,900)});
     return JSON.stringify({ok:true, id:j.id, title:j.title, posts_count:j.posts_count,
       category_id:j.category_id, tags:(j.tags||[]), created:j.created_at,
-      posts: ps.slice(0,8).map(p => ({id:p.id, num:p.post_number, user:p.username,
-        text: strip(p.cooked).slice(0,900)}))});
+      posts: ps.slice(0,8).map(pick),
+      latest: ps.slice(-3).map(pick)});
   } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
 })()
 """
@@ -285,6 +380,38 @@ POST_TOPIC_JS = r"""
     return JSON.stringify({ok:r.ok, status:r.status, topic_id:(j&&j.topic_id)||null,
       id:(j&&j.id)||null, err:(j&&(j.errors||j.error_type))||null, body: j ? null : t.slice(0,400)});
   } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
+})()
+"""
+
+
+PAGE_EVENTS_JS = r"""
+(async () => {
+  try {
+    const w = window, d = document;
+    const nap = ms => new Promise(r => setTimeout(r, ms));
+    const H = Math.max(d.documentElement.scrollHeight || 0, w.innerHeight || 800);
+    let ev = 0, y = w.scrollY || 0;
+    for (let i = 0; i < __STEPS__; i++) {
+      y = Math.max(0, Math.min(Math.max(0, H - 200), y + (Math.random() * 2 - 0.6) * 320));
+      w.scrollTo({top: y, behavior: 'auto'});
+      d.dispatchEvent(new Event('scroll'));    // 部分站点在 document 上监听
+      ev++; await nap(120 + Math.random() * 380);
+    }
+    for (let i = 0; i < __MOVES__; i++) {
+      const x = Math.random() * (w.innerWidth || 1200), yy = Math.random() * (w.innerHeight || 800);
+      d.dispatchEvent(new MouseEvent('mousemove', {bubbles: true, clientX: x, clientY: yy}));
+      d.dispatchEvent(new MouseEvent('mouseover', {bubbles: true, clientX: x, clientY: yy}));
+      ev += 2; await nap(60 + Math.random() * 240);
+    }
+    const alpha = 'abcdefghijklmnopqrstuvwxyz';
+    for (let i = 0; i < __KEYS__; i++) {
+      const k = alpha[Math.floor(Math.random() * alpha.length)];
+      d.dispatchEvent(new KeyboardEvent('keydown', {bubbles: true, key: k}));
+      d.dispatchEvent(new KeyboardEvent('keyup', {bubbles: true, key: k}));
+      ev += 2; await nap(90 + Math.random() * 260);
+    }
+    return JSON.stringify({ok: true, events: ev, scrollY: (w.scrollY || 0) | 0});
+  } catch (e) { return JSON.stringify({ok: false, err: String(e).slice(0, 140)}); }
 })()
 """
 
@@ -452,7 +579,7 @@ def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=No
         raw = text_override
         if not raw:
             body = "\n".join("【%s楼 %s】%s" % (p.get("num"), p.get("user"), p.get("text"))
-                             for p in (tinfo.get("posts") or [])[:4])
+                             for p in ((tinfo.get("latest") or tinfo.get("posts") or [])[:4]))
             prompt = REPLY_PROMPT.format(title=tinfo.get("title") or t.get("title"),
                                          posts=body[:2400],
                                          lo=REPLY_MIN_CHARS, hi=REPLY_MAX_CHARS)
@@ -464,12 +591,16 @@ def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=No
         if not vok:
             res["items"].append({"topic": t["id"], "status": "REJECT_TEXT", "why": vr})
             continue
-        item = {"topic": t["id"], "title": tinfo.get("title"), "text": vr}
+        _txt = "".join((p.get("text") or "") for p in (tinfo.get("posts") or []))
+        item = {"topic": t["id"], "title": tinfo.get("title"), "text": vr,
+                "pose": humanize_pose("reply", len(_txt)), "read_chars": len(_txt)}
         if dry:
             item["status"] = "DRY_RUN"
             res["items"].append(item)
             n += 1
             continue
+        item["page"] = page_events(session, "reply", len(_txt), log=log, dry=dry, tag="[reply] 页面")
+        item["typing"] = humanize_typing(vr, log=log, tag="[reply]")   # 打字时长模拟（发送前）
         r2 = post_reply(session, t["id"], vr)
         ok2, why2, rk2 = classify_result(r2)
         if ok2:
@@ -477,6 +608,7 @@ def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=No
             cnt = bump(st, "reply")
             item.update({"status": "POSTED", "post_id": (r2 or {}).get("id"), "n_today": cnt})
             log("[reply] ✅ topic=%s post=%s %s" % (t["id"], (r2 or {}).get("id"), vr[:40]))
+            item["wrap_s"] = humanize_wrap("reply", log=log)
         else:
             item.update({"status": "POST_FAIL", "why": why2})
             if rk2:
@@ -524,6 +656,8 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
                 break
             res["items"].append({"topic": tid, "status": "READ_FAIL", "why": why})
             continue
+        _txt = "".join((p.get("text") or "") for p in (tinfo.get("posts") or []))
+        pose = humanize_read("like", len(_txt), log=log, dry=dry, tag="[like] 阅读")
         cand_posts = [p for p in (tinfo.get("posts") or []) if str(p.get("id")) not in done]
         if post_id:
             cand_posts = [p for p in cand_posts if str(p.get("id")) == str(post_id)]
@@ -533,7 +667,14 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
         # 点赞目标偏好：主楼之后的楼层（1-5 楼区间更像真人随手赞）
         pool = [p for p in cand_posts if 2 <= int(p.get("num") or 1) <= 8] or cand_posts
         target = random.choice(pool)
-        item = {"topic": tid, "post": target.get("id"), "num": target.get("num")}
+        item = {"topic": tid, "post": target.get("id"), "num": target.get("num"),
+                "pose": pose, "read_dwell": (pose or {}).get("read_dwell")}
+        if hu and hu.decision_skip("like"):          # 读了不赞 = 真人常态（不计入 cap）
+            item["status"] = "SKIP_AFTER_READ"
+            res["items"].append(item)
+            res["n_skip_after_read"] = int(res.get("n_skip_after_read") or 0) + 1
+            continue
+        item["page"] = page_events(session, "like", len(_txt), log=log, dry=dry, tag="[like] 页面")
         if dry:
             item["status"] = "DRY_RUN"
             res["items"].append(item)
@@ -546,6 +687,7 @@ def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
             cnt = bump(st, "like")
             item.update({"status": "LIKED", "n_today": cnt})
             log("[like] ✅ topic=%s post=%s" % (tid, target.get("id")))
+            item["wrap_s"] = humanize_wrap("like", log=log)
         else:
             item.update({"status": "LIKE_FAIL", "why": why2})
             if rk2:
@@ -580,9 +722,14 @@ def act_post(st, session, title, raw, category, tags, apply_=False, dry_run=None
     if count_today(st, "post", day) >= ad.cap_today(st, day, "post"):
         res["why"] = "cap_reached"
         return res
+    res["pose"] = humanize_pose("post", len(raw or ""))
     if dry:
         res["status"] = "DRY_RUN"
         return res
+    res["preface"] = humanize_read("post", len(raw or "") + 800, log=log,
+                                   tag="[post] 前置闲逛")   # 先逛几帖再发（禁直筒）
+    res["page"] = page_events(session, "post", len(raw or "") + 800, log=log, tag="[post] 页面")
+    res["write"] = humanize_write("post", raw, log=log)                          # 分段写作停顿
     r2 = post_topic(session, title, raw, category, tags)
     ok2, why2, rk2 = classify_result(r2)
     if ok2:
@@ -590,7 +737,8 @@ def act_post(st, session, title, raw, category, tags, apply_=False, dry_run=None
         bump(st, "post")
         st["post_history"].append({"ts": now_ts, "id": tid, "title": title})
         mark_done(st, "post", tid)
-        res.update({"status": "POSTED", "topic_id": tid})
+        res.update({"status": "POSTED", "topic_id": tid,
+                    "wrap_s": humanize_wrap("post", log=log)})
     else:
         res.update({"status": "POST_FAIL", "why": why2})
         if rk2:
@@ -816,6 +964,81 @@ def _selftest_impl(tmpdir):
     release_lock(t5)
     chk("T40 正常释放后锁文件消失", not os.path.exists(lp))
 
+    # ---- 拟人层接线（防「改了没接上」：源码级 + 行为级双证据）----
+    src = open(os.path.abspath(__file__), "r", encoding="utf-8").read()
+    chk("T41 拟人层可加载且类别与内核一致",
+        hu is not None and set(hu.KIND_BEHAVIOR) == set(ad.ACTION_PROFILES))
+    chk("T42 act_like 读后有犹豫分支", "SKIP_AFTER_READ" in src and "humanize_read(\"like\"" in src)
+    chk("T43 act_reply 打字时长模拟已接", "humanize_typing(" in src)
+    chk("T44 act_post 前置闲逛+写作停顿已接", "humanize_read(\"post\"" in src and "humanize_write(" in src)
+    chk("T45 读帖JS 带最新楼(回帖读尾楼)", "latest:" in READ_TOPIC_JS and "ps.slice(-3)" in READ_TOPIC_JS)
+    # 睡眠出口受上限保护（防长休挂住守护）；负控=上限放开时必须显著变长
+    _old_cap = globals()["HUMANIZE_MAX_SLEEP"]
+    try:
+        globals()["HUMANIZE_MAX_SLEEP"] = 0.05
+        t0 = time.time()
+        humanize_typing("这是一段用于自测的中文文案，需要在发送前模拟真人打字时长。", log=None)
+        capped = time.time() - t0
+        globals()["HUMANIZE_MAX_SLEEP"] = 1.0
+        t1 = time.time()
+        s1 = humanize_typing("这是一段用于自测的中文文案，需要在发送前模拟真人打字时长。", log=None)
+        uncapped = time.time() - t1
+        chk("T46 拟人睡眠受上限截断", capped <= 0.6 and uncapped > capped)
+    finally:
+        globals()["HUMANIZE_MAX_SLEEP"] = _old_cap
+    # 负控：拟人层缺席时不得抛异常（fail-safe）
+    _hu = globals().get("hu")
+    try:
+        globals()["hu"] = None
+        chk("T47 负控(拟人层缺席不崩)",
+            humanize_typing("x", log=None) is None and humanize_read("like", 100) is None
+            and humanize_write("post", "y") is None and humanize_wrap("like") == 0.0)
+    finally:
+        globals()["hu"] = _hu
+
+    # ---- 页面级行为事件注入（弱信号补强）----
+    chk("T48 页面事件JS含滚动/鼠标/键盘且占位符齐",
+        all(t in PAGE_EVENTS_JS for t in ("scrollTo", "mousemove", "KeyboardEvent",
+                                          "__STEPS__", "__MOVES__", "__KEYS__")))
+    _hu2 = globals().get("hu")
+    _pe_on = globals().get("PAGE_EVENTS_ON")
+    try:
+        calls = []
+
+        class _Sess(dict):
+            pass
+
+        _real_run = globals()["bd"].run_js
+        globals()["bd"].run_js = lambda sid, code, timeout=30: (
+            calls.append(code), {"ok": True, "events": 7})[1]
+        # 默认关（负控）：未显式开启时绝不注入
+        globals()["PAGE_EVENTS_ON"] = False
+        chk("T50c 默认关(未开启时不注入页面事件)",
+            page_events(_Sess(id="t"), "like", 1200, log=None) is None and not calls)
+        globals()["PAGE_EVENTS_ON"] = True
+        pe = page_events(_Sess(id="t"), "like", 1200, log=None)
+        chk("T49 开启后非 dry 真发且回读计数",
+            bool(calls) and pe and pe.get("events") == 7
+            and "__STEPS__" not in calls[0] and "scrollTo" in calls[0])
+        calls[:] = []
+        chk("T50 dry 时不发页面事件", page_events(_Sess(id="t"), "like", 1200, dry=True) is None
+            and not calls)
+
+        def _boom(sid, code, timeout=30):
+            raise RuntimeError("boom")
+
+        globals()["bd"].run_js = _boom
+        chk("T50b 负控(页面事件异常不崩且返回None)",
+            page_events(_Sess(id="t"), "reply", 900, log=None) is None)
+    finally:
+        globals()["bd"].run_js = _real_run
+        globals()["hu"] = _hu2
+        globals()["PAGE_EVENTS_ON"] = _pe_on
+    src2 = open(os.path.abspath(__file__), "r", encoding="utf-8").read()
+    chk("T50d CLI 有 --page-events 且默认关语义写明",
+        "--page-events" in src2 and 'LJQ_PAGE_EVENTS_ON' in src2
+        and "PAGE_EVENTS_ON = os.environ" in src2)
+
     passed = sum(1 for _, c in checks if c)
     print("selftest %d/%d PASS" % (passed, len(checks)))
     return 0 if passed == len(checks) else 1
@@ -886,7 +1109,11 @@ def main(argv=None):
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--apply", action="store_true", help="真正发送（默认 dry-run）")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--page-events", action="store_true", dest="page_events",
+                    help="启用页面级合成事件注入（默认关；isTrusted=false，收益有限）")
     a = ap.parse_args(argv)
+    if getattr(a, "page_events", False):
+        globals()["PAGE_EVENTS_ON"] = True
 
     if a.selftest:
         return selftest()

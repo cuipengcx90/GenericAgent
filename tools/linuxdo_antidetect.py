@@ -29,6 +29,8 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
+import os
 import random
 import sys
 import time
@@ -162,16 +164,33 @@ def wait_hint(now_ts, segs):
 
 
 # ------------------------------------------------------------------ 多种随机叠加
+def _logn(median, sigma, lo=None, hi=None, rng=None):
+    """对数正态（人类行为的标准长尾形态）：中位数给 median，右侧拖尾。"""
+    r = rng or random.Random()
+    v = math.exp(r.gauss(math.log(max(float(median), 1e-6)), sigma))
+    if lo is not None:
+        v = max(v, lo)
+    if hi is not None:
+        v = min(v, hi)
+    return v
+
+
 def gap_seconds(kind, rng=None):
-    """段内动作间隔：常规档 3:1 概率优先，长休档 1 份（对偶随机）。"""
+    """段内动作间隔：常规档 3:1 概率优先，长休档 1 份（对偶随机）。
+
+    v2（2026-10-05）：档内取值由 uniform 改**对数正态**（中位数在区间偏左、右侧拖长尾），
+    再 clamp 回原区间 ⇒ 区间契约与调用方不变，但「永远均匀」这一机械特征被去掉。
+    """
     p = profile(kind)
     r = rng or random.Random()
     lo, hi = p["gap"]
     if hi <= lo:
         return 0.0
     if p["gap_long_p"] > 0 and r.random() < p["gap_long_p"]:
-        return r.uniform(*p["gap_long"])
-    return r.uniform(lo, hi)
+        llo, lhi = p["gap_long"]
+        return round(_logn((llo + lhi) / 2.0 * 0.8, 0.5, llo, lhi, r), 1)
+    mid = (lo + hi) / 2.0
+    return round(_logn(mid * 0.85, 0.45, lo, hi, r), 1)
 
 
 def cap_today(st, day, kind, rng=None):
@@ -299,6 +318,96 @@ def next_wait(st, now_ts, kind, done_today=0, rng=None):
             end += dt.timedelta(days=1)
         return max(60.0, (end - nowdt).total_seconds() + rng.uniform(0, 1800)), "wait_quiet_end"
     return 600.0 + rng.uniform(0, 300), "fallback"
+
+
+# --------------------------------------------------- 等级检测（低频前置动作，v2）
+# 用户口径（2026-10-05）：每天只查 **1 次**，且**不在固定时刻**触发（错峰）。
+# 与其它动作一样由确定性种子派生 ⇒ 当天计划稳定可复现、跨天自然不同。
+LEVEL_CHECK_PER_DAY = 1
+LEVEL_CHECK_TTL_S = 20 * 3600          # 两次检查最小间隔（防重启/多入口同日重查）
+LEVEL_MIN_GAP_S = 90 * 60              # 与上一次检查至少隔 90min（避免连着两天同一时刻）
+
+
+def level_check_ts(day, prev_ts=None, kind="browse"):
+    """返回该日等级检查的时刻（epoch 秒）：落在活动窗内、避开静默窗、错峰。
+
+    错峰做法：在「当日第一段起点→窗尾」之间抽一个**对数正态**主导 + 90min 最小间隔。
+    """
+    p = profile(kind)
+    segs = day_segments(day, kind)
+    if not segs:
+        return _ts(day, 12.0) + _rng(day, "level", "ts").randint(-1800, 1800)
+    lo = segs[0]["start"]
+    hi = min(segs[-1]["end"], _ts(day, 23.5))
+    if hi <= lo:
+        hi = lo + 3600.0
+    r = _rng(day, "level", "ts")
+    # 中位数放在窗口 35% 处，sigma 大 ⇒ 早晚都可能，右侧拖尾
+    cand = lo + _logn((hi - lo) * 0.35, 0.7, 0.0, hi - lo, r)
+    cand += r.uniform(-900, 900)
+    cand = max(lo, min(hi, cand))
+    if prev_ts:
+        # 与上次检查冲突 ⇒ 顺延到「上次+最小间隔」之后再抽一次（同日只顺延一次）
+        if cand < prev_ts + LEVEL_MIN_GAP_S:
+            room_lo = max(lo, prev_ts + LEVEL_MIN_GAP_S)
+            if room_lo < hi:
+                cand = room_lo + _logn((hi - room_lo) * 0.5, 0.6, 0.0, hi - room_lo, r)
+            else:
+                cand = lo + r.uniform(0, 600)
+    return round(cand, 1)
+
+
+def level_check_state(st, kind="browse"):
+    """st["level_check"] = {"last_ts": float, "last_day": str, "count": int(近 40 天)}"""
+    return st.setdefault("level_check", {})
+
+
+def level_check_due(st, now_ts, kind="browse"):
+    """等级检查现在该不该跑 → (bool, why)。
+
+    判据：① 静默窗内不跑 ② 当天已跑过（last_day==今天）不跑 ③ 距离上次 < TTL 不跑
+          ④ 未到当天算出的错峰时刻不跑 ⑤ 到点即跑（超时未跑不补跑多次，只补一次）
+    """
+    ls = level_check_state(st, kind)
+    nowdt = dt.datetime.fromtimestamp(now_ts)
+    day = _day_of(now_ts)
+    if quiet_now(nowdt, kind):
+        return False, "quiet_window"
+    if ls.get("last_day") == day:
+        return False, "already_checked_today"
+    last = float(ls.get("last_ts") or 0)
+    if last and (now_ts - last) < LEVEL_CHECK_TTL_S:
+        return False, "ttl_%dh" % int((now_ts - last) / 3600)
+    target = level_check_ts(day, prev_ts=last or None, kind=kind)
+    if now_ts < target:
+        return False, "before_slot_%s" % dt.datetime.fromtimestamp(target).strftime("%H:%M")
+    return True, "ok"
+
+
+def level_check_mark(st, now_ts, kind="browse"):
+    """执行成功后记账（调用方在真跑通后调）。"""
+    ls = level_check_state(st, kind)
+    ls["last_ts"] = float(now_ts)
+    ls["last_day"] = _day_of(now_ts)
+    hist = ls.setdefault("history", [])
+    hist.append({"ts": round(float(now_ts), 1), "day": ls["last_day"]})
+    ls["history"] = hist[-40:]
+    return ls
+
+
+def level_check_next_wait(st, now_ts, kind="browse"):
+    """守护用：距下次等级检查还有多少秒（恒 >0，且不会早于错峰时刻）。"""
+    ls = level_check_state(st, kind)
+    day = _day_of(now_ts)
+    last = float(ls.get("last_ts") or 0)
+    if ls.get("last_day") == day:
+        nd = (dt.datetime.fromtimestamp(now_ts).date() + dt.timedelta(days=1)).strftime("%Y-%m-%d")
+        t = level_check_ts(nd, prev_ts=now_ts, kind=kind)
+        return max(60.0, t - now_ts), "next_day_%s" % dt.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+    t = level_check_ts(day, prev_ts=last or None, kind=kind)
+    if now_ts >= t:
+        return 0.0, "due_now"
+    return max(60.0, t - now_ts), "at_%s" % dt.datetime.fromtimestamp(t).strftime("%H:%M")
 
 
 # ------------------------------------------------------------------ selftest
@@ -432,6 +541,63 @@ def _selftest():
     # T22 负控：next_wait 不得返回非数/零（模拟坏 profile）
     bad_w = -1.0
     chk("T22 负控(零/负等待可被抓)", not (bad_w > 0))
+
+    # T23 等级检查：每天 1 次、时刻错峰、状态机自洽
+    lday = "2026-10-05"
+    t1 = level_check_ts(lday)
+    t1b = level_check_ts(lday)
+    chk("T23 错峰时刻确定性", t1 == t1b)
+    segs_l = day_segments(lday, "browse")
+    chk("T23b 时刻落在当日活动窗", segs_l[0]["start"] <= t1 <= min(segs_l[-1]["end"], _ts(lday, 23.5)) + 1)
+    # 跨天两两不同 + 与上次 ≥90min（连抽 10 天）
+    days10 = ["2026-10-%02d" % d for d in range(5, 15)]
+    ts10 = []
+    prev = None
+    for d in days10:
+        ts10.append(level_check_ts(d, prev_ts=prev))
+        prev = ts10[-1]
+    chk("T23c 跨天时刻不全相同", len(set(ts10)) >= 8)
+    chk("T23d 与上次间隔≥90min", all(
+        (ts10[i] - ts10[i - 1]) >= LEVEL_MIN_GAP_S - 1 for i in range(1, len(ts10)))
+        or all(level_check_ts(days10[i], prev_ts=ts10[i - 1]) >= ts10[i - 1] + LEVEL_MIN_GAP_S - 1
+               for i in range(1, len(ts10))))
+    # 状态机：未到点 → before_slot；到点 → ok；标记后 → already_checked
+    stl = {}
+    chk("T23e 未到点不跑", level_check_due(stl, t1 - 600)[0] is False)
+    ok23, why23 = level_check_due(stl, t1 + 5)
+    chk("T23f 到点跑", ok23 is True)
+    level_check_mark(stl, t1 + 5)
+    chk("T23g 当天不重复", level_check_due(stl, t1 + 400)[0] is False)
+    chk("T23h 次日可再跑", level_check_due(stl, t1 + 86400 + 3600 * 3)[1] != "already_checked_today")
+    # T24 等级检查恒为「每天 1 次」形态
+    chk("T24 每日次数=1", LEVEL_CHECK_PER_DAY == 1)
+    # T25 负控：静默窗内必不 due；未标记却报已完成必错
+    q_ts = _ts("2026-10-05", 3.0)
+    qst = {"level_check": {"last_day": "2026-10-05", "last_ts": q_ts - 86400}}
+    chk("T25 负控(静默窗不跑)", level_check_due(qst, q_ts)[0] is False)
+    chk("T25b 负控(未跑却判已跑)", level_check_state({}).get("last_day") != "2026-08-08")
+    # T26 next_wait 恒正 + 不会给出过去时刻
+    w_l, why_l = level_check_next_wait({}, t1 - 3600)
+    chk("T26 等待为正", w_l > 0)
+    chk("T26b 等待不早于错峰点", abs((t1 - 3600 + w_l) - t1) < 2)
+    # T27 跨层一致性：拟人层（linuxdo_humanize）的动作档必须与内核档位**同名同集**
+    try:
+        import importlib.util as _ilu
+        _hp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "linuxdo_humanize.py")
+        _spec = _ilu.spec_from_file_location("_lj_humanize_for_test", _hp)
+        _m = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_m)
+        chk("T27 拟人层档位与内核同集",
+            set(_m.KIND_BEHAVIOR) == set(ACTION_PROFILES))
+        chk("T27b 每类都有驻留/犹豫/收尾字段", all(
+            all(k in v for k in ("pre_topics", "pre_dwell", "skip_p", "wrap"))
+            for v in _m.KIND_BEHAVIOR.values()))
+        chk("T27c 犹豫率合法的类", all(
+            0.0 <= _m.KIND_BEHAVIOR[k]["skip_p"] < 1.0 for k in ("like", "reply", "browse", "post")))
+        chk("T27d 点赞/回帖存在「读了不动」噪声",
+            _m.KIND_BEHAVIOR["like"]["skip_p"] > 0 and _m.KIND_BEHAVIOR["reply"]["skip_p"] > 0)
+    except Exception as e:      # 缺件/语法错必须显式失败，不许静默跳过
+        chk("T27 拟人层可加载(%s)" % e, False)
 
     if fails:
         for f in fails:

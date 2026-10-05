@@ -31,7 +31,9 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
   - 静默窗结束后随机晨抖 0–60min 再开工（防每天准点开工的机械特征）
   - --max-session-min 单段运行上限（默认 110min），跑满休息 25–53min 再继续
   - 静默窗默认 01:00–07:30 不浏览、不查等级
-  - 等级前置检查节流：每天 1–3 次、时刻随机（LEVEL_CHECK_GAP 5–11h，2026-10-05 用户要求）
+  - 等级前置检查：**每天 1 次**、错峰随机时刻（2026-10-05 用户要求；节奏由内核
+    linuxdo_antidetect.level_check_ts 单一源决定：活动窗内对数正态抽点 + 90min 最小间隔，
+    恒不在固定钟点。LEVEL_CHECK_GAP 仅作内核缺席时的兜底）
 
 用法:
   python3 tools/linuxdo_browse_daemon.py status            # 只读：state+最近等级
@@ -85,7 +87,11 @@ MORNING_JITTER = (0, 3600)  # 静默窗结束后随机延迟 0–60min 再开工
 QUIET_WINDOW = (1, 0, 7, 30)          # 01:00–07:30 静默
 # 等级前置检查节流（2026-10-05 用户要求）：不再每轮都读等级卡 —— 每天 1–3 次、时刻随机。
 # 「不满足 ⇒ 浏览补足」的路由语义不变；两次检查之间沿用上次判定继续补足。
-LEVEL_CHECK_GAP = (5 * 3600, 11 * 3600)
+LEVEL_CHECK_GAP = (12 * 3600, 20 * 3600)   # 兜底/展示用；真实节奏见内核 level_check_ts（每日 1 次错峰）
+try:                                        # 统一随机化内核（单一源）
+    import linuxdo_antidetect as _ad
+except Exception:                           # 内核缺席 ⇒ 回退本地兜底，绝不静默假绿
+    _ad = None
 # 缺项路由（2026-10-05 用户定义）：未达标项分四路 ——
 #   浏览类 → 浏览 SOP（daemon 自身随机节奏）；
 #   回复类 → 回帖执行器 tools/linuxdo_acts.py（排队后由 acts 自己的随机段执行，与等级检查时刻解耦）；
@@ -409,12 +415,54 @@ def _ts_str(ts):
         return "?"
 
 
+def _ts_of_today(hour, minute=0):
+    """今日 hh:mm 的本地 epoch 秒（自测取样用，避开静默窗）。"""
+    n = dt.datetime.now()
+    return dt.datetime(n.year, n.month, n.day, int(hour), int(minute)).timestamp()
+
+
 def level_check_due(st, now_ts=None):
-    """等级前置检查是否到期。无历史判定 / 缺 next_ts ⇒ 保守必查（绝不永久沿用旧判定）。"""
+    """等级前置检查是否到期。
+
+    v2（2026-10-05）：节奏委托内核（单一源）——每天 1 次、错峰时刻、静默窗内不跑。
+    两条保守例外（绝不永久沿用旧判定）：① 从未查过 ② 内核缺席（回退旧的 next_ts 口径）。
+    """
     now_ts = time.time() if now_ts is None else now_ts
     if not st.get("level"):
         return True
+    if _ad is not None:
+        try:
+            return bool(_ad.level_check_due(st, now_ts)[0])
+        except Exception:
+            pass
     return (st.get("level_next_ts") or 0) <= now_ts
+
+
+def level_check_wait(st, now_ts=None):
+    """守护用：距下次等级检查还有多少秒 + 人类可读时刻（内核缺席回退 next_ts）。"""
+    now_ts = time.time() if now_ts is None else now_ts
+    if _ad is not None:
+        try:
+            w, why = _ad.level_check_next_wait(st, now_ts)
+            return float(w), why
+        except Exception:
+            pass
+    left = max(0.0, float(st.get("level_next_ts") or 0) - now_ts)
+    return left, "fallback"
+
+
+def level_check_mark(st, now_ts=None):
+    """查完记账：内核记 level_check；同时维护旧字段 level_next_ts（兼容展示与旧状态）。"""
+    now_ts = time.time() if now_ts is None else now_ts
+    st["level_next_ts"] = now_ts + random.uniform(*LEVEL_CHECK_GAP)
+    if _ad is not None:
+        try:
+            _ad.level_check_mark(st, now_ts)
+            w, _why = _ad.level_check_next_wait(st, now_ts)
+            st["level_next_ts"] = now_ts + max(60.0, float(w))
+        except Exception:
+            pass
+    return st["level_next_ts"]
 
 
 def _item_unmet(it):
@@ -968,7 +1016,7 @@ def watch(args):
         log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "OK", "source": src,
                                       "met": lvl.get("met"), "pending": lvl.get("pending"), "items": lvl.get("items")})
         st["level"] = {"ts": now_str(), "met": lvl.get("met"), "pending": lvl.get("pending")}
-        st["level_next_ts"] = time.time() + random.uniform(*LEVEL_CHECK_GAP)
+        level_check_mark(st)
         save_state(st)
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
@@ -1206,18 +1254,52 @@ def _selftest_impl():
     if len(_r5["unknown"]) != 1:
         fails.append("T6c5 短表(不可映射)应落 unknown: %s" % _r5)
     cases += 1
-    # T6b 等级前置检查节流（2026-10-05 用户要求：不要固定时刻/固定频率打站点）
-    if not (0 < LEVEL_CHECK_GAP[0] < LEVEL_CHECK_GAP[1] <= 12 * 3600):
-        fails.append("T6b LEVEL_CHECK_GAP 区间不合理: %s" % (LEVEL_CHECK_GAP,))
+    # T6b 等级前置检查节奏（2026-10-05 用户要求：每天 1 次、错峰、不要固定时刻打站点）
+    if not (0 < LEVEL_CHECK_GAP[0] < LEVEL_CHECK_GAP[1] <= 24 * 3600):
+        fails.append("T6b LEVEL_CHECK_GAP 兜底区间不合理: %s" % (LEVEL_CHECK_GAP,))
     if not level_check_due({}):
         fails.append("T6b 首次（无 level 记录）应到期必查")
-    if not level_check_due({"level": {"pending": 1}}):
-        fails.append("T6b 有 level 但缺 level_next_ts 应保守必查")
-    _n0 = time.time()
-    if level_check_due({"level": {"pending": 1}, "level_next_ts": _n0 + 3600}):
-        fails.append("T6b 节流窗内不应重复检查")
-    if not level_check_due({"level": {"pending": 1}, "level_next_ts": _n0 - 1}):
-        fails.append("T6b 已到期应再查")
+    # 白昼固定时刻取样（避开静默窗 01:00–07:30 造成的假红）
+    _t0 = _ts_of_today(12, 0)
+    _st0 = {"level": {"pending": 1}}
+    if _ad is not None:                              # 委托证明：判定必须与内核逐字一致
+        _kd = bool(_ad.level_check_due(_st0, _t0)[0])
+        if level_check_due(_st0, _t0) != _kd:
+            fails.append("T6b 等级检查未委托内核: %s vs %s" % (level_check_due(_st0, _t0), _kd))
+        if not _kd and not _ad.quiet_now(dt.datetime.fromtimestamp(_t0)):
+            # 未到期 ⇒ 只能是错峰时刻未到（不允许出现别的沉默理由）
+            _why = _ad.level_check_due(_st0, _t0)[1]
+            if not _why.startswith("before_slot_"):
+                fails.append("T6b 未到期的理由不可解释: %s" % _why)
+    else:
+        fails.append("T6b 内核缺席（统一随机化内核必须可加载）")
+    _st = {"level": {"pending": 1}}
+    level_check_mark(_st, _t0)                       # 模拟今天已在 t0 查过
+    if level_check_due(_st, _t0 + 60):
+        fails.append("T6b 同一天内不应重复检查")
+    _w, _why = level_check_wait(_st, _t0 + 60)
+    if not (_w > 0 and _why.startswith("next_day")):
+        fails.append("T6b 下次检查应落到次日错峰时刻: %s/%s" % (_w, _why))
+    if not level_check_due(_st, _t0 + 60 + _w + 5):
+        fails.append("T6b 到了次日错峰时刻应到期")
+    if _ad is not None:                              # 内核在场 ⇒ 每日次数上限必须为 1
+        if getattr(_ad, "LEVEL_CHECK_PER_DAY", 0) != 1:
+            fails.append("T6b 内核 LEVEL_CHECK_PER_DAY 应为 1: %s" % getattr(_ad, "LEVEL_CHECK_PER_DAY", None))
+        _ts1 = _ad.level_check_ts(_ad._day_of(_t0))
+        if not (0 < _ad.LEVEL_MIN_GAP_S <= 24 * 3600):
+            fails.append("T6b 内核最小间隔越界: %s" % _ad.LEVEL_MIN_GAP_S)
+        if not (_ts1 > 0):
+            fails.append("T6b 内核错峰时刻异常: %s" % _ts1)
+    # 内核缺席 ⇒ 回退旧 next_ts 口径（负控：证明兜底仍可用而非静默假绿）
+    _keep = _ad
+    try:
+        globals()["_ad"] = None
+        if level_check_due({"level": {"pending": 1}, "level_next_ts": _t0 + 3600}, _t0):
+            fails.append("T6b2 兜底口径：节流窗内不应检查")
+        if not level_check_due({"level": {"pending": 1}, "level_next_ts": _t0 - 1}, _t0):
+            fails.append("T6b2 兜底口径：已到期应再查")
+    finally:
+        globals()["_ad"] = _keep
     cases += 1
     # T6 防检测参数齐全
     for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):
