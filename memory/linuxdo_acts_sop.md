@@ -130,4 +130,4 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 
 ## 尾注
 - 站点侧浏览器操作细则（标签页/CF/登录态）见 `memory/linuxdo_browse_sop.md`、`memory/linuxdo_reply_sop.md`、`memory/linuxdo_trust_level_sop.md`。
-- 对外分享镜像：暂未镜像到 OB；如需对外，按 `60 Wiki/topics/` 格式建页。
+- 对外分享镜像（更新 2026-10-05）：OB 知识库已建页 `60 Wiki/topics/linuxdo-anti-detection-system.md`（结构化条目，mature），方案全文备份在 `30 Areas/research/linuxdo/2026-10-05 linux.do 全动作防检测体系（方案全文）.md`；vault 提交 `5efb5e2`（vault=`~/develop/obsidian-note`，无远端只本地 commit）。改本 SOP 涉及的机制/参数后，须同批回填该 OB 页与全文备份，避免两处口径漂移。
