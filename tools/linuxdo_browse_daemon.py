@@ -58,6 +58,17 @@ import tempfile
 import time
 import urllib.request
 
+# ---- 拟人层单一源（2026-10-05）：浏览路径必须与 acts（回复/点赞/发帖）共用同一内核，
+#      否则「浏览」是独立实现、参数漂移，用户要求的通用抽象就不成立。
+try:
+    import linuxdo_humanize as hu
+except Exception:                                       # 非 tools/ 目录被 import 时的兜底
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import linuxdo_humanize as hu
+    except Exception:
+        hu = None
+
 GA_ROOT = os.environ.get("GA_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 BASE = os.path.join(GA_ROOT, "temp", "linuxdo_browse_daemon")
 BRIDGE = os.environ.get("LJQ_BRIDGE", "http://127.0.0.1:18766")
@@ -830,9 +841,14 @@ ROUTE_JS = r"""
   for (let i=0;i<25;i++){ await new Promise(r=>setTimeout(r,500));
     const h1=document.querySelector('.fancy-title');
     if (h1){
-      for(let s=0;s<__STEPS__;s++){ await new Promise(r=>setTimeout(r, __DTMS__ + Math.random()*400));
-        window.scrollBy(0, __AMP__ + Math.random()*120); }
-      await new Promise(r=>setTimeout(r, __STAYMS__ + Math.random()*8000));
+      // 分屏滚动计划（humanize.scroll_plan 生成）：[[dy,pause_s],...]，
+      // 步长/停顿逐步不同、含回滚项⇒不再匀速等高。
+      const plan = __PLAN__;
+      for (let k=0;k<plan.length;k++){
+        await new Promise(r=>setTimeout(r, plan[k][1]*1000 + Math.random()*400));
+        window.scrollBy(0, plan[k][0] + Math.random()*120);
+      }
+      await new Promise(r=>setTimeout(r, __STAYMS__ + Math.random()*2500));
       for(let s=0;s<__RB__;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*500));
         window.scrollBy(0, -380); }
       return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length}); } }
@@ -855,23 +871,59 @@ LOITER_JS = r"""
 """
 
 
-def browse_one(session, tid, state):
+# 帖文本量先验：候选只给 id/title/cat，无法预探正文⇒按楼层数×每楼约 420 字估算。
+POST_CHARS_PER_FLOOR = 420
+POST_CHARS_FALLBACK = (2200, 9000)
+# 单帖时长的上界（沿用接线前的预算，避免接上拟人层后慢到日 cap 跑不完）。
+DEEP_DWELL_CAP_S = 150.0
+LIGHT_DWELL_CAP_S = 25.0
+
+
+def _estimate_chars(c):
+    try:
+        posts = int((c or {}).get("posts") or 0)
+    except Exception:
+        posts = 0
+    if posts >= 2:
+        return max(1500, min(posts * POST_CHARS_PER_FLOOR, 60000))
+    return random.randint(*POST_CHARS_FALLBACK)
+
+
+def _browse_plan(n_chars, light=False):
+    """一次浏览的姿势（humanize 单一源）：分屏滚动计划 + 底部停留 + 回滚。
+
+    light=浅读：约三成帖子是「刷到划走」——等效文本量砍到 35%、屏内停顿减半、不回滚。
+    humanize 缺席时回退常量均匀计划（保证守护仍能跑）。返回 (plan, stay_ms, rb, pose)。
+    """
+    if hu is None:
+        steps = random.randint(*(LIGHT_STEPS if light else SCROLL_STEPS))
+        dt = random.uniform(0.25, 0.5) if light else random.uniform(*SCROLL_DT)
+        amp = random.randint(520, 760) if light else random.randint(*SCROLL_AMP)
+        plan = [{"dy": amp, "pause": dt} for _ in range(steps)]
+        stay_ms = int(random.uniform(*(LIGHT_DWELL if light else BOTTOM_STAY)) * 1000)
+        return plan, stay_ms, (0 if light else ROLLBACK_STEPS), None
+    n_eff = max(600, int(n_chars * (0.35 if light else 1.0)))
+    dwell = hu.read_dwell_seconds(n_eff, kind="browse")
+    dwell = min(dwell, LIGHT_DWELL_CAP_S if light else DEEP_DWELL_CAP_S)
+    plan = hu.scroll_plan(n_eff, dwell, kind="browse")
+    if light:                                     # 浅读：屏幅更大、停顿更短
+        for p in plan:
+            p["dy"] = round(p["dy"] * random.uniform(1.3, 1.8), 1)
+            p["pause"] = round(max(0.25, p["pause"] * 0.5), 2)
+    stay_ms = int(hu.wrap_up_seconds("browse") * 1000)
+    pose = hu.pose("browse", n_eff)
+    pose.update({"light": light, "n_chars": n_eff})
+    return plan, stay_ms, (0 if light else ROLLBACK_STEPS), pose
+
+
+def browse_one(session, tid, state, cand=None):
     # 深浅分层：真人不是每帖都读到底——约三成是「刷到划走」型浅读（快滚大屏幅、不回滚、短驻留）
     light = random.random() < LIGHT_P
-    if light:
-        steps = random.randint(*LIGHT_STEPS)
-        dtms = int(random.uniform(0.25, 0.5) * 1000)
-        amp = random.randint(520, 760)
-        stay = int(random.uniform(*LIGHT_DWELL) * 1000)
-        rb = 0
-    else:
-        steps = random.randint(*SCROLL_STEPS)
-        dtms = int(random.uniform(*SCROLL_DT) * 1000)
-        amp = random.randint(*SCROLL_AMP)
-        stay = int(random.uniform(*BOTTOM_STAY) * 1000)
-        rb = ROLLBACK_STEPS
-    code = ROUTE_JS.replace("__TID__", str(tid)).replace("__STEPS__", str(steps)).replace("__DTMS__", str(dtms)).replace("__AMP__", str(amp)).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
-    res = run_js(session["id"], code, timeout=max(150, steps * 3 + stay // 1000 + 30))
+    plan, stay, rb, pose = _browse_plan(_estimate_chars(cand), light)
+    plan_js = "[" + ",".join("[%s,%s]" % (p["dy"], p["pause"]) for p in plan) + "]"
+    code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
+    js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2)
+    res = run_js(session["id"], code, timeout=max(150, js_budget + 45))
     ok = isinstance(res, dict) and not res.get("need_loc") and not res.get("fail")
     if isinstance(res, dict) and res.get("need_loc"):
         # 兜底整页导航仅允许在主站 tab 上做：connect.linux.do 等子域无 Discourse，
@@ -882,11 +934,12 @@ def browse_one(session, tid, state):
             return False, {"fail": "non-linuxdo-tab:%s" % host}
         run_js(session["id"], "location.href='/t/topic/%s'" % tid, timeout=20)  # 整页直达兜底
         time.sleep(6)
-        res2 = run_js(session["id"], code, timeout=max(150, steps * 3 + stay // 1000 + 30))
+        res2 = run_js(session["id"], code, timeout=max(150, js_budget + 45))
         ok = isinstance(res2, dict) and not res2.get("fail")
         res = res2
     if isinstance(res, dict):
         res["mode"] = "LIGHT" if light else "DEEP"
+        res["pose"] = pose
     return ok, res
 
 
@@ -926,7 +979,8 @@ def browse_batch(session, st, batch=25):
         log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "DONE" if ok else "FAIL",
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
-                                       "mode": res.get("mode") if isinstance(res, dict) else None})
+                                       "mode": res.get("mode") if isinstance(res, dict) else None,
+                                       "pose": res.get("pose") if isinstance(res, dict) else None})
         if ok:
             done += 1
             seen.add(int(tid))
@@ -936,9 +990,8 @@ def browse_batch(session, st, batch=25):
             save_state(st)
         else:
             skipped += 1
-        # 帖间随机间隔（防检测核心）
-        gap = random.choice([random.randint(*GAP_RANGE)] * 3 + [random.randint(*GAP_LONG_RANGE)])
-        time.sleep(gap)
+        # 帖间随机间隔（防检测核心）：统一走 humanize，含 25-35% 长休
+        time.sleep(hu.action_gap("browse", base=random.uniform(*GAP_RANGE)))
     return done, skipped
 
 
