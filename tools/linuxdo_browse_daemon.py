@@ -27,7 +27,8 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
   - 深翻随机 14–26 步 × 0.8–1.5s，步长 380–900px（随机）
   - 每 batch 随机混入 2–4 次「只逛列表页」不进帖（拟人翻列表）
   - 候选页序随机（/latest.json?page=<rand>），已浏览 id 去重
-  - --batch 默认 25 帖/批；--daily-cap 每日话题上限（默认 120）
+  - --batch 默认 25 帖/批；--daily-cap 每日话题上限（默认 120，每日 ±20 内随机定一次）
+  - 静默窗结束后随机晨抖 0–60min 再开工（防每天准点开工的机械特征）
   - --max-session-min 单段运行上限（默认 90min），跑满 sleep 30–60min 再继续
   - 静默窗默认 01:00–07:30 不浏览（只整点查一次等级）
 
@@ -58,25 +59,27 @@ HINT = "linux.do"
 
 RC_OK, RC_GAPS, RC_NO_SESSION, RC_UNJUDGEABLE, RC_USAGE, RC_SELFTEST = 0, 1, 2, 3, 4, 5
 
-# 防检测参数（后台版）
-GAP_RANGE = (90, 240)
-GAP_LONG_RANGE = (240, 420)
-GAP_LONG_P = 0.25
+# 防检测参数（后台版）——2026-10-05 二轮：日上限 120→160(每日±20 抖动) + 帖内节奏放慢
+GAP_RANGE = (110, 260)
+GAP_LONG_RANGE = (300, 600)
+GAP_LONG_P = 0.30
 SCROLL_STEPS = (22, 30)      # 慢滚多步：步长<半楼 ⇒ 每楼≥2个 tick 覆盖
-SCROLL_DT = (1.2, 1.8)
+SCROLL_DT = (1.4, 2.0)
 SCROLL_AMP = (300, 440)
-BOTTOM_STAY = (70, 84)       # 底部驻留秒——跨 Discourse ~60s timings flush 周期（2026-10-05 实测根因）
+BOTTOM_STAY = (90, 125)      # 底部驻留秒——跨 Discourse ~60s timings flush 周期（2026-10-05 实测根因）；二轮拉长更像细看
 ROLLBACK_STEPS = 10          # 回滚给每楼二次 tick 机会
-LOITER_P_LIST = (2, 4)
-LIGHT_P = 0.30              # 30% 浅读（刷到不感兴趣划走型）：每帖都读到底=机器味（2026-10-05 反检测审查）
+LOITER_P_LIST = (2, 5)
+LIGHT_P = 0.25              # 25% 浅读（刷到不感兴趣划走型）：每帖都读到底=机器味（2026-10-05 反检测审查）
 LIGHT_STEPS = (4, 6)
 LIGHT_DWELL = (15, 30)      # 浅读驻留秒
-BATCH_DEFAULT = 25
-DAILY_CAP_DEFAULT = 120
-SESSION_MIN_DEFAULT = 90
-SESSION_REST = (1800, 3600)
+BATCH_DEFAULT = 20
+DAILY_CAP_DEFAULT = 160
+DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固定同一数字=机械特征
+SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入迷的真人，提高占空比）
+SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
+MORNING_JITTER = (0, 3600)  # 静默窗结束后随机延迟 0–60min 再开工——真人不会每天准点开始
 QUIET_WINDOW = (1, 0, 7, 30)          # 01:00–07:30 静默
-INTER_BATCH_GAP = (300, 900)
+INTER_BATCH_GAP = (420, 900)
 SESS_RETRY_MAX = 6                      # pick_session/判级连续失败达上限才退出（断链重试≈1h+）
 SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
 FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
@@ -224,6 +227,26 @@ def quiet_window_check(now=None):
 
 def daily_count(st):
     return int(st.get("daily", {}).get(today(), 0))
+
+
+def daily_cap_today(st, base):
+    """当日 cap：base±JITTER 内每日随机定一次（先存内存，判级落盘后跨重启稳定）。"""
+    caps = st.setdefault("cap", {})
+    v = caps.get(today())
+    if not v:
+        v = max(1, int(base) + random.randint(-DAILY_CAP_JITTER, DAILY_CAP_JITTER))
+        caps[today()] = v
+    return int(v)
+
+
+def morning_jitter_sec(st):
+    """今日晨间抖动秒：静默窗结束后再随机等这么久才开工（每日定一次，仅内存）。"""
+    jt = st.setdefault("jitter", {})
+    v = jt.get(today())
+    if v is None:
+        v = int(random.uniform(*MORNING_JITTER))
+        jt[today()] = v
+    return int(v)
 
 
 # ---------------------------------------------------------------- TL3 判停（按页面标记，禁数值比较）
@@ -509,6 +532,14 @@ def watch(args):
             print("[%s] 静默窗内，睡 30min" % now_str(), flush=True)
             time.sleep(1800)
             continue
+        mj = morning_jitter_sec(st)
+        if mj:
+            now = dt.datetime.now()
+            gate = dt.datetime(now.year, now.month, now.day, QUIET_WINDOW[2], QUIET_WINDOW[3]) + dt.timedelta(seconds=mj)
+            if now < gate:
+                print("[%s] 晨间抖动：静默窗后延 %dmin 再开工（先睡 %dmin）" % (now_str(), mj / 60, (gate - now).total_seconds() / 60), flush=True)
+                time.sleep(min((gate - now).total_seconds(), 1800))
+                continue
         session, note = pick_session()
         if not session:
             sess_fails += 1
@@ -538,8 +569,9 @@ def watch(args):
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
             return RC_OK
-        if daily_count(st) >= args.daily_cap:
-            print("[%s] 今日已达 daily-cap=%d，睡到明天" % (now_str(), args.daily_cap), flush=True)
+        cap_today = daily_cap_today(st, args.daily_cap)
+        if daily_count(st) >= cap_today:
+            print("[%s] 今日已达 daily-cap=%d（base=%d，每日随机定一次），睡到明天" % (now_str(), cap_today, args.daily_cap), flush=True)
             time.sleep(3600)
             continue
         if (time.time() - start) / 60 >= args.max_session_min:
@@ -677,11 +709,32 @@ def selftest():
         fails.append("T7n SESS_RETRY 常量边界错")
     if not ("hasFocus" in FRONT_JS and "visibilityState" in FRONT_JS and "JSON.stringify" in FRONT_JS):
         fails.append("T7n FRONT_JS 形状缺关键 token")
+    # T8 cap 抖动 / T9 晨抖（纯函数断言，传局部 dict，不触真 state）
+    cst = {"cap": {}}
+    c1 = daily_cap_today(cst, 250)
+    c2 = daily_cap_today(cst, 250)
+    if abs(c1 - 250) > DAILY_CAP_JITTER or abs(c2 - 250) > DAILY_CAP_JITTER:
+        fails.append("T8 cap 抖动越界: %s/%s" % (c1, c2))
+    if c1 != c2:
+        fails.append("T8 同 st 二次调用不稳定: %s vs %s" % (c1, c2))
+    if not (1 <= DAILY_CAP_JITTER <= 60):
+        fails.append("T8 抖动常量边界错")
+    if daily_cap_today({"cap": {today(): 999}}, 250) != 999:
+        fails.append("T8 已存当日 cap 未直接返回")
+    jst = {"jitter": {}}
+    j1 = morning_jitter_sec(jst)
+    j2 = morning_jitter_sec(jst)
+    if not (0 <= j1 <= MORNING_JITTER[1] and j1 == j2):
+        fails.append("T9 晨抖越界或不稳定: %s vs %s" % (j1, j2))
+    if morning_jitter_sec({"jitter": {today(): 123}}) != 123:
+        fails.append("T9 已存晨抖未直接返回")
+    if not (isinstance(MORNING_JITTER, tuple) and MORNING_JITTER[0] == 0 and MORNING_JITTER[1] > 0):
+        fails.append("T9 晨抖常量形状错")
     if fails:
         for f in fails:
             print("FAIL " + f)
         return RC_SELFTEST
-    print("selftest 7/7 PASS")
+    print("selftest 9/9 PASS")
     return RC_OK
 
 
