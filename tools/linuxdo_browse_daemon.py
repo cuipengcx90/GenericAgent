@@ -86,11 +86,22 @@ QUIET_WINDOW = (1, 0, 7, 30)          # 01:00–07:30 静默
 # 等级前置检查节流（2026-10-05 用户要求）：不再每轮都读等级卡 —— 每天 1–3 次、时刻随机。
 # 「不满足 ⇒ 浏览补足」的路由语义不变；两次检查之间沿用上次判定继续补足。
 LEVEL_CHECK_GAP = (5 * 3600, 11 * 3600)
-# 缺项路由：等级卡未达标项分两类 —— 能自动补的（浏览类）走浏览 SOP 自动做；
-# 不能自动的（回复/点赞/获赞/访问天数/上限类）一律只通知人，绝不代操作（发帖点赞=红线）。
-MANUAL_NAME_HINTS = ("回复", "点赞", "送赞", "获赞", "访问天数", "活跃程度", "登录",
-                    "举报", "禁言", "封禁")
+# 缺项路由（2026-10-05 用户定义）：未达标项分四路 ——
+#   浏览类 → 浏览 SOP（daemon 自身随机节奏）；
+#   回复类 → 回帖执行器 tools/linuxdo_acts.py（排队后由 acts 自己的随机段执行，与等级检查时刻解耦）；
+#   送赞类 → 点赞执行器（同上，独立 cap/节奏）；
+#   其余（获赞/访问天数/活跃程度/登录/举报/禁言/封禁）只能人工，只通知不代操作。
+MANUAL_NAME_HINTS = ("获赞", "访问天数", "活跃程度", "登录", "举报", "禁言", "封禁",
+                     "获赞数", "被赞")
 BROWSE_KINDS = ("浏览话题", "浏览帖子", "浏览", "阅读")
+REPLY_KINDS = ("回复话题", "回复帖子", "回复")
+LIKE_KINDS = ("点赞", "送赞")
+# 排队上限：一次等级检查最多排多少（真正的日 cap/节奏由 acts 内核管，这里只是欠账量）
+QUEUE_REPLY_MAX = 2
+QUEUE_LIKE_MAX = 3
+# 等级检查与动作执行的解耦：等级检查即时排队，动作由 acts 随机段内执行；
+# 每轮最多各做 1 条，且两轮之间至少歇 20–45min（防「检查完立刻动手」的固定时刻特征）。
+ACTS_ROUND_GAP = (1200, 2700)
 # connect 页两条路径结构不同：connect=({met:bool,name:'当前/门槛'}，无指标名)；首页卡=({mark, name, cur, req})。
 # connect 实测固定 12 项顺序（2026-10-05 level_log.jsonl）⇒ 仅当这些项的**门槛值全部吻合**才启用顺序映射，
 # 否则一律按「未识别」处理（fail-safe：只通知人，绝不误判为可自动补）。
@@ -248,6 +259,7 @@ def load_state():
     st.setdefault("level", {})
     st.setdefault("browsed_total", 0)
     st.setdefault("rest_days", {})
+    st.setdefault("pending_acts", {})       # 等级缺项排队的回帖/点赞（由 acts 随机节奏消费）
     return st
 
 
@@ -433,10 +445,10 @@ def _map_connect_names(items):
 
 
 def classify_pending(lvl):
-    """未达标项分「可自动补(浏览类)」/「须人工」/「未识别(fail-safe 也通知)」。"""
+    """未达标项分四路：browse/reply/like 可自动补；manual 须人工；unknown fail-safe 也通知。"""
     items = lvl.get("items") or []
     names = _map_connect_names(items)
-    manual, auto, unknown = [], [], []
+    manual, auto, unknown, reply, like = [], [], [], [], []
     for i, it in enumerate(items):
         if not _item_unmet(it):
             continue
@@ -444,11 +456,115 @@ def classify_pending(lvl):
         rec = {"name": nm, "cur": it.get("cur"), "req": _req_of(it)}
         if any(k in nm for k in BROWSE_KINDS):
             auto.append(rec)
+        elif any(k in nm for k in REPLY_KINDS):
+            reply.append(rec)
+        elif any(k in nm for k in LIKE_KINDS):
+            like.append(rec)
         elif any(k in nm for k in MANUAL_NAME_HINTS):
             manual.append(rec)
         else:
             unknown.append(rec)
-    return {"manual": manual, "auto": auto, "unknown": unknown}
+    return {"manual": manual, "auto": auto, "unknown": unknown,
+            "reply": reply, "like": like}
+
+
+def _deficit(rec, cap):
+    """欠账量：cur/req 可解析就算差值，否则保守取 1；上限 cap。"""
+    cur, req = rec.get("cur"), rec.get("req")
+    try:
+        n = int(req) - int(cur)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(int(cap), n if n > 0 else 1))
+
+
+def queue_pending_from_route(st, route):
+    """把「回复类/送赞类」欠项排进 pending_acts（不立即执行）。
+
+    关键设计：排队与执行解耦 —— 等级检查即时排队，实际动作由 linuxdo_acts 的
+    随机段/随机间隔决定，避免「检查完就动手」形成固定时刻特征。
+    """
+    pa = st.setdefault("pending_acts", {})
+    added = {}
+    for kind, key, cap in (("reply", "reply", QUEUE_REPLY_MAX),
+                           ("like", "like", QUEUE_LIKE_MAX)):
+        for rec in route.get(key) or []:
+            n = _deficit(rec, cap)
+            pa[kind] = max(int(pa.get(kind) or 0), n)
+            added[kind] = pa[kind]
+    if added:
+        pa["ts"] = time.time()
+        pa["src"] = "level_route"
+        save_state(st)
+        log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "QUEUED",
+                                     "queued": added,
+                                     "items": [r.get("name") for kk in ("reply", "like")
+                                               for r in (route.get(kk) or [])]})
+    return added
+
+
+def maybe_run_pending_acts(st, session, apply_=True):
+    """按 acts 内核的随机节奏执行排队中的回帖/点赞（每轮最多各 1 条）。
+
+    返回 dict（有多少条执行成功/被跳过）。失败一律留痕，不改 pending，也不抛。
+    """
+    pa = st.get("pending_acts") or {}
+    if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)):
+        return {}
+    last = float(pa.get("last_run_ts") or 0)
+    gap = random.uniform(*ACTS_ROUND_GAP)
+    if last and (time.time() - last) < gap:
+        return {}
+    out = {}
+    tok = None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import linuxdo_acts as A           # 延迟 import（避免循环 import）
+        tok = A.acquire_lock("daemon-acts")   # 与提示词触发的 acts 互斥：同一 linux.do 标签
+        if not tok:
+            log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "LOCK_BUSY"})
+            return {"locked": True}
+        ast_ = A.load_state()              # acts 自己的 state（独立 cap/日账）
+        for kind, fn in (("reply", A.act_reply), ("like", A.act_like)):
+            n_pending = int(pa.get(kind) or 0)
+            if n_pending <= 0:
+                continue
+            try:
+                res = fn(ast_, session, max_n=1, apply_=apply_,
+                         log=lambda *a, **k: None)
+            except Exception as e:                     # 执行器异常绝不死守护
+                log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "ERROR",
+                                             "kind": kind, "note": repr(e)[:200]})
+                out[kind] = "ERROR"
+                continue
+            if not res or res.get("skip"):
+                out[kind] = "SKIP:%s" % (res or {}).get("why")
+                continue
+            items = res.get("items") or []
+            ok = [x for x in items if x.get("status") in ("REPLIED", "LIKED")]
+            if ok:
+                pa[kind] = max(0, n_pending - len(ok))
+                out[kind] = "DONE:%d" % len(ok)
+            else:
+                out[kind] = "NOOP"
+        st["pending_acts"] = pa
+        pa["last_run_ts"] = time.time()
+        if not (int(pa.get("reply") or 0) or int(pa.get("like") or 0)):
+            pa["done_ts"] = time.time()
+        save_state(st)
+        log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "RUN", "result": out,
+                                     "left": {k: int(pa.get(k) or 0) for k in ("reply", "like")}})
+    except Exception as e:
+        log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "IMPORT_ERROR",
+                                     "note": repr(e)[:200]})
+        return {"error": repr(e)[:200]}
+    finally:
+        if tok:
+            try:
+                A.release_lock(tok)        # 只删自己的锁；异常绝不死守护
+            except Exception:
+                pass
+    return out
 
 
 def maybe_notify_manual(st, route):
@@ -465,7 +581,11 @@ def maybe_notify_manual(st, route):
     if route.get("auto"):
         lines.append("（浏览类缺项已由后台随机节奏自动补足：%s）" % "、".join(
             str(it.get("name")) for it in route["auto"]))
-    lines.append("提示：回复/点赞需本人操作（自动化=发帖点赞红线）；访问天数只能靠本人持续登录。")
+    for key, label in (("reply", "回复"), ("like", "点赞")):
+        if route.get(key):
+            lines.append("（%s类缺项已排队，由独立随机节奏自动补：%s）" % (
+                label, "、".join(str(it.get("name")) for it in route[key])))
+    lines.append("提示：获赞/访问天数只能靠本人持续活跃；登录/举报/封禁类无需处理。")
     notify("\n".join(lines))
     st["route_notified"] = today()
     save_state(st)
@@ -853,18 +973,29 @@ def watch(args):
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
             return RC_OK
-        # 缺项路由：可自动补的（浏览类）继续走浏览 SOP；须人工的只通知（幂等，每天≤1次）
+        # 缺项路由：浏览类走浏览 SOP 自补；回复/送赞类排队给 acts 随机节奏执行；其余只通知
         route = classify_pending(lvl)
-        if route["manual"] or route["unknown"]:
-            print("[%s] 缺项路由：须人工 %s / 未识别 %s / 自动补 %s" % (
+        if route["manual"] or route["unknown"] or route.get("reply") or route.get("like"):
+            print("[%s] 缺项路由：须人工 %s / 未识别 %s / 自动补 %s / 排队回帖 %s / 排队点赞 %s" % (
                 now_str(), [it.get("name") for it in route["manual"]],
                 [it.get("name") for it in route["unknown"]],
-                [it.get("name") for it in route["auto"]]), flush=True)
+                [it.get("name") for it in route["auto"]],
+                [it.get("name") for it in route.get("reply") or []],
+                [it.get("name") for it in route.get("like") or []]), flush=True)
+        if route.get("reply") or route.get("like"):
+            queued = queue_pending_from_route(st, route)
+            print("[%s] 已排队自动补足（等 acts 随机段执行，不即刻动手）：%s" % (now_str(), queued), flush=True)
+        if route["manual"] or route["unknown"]:
             if maybe_notify_manual(st, route):
                 print("[%s] 已私信提醒须人工项（今日首次）" % now_str(), flush=True)
         cap_today = daily_cap_today(st, args.daily_cap)
         if daily_count(st) >= cap_today:
             print("[%s] 今日已达 daily-cap=%d（base=%d，每日随机定一次），睡到明天" % (now_str(), cap_today, args.daily_cap), flush=True)
+            _r = maybe_run_pending_acts(st, session)
+            if _r:
+                print("[%s] 浏览已到量，仍按随机节奏补做排队动作：%s（剩余 %s）" % (
+                    now_str(), _r, {k: int((st.get("pending_acts") or {}).get(k) or 0)
+                                    for k in ("reply", "like")}), flush=True)
             time.sleep(3600)
             continue
         if (time.time() - start) / 60 >= args.max_session_min:
@@ -883,6 +1014,12 @@ def watch(args):
             print("[%s] %s，睡 5min" % (now_str(), why), flush=True)
             time.sleep(300)
             continue
+        # 排队中的回帖/点赞：按 acts 内核的随机段与随机间隔执行（与等级检查时刻解耦）
+        _ra = maybe_run_pending_acts(st, session)
+        if _ra:
+            print("[%s] 排队动作执行：%s（剩余 %s）" % (
+                now_str(), _ra, {k: int((st.get("pending_acts") or {}).get(k) or 0)
+                                 for k in ("reply", "like")}), flush=True)
         done, skipped = browse_batch(session, st, batch=args.batch)
         print("[%s] batch done=%d skipped=%d total_browsed=%d" % (now_str(), done, skipped, st.get("browsed_total", 0)), flush=True)
         # 候选抓取失败时留了诊断 ⇒ 先判是不是风控（HTTP 429/403 / 封禁文案）
@@ -1012,11 +1149,36 @@ def _selftest_impl():
     if [it["name"] for it in _r["auto"]] != ["浏览帖子"] or _r["manual"] or _r["unknown"]:
         fails.append("T6c connect 形态：浏览帖子应归自动补且无人工项: %s" % _r)
     cases += 1
-    # T6c2 回复类未达标（idx3 门槛吻合⇒映射出「回复话题」）⇒ 须人工
+    # T6c2 回复类未达标（idx3 门槛吻合⇒映射出「回复话题」）⇒ 归 reply 路由（排队给 acts，不须人工）
     _ci2 = [dict(x) for x in _ci]; _ci2[3] = {"met": False, "name": "8/ 10"}
     _r2 = classify_pending({"items": _ci2})
-    if [it["name"] for it in _r2["manual"]] != ["回复话题"]:
-        fails.append("T6c2 回复类应归须人工: %s" % _r2)
+    if [it["name"] for it in _r2["reply"]] != ["回复话题"] or _r2["manual"]:
+        fails.append("T6c2 回复类应归 reply 路由且不进人工: %s" % _r2)
+    cases += 1
+    # T6c2b 送赞类未达标（idx4=点赞门槛）⇒ 归 like 路由
+    _ci2b = [dict(x) for x in _ci]; _ci2b[4] = {"met": False, "name": "22/ 30"}
+    _r2b = classify_pending({"items": _ci2b})
+    if [it["name"] for it in _r2b["like"]] != ["点赞"] or _r2b["manual"]:
+        fails.append("T6c2b 送赞类应归 like 路由且不进人工: %s" % _r2b)
+    cases += 1
+    # T6c2c 排队：欠账按 cur/req 差值算，且受上限封顶（dry：不执行动作，仅排队）
+    _stq = {"pending_acts": {}}
+    _add = queue_pending_from_route(_stq, {"reply": [{"name": "回复话题", "cur": 8, "req": 10}],
+                                           "like": [{"name": "点赞", "cur": 0, "req": 30}]})
+    if _add != {"reply": 2, "like": QUEUE_LIKE_MAX} or \
+       _stq["pending_acts"].get("reply") != 2 or _stq["pending_acts"].get("src") != "level_route":
+        fails.append("T6c2c 排队欠账量/封顶错: %s / %s" % (_add, _stq.get("pending_acts")))
+    cases += 1
+    # T6c2d 负控：无 reply/like 缺项 ⇒ 不得产生任何排队（不许无中生有）
+    _stq2 = {"pending_acts": {}}
+    if queue_pending_from_route(_stq2, {"reply": [], "like": [], "auto": [{"name": "浏览帖子"}]}) or \
+       _stq2["pending_acts"]:
+        fails.append("T6c2d 无缺项却排队: %s" % _stq2["pending_acts"])
+    cases += 1
+    # T6c2e 执行节流：距上轮不足随机间隔 ⇒ 本轮不执行（且不触发 import 执行器）
+    _stt = {"pending_acts": {"reply": 1, "like": 0, "last_run_ts": time.time()}}
+    if maybe_run_pending_acts(_stt, None) != {}:
+        fails.append("T6c2e 节流窗内不应执行排队动作")
     cases += 1
     # T6c3 负控：门槛值被改（idx1 req 600）⇒ 顺序不可信 ⇒ 未达标项必须落 unknown（不得误判 auto）
     _ci3 = [dict(x) for x in _ci]; _ci3[1] = {"met": False, "name": "598/ 600"}
@@ -1031,9 +1193,11 @@ def _selftest_impl():
                      {"mark": "○", "name": "访问天数", "cur": 40, "req": 50}]}
     _r4 = classify_pending(_hc)
     if [it["name"] for it in _r4["auto"]] != ["浏览话题"] or \
-       sorted(it["name"] for it in _r4["manual"]) != ["回复话题", "访问天数"]:
+       [it["name"] for it in _r4["reply"]] != ["回复话题"] or \
+       [it["name"] for it in _r4["manual"]] != ["访问天数"]:
         fails.append("T6c4 首页卡形态分类错: %s" % _r4)
-    if any(it["name"] == "点赞" for it in _r4["manual"] + _r4["auto"] + _r4["unknown"]):
+    if any(it["name"] == "点赞" for it in _r4["manual"] + _r4["auto"] + _r4["unknown"] +
+           _r4["reply"] + _r4["like"]):
         fails.append("T6c4 已达标项(✓)不应进入路由")
     cases += 1
     # T6c5 负控：unknown 不得静默 —— 必须进通知面

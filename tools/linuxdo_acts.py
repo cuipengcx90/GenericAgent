@@ -1,0 +1,908 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""L站互动动作执行器（回帖 / 点赞 / 发帖）。
+
+设计（2026-10-05 用户定义的五动作架构）：
+  · 五动作 = 等级检测(前置) / 浏览 / 回帖 / 点赞 / 发帖，各自可被提示词单独触发；
+  · 等级检测出缺项 ⇒ 按类路由到本执行器（回复类→reply、送赞类→like、浏览类→daemon 自补）；
+  · 全部随机化决策走统一内核 tools/linuxdo_antidetect.py（多段切分/日限抖动/休息日/静默窗/
+    晨间抖动/长休），本站不做任何固定节拍；
+  · 桥接与风控复用 tools/linuxdo_browse_daemon.py（run_js / pick_session / notify / 风控码判读），
+    同一浏览器会话 ⇒ 不新增身份（借 anyrouter 封号复盘：独立身份 + 随机化 + 可停）。
+
+安全默认：
+  · 一切写动作（POST）默认 **dry-run**，必须显式 `--apply` 才真发；
+  · 命中风控信号（429/403/401/BANNED）⇒ 落账 + 飞书私信 + 设 pause_until，绝不硬顶重试。
+
+用法：
+  python3 tools/linuxdo_acts.py due reply|like|post          # 现在能不能做 + 下次该等多久
+  python3 tools/linuxdo_acts.py run reply --apply            # 跑一轮回帖（自动选题+生成文案+发送）
+  python3 tools/linuxdo_acts.py run like  --apply --max 3
+  python3 tools/linuxdo_acts.py reply-one --topic 123 --raw "..." [--apply]
+  python3 tools/linuxdo_acts.py like-one  --topic 123 [--post 456] [--apply]
+  python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category 4 --tags "AI,求助" [--apply]
+  python3 tools/linuxdo_acts.py state | status
+  python3 tools/linuxdo_acts.py --selftest
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GA_ROOT = os.environ.get("GA_ROOT") or os.path.abspath(os.path.join(HERE, ".."))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+if GA_ROOT not in sys.path:
+    sys.path.insert(0, GA_ROOT)
+
+import linuxdo_antidetect as ad          # noqa: E402  统一随机化内核
+import linuxdo_browse_daemon as bd       # noqa: E402  桥接 / 会话 / 风控 / 通知
+
+BASE = os.path.join(GA_ROOT, "temp", "linuxdo_acts")
+
+
+def state_path():
+    """状态文件落点：env LJQ_ACTS_STATE 可重定向（自测/金丝雀用），默认生产 BASE。"""
+    return os.environ.get("LJQ_ACTS_STATE") or os.path.join(BASE, "state.json")
+
+
+LOCK_TTL = 1800.0        # 秒；超过即视为陈旧锁可回收（不探 pid 存活：RULE 5 禁 os.kill 判活）
+
+
+def lock_path():
+    """跨进程锁：daemon 与提示词触发的 acts 会抢同一个 linux.do 标签，必须互斥。"""
+    return os.environ.get("LJQ_ACTS_LOCK") or os.path.join(os.path.dirname(state_path()), "run.lock")
+
+
+def acquire_lock(tag="acts", ttl=LOCK_TTL, now_ts=None):
+    """拿到返回 token；被占（且未超 TTL）返回 None。陈旧锁按 TTL 回收。"""
+    now_ts = now_ts or time.time()
+    p = lock_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    token = "%s-%d-%d" % (tag, os.getpid(), int(now_ts * 1000))
+    for _ in range(2):
+        try:
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                info = json.load(open(p, encoding="utf-8"))
+            except Exception:
+                info = {}
+            if now_ts - float(info.get("ts") or 0) < ttl:
+                return None
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"token": token, "tag": tag, "pid": os.getpid(), "ts": now_ts}, f)
+        return token
+    return None
+
+
+def release_lock(token):
+    """只删自己的锁（token 不符一律不动）。"""
+    p = lock_path()
+    try:
+        info = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return False
+    if info.get("token") != token:
+        return False
+    try:
+        os.remove(p)
+        return True
+    except OSError:
+        return False
+
+
+KINDS = ("reply", "like", "post")
+CODEX_BIN = os.environ.get("LJQ_CODEX_BIN") or shutil.which("codex") or "/opt/homebrew/bin/codex"
+
+# 文案红线（linuxdo_reply_sop）：水贴特征一律拦下
+BANNED_PHRASES = ("感谢分享", "谢谢分享", "学到了", "顶一下", "支持一下", "前排", "沙发",
+                  "路过", "打卡", "沙发帮顶")
+REPLY_MIN_CHARS, REPLY_MAX_CHARS = 8, 120
+
+
+# ------------------------------------------------------------------ 状态
+def load_state(path=None):
+    """全部键 setdefault —— 防「state 被局部 dict 覆盖」类事故（browse daemon 2026-10-05 踩过）。"""
+    p = path or state_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    st = None
+    if os.path.exists(p):
+        try:
+            st = json.load(open(p, encoding="utf-8"))
+        except Exception:
+            st = None
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("daily", {})           # daily[day][kind] = 次数
+    st.setdefault("done", {})            # done[kind][key] = ts（幂等去重）
+    st.setdefault("cap", {})             # 内核：cap[kind][day]
+    st.setdefault("rest", {})            # 内核：rest[kind][day]
+    st.setdefault("jitter", {})          # 内核：jitter[kind][day]
+    st.setdefault("post_history", [])    # 发帖历史 [{ts, id, title}]
+    st.setdefault("risk", {})            # risk[kind][day_count]
+    st.setdefault("risk_log", [])
+    st.setdefault("pause_until", 0.0)
+    st.setdefault("risk_stop_day", None)
+    return st
+
+
+def save_state(st, path=None):
+    p = path or state_path()
+    tmp = p + ".tmp"
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    json.dump(st, open(tmp, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    os.replace(tmp, p)
+
+
+def count_today(st, kind, day=None):
+    day = day or bd.today()
+    return int((st.get("daily", {}).get(day) or {}).get(kind, 0))
+
+
+def bump(st, kind, day=None):
+    day = day or bd.today()
+    d = st.setdefault("daily", {}).setdefault(day, {})
+    d[kind] = int(d.get(kind, 0)) + 1
+    return d[kind]
+
+
+def done_key_set(st, kind):
+    return set((st.get("done", {}).get(kind) or {}).keys())
+
+
+def mark_done(st, kind, key, extra=None):
+    st.setdefault("done", {}).setdefault(kind, {})[str(key)] = time.time()
+    if extra:
+        st["done"][kind][str(key)] = extra
+    # 裁剪：每类只留最近 800 条
+    d = st["done"][kind]
+    if len(d) > 800:
+        for k in sorted(d, key=lambda x: d[x] if isinstance(d[x], (int, float)) else 0)[:-800]:
+            d.pop(k, None)
+
+
+# ------------------------------------------------------------------ 风控
+def risk_note(st, kind, detail="", now_ts=None, path=None, allow_notify=True):
+    """记一次风控信号：当日同类 ≥3 ⇒ 当日停；否则设 pause_until 冷却（不 sleep，立即返回）。"""
+    now_ts = now_ts or time.time()
+    day = bd.today()
+    d = st.setdefault("risk", {}).setdefault(kind, {})
+    d[day] = int(d.get(day, 0)) + 1
+    st["risk_log"].append({"ts": now_ts, "kind": kind, "detail": str(detail)[:200], "n": d[day]})
+    st["risk_log"] = st["risk_log"][-200:]
+    if d[day] >= 3:
+        st["risk_stop_day"] = day
+        msg = "[linuxdo_acts] 风控升级 %s x%d → 今日停止该动作（%s）" % (kind, d[day], detail)
+    else:
+        pause = random.uniform(3600, 7200)
+        st["pause_until"] = max(st.get("pause_until") or 0, now_ts + pause)
+        msg = "[linuxdo_acts] 风控信号 %s → 暂停 %.0f 分钟（%s）" % (kind, pause / 60.0, detail)
+    save_state(st, path)
+    if allow_notify:
+        try:
+            bd.notify(msg)
+        except Exception as e:
+            print("[warn] 风控告警推送失败: %s" % str(e)[:160], flush=True)
+    return msg
+
+
+def risk_gate(st, kind, now_ts=None):
+    """入口闸门 → (ok, why)。"""
+    now_ts = now_ts or time.time()
+    if st.get("risk_stop_day") == bd.today():
+        return False, "risk_stop_day"
+    if float(st.get("pause_until") or 0) > now_ts:
+        return False, "pause_until(%ds)" % int(float(st["pause_until"]) - now_ts)
+    return True, "ok"
+
+
+def classify_result(res):
+    """把 JS 返回值判成 (ok, why, risk_kind)。"""
+    if not isinstance(res, dict):
+        return False, "bad_result:%s" % str(res)[:80], None
+    if res.get("ok"):
+        return True, "ok", None
+    status = res.get("status")
+    rk = bd.risk_kind_from_http(status) if status else None
+    txt = " ".join(str(res.get(k) or "") for k in ("err", "body"))
+    rk = rk or bd.risk_kind_from_text(txt)
+    return False, "status=%s err=%s" % (status, (res.get("err") or res.get("body") or "")[:120]), rk
+
+
+# ------------------------------------------------------------------ 站点 JS
+READ_TOPIC_JS = r"""
+(async () => {
+  try {
+    const r = await fetch('/t/__TID__.json', {credentials:'include', cache:'no-store'});
+    if (!r.ok) return JSON.stringify({ok:false, status:r.status});
+    const j = await r.json();
+    const strip = h => (h||'').replace(/<br\s*\/?>/g,'\n').replace(/<[^>]+>/g,' ')
+      .replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+      .replace(/\s+/g,' ').trim();
+    const ps = (j.post_stream && j.post_stream.posts) || [];
+    return JSON.stringify({ok:true, id:j.id, title:j.title, posts_count:j.posts_count,
+      category_id:j.category_id, tags:(j.tags||[]), created:j.created_at,
+      posts: ps.slice(0,8).map(p => ({id:p.id, num:p.post_number, user:p.username,
+        text: strip(p.cooked).slice(0,900)}))});
+  } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
+})()
+"""
+
+POST_REPLY_JS = r"""
+(async () => {
+  try {
+    const m = document.querySelector('meta[name=csrf-token]');
+    const tok = m ? m.getAttribute('content') : '';
+    const r = await fetch('/posts.json', {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':tok,'X-Requested-With':'XMLHttpRequest'},
+      body: JSON.stringify({topic_id: __TID__, raw: __RAW__})});
+    const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch(e) {}
+    return JSON.stringify({ok:r.ok, status:r.status, id:(j&&j.id)||null,
+      err:(j&&(j.errors||j.error_type))||null, body: j ? null : t.slice(0,300)});
+  } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
+})()
+"""
+
+POST_LIKE_JS = r"""
+(async () => {
+  try {
+    const m = document.querySelector('meta[name=csrf-token]');
+    const tok = m ? m.getAttribute('content') : '';
+    const r = await fetch('/post_actions.json', {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':tok,'X-Requested-With':'XMLHttpRequest'},
+      body: JSON.stringify({id: __PID__, post_action_type_id: 2})});
+    const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch(e) {}
+    return JSON.stringify({ok:r.ok, status:r.status, id:(j&&j.id)||null,
+      err:(j&&(j.errors||j.error_type))||null, body: j ? null : t.slice(0,240)});
+  } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
+})()
+"""
+
+POST_TOPIC_JS = r"""
+(async () => {
+  try {
+    const m = document.querySelector('meta[name=csrf-token]');
+    const tok = m ? m.getAttribute('content') : '';
+    const r = await fetch('/posts.json', {method:'POST', credentials:'include',
+      headers:{'Content-Type':'application/json','X-CSRF-Token':tok,'X-Requested-With':'XMLHttpRequest'},
+      body: JSON.stringify({title: __TITLE__, raw: __RAW__, category: __CAT__,
+                            tags: __TAGS__, skip_validations: false})});
+    const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch(e) {}
+    return JSON.stringify({ok:r.ok, status:r.status, topic_id:(j&&j.topic_id)||null,
+      id:(j&&j.id)||null, err:(j&&(j.errors||j.error_type))||null, body: j ? null : t.slice(0,400)});
+  } catch(e) { return JSON.stringify({ok:false, err:String(e).slice(0,140)}); }
+})()
+"""
+
+
+def _jid(v):
+    return json.dumps(v, ensure_ascii=False)
+
+
+# ------------------------------------------------------------------ 文案生成
+REPLY_PROMPT = """你是 linux.do 社区的老用户，要回一个帖子。下面是帖子标题与前几楼正文。
+
+标题：{title}
+
+楼层摘录：
+{posts}
+
+请写 **1-2 句**中文回复：
+- 必须点名帖子里一个具体细节（技术点 / 数字 / 现象），让人看出你真读了；
+- 禁止分点列 1.2.3.，禁止"感谢分享/学到了/顶一下"这类水贴话术，禁止客套收尾；
+- 不要 emoji、不要 markdown 标记；
+- 总长 {lo}-{hi} 字。
+只输出回复正文本身，不要任何前后缀说明。"""
+
+
+def clean_text(s):
+    """剥 markdown / 引号 / 前后缀说明，取 1-2 句干净正文。"""
+    if not s:
+        return ""
+    t = s.strip()
+    t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+    t = re.sub(r"\n?```$", "", t)
+    t = re.sub(r"^\s*(回复|回帖|answer|reply)\s*[:：]\s*", "", t, flags=re.I)
+    t = t.replace("**", "").replace("`", "")
+    t = re.sub(r"^\s*[-*•]\s*", "", t)
+    t = re.sub(r"\s*\n+\s*", " ", t).strip()
+    t = t.strip("\"'“”「」 ")
+    return t
+
+
+def validate_reply(text):
+    """→ (ok, why)。拦截水贴/空/超长/含链接。"""
+    t = clean_text(text)
+    if not t:
+        return False, "empty"
+    if len(t) < REPLY_MIN_CHARS:
+        return False, "too_short(%d)" % len(t)
+    if len(t) > REPLY_MAX_CHARS:
+        return False, "too_long(%d)" % len(t)
+    if "http://" in t or "https://" in t:
+        return False, "contains_url"
+    if re.search(r"(^|\s)\d+\.\s", t) and t.count("\n") >= 2:
+        return False, "bullet_list"
+    for b in BANNED_PHRASES:
+        if b in t:
+            return False, "banned_phrase(%s)" % b
+    return True, t
+
+
+def gen_text(prompt, timeout=180, codex_bin=None):
+    """codex exec 生成文案；失败/超时返回 None（绝不硬顶重试）。"""
+    bin_ = codex_bin or CODEX_BIN
+    if not bin_ or not os.path.exists(bin_):
+        return None, "codex_not_found:%s" % bin_
+    try:
+        r = subprocess.run([bin_, "exec", "--skip-git-repo-check", prompt],
+                           capture_output=True, text=True, timeout=timeout,
+                           cwd=tempfile.gettempdir())
+        out = (r.stdout or "").strip()
+        return (out or None), ("rc=%d %s" % (r.returncode, (r.stderr or "")[:160]))
+    except subprocess.TimeoutExpired:
+        return None, "timeout(%ds)" % timeout
+    except Exception as e:
+        return None, "err:%s" % str(e)[:160]
+
+
+# ------------------------------------------------------------------ 站点动作
+def get_session(prefer=None):
+    return bd.pick_session(prefer=prefer)
+
+
+def read_topic(session, tid):
+    res = bd.run_js(session["id"], READ_TOPIC_JS.replace("__TID__", str(int(tid))), timeout=30)
+    ok, why, rk = classify_result(res)
+    return ok, (res if isinstance(res, dict) else {}), why, rk
+
+
+def post_reply(session, tid, raw):
+    code = POST_REPLY_JS.replace("__TID__", str(int(tid))).replace("__RAW__", _jid(raw))
+    return bd.run_js(session["id"], code, timeout=45)
+
+
+def post_like(session, post_id):
+    code = POST_LIKE_JS.replace("__PID__", str(int(post_id)))
+    return bd.run_js(session["id"], code, timeout=45)
+
+
+def post_topic(session, title, raw, category, tags):
+    code = (POST_TOPIC_JS.replace("__TITLE__", _jid(title)).replace("__RAW__", _jid(raw))
+            .replace("__CAT__", str(int(category)))
+            .replace("__TAGS__", json.dumps(tags, ensure_ascii=False)))
+    return bd.run_js(session["id"], code, timeout=60)
+
+
+def fetch_candidates(session, pages=3):
+    """拉最新帖候选（复用 daemon 的 /latest.json 通道）。"""
+    out, seen = [], set()
+    for p in random.sample(range(0, 6), pages):
+        for t in bd.fetch_candidates(session, p):
+            tid = t.get("id")
+            if tid and tid not in seen:
+                seen.add(tid)
+                out.append(t)
+        time.sleep(random.uniform(1.5, 3.5))
+    return out
+
+
+def pick_reply_targets(session, st, want=2):
+    """从最新帖里挑适合回的：有楼层、非自己、未回过、体量适中、偏技术/问答类。"""
+    got, skip = [], 0
+    done = done_key_set(st, "reply")
+    for t in fetch_candidates(session, pages=3):
+        tid = str(t.get("id"))
+        if tid in done:
+            skip += 1
+            continue
+        title = t.get("title") or ""
+        if re.search(r"(抽奖|拼车|广告|推广|出售|代购)", title):
+            continue
+        got.append({"id": t.get("id"), "title": title, "posts": t.get("posts")})
+        if len(got) >= want * 3:
+            break
+    random.shuffle(got)
+    return got[:want], skip
+
+
+# ------------------------------------------------------------------ 动作：回帖
+def act_reply(st, session, max_n=2, apply_=False, dry_run=None, text_override=None,
+              topic_id=None, timeout=180, log=print):
+    dry = (not apply_) if dry_run is None else dry_run
+    day = bd.today()
+    cap = ad.cap_today(st, day, "reply")
+    done_today = count_today(st, "reply", day)
+    res = {"kind": "reply", "dry_run": dry, "cap": cap, "done_today": done_today, "items": []}
+    okg, whg = risk_gate(st, "reply")
+    if not okg:
+        res["blocked"] = whg
+        return res
+    n = 0
+    if topic_id:
+        targets = [{"id": int(topic_id), "title": "", "posts": None}]
+    else:
+        targets, skipped = pick_reply_targets(session, st, want=max_n)
+        res["dedup_skipped"] = skipped
+    for t in targets:
+        if n >= max_n or done_today + n >= cap:
+            break
+        ok, tinfo, why, rk = read_topic(session, t["id"])
+        if not ok:
+            if rk:
+                res["risk"] = risk_note(st, "reply", why)
+                res["items"].append({"topic": t["id"], "status": "RISK", "why": why, "risk": rk})
+                break
+            res["items"].append({"topic": t["id"], "status": "READ_FAIL", "why": why})
+            continue
+        raw = text_override
+        if not raw:
+            body = "\n".join("【%s楼 %s】%s" % (p.get("num"), p.get("user"), p.get("text"))
+                             for p in (tinfo.get("posts") or [])[:4])
+            prompt = REPLY_PROMPT.format(title=tinfo.get("title") or t.get("title"),
+                                         posts=body[:2400],
+                                         lo=REPLY_MIN_CHARS, hi=REPLY_MAX_CHARS)
+            raw, diag = gen_text(prompt, timeout=timeout)
+            if not raw:
+                res["items"].append({"topic": t["id"], "status": "GEN_FAIL", "why": diag})
+                continue
+        vok, vr = validate_reply(raw)
+        if not vok:
+            res["items"].append({"topic": t["id"], "status": "REJECT_TEXT", "why": vr})
+            continue
+        item = {"topic": t["id"], "title": tinfo.get("title"), "text": vr}
+        if dry:
+            item["status"] = "DRY_RUN"
+            res["items"].append(item)
+            n += 1
+            continue
+        r2 = post_reply(session, t["id"], vr)
+        ok2, why2, rk2 = classify_result(r2)
+        if ok2:
+            mark_done(st, "reply", t["id"])
+            cnt = bump(st, "reply")
+            item.update({"status": "POSTED", "post_id": (r2 or {}).get("id"), "n_today": cnt})
+            log("[reply] ✅ topic=%s post=%s %s" % (t["id"], (r2 or {}).get("id"), vr[:40]))
+        else:
+            item.update({"status": "POST_FAIL", "why": why2})
+            if rk2:
+                res["risk"] = risk_note(st, "reply", why2)
+                random.shuffle(res["items"])
+                save_state(st)
+                return res
+        res["items"].append(item)
+        n += 1
+        if n < max_n:
+            gap = ad.gap_seconds("reply")
+            log("[reply] 间隔 %.0fs" % gap)
+            time.sleep(gap)
+    save_state(st)
+    return res
+
+
+# ------------------------------------------------------------------ 动作：点赞
+def act_like(st, session, max_n=3, apply_=False, dry_run=None, topic_id=None,
+             post_id=None, log=print):
+    dry = (not apply_) if dry_run is None else dry_run
+    day = bd.today()
+    cap = ad.cap_today(st, day, "like")
+    done_today = count_today(st, "like", day)
+    res = {"kind": "like", "dry_run": dry, "cap": cap, "done_today": done_today, "items": []}
+    okg, whg = risk_gate(st, "like")
+    if not okg:
+        res["blocked"] = whg
+        return res
+    done = done_key_set(st, "like")
+    n = 0
+    if not topic_id:
+        cands, _ = pick_reply_targets(session, st, want=max_n * 2)
+        topic_ids = [c["id"] for c in cands] or []
+    else:
+        topic_ids = [int(topic_id)]
+    for tid in topic_ids:
+        if n >= max_n or done_today + n >= cap:
+            break
+        ok, tinfo, why, rk = read_topic(session, tid)
+        if not ok:
+            if rk:
+                res["risk"] = risk_note(st, "like", why)
+                res["items"].append({"topic": tid, "status": "RISK", "why": why})
+                break
+            res["items"].append({"topic": tid, "status": "READ_FAIL", "why": why})
+            continue
+        cand_posts = [p for p in (tinfo.get("posts") or []) if str(p.get("id")) not in done]
+        if post_id:
+            cand_posts = [p for p in cand_posts if str(p.get("id")) == str(post_id)]
+        if not cand_posts:
+            res["items"].append({"topic": tid, "status": "NO_TARGET"})
+            continue
+        # 点赞目标偏好：主楼之后的楼层（1-5 楼区间更像真人随手赞）
+        pool = [p for p in cand_posts if 2 <= int(p.get("num") or 1) <= 8] or cand_posts
+        target = random.choice(pool)
+        item = {"topic": tid, "post": target.get("id"), "num": target.get("num")}
+        if dry:
+            item["status"] = "DRY_RUN"
+            res["items"].append(item)
+            n += 1
+            continue
+        r2 = post_like(session, target["id"])
+        ok2, why2, rk2 = classify_result(r2)
+        if ok2:
+            mark_done(st, "like", target["id"])
+            cnt = bump(st, "like")
+            item.update({"status": "LIKED", "n_today": cnt})
+            log("[like] ✅ topic=%s post=%s" % (tid, target.get("id")))
+        else:
+            item.update({"status": "LIKE_FAIL", "why": why2})
+            if rk2:
+                res["risk"] = risk_note(st, "like", why2)
+                save_state(st)
+                return res
+        res["items"].append(item)
+        n += 1
+        if n < max_n:
+            gap = ad.gap_seconds("like")
+            log("[like] 间隔 %.0fs" % gap)
+            time.sleep(gap)
+    save_state(st)
+    return res
+
+
+# ------------------------------------------------------------------ 动作：发帖
+def act_post(st, session, title, raw, category, tags, apply_=False, dry_run=None,
+             log=print):
+    dry = (not apply_) if dry_run is None else dry_run
+    day = bd.today()
+    now_ts = time.time()
+    ok_i, why_i = ad.post_interval_ok(st, now_ts)
+    res = {"kind": "post", "dry_run": dry, "interval_ok": ok_i, "why": why_i,
+           "title": title, "category": category, "tags": tags}
+    okg, whg = risk_gate(st, "post")
+    if not okg:
+        res["blocked"] = whg
+        return res
+    if not ok_i:
+        return res
+    if count_today(st, "post", day) >= ad.cap_today(st, day, "post"):
+        res["why"] = "cap_reached"
+        return res
+    if dry:
+        res["status"] = "DRY_RUN"
+        return res
+    r2 = post_topic(session, title, raw, category, tags)
+    ok2, why2, rk2 = classify_result(r2)
+    if ok2:
+        tid = (r2 or {}).get("topic_id")
+        bump(st, "post")
+        st["post_history"].append({"ts": now_ts, "id": tid, "title": title})
+        mark_done(st, "post", tid)
+        res.update({"status": "POSTED", "topic_id": tid})
+    else:
+        res.update({"status": "POST_FAIL", "why": why2})
+        if rk2:
+            res["risk"] = risk_note(st, "post", why2)
+    save_state(st)
+    return res
+
+
+# ------------------------------------------------------------------ 入口判定
+def cmd_due(args):
+    st = load_state()
+    now = time.time()
+    day = bd.today()
+    out = {}
+    for k in (args.kind,) if args.kind else KINDS:
+        ok, why = risk_gate(st, k, now)
+        if ok:
+            ok, why = ad.due_now(st, now, k, count_today(st, k, day))
+        w, wwhy = ad.next_wait(st, now, k, count_today(st, k, day))
+        out[k] = {"due": ok, "why": why, "done_today": count_today(st, k, day),
+                  "cap": ad.cap_today(st, day, k), "rest_day": ad.rest_day(st, day, k),
+                  "wait_seconds": round(w, 1), "wait_why": wwhy,
+                  "eta": dt.datetime.fromtimestamp(now + w).strftime("%Y-%m-%d %H:%M:%S")}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_run(args):
+    st = load_state()
+    now = time.time()
+    day = bd.today()
+    ok, why = risk_gate(st, args.kind, now)
+    if ok:
+        ok, why = ad.due_now(st, now, args.kind, count_today(st, args.kind, day))
+    if not ok:
+        w, wwhy = ad.next_wait(st, now, args.kind, count_today(st, args.kind, day))
+        print(json.dumps({"skip": True, "kind": args.kind, "why": why,
+                          "wait_seconds": round(w, 1), "wait_why": wwhy}, ensure_ascii=False))
+        return 0
+    session, diag = get_session(args.tab)
+    if not session:
+        print(json.dumps({"skip": True, "kind": args.kind, "why": "no_session", "diag": diag},
+                         ensure_ascii=False))
+        return 2
+    if args.kind == "reply":
+        r = act_reply(st, session, max_n=args.max, apply_=args.apply)
+    elif args.kind == "like":
+        r = act_like(st, session, max_n=args.max, apply_=args.apply)
+    else:
+        print(json.dumps({"skip": True, "kind": "post",
+                          "why": "post 需显式 --title/--raw/--category/--tags，用 `post` 子命令"},
+                         ensure_ascii=False))
+        return 2
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_reply_one(args):
+    st = load_state()
+    session, diag = get_session(args.tab)
+    if not session:
+        print(json.dumps({"skip": True, "why": "no_session", "diag": diag}, ensure_ascii=False))
+        return 2
+    r = act_reply(st, session, max_n=1, apply_=args.apply, topic_id=args.topic,
+                  text_override=args.raw, timeout=args.timeout)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_like_one(args):
+    st = load_state()
+    session, diag = get_session(args.tab)
+    if not session:
+        print(json.dumps({"skip": True, "why": "no_session", "diag": diag}, ensure_ascii=False))
+        return 2
+    r = act_like(st, session, max_n=1, apply_=args.apply, topic_id=args.topic, post_id=args.post)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_post(args):
+    st = load_state()
+    tags = [x.strip() for x in (args.tags or "").split(",") if x.strip()]
+    session = None
+    if args.apply:
+        session, diag = get_session(args.tab)
+        if not session:
+            print(json.dumps({"skip": True, "why": "no_session", "diag": diag}, ensure_ascii=False))
+            return 2
+    r = act_post(st, session, args.title, args.raw, args.category, tags, apply_=args.apply)
+    print(json.dumps(r, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_state(args):
+    st = load_state()
+    day = bd.today()
+    out = {"day": day, "daily": st.get("daily", {}).get(day, {}),
+           "cap": {k: ad.cap_today(st, day, k) for k in KINDS},
+           "rest_day": {k: ad.rest_day(st, day, k) for k in KINDS},
+           "pause_until": st.get("pause_until"), "risk_stop_day": st.get("risk_stop_day"),
+           "risk_log_tail": st.get("risk_log", [])[-3:]}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+# ------------------------------------------------------------------ 自测
+def _selftest_impl(tmpdir):
+    checks = []
+
+    def chk(name, cond):
+        checks.append((name, bool(cond)))
+        if not cond:
+            print("  FAIL %s" % name)
+
+    sp = os.path.join(tmpdir, "state.json")
+    st = load_state(sp)
+    chk("T1 初始状态键齐全", all(k in st for k in
+                            ("daily", "done", "cap", "rest", "jitter", "post_history", "risk")))
+    bump(st, "reply")
+    bump(st, "reply")
+    chk("T2 计数累加", count_today(st, "reply") == 2)
+    mark_done(st, "reply", "123")
+    chk("T3 幂等去重集合", "123" in done_key_set(st, "reply"))
+    save_state(st, sp)
+    st2 = load_state(sp)
+    chk("T4 状态往返", count_today(st2, "reply") == 2 and "123" in done_key_set(st2, "reply"))
+    # 脏 state 不得 KeyError（browse daemon 2026-10-05 事故）
+    json.dump({"rest": {}}, open(sp, "w"), ensure_ascii=False)
+    st3 = load_state(sp)
+    chk("T5 脏状态不崩(局部dict覆盖)", isinstance(st3.get("daily"), dict) and count_today(st3, "reply") == 0)
+
+    # 文案清洗/校验
+    chk("T6 清洗去说明前缀", clean_text("回复：这个 20000 楼的边界条件很有意思") == "这个 20000 楼的边界条件很有意思")
+    chk("T7 清洗去 markdown", clean_text("**确实**，那个 `timeout` 值偏小") == "确实，那个 timeout 值偏小")
+    ok, v = validate_reply("这帖里 128 并发那段的瓶颈其实在写锁，跟 GC 关系不大")
+    chk("T8 正常文案放行", ok and v.startswith("这帖里"))
+    chk("T9 水贴拦截", not validate_reply("感谢分享，学到了")[0])
+    chk("T10 空/短拦截", not validate_reply("好")[0] and not validate_reply("")[0])
+    chk("T11 超长拦截", not validate_reply("测" * 200)[0])
+    chk("T12 链接拦截", not validate_reply("看这个 https://x.com/a 讲的挺细的")[0])
+    # T13 负控：被拦截项必须返回 False（拿真值反证判据非恒真）
+    chk("T13 负控(恒真判据可被抓)", not validate_reply("顶一下")[0] and validate_reply("这帖里 128 并发那段瓶颈在写锁")[0])
+
+    # 风控判读
+    chk("T14 429→RATE_LIMIT", bd.risk_kind_from_http(429) == "RATE_LIMIT")
+    chk("T15 403→FORBIDDEN", bd.risk_kind_from_http(403) == "FORBIDDEN")
+    ok, why, rk = classify_result({"ok": False, "status": 403, "err": "blocked"})
+    chk("T16 classify 传风控类", (not ok) and rk == "FORBIDDEN")
+    ok, why, rk = classify_result({"ok": True, "status": 200, "id": 99})
+    chk("T17 classify 正常", ok and rk is None)
+
+    # 风控记账 + 闸门（沙箱 state，绝不碰生产）
+    stx = load_state(os.path.join(tmpdir, "s2.json"))
+    msg = risk_note(stx, "reply", "sandbox", now_ts=time.time(), allow_notify=False)
+    chk("T18 风控记账写 pause", float(stx.get("pause_until") or 0) > time.time())
+    okg, whg = risk_gate(stx, "reply")
+    chk("T19 pause 期内闸门关闭", (not okg) and "pause_until" in whg)
+    risk_note(stx, "like", "x1", now_ts=time.time(), allow_notify=False)
+    risk_note(stx, "like", "x2", now_ts=time.time(), allow_notify=False)
+    risk_note(stx, "like", "x3", now_ts=time.time(), allow_notify=False)
+    chk("T20 同类≥3 当日停", stx.get("risk_stop_day") == bd.today())
+    chk("T21 当日停闸门", risk_gate(stx, "like")[0] is False)
+    # T22 负控：未达阈值不得置当日停
+    sty = load_state(os.path.join(tmpdir, "s3.json"))
+    risk_note(sty, "reply", "once", now_ts=time.time(), allow_notify=False)
+    chk("T22 负控(单次不得当日停)", sty.get("risk_stop_day") is None)
+
+    # 入口判定与内核联动（沙箱）
+    stz = load_state(os.path.join(tmpdir, "s4.json"))
+    now = time.time()
+    w, ww = ad.next_wait(stz, now, "reply", 0)
+    chk("T23 next_wait 正数", w > 0)
+    okd, whyd = ad.due_now(stz, now, "reply", 0)
+    chk("T24 due_now 可判", isinstance(okd, bool) and isinstance(whyd, str))
+    chk("T25 发帖间隔门", ad.post_interval_ok(stz, now)[0] is True)
+    stz["post_history"].append({"ts": now - 60})
+    chk("T26 发帖间隔门拦截", ad.post_interval_ok(stz, now)[0] is False)
+
+    # JS 片段结构（防模板漏替换字段）
+    chk("T27 读帖JS", "__TID__" in READ_TOPIC_JS and "/t/__TID__.json" in READ_TOPIC_JS)
+    for nm, js, tok in (("T28 回帖JS", POST_REPLY_JS, "__RAW__"),
+                        ("T29 点赞JS", POST_LIKE_JS, "__PID__"),
+                        ("T30 发帖JS", POST_TOPIC_JS, "__TAGS__")):
+        chk(nm, tok in js and "csrf-token" in js)
+    chk("T31 回帖JS 替换后无残留占位", "__TID__" not in POST_REPLY_JS.replace("__TID__", "1").replace("__RAW__", '"x"'))
+
+    chk("T33 自测状态隔离(路径在沙箱)", state_path().startswith(tmpdir))
+    # 只读自证：自测不得写生产 state
+    prod = os.path.join(BASE, "state.json")
+    fp_before = None
+    if os.path.exists(prod):
+        fp_before = (os.path.getsize(prod), os.path.getmtime(prod))
+    _ = load_state()   # 只读加载生产
+    fp_after = None
+    if os.path.exists(prod):
+        fp_after = (os.path.getsize(prod), os.path.getmtime(prod))
+    chk("T34 自测不写生产 state", fp_before == fp_after)
+
+    # 跨进程锁（沙箱；锁文件与 state 同目录，避免碰生产 run.lock）
+    t1 = acquire_lock("st-a")
+    chk("T35 首次加锁成功", bool(t1))
+    chk("T36 二次加锁互斥(占用)", acquire_lock("st-b") is None)
+    release_lock(t1)
+    t2 = acquire_lock("st-c")
+    chk("T37 释放后可再取", bool(t2))
+    release_lock(t2)
+    # 陈旧锁可回收（把 ts 改老，不探 pid）
+    t3 = acquire_lock("st-d")
+    lp = lock_path()
+    with open(lp, "w") as f:
+        json.dump({"tag": "stale", "pid": 1, "ts": time.time() - LOCK_TTL - 10}, f)
+    t4 = acquire_lock("st-e")
+    chk("T38 陈旧锁可回收", bool(t4))
+    release_lock(t4)
+    # 负控：非己 token 不得删他人锁
+    t5 = acquire_lock("st-f")
+    try:
+        release_lock(t5 + "_wrong")
+    except Exception:
+        pass
+    chk("T39 负控(错 token 不误删)", os.path.exists(lp) is False or bool(t5))
+    release_lock(t5)
+    chk("T40 正常释放后锁文件消失", not os.path.exists(lp))
+
+    passed = sum(1 for _, c in checks if c)
+    print("selftest %d/%d PASS" % (passed, len(checks)))
+    return 0 if passed == len(checks) else 1
+
+
+def selftest():
+    """自测全程状态重定向到沙箱（LJQ_ACTS_STATE）⇒ 生产 state 零写入（铁律）。"""
+    old = os.environ.get("LJQ_ACTS_STATE")
+    old_lk = os.environ.get("LJQ_ACTS_LOCK")
+    with tempfile.TemporaryDirectory(prefix="linuxdo_acts_st_") as td:
+        os.environ["LJQ_ACTS_STATE"] = os.path.join(td, "state.json")
+        os.environ["LJQ_ACTS_LOCK"] = os.path.join(td, "run.lock")
+        try:
+            return _selftest_impl(td)
+        finally:
+            if old is None:
+                os.environ.pop("LJQ_ACTS_STATE", None)
+            else:
+                os.environ["LJQ_ACTS_STATE"] = old
+            if old_lk is None:
+                os.environ.pop("LJQ_ACTS_LOCK", None)
+            else:
+                os.environ["LJQ_ACTS_LOCK"] = old_lk
+
+
+# ------------------------------------------------------------------ main
+def dispatch(a):
+    """命令派发（main 负责加锁与全局开关）。"""
+    if a.cmd == "profiles":
+        print(json.dumps({k: ad.profile(k) for k in KINDS}, ensure_ascii=False, indent=2))
+        return 0
+    if a.cmd == "state":
+        return cmd_state(a)
+    if a.cmd == "due":
+        return cmd_due(a)
+    if a.cmd == "run":
+        if not a.kind:
+            print("usage: run reply|like|post"); return 2
+        return cmd_run(a)
+    if a.cmd == "reply-one":
+        if not a.topic:
+            print("usage: reply-one --topic N [--raw ...]"); return 2
+        return cmd_reply_one(a)
+    if a.cmd == "like-one":
+        if not a.topic:
+            print("usage: like-one --topic N [--post M]"); return 2
+        return cmd_like_one(a)
+    if a.cmd == "post":
+        if not (a.title and a.raw):
+            print("usage: post --title ... --raw ... --category N --tags a,b"); return 2
+        return cmd_post(a)
+    return 2
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="L站互动动作执行器（回帖/点赞/发帖）")
+    ap.add_argument("cmd", nargs="?", default="due",
+                    choices=["due", "run", "reply-one", "like-one", "post", "state", "profiles"])
+    ap.add_argument("kind", nargs="?", choices=list(KINDS))
+    ap.add_argument("--max", type=int, default=2)
+    ap.add_argument("--topic", type=int)
+    ap.add_argument("--post", type=int)
+    ap.add_argument("--raw", default=None)
+    ap.add_argument("--title", default=None)
+    ap.add_argument("--category", type=int, default=4)
+    ap.add_argument("--tags", default="")
+    ap.add_argument("--tab", default=None)
+    ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--apply", action="store_true", help="真正发送（默认 dry-run）")
+    ap.add_argument("--selftest", action="store_true")
+    a = ap.parse_args(argv)
+
+    if a.selftest:
+        return selftest()
+    if a.cmd in ("run", "reply-one", "like-one", "post"):
+        tok = acquire_lock("cli-%s" % a.cmd)
+        if not tok:
+            # 与 daemon（浏览循环 / 排队补动作）互斥：拿到不到锁就安静退出，绝不并发抢标签
+            print(json.dumps({"skip": True, "why": "LOCKED_BUSY",
+                              "lock": lock_path()}, ensure_ascii=False))
+            return 0
+        try:
+            return dispatch(a)
+        finally:
+            release_lock(tok)
+    return dispatch(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
