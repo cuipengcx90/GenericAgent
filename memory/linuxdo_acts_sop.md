@@ -88,6 +88,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 
 - 四类形态：`KIND_BEHAVIOR = browse | reply | like | post`，每类有独立参数（阅读停留、滚动计划、打字计划、写作停顿、决策犹豫、动作间隔）。
 - 浏览：先读帖（`read_dwell` = 按正文长度估真人阅读时长）→ 按 `scroll_plan` 分段滚动 → 30% 概率浅读提前收工。
+  - 2026-10-05 起 **daemon 浏览路径也走本内核**（此前 daemon 自带一套匀速等高计划 = 独立实现，违反单一源）：`_browse_plan()` 用 `read_dwell_seconds/scroll_plan/wrap_up_seconds/pose` 生成计划，帖间间隔用 `action_gap('browse', base=GAP_RANGE)`（含 25-35% 长休）；深读停留上限 150s、浅读 25s（保原日 cap 可跑完）；每次浏览把 `pose` 写进 `browse_log.jsonl`（可回看真实停留/屏数）；humanize 缺席时回退常量计划（守护仍可跑）。
 - 回帖：先读**最新楼**（`latest:` 取尾部）再打字；发送前 `humanize_typing` 模拟打字时长；写完有写作停顿。
 - 点赞：读帖后有 `SKIP_AFTER_READ` 犹豫分支（不一定点），避免「见帖必赞」的机器特征。
 - 发帖：先 `preface_` 闲逛几帖（禁「进站即发」），写作过程中有分段停顿再提交。
@@ -100,7 +101,7 @@ python3 tools/linuxdo_acts.py post --title "..." --raw "..." --category <id> --t
 - `python3 tools/linuxdo_humanize.py --selftest`（25/25）。
 - `python3 tools/linuxdo_antidetect.py --selftest`（56/56，含 T27 跨层自洽）。
 - `python3 tools/linuxdo_acts.py --selftest`（52/52；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d；自测把 state/lock/通知全部重定向到沙箱）。
-- `python3 tools/linuxdo_browse_daemon.py --selftest`（含风控/休息日/LOCK_BUSY 用例）。
+- `python3 tools/linuxdo_browse_daemon.py --selftest`（24/24；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线）。
 - `python3 tools/sche_tasks_lint.py --only linuxdo_acts_reply,linuxdo_acts_like,linuxdo_acts_post,linuxdo_acts_browse` ⇒ FAIL 0。
 - 判活：`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
 
