@@ -44,11 +44,14 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -211,12 +214,21 @@ def pick_session(prefer=None, timeout=20):
 def load_state():
     os.makedirs(BASE, exist_ok=True)
     p = os.path.join(BASE, "state.json")
+    st = None
     if os.path.exists(p):
         try:
-            return json.load(open(p, encoding="utf-8"))
+            st = json.load(open(p, encoding="utf-8"))
         except Exception:
-            pass
-    return {"seen_ids": [], "daily": {}, "level": {}, "browsed_total": 0}
+            st = None
+    if not isinstance(st, dict):
+        st = {}
+    # 健壮化：任何缺键都补默认值 —— 防「state 被局部 dict 覆盖」类事故导致 KeyError 崩守护
+    st.setdefault("seen_ids", [])
+    st.setdefault("daily", {})
+    st.setdefault("level", {})
+    st.setdefault("browsed_total", 0)
+    st.setdefault("rest_days", {})
+    return st
 
 
 def save_state(st):
@@ -650,7 +662,7 @@ def browse_batch(session, st, batch=25):
             seen.add(int(tid))
             st["seen_ids"] = (st.get("seen_ids", []) + [int(tid)])[-4000:]
             st["browsed_total"] = st.get("browsed_total", 0) + 1
-            st["daily"][today()] = daily_count(st) + 1
+            st.setdefault("daily", {})[today()] = daily_count(st) + 1
             save_state(st)
         else:
             skipped += 1
@@ -816,7 +828,7 @@ def main(argv=None):
 
 
 # ---------------------------------------------------------------- selftest
-def selftest():
+def _selftest_impl():
     fails = []
     cases = 0
     cases += 1
@@ -976,6 +988,40 @@ def selftest():
         fails.append("T13 最小间隔未生效（可连休）")
     if not (0 < REST_DAY_P <= 0.5 and REST_MIN_GAP_DAYS >= 2):
         fails.append("T13 休息日常量边界错")
+    return fails, cases
+
+
+def _state_fp():
+    """生产 state.json 指纹（sha256 前16 + 字节数）；不存在→None。"""
+    p = os.path.join(BASE, "state.json")
+    if not os.path.exists(p):
+        return None
+    with open(p, "rb") as f:
+        data = f.read()
+    return hashlib.sha256(data).hexdigest()[:16], len(data)
+
+
+def selftest():
+    """沙箱化自测 + 生产面零污染自证（T14）。
+
+    2026-10-05 事故：T13 走 rest_day_today(st) → save_state(st)，把只含 rest_days 的
+    局部 dict 直接写成生产 state.json，抹掉 daily/seen_ids/browsed_total ⇒ watch 崩。
+    根修：整个 self-test 在临时 BASE 内跑；并比对前后生产 state.json 指纹（不一致即 FAIL）。
+    """
+    global BASE
+    orig = BASE
+    sb = tempfile.mkdtemp(prefix="ldo_selftest_")
+    before = _state_fp()
+    try:
+        BASE = sb
+        fails, cases = _selftest_impl()
+    finally:
+        BASE = orig
+        shutil.rmtree(sb, ignore_errors=True)
+    cases += 1
+    after = _state_fp()
+    if before != after:
+        fails.append("T14 selftest 污染生产 state.json：%r → %r" % (before, after))
     if fails:
         for f in fails:
             print("FAIL " + f)
