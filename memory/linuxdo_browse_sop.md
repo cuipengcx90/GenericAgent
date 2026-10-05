@@ -61,7 +61,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 ## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
 
 触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
-后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 13/13）：
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 14/14）：
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
 - 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 慢滚 22–30 步×1.4–2.0s + 底部驻留 90–125s + 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（默认 160，每日 ±20 内随机定一次）+ 单段 110min 后休息 25–53min + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
@@ -75,7 +75,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 - 同类信号当日累计 ≥3 ⇒ **当日停止浏览**并强制告警；同类告警有 6h 冷却（防刷屏）。
 - 强信号集 `RISK_STRONG` 只含 `BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED`；`CF_CHALLENGE` 刻意**不**入强信号（常见且多半自愈，否则误伤成小时级停机）。
 - **随机休息日**：平均每 7 天 1 天完全不浏览（`REST_DAY_P=1/7`），两次休息至少隔 3 天不连休；判定一次即落盘（幂等），当日零浏览。
-- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ **13/13 PASS**（含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界）。
+- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ **14/14 PASS**（含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」）。
 
 ## 反检测审查强化（2026-10-05）
 
@@ -83,3 +83,20 @@ return JSON.stringify({fail:true,now:location.pathname});
 - **判读口径**：浅读帖照样计入浏览话题数（主指标不受损），但 posts_read（楼数）偏少——这是预期行为不是漏报，勿当故障修。
 - **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
 - 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
+
+
+## 事故：自测污染现场致守护自杀（2026-10-05，已修）
+
+现象：`watch` 守护跑了几轮后无声退出，`browse_log.jsonl` 不再新增 DONE、`bg_task` 状态转 dead；表象像「站点封了 /latest.json」，实则本地自毁。
+
+根因（已受控复现）：`--selftest` 的 T13 走的是**生产路径**（`rest_day_today()` → `save_state()`），把生产 `state.json` 整个覆盖成只剩 `rest_days` 一个键（66B）；守护下一轮 `load_state()` 读到缺 `daily` 的 state，`KeyError: 'daily'` 当场退出。⇒ **自测把现场给吃了**。
+
+修法三件（提交 `50368cf`，同文件 51+/5−）：
+1. `load_state()` 对全部键 `setdefault`（缺键回落默认值，不再 KeyError）；
+2. `browse_batch` 取 `daily` 前同款 `setdefault`（双保险）；
+3. `--selftest` 改名 `_selftest_impl()` + 外层包装：把 `BASE` 指到 `tempfile.mkdtemp(prefix="ldo_selftest_")` 沙箱跑，跑完 `rmtree` 并还原 `BASE`，再新增 **T14**：比对生产 `state.json` 指纹（mtime+size+sha256）自测前后必须逐字相同，变了即 FAIL。
+
+铁律（通用，已同步 L1）：
+- **自测/金丝雀禁写生产状态**：任何带副作用的函数（save_state/落盘台账/发通知）在自测里必须走沙箱 `BASE`/隔离 `--state`，且自测结束**用指纹断言生产侧零变化**——「测试全绿」不能只证明管道通，还要证明它没污染现场（RULES#25 的同族）。
+- **守护判活别只看日志尾部**：`bg_task` 的 stdout 常 0 字节（输出不落该文件），权威判据是 `browse_log.jsonl` 新增 `DONE` 行 + `state.json` 的 `daily` 增长。
+- 判「站点封了」之前先查本地 state 完整性（键是否齐、字节数是否异常小），别把自家自杀当成平台故障。

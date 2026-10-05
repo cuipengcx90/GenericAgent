@@ -106,3 +106,11 @@ grep -n 'selftest' memory/linuxdo_browse_sop.md memory/linuxdo_reply_sop.md
 python3 tools/bg_task.py status --name ldo_watch
 wc -c -l tools/linuxdo_browse_daemon.py memory/linuxdo_browse_sop.md memory/linuxdo_reply_sop.md memory/anti_detection_sop.md
 ```
+
+
+## 8. 附：守护自杀事故与根修（2026-10-05 同批）
+
+事故与修法详见 `memory/linuxdo_browse_sop.md` 的「事故：自测污染现场致守护自杀」节（含三件修法与 T14 自测），此处只留要点：
+- 现象：watch 无声退出、`browse_log.jsonl` 停更，表象像站点封禁；实为 `--selftest` 的 T13 走生产 `save_state()`，把 `state.json` 覆盖成仅 `rest_days`（66B），下一轮 `load_state()` 因缺 `daily` 抛 `KeyError` 自杀。
+- 根修（commit `50368cf`，`tools/linuxdo_browse_daemon.py` 51+/5−）：`load_state` 全键 `setdefault` + `browse_batch` 同款兜底 + `--selftest` 拆 `_selftest_impl()` 并加沙箱 `BASE`（`tempfile.mkdtemp`，跑完 rmtree 还原）+ 新增 T14「自测前后生产 state 指纹必须逐字相同」⇒ 自测 14/14 PASS。
+- 通用铁律（已同步 L1）：**自测/金丝雀禁写生产状态**——带副作用的函数在自测里必须走沙箱/隔离状态，并用指纹断言生产侧零变化；守护判活别看 `bg_task` 日志字节数（常为 0），看 `browse_log.jsonl` 新增 DONE 与 `state.json` 的 `daily` 增长。
