@@ -64,6 +64,7 @@ import os
 import random
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -130,6 +131,9 @@ QUEUE_LIKE_MAX = 3
 # 等级检查与动作执行的解耦：等级检查即时排队，动作由 acts 随机段内执行；
 # 每轮最多各做 1 条，且两轮之间至少歇 20–45min（防「检查完立刻动手」的固定时刻特征）。
 ACTS_ROUND_GAP = (1200, 2700)
+FORGE_MIN_GAP_S = 3 * 86400       # 无草稿时后台锻造的最小间隔（3 天）
+FORGE_JITTER_S = 4 * 86400        # 再叠 0~4 天随机抖动 ⇒ 实际 3~7 天，禁固定节奏
+FORGE_STATE = os.environ.get("LJQ_FORGE_STATE") or os.path.join(BASE, "post_forge.json")
 # connect 页两条路径结构不同：connect=({met:bool,name:'当前/门槛'}，无指标名)；首页卡=({mark, name, cur, req})。
 # connect 实测固定 12 项顺序（2026-10-05 level_log.jsonl）⇒ 仅当这些项的**门槛值全部吻合**才启用顺序映射，
 # 否则一律按「未识别」处理（fail-safe：只通知人，绝不误判为可自动补）。
@@ -624,6 +628,66 @@ def queue_pending_from_route(st, route):
     return added
 
 
+def _forge_gate(now=None):
+    """低频闸门：距上次锻造尝试 >= 3 天 + 0~4 天随机抖动 才放行。
+
+    返回 (allow, 还需等待的天数)。锻造只读本地素材 + 本地 codex，零站点流量；
+    真正发帖仍走 act_post 自己的日/周/间隔上限，这里只控制「稿子多久备一份」。
+    """
+    now = now or time.time()
+    st = {}
+    try:
+        if os.path.exists(FORGE_STATE):
+            with open(FORGE_STATE, encoding="utf-8") as f:
+                st = json.load(f) or {}
+    except Exception:
+        st = {}
+    last = float(st.get("last_ts") or 0)
+    need = FORGE_MIN_GAP_S + random.uniform(0, FORGE_JITTER_S)
+    if last and (now - last) < need:
+        return False, round((need - (now - last)) / 86400.0, 2)
+    return True, 0.0
+
+
+def _maybe_forge_draft(out, apply_=True):
+    """无草稿时在后台备一份（本地 codex 生成 + 去 AI 味闸门），不阻塞浏览循环。
+
+    dry-run（apply_=False）绝不落盘、绝不写状态——自测/金丝雀禁写生产状态。
+    """
+    if not apply_:
+        out["forge"] = "SKIP:DRY_RUN"
+        return
+    try:
+        ok, wait_d = _forge_gate()
+    except Exception as e:
+        out["forge"] = "ERROR:%s" % repr(e)[:80]
+        return
+    if not ok:
+        out["forge"] = "SKIP:COOLDOWN(%.2fd)" % wait_d
+        return
+    try:
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "linuxdo_post_forge.py")
+        os.makedirs(BASE, exist_ok=True)
+        logf = open(os.path.join(BASE, "forge.log"), "a")
+        proc = subprocess.Popen([sys.executable, script, "forge", "--notify"],
+                                stdout=logf, stderr=subprocess.STDOUT,
+                                start_new_session=True, close_fds=True)
+        logf.close()
+        tmp = FORGE_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:      # 先落 last_ts 再回到守护循环
+            json.dump({"last_ts": time.time(), "pid": proc.pid,
+                       "at": now_str()}, f)
+        os.replace(tmp, FORGE_STATE)
+        out["forge"] = "SPAWNED:%d" % proc.pid
+        log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "FORGE_SPAWNED",
+                                     "pid": proc.pid})
+    except Exception as e:                              # 锻造异常绝不死守护
+        out["forge"] = "ERROR:%s" % repr(e)[:80]
+        log_jsonl("acts_log.jsonl", {"ts": now_str(), "st": "FORGE_ERROR",
+                                     "note": repr(e)[:200]})
+
+
 def maybe_run_pending_acts(st, session, apply_=True):
     """按 acts 内核的随机节奏执行排队中的回帖/点赞/发帖（每轮每类最多 1 条）。
 
@@ -676,6 +740,7 @@ def maybe_run_pending_acts(st, session, apply_=True):
             if not draft:
                 pa["post"] = 0
                 out["post"] = "SKIP:NO_DRAFT"
+                _maybe_forge_draft(out, apply_)     # 稿子空了 ⇒ 低频后台补一份
             else:
                 try:
                     res_p = A.act_post(ast_, session, draft.get("title"), draft.get("raw"),

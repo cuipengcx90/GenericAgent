@@ -206,6 +206,8 @@ CODEX_BIN = os.environ.get("LJQ_CODEX_BIN") or shutil.which("codex") or "/opt/ho
 BANNED_PHRASES = ("感谢分享", "谢谢分享", "学到了", "顶一下", "支持一下", "前排", "沙发",
                   "路过", "打卡", "沙发帮顶")
 REPLY_MIN_CHARS, REPLY_MAX_CHARS = 8, 120
+# 去 AI 味闸门（tools/linuxdo_deai.py）及格线：机器味扣分低于此值即拒发
+DEAI_MIN_SCORE = int(os.environ.get("LJQ_DEAI_MIN_SCORE") or 60)
 
 
 # ------------------------------------------------------------------ 状态
@@ -468,7 +470,39 @@ def validate_reply(text):
     for b in BANNED_PHRASES:
         if b in t:
             return False, "banned_phrase(%s)" % b
+    ok_deai, why_deai, _score = deai_check(t)
+    if not ok_deai:
+        return False, "deai(%s)" % why_deai
     return True, t
+
+
+def deai_check(text, min_score=None):
+    """调去 AI 味机械闸门（单一源 tools/linuxdo_deai.py）→ (ok, why, score)。
+
+    闸门缺失/异常时 **fail-closed**（宁可少发一条，也不把机器味文案发到站上）。
+    「人味」这条硬要求只有这一份机械判据，禁在别处另写一份。
+    """
+    if len((text or "").strip()) < 12:      # 短回帖交长度判据管，闸门只判机器味
+        return True, "", 0
+    try:
+        import sys as _sys
+        _here = os.path.dirname(os.path.abspath(__file__))
+        for _d in (_here, os.path.join(os.path.dirname(_here), "tools")):
+            if _d not in _sys.path:
+                _sys.path.insert(0, _d)
+        import linuxdo_deai as _D
+    except Exception as e:
+        return False, "gate_missing:%s" % repr(e)[:80], 0
+    try:
+        r = _D.lint(text, min_score=int(min_score or DEAI_MIN_SCORE))
+    except Exception as e:
+        return False, "gate_error:%s" % repr(e)[:80], 0
+    if r.get("ok"):
+        return True, "", int(r.get("score") or 0)
+    bad = (r.get("hard") or []) + (r.get("warn") or [])
+    return (False,
+            "%s score=%s" % (",".join(bad[:3]) or "low_score", r.get("score")),
+            int(r.get("score") or 0))
 
 
 def gen_text(prompt, timeout=180, codex_bin=None):
