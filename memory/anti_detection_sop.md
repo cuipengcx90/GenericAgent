@@ -31,6 +31,6 @@
 - [ ] 量级与真人可用强度可比（避免日均上千发）？
 
 ## L 站既有实现（正面范例）
-- `tools/linuxdo_browse_daemon.py`：cap 140–180 每日随机定一次 / 晨抖 0–60min / 静默窗 01:00–07:30 / 帖间 110–260s（30% 概率 300–600s）/ 30% 浅读 / 偏好分类每批重抽 / 单段 110min 后休 25–53min / 只读铁律。
-- `memory/linuxdo_reply_sop.md`：条间 180–420s 随机、日 ≤20、只走用户浏览器同源 fetch、文案去 AI 味。
+- `tools/linuxdo_browse_daemon.py`：cap 140–180 每日随机定一次 / 晨抖 0–60min / 静默窗 01:00–07:30 / 帖间 110–260s（30% 概率 300–600s）/ 30% 浅读 / 偏好分类每批重抽 / 单段 110min 后休 25–53min / 只读铁律；★2026-10-05 增**风控保险丝**（risk_kind_from_http/text 识别 BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED ⇒ handle_risk 写 state + 飞书告警 + 暂停 RISK_PAUSE(3600,7200)s，同类 ≥3 当日停；CF 挑战只轻量计数不中断）与**随机休息日**（rest_day_today 1/7 概率且与上次休息最小间隔 3 天不连休）；离线自测 `--selftest` 13/13。
+- `memory/linuxdo_reply_sop.md`：条间 240–600s 随机、日 ≤10、单任务 ≤5（2026-10-05 收紧，旧 180–420s/日≤20 作废）、只走用户浏览器同源 fetch、文案去 AI 味；遇 429/403/BANNED 立即停当日回帖并记录原因。
 - 反面：sche_tasks 定时任务由 `reflect/scheduler.py` 到点即跑（**无随机**；`max_delay_hours` 只是「过期跳过」窗口，不是随机延迟）⇒ 每天准点（如 09:30）也构成节奏特征，涉站点访问的定时任务应避开准点或改由长驻 daemon 顺带做。
