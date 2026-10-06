@@ -175,5 +175,23 @@
     "published_at": null,
     "found_at": null,
     "search_count": 0
+  },
+  "Agent 工程化 + AI 编程深度实战营 (2026)": {
+    "added_at": "2026-10-06 14:27:06",
+    "found": false,
+    "source_url": "",
+    "published_at": "2026-10-06T00:00:00+08:00",
+    "found_at": null,
+    "search_count": 0,
+    "origin": "pool:pan:p1"
+  },
+  "Agent 工程化 + AI 编程深度实战营 (2027)": {
+    "added_at": "2026-10-06 14:27:06",
+    "found": false,
+    "source_url": "",
+    "published_at": "2026-10-06T00:00:00+08:00",
+    "found_at": null,
+    "search_count": 0,
+    "origin": "pool:pan:p9"
   }
 }

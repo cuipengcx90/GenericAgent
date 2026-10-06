@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "imooc",
+      "name": "慕课网实战",
+      "enabled": true,
+      "channel": [
+        "browser",
+        "jina"
+      ],
+      "parser": "imooc_list",
+      "detail": "imooc_detail",
+      "kind": "course",
+      "note": "全站反爬：仅真实浏览器通道可过（实测）",
+      "urls": [
+        "https://coding.imooc.com/?page=1",
+        "https://coding.imooc.com/?page=2",
+        "https://coding.imooc.com/?page=3"
+      ],
+      "parser_by_channel": {
+        "jina": "imooc_md_list"
+      }
+    },
+    {
+      "id": "quangneng",
+      "name": "全能资源网",
+      "enabled": true,
+      "channel": [
+        "http",
+        "browser"
+      ],
+      "parser": "quangneng_list",
+      "detail": "quangneng_detail",
+      "kind": "course",
+      "note": "WordPress 服务端渲染，http 直取即可",
+      "urls": [
+        "https://www.quangneng.com/"
+      ]
+    }
+  ]
+}

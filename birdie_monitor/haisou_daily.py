@@ -54,6 +54,22 @@ BUDGET_SHARE = float(os.environ.get("HAISOU_BUDGET_SHARE", "0.35"))
 PROGRESS_LOG_PATH = Path(__file__).resolve().parents[1] / "temp" / "haisou_progress.jsonl"
 
 
+def rotate_window(items, start, head):
+    """从 start 处环形切出长度 head 的窗口（纯函数，便于自测轮转覆盖）。"""
+    n = len(items)
+    if n == 0 or head <= 0:
+        return []
+    s = int(start or 0) % n
+    return (items[s:] + items[:s])[:head]
+
+
+def next_dyn_index(dyn_total, head, dyn_start):
+    """动态词窗口推进：窗口装不下全部词时按 head 步进；装得下则归零。"""
+    if dyn_total <= 0 or dyn_total <= head:
+        return 0
+    return (int(dyn_start or 0) + head) % dyn_total
+
+
 def load_cursor():
     """读取轮转游标；文件缺失/损坏一律回落 index=0（不因此中断监控）。"""
     try:
@@ -336,7 +352,16 @@ def run(max_tasks=None, static_daily=None):
     cursor = load_cursor()
     static_total = len(static_tasks)
     start = int(cursor.get("index", 0) or 0) % max(1, static_total)
-    plan = list(dyn_quark[:budget])
+    # 静态词保底窗口（2026-10-06）：课程词/池词增长到 ≥ 预算时，旧式 dyn[:budget] 会把静态面
+    # 挤成 0（静态词永不覆盖）。这里先给静态留一个 1/5 保底槽位，再让动态词占其余。
+    static_floor = min(static_total, max(1, budget // 5))
+    head = max(0, budget - static_floor)
+    # 动态词轮转窗口（2026-10-06）：动态词 ≥ 窗口时旧式 dyn[:head] 会让排在后面的课程池词
+    # 永远轮不到（实测 37 条动态词 / 窗口 28 ⇒ 12 条池词只覆盖 3 条）。按游标轮转起点，
+    # 保证 ⌈动态词数/窗口⌉ 天内每个词至少被搜一次。
+    dyn_total = len(dyn_quark)
+    dyn_start = int(cursor.get("dyn_index", 0) or 0) % max(1, dyn_total)
+    plan = list(rotate_window(dyn_quark, dyn_start, head))
     remaining = max(0, budget - len(plan))
     # 静态词窗口：至少 static_daily，至多占剩余预算的一半（另一半留给课程词的 baidu/ali 补齐）
     static_n = min(static_total, remaining, max(static_daily, remaining // 2))
@@ -413,10 +438,14 @@ def run(max_tasks=None, static_daily=None):
 
     next_index = (start + static_used) % max(1, static_total)
     cycle = int(cursor.get("cycle", 0) or 0) + (1 if next_index == 0 and static_used else 0)
+    # 动态词窗口推进：窗口小于动态词总数时按 head 步进轮转；一次能装下则回到 0。
+    dyn_next = next_dyn_index(dyn_total, head, dyn_start)
     save_cursor({
         "index": next_index,
         "total": static_total,
         "cycle": cycle,
+        "dyn_index": dyn_next,
+        "dyn_total": dyn_total,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "last_run": {"start": started_at, "done": done, "error": error,
                      "static_used": static_used, "plan_len": len(plan)},
@@ -633,6 +662,53 @@ def _selftest():
             n1 = len(seen_calls)
             a7, f7, e7 = run(max_tasks=5)
             ck("T7 接口失败 fail-closed", len(seen_calls) == n1 and "fail-closed" in (e7 or ""))
+
+            # T9 静态保底（2026-10-06）：课程词条数 ≥ 预算时，静态面不得被挤成 0
+            globals()["fetch_quota"] = fake_quota          # T7 曾把它换成 fail-closed
+            quota_state.update({"remaining_today": 200, "used_today": 0})
+            many = {f"课程{i}": {"source_url": "u", "query": f"课程{i}",
+                                 "search_count": 0, "found": False} for i in range(40)}
+            dyn9 = td / "dyn9.json"
+            dyn9.write_text(json.dumps(many, ensure_ascii=False), encoding="utf-8")
+            globals()["DYNAMIC_KEYWORDS_PATH"] = dyn9
+            globals()["STATE_PATH"] = td / "state9.json"
+            globals()["CURSOR_PATH"] = td / "cursor9.json"
+            save_cursor({"index": 0})
+            calls9 = []
+
+            def search9(session, q, platform):
+                calls9.append((q, platform))
+                return [{"hsid": f"{q}-{platform}", "share_name": f"{q} 课程",
+                         "share_pwd": "", "url": "u"}]
+
+            globals()["search"] = search9
+            quota_state.update({"remaining_today": 200, "used_today": 0})
+            _a9, _f9, _e9 = run(max_tasks=10)
+            stat9 = [q for q, _p in calls9 if q in STATIC_KEYWORDS]
+            ck("T9 课程词占满仍轮转静态词", len(calls9) == 10 and len(stat9) >= 1)
+            ck("T9 保底量级=预算 1/5", len(stat9) == max(1, 10 // 5))
+            ck("T9 未被保底的动态词让位", sum(1 for q, _p in calls9 if q not in STATIC_KEYWORDS) == 8)
+            globals()["DYNAMIC_KEYWORDS_PATH"] = td / "dyn_missing.json"
+            globals()["search"] = fake_search
+
+            # T10 动态词轮转窗口覆盖（修「窗口外的池词永远轮不到」）
+            words10 = [f"w{i}" for i in range(37)]
+            head10 = 28
+            start = 0
+            seen = set()
+            for _ in range(5):          # 模拟连续 5 轮
+                win = rotate_window(words10, start, head10)
+                ck(f"T10 窗口长度={head10}", len(win) == head10)
+                assert len(set(win)) == len(win)
+                seen.update(win)
+                start = next_dyn_index(len(words10), head10, start)
+            ck("T10 五轮覆盖全部 37 词", len(seen) == 37)
+            ck("T10 轮转步进=窗口长", next_dyn_index(37, 28, 0) == 28)
+            ck("T10 步进回绕取模", next_dyn_index(37, 28, 28) == 19)
+            ck("T10 窗口装得下时归零", next_dyn_index(10, 10, 3) == 0)
+            ck("T10 空列表安全", rotate_window([], 0, 5) == [] and next_dyn_index(0, 5, 0) == 0)
+            # 边界：窗口刚好等于词数 ⇒ 每轮同一批（全量覆盖不丢）
+            ck("T10 窗口=全量时不轮转", next_dyn_index(28, 28, 7) == 0)
         finally:
             for k, v in saved.items():
                 globals()[k] = v
