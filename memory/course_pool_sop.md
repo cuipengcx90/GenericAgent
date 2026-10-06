@@ -52,3 +52,9 @@ P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；�
 2. `archive/courses/index.html` 与池 JSON 不进 git：耐久性=靠重抓重渲染，属可再生数据；若要留档须用户批准另立路径。
 3. docstring 与 argparse 会漂移（R551 实测：docstring 写了不存在的 proof 子命令）⇒ 修文档必须逐子命令取 `--help` 对账，禁凭印象补。
 4. 本机无 `lsof`/`netstat`：端口归属用 Python（socket 枚举/psutil）+ 进程命令行交叉定位。
+
+## 七、词表产物与入库口径
+
+- `birdie_monitor/pool_keywords.json`（`words` 默认产出，可用 `COURSE_WORDS_OUT` 改）＝**逐课程搜索词状态**（found / search_count / origin=pool:<src>:<id>），供海搜沿用；`--merge-into birdie_monitor/quangneng_keywords.json` 时同时并入海搜动态词表。
+- 两个词表都**入库**（`quangneng_keywords.json` 既有、`pool_keywords.json` 作初始种子）：池 DB 与看板在 gitignored 路径，词表是 clone 后唯一可直接沿用的状态；日更重跑会更新它们并产生 diff，属预期。
+- `--no-merge` 只写 `pool_keywords.json`，用于负控/调试。
