@@ -11,7 +11,7 @@
 | 动作 | 角色 | 谁执行 | 触发方式 | 日量级（默认，见 `profiles`） |
 |---|---|---|---|---|
 | 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1 次（**上午 08:00–10:00 窗内随机**；内核 `LEVEL_CHECK_WINDOW=(8,10)`，env `LJQ_LEVEL_WINDOW` 可覆盖；见坑 §11） | 零动作，仅读等级卡 |
-| 浏览 | 补量（缺「已读帖子/浏览比例」时） | daemon `browse_batch` | daemon 自动，或提示词触发（拉起 daemon） | cap 140–180（日抖） |
+| 浏览 | 补量（缺「已读帖子/浏览比例」时） | daemon `browse_batch` | daemon 自动，或提示词触发（拉起 daemon） | cap 180–220（日抖，内核 `daily_cap=200` ± `cap_jitter=20`，当天摇一次且跨重启稳定） |
 | 回帖 | 补量（缺「回复话题数」时） | `tools/linuxdo_acts.py` reply | **等级路由排队**（daemon 随机消费）/ 提示词 | cap 6（±2 抖） |
 | 点赞 | 补量（缺「获赞/送赞」时） | `tools/linuxdo_acts.py` like | 同上 | cap 12（±4 抖） |
 | 发帖 | 补量（缺「获赞」且有草稿时） | `tools/linuxdo_acts.py` post | 等级路由排队（★无草稿时 daemon 低频自动锻造草稿，见 §十一）/ 提示词 | cap 1 |
