@@ -64,6 +64,7 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
 import argparse
 import datetime as dt
 import hashlib
+import io
 import json
 import os
 import random
@@ -151,8 +152,10 @@ CONNECT_ITEM_MAP = (
     (5, 20, "获赞"),
 )
 BATCH_GAP_MULT = 1.5                    # 批间休息 = 内核 gap_long 档 ×1.5（同一来源的批级放大）
-SESS_RETRY_MAX = 6                      # pick_session/判级连续失败达上限才退出（断链重试≈1h+）
-SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
+SESS_RETRY_MAX = 8                      # pick_session/判级连续失败达上限才退出
+SESS_RETRY_SHORT = (20, 40)             # 首段短退避（秒）：覆盖 Chrome 冷启动/扩展重连成
+SESS_RETRY_SHORT_MAX = 6                # 前 N 次用短退避，之后转长退避
+SESS_RETRY_SLEEP = (600, 1200)          # 断链长退避间隔 10–20min
 FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
 LATEST_PAGE_MAX = 9
 
@@ -1310,7 +1313,8 @@ def browse_one(session, tid, state, cand=None):
     return ok, res
 
 
-def try_ensure_tab(now=None, max_per_day=2, min_gap_s=1800):
+def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
+    """无 linux.do 标签时补一个**后台**标签（有界自愈；2026-10-06 放宽至 6 次/日、间隔 10min）。"""
     """无 linux.do 标签时补一个**后台**标签（有界自愈）。
 
     2026-10-06 实测事故：浏览器里 linux.do 标签消失后，守护 pick_session 恒失败
@@ -1339,6 +1343,11 @@ def try_ensure_tab(now=None, max_per_day=2, min_gap_s=1800):
     # 的 document.visibilityState 变 visible，用户前台保护随即每 5min 判「用户在看」而永远跳过。
     # 故建完立刻把原先的活动标签换回来（新标签留在后台），既补上供给也不打扰用户。
     script = ("tell application \"Google Chrome\"\n"
+              "  repeat with w in windows\n"
+              "    repeat with tb in tabs of w\n"
+              "      if (URL of tb) contains \"linux.do\" then return \"EXISTS\"\n"
+              "    end repeat\n"
+              "  end repeat\n"
               "  if (count of windows) = 0 then make new window\n"
               "  set _prev to (active tab index of window 1)\n"
               "  tell window 1 to make new tab with properties {URL:\"https://linux.do/\"}\n"
@@ -1352,6 +1361,8 @@ def try_ensure_tab(now=None, max_per_day=2, min_gap_s=1800):
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=25)
         ok = (r.returncode == 0)
         note = (r.stdout or r.stderr or "").strip()[:120]
+        if ok and note.upper().startswith("EXISTS"):
+            return False, "已有 linux.do 标签(仅等驱动重连)"
         if ok:
             try:
                 prev_idx = int(str(note).strip() or 0) or None
@@ -1476,8 +1487,13 @@ def watch(args):
             if sess_fails >= SESS_RETRY_MAX:
                 print("[%s] RC_NO_SESSION: %s（连续 %d 次断链，退出）" % (now_str(), note, sess_fails), flush=True)
                 return RC_NO_SESSION
-            wait = random.uniform(*SESS_RETRY_SLEEP)
-            print("[%s] RC_NO_SESSION_RETRY: %s（%d/%d，睡 %.0fmin 后重试）" % (now_str(), note, sess_fails, SESS_RETRY_MAX, wait / 60), flush=True)
+            if sess_fails <= SESS_RETRY_SHORT_MAX:
+                wait = random.uniform(*SESS_RETRY_SHORT)
+                _wu = "%.0fs" % wait
+            else:
+                wait = random.uniform(*SESS_RETRY_SLEEP)
+                _wu = "%.0fmin" % (wait / 60)
+            print("[%s] RC_NO_SESSION_RETRY: %s（%d/%d，睡 %s 后重试）" % (now_str(), note, sess_fails, SESS_RETRY_MAX, _wu), flush=True)
             time.sleep(wait)
             continue
         sess_fails = 0
@@ -1887,6 +1903,47 @@ def _selftest_impl():
         fails.append("T7n SESS_RETRY 常量边界错")
     if not ("hasFocus" in FRONT_JS and "visibilityState" in FRONT_JS and "JSON.stringify" in FRONT_JS):
         fails.append("T7n FRONT_JS 形状缺关键 token")
+    cases += 1
+    # T7o 短退避常量边界 + 必须显著短于长退避（2026-10-06：Chrome 冷启动 1-2min，旧码首轮就睡 10-20min）
+    if not (SESS_RETRY_SHORT_MAX >= 1 and 0 < SESS_RETRY_SHORT[0] < SESS_RETRY_SHORT[1]):
+        fails.append("T7o SESS_RETRY_SHORT 常量边界错")
+    if not (SESS_RETRY_SHORT[1] < SESS_RETRY_SLEEP[0]):
+        fails.append("T7o 短退避未显著短于长退避")
+    if not ("io" in globals()):
+        fails.append("T7o io 未导入(try_ensure_tab 台账会静默失败)")
+    cases += 1
+    # T7p/T7q try_ensure_tab：EXISTS 短路不记账；超日上限拒绝（沙箱 BASE + 桩 subprocess）
+    _pb, _psub = globals()["BASE"], globals()["subprocess"]
+    _sd = tempfile.mkdtemp(prefix="ljq_selftest_tab_")
+    class _ShimSub(object):
+        @staticmethod
+        def run(*a, **k):
+            class _R(object):
+                returncode = 0
+                stdout = "EXISTS"
+                stderr = ""
+            return _R()
+    try:
+        globals()["BASE"] = _sd
+        globals()["subprocess"] = _ShimSub
+        _okx, _notex = try_ensure_tab(now=time.time())
+        if _okx or "已有" not in str(_notex):
+            fails.append("T7p EXISTS 应短路不新建: %r/%r" % (_okx, _notex))
+        if os.path.exists(os.path.join(_sd, "ensure_tab.jsonl")):
+            fails.append("T7p EXISTS 分支不应写 ensure_tab 台账")
+        _day = time.strftime("%Y-%m-%d")
+        with io.open(os.path.join(_sd, "ensure_tab.jsonl"), "w", encoding="utf-8") as _f:
+            for _i in range(6):
+                _f.write(json.dumps({"ts": time.time() - 1, "day": _day, "ok": True, "note": "x"}) + "\n")
+        _ok2, _note2 = try_ensure_tab(now=time.time())
+        if _ok2 or "上限" not in str(_note2):
+            fails.append("T7q 超日上限应拒绝: %r/%r" % (_ok2, _note2))
+        _ok3, _note3 = try_ensure_tab(now=time.time())
+        if _ok3 or "上限" not in str(_note3):
+            fails.append("T7q 台账读取应可复现(io 已导入): %r/%r" % (_ok3, _note3))
+    finally:
+        globals()["BASE"], globals()["subprocess"] = _pb, _psub
+        shutil.rmtree(_sd, ignore_errors=True)
     cases += 1
     # T8 cap 抖动 / T9 晨抖（纯函数断言，传局部 dict，不触真 state）
     cst = {"cap": {}}

@@ -61,7 +61,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 ## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
 
 触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
-后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 14/14）：
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 35/35；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
 - 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 慢滚 22–30 步×1.4–2.0s + 底部驻留 90–125s + 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（内核 `daily_cap=200` ± `cap_jitter=20` ⇒ 实际 180–220，每天摇一次、跨重启稳定）+ 全天切成 `seg_n=6–8` 段 × 每段 `seg_len=85–160min`（内核 `day_segments` 日期种子派生 ⇒ 重启不重置段位；段总长 ≤ 活动窗 80%，段间随机长休 ~130–150min） + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
@@ -105,3 +105,16 @@ return JSON.stringify({fail:true,now:location.pathname});
 `memory/linuxdo_trust_level_sop.md` 的等级卡判读若出现**浏览类缺项**（浏览话题/浏览帖子/已读帖子），即路由到本 SOP 的 daemon 自动补足（只读，随机节奏）；
 **须人工的项**（回复/点赞/获赞/访问天数）由 daemon 私信通知（每天≤1 次，幂等），本 SOP 不代操作。
 路由实现=daemon `classify_pending()`/`maybe_notify_manual()`（`MANUAL_KINDS` 正则）。
+
+## 守护生存面：Galley 解耦与浏览器自愈（2026-10-06 R556）
+
+用户裁决：**不把「开着 Galley 座舱」当前置**；就用日常 Chrome（非无头）；浏览器关了要能自动重开。三层自愈链：
+
+1. **独立桥保活** `tools/tmwd_bridge_watch.py`（新）：长驻监督 `18765 WS/18766 HTTP` 两端口，桥不在即拉起（失败退避重试、收手守卫），与 Galley 的 runner.workbench_bridge 彻底解耦；`--selftest` 离线自测 PASS。
+2. **看门狗兜底** `linuxdo_daemon_watchd.py ensure_bridge()`：桥不可达 ⇒ 先自动拉起独立桥（冷却 600s、起后等 15s），仍不可达才判 `BRIDGE_DOWN` 只告警不重启；`status` 增 `bridge_reachable`/`bridge_runner_pids`/`bridge_ensure`（selftest 86 checks / 0 failed）。
+3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab_ledger.jsonl`。
+
+真机链（21:12）：watchd 起→`BRIDGE_DOWN`→独立桥拉起→daemon 重生→补标签顺带拉起 Chrome→扩展连上→ROUND OK；21:17 新码短退避生效（`RC_NO_SESSION_RETRY …（1/8，睡 40s）`）。
+
+- **短退避**：Chrome 冷启动仅 1–2min，旧码无会话首轮睡 10–20min 纯属浪费 ⇒ 新增 `SESS_RETRY_SHORT=(20,40)s`、前 `SESS_RETRY_SHORT_MAX=6` 次短退避，用尽才走原长退避（新码日志可取证 `1/8，睡 40s`）。
+- ★真缺陷：`try_ensure_tab` 用 `io.open` 读写台账但模块从未 `import io` ⇒ 每次抛 NameError 被 `except` 吞 ⇒ **补开限额从未生效**（可无限堆标签）。修=补 `import io` + 用例 T7o/T7p/T7q（限额/EXISTS 去重/短退避边界）。★判据：`except` 兜底的路径必须先证明「正常路径能走通」。

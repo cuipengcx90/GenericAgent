@@ -7,7 +7,9 @@
 期间「浏览/等级检查/排队动作」全部停摆，且**用户看不见**（静默失效）。
 
 本器只做四件事（全部本地、零站点请求、零 LLM token）：
-  1. 探活：守护进程不在 ⇒ 先探工作台桥；桥不可达 ⇒ 判 BRIDGE_DOWN（**不重启**、长冷却告警），桥可达才用 bg_task 拉起（幂等）；
+  1. 探活：守护进程不在 ⇒ 先探工作台桥；桥不可达 ⇒ 先**自动拉起独立桥**
+     （tools/tmwd_bridge_watch.py，脱离 Galley 座舱，R556），仍不可达才判 BRIDGE_DOWN
+     （**不重启**、长冷却告警）；桥可达才用 bg_task 拉起（幂等）；
   2. 停滞：在活动窗内长时间没有浏览产出（browse_log 无新增 DONE）⇒ 判为卡死并重启；近 1h 已重启超频则抑制（RESTART_SKIP）；
   3. 留痕 + 告警：事件写 temp/linuxdo_watch/watchd.jsonl，重启/恢复各发一次私信；
   4. 合并告警（R551）：同类事件在 6h 窗口内只发一条汇总（含累计次数），防刷屏但仍看得见。
@@ -55,8 +57,12 @@ RESTART_RATE_PER_HOUR = 3    # 每小时重启上限（超限改「跳过」；�
 BUSY_LOG_S = 20 * 60         # 环境忙信号回看窗口（秒）：daemon 日志近 N 分钟含忙标记 ⇒ 判 BLOCKED_ENV
 FAIL_STREAK_NOTIFY = 3       # 连续重启失败达 N 次 ⇒ 告警（并继续重试）
 BRIDGE_TARGETS = [("127.0.0.1", int(os.environ.get("LJQ_BRIDGE_PORT", "18766"))),
-                  ("127.0.0.1", 18765)]  # 工作台桥(TMWebDriver)：18766=守护默认 / 18765=兼容
+                  ("127.0.0.1", int(os.environ.get("TMWD_PORT", "18765")))]  # 工作台桥：18766=HTTP(守护默认) / 18765=WS(兼容)；两端口均可 env 覆盖(LJQ_BRIDGE_PORT/TMWD_PORT)以便沙盒端到端
 BRIDGE_TIMEOUT = 2.0                     # 桥探活超时（秒）
+BRIDGE_RUNNER_PAT = "tmwd_bridge_watch.py"   # 独立桥监督进程（不依赖 Galley 座舱）
+BRIDGE_RUNNER_NAME = "tmwd_bridge"           # bg_task 任务名（同名幂等）
+BRIDGE_ENSURE_WAIT_S = 15                    # 起桥后等桥可达的上限（秒）
+BRIDGE_ENSURE_COOLDOWN_S = 600               # 起桥尝试冷却（秒），防每轮空拉
 ALERT_MERGE_WINDOW_H = 6                 # 同类重启告警合并窗口（小时）：窗口内只发一条汇总
 RECOVERY_NOTIFY_MIN_S = 300              # 停机 ≥ 该秒数才发「已恢复」（一闪而过不打扰）
 DEFAULT_MAX_HOURS = 26.0     # 长驻上限；由每日入口重新武装（对齐 anyrouter watchd 模式）
@@ -392,6 +398,82 @@ def browse_busy_hint(now=None):
     return (False, "")
 
 
+# ---------------------------------------------- 独立桥自愈（脱离 Galley 座舱）
+def bridge_runner_pids():
+    """独立桥监督进程（tools/tmwd_bridge_watch.py）的 pid 列表（只读 ps，绝不杀进程）。"""
+    out = []
+    for ln in _ps_lines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$", ln)
+        if not m:
+            continue
+        cmd = m.group(4)
+        if BRIDGE_RUNNER_PAT in cmd and "grep" not in cmd:
+            out.append(int(m.group(1)))
+    return out
+
+
+def _spawn_cmd(name, argv, dry=False, bg=DEFAULT_BG, cwd=ROOT, timeout=90):
+    """用 bg_task 起一个后台任务（同名幂等）。返回 {rc,out,err}。"""
+    if dry:
+        return {"rc": 0, "dry": True, "argv": list(argv)}
+    cmd = [sys.executable, bg, "start", "--name", name, "--cwd", cwd, "--"] + list(argv)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {"rc": r.returncode, "out": (r.stdout or "").strip()[-400:],
+                "err": (r.stderr or "").strip()[-200:]}
+    except Exception as e:
+        return {"rc": -1, "err": repr(e)[:200]}
+
+
+def ensure_bridge(dry=False, spawn=None, wait_s=None, now=None, probe=None, sleep_fn=None,
+                  runner_pids=None):
+    """桥不可达 ⇒ 自动拉起**独立桥**（不再要求用户开着 Galley 座舱）。
+
+    2026-10-06 用户裁决：浏览器可以开着（就用日常 Chrome），但**不允许**把「开着座舱」
+    当前置。桥（127.0.0.1:18765 WS / 18766 HTTP）历史上由 Galley 的
+    runner.workbench_bridge 顺手拉起 ⇒ 座舱一关桥就没了，看门狗只能干等。
+    本函数让看门狗自己兜底（只读探活 + 起一个零 token 的后台监督进程）。
+
+    返回 (status, info)，status ∈
+      UP / STARTED / ALREADY_RUNNING / SKIPPED_COOLDOWN / START_FAILED / DRY
+    fail-open：任何异常都不阻断巡检（最坏情况退回旧的「只告警」行为）。
+    """
+    spawn = spawn or _spawn_cmd
+    probe = probe or bridge_ok
+    pids_fn = runner_pids or bridge_runner_pids
+    sleep_fn = sleep_fn or time.sleep
+    wait_s = BRIDGE_ENSURE_WAIT_S if wait_s is None else wait_s
+    now = now if now is not None else _now()
+    try:
+        if probe():
+            return ("UP", {})
+        rt = read_runtime()
+        if pids_fn():
+            deadline = _now() + wait_s
+            while _now() < deadline and not probe():
+                sleep_fn(1.0)
+            if probe():
+                return ("STARTED", {"waited": True, "runner_running": True})
+            return ("ALREADY_RUNNING", {})
+        last = float(rt.get("bridge_ensure_ts") or 0)
+        if last and (now - last) < BRIDGE_ENSURE_COOLDOWN_S:
+            return ("SKIPPED_COOLDOWN", {"age_s": now - last})
+        if dry:
+            return ("DRY", {})
+        res = spawn(BRIDGE_RUNNER_NAME,
+                    [sys.executable, "-u", os.path.join("tools", BRIDGE_RUNNER_PAT)])
+        deadline = _now() + wait_s
+        while _now() < deadline and not probe():
+            sleep_fn(1.0)
+        if probe():
+            write_runtime({"bridge_ensure_ts": now})
+            return ("STARTED", {"rc": res.get("rc"), "out": res.get("out")})
+        write_runtime({"bridge_ensure_ts": now})
+        return ("START_FAILED", {"rc": res.get("rc"), "err": res.get("err")})
+    except Exception as e:
+        return ("START_FAILED", {"err": repr(e)[:200]})
+
+
 # ---------------------------------------------------------------- 单实例锁
 def _lock_pid():
     try:
@@ -536,10 +618,11 @@ def write_runtime(patch):
 
 
 # ---------------------------------------------------------------- 主循环
-def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None):
+def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None):
     """一轮巡检。snapshot 非 None 时跳过探针（仅供自测注入，生产恒为探针）。"""
     spawn = spawn or spawn_daemon
     notify_fn = notify_fn or notify
+    ensure = ensure or ensure_bridge
     rt = read_runtime()
     if snapshot is not None:
         snap = dict(snapshot)
@@ -562,16 +645,22 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None):
                n_pids=len(snap["pids"]), quiet=snap["quiet"],
                last=snap.get("last_done"))
     if d["action"] == "BRIDGE_DOWN":
-        # 桥不可达：守护根本起不来（不是它的错）⇒ 不重启，按 6h 冷却告警一次（R551）
-        last_n = float(rt.get("bridge_notified_ts") or 0)
-        if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
-            notify_fn("⛔ L站浏览守护已停：工作台桥（127.0.0.1:18766/18765）不可达，"
-                      "看门狗**不重启**（重启也起不来，避免空转刷屏）。"
-                      "恢复 Galley 工作台后我会自动继续。· %s" % _ts())
-            write_runtime({"bridge_notified_ts": _now(), "notified_down": True,
-                           "down_since": _now()})
-        _log_event("BRIDGE_DOWN", reason=d["reason"])
-        return dict(d, pids=snap["pids"])
+        # R556：不再只是告警——先自己把**独立桥**拉起来（不依赖 Galley 座舱）
+        _st, _info = ensure(dry=dry)
+        _log_event("BRIDGE_ENSURE", status=_st)
+        if not dry and _st in ("UP", "STARTED", "ALREADY_RUNNING"):
+            d = decide(dict(snap, bridge_ok=True))      # 桥已可用 ⇒ 重判（通常 RESTART；判据不变）
+            _log_event("ROUND", action=d["action"], reason="AFTER_BRIDGE_ENSURE_" + str(d["reason"]))
+        if d["action"] == "BRIDGE_DOWN":
+            # 起桥失败/冷却中：守护根本起不来（不是它的错）⇒ 不重启，按 6h 冷却告警一次（R551）
+            last_n = float(rt.get("bridge_notified_ts") or 0)
+            if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
+                notify_fn("⛔ L站浏览守护已停：工作台桥（127.0.0.1:18766/18765）不可达，"
+                          "看门狗已尝试自动拉独立桥但未成功。· %s" % _ts())
+                write_runtime({"bridge_notified_ts": _now(), "notified_down": True,
+                               "down_since": _now()})
+            _log_event("BRIDGE_DOWN", reason=d["reason"])
+            return dict(d, pids=snap["pids"])
     if d["action"] == "BLOCKED_ENV":
         last_n = float(rt.get("blocked_notified_ts") or 0)
         if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
@@ -720,7 +809,11 @@ def cmd_status(args):
            # 只读派生（R546 #7）：重启风暴一眼可见 —— 对照 rate_limit_per_hour 上限
            "restarts": restart_audit(),
            # R551：桥可达性（桥不可达时守护必然起不来；此字段让 status 一眼可判）
-           "bridge_reachable": bridge_ok()}
+           "bridge_reachable": bridge_ok(),
+           # R556：独立桥监督进程与起桥冷却状态（桥缺失时看门狗会自己拉起）
+           "bridge_runner_pids": bridge_runner_pids(),
+           "bridge_ensure": {"ts": rt.get("bridge_ensure_ts"),
+                             "cooldown_s": BRIDGE_ENSURE_COOLDOWN_S}}
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0
 
@@ -1081,6 +1174,72 @@ def _selftest():
     sandbox_state(_old32[0])
     ck(EVENTS == os.path.join(_old32[0], "watchd.jsonl") and STATE_DIR == _old32[0],
        "T32c 复原后应回到生产路径: %s" % (STATE_DIR,))
+    # ---- T33 桥不可达 ⇒ 自动起独立桥（R556）：四态 + one_round 联动 + 负控
+    import tempfile as _tf33
+    _sb = _tf33.mkdtemp(prefix="ljqsb33")
+    sandbox_state(_sb)
+    _calls = {"spawn": 0}
+    _spawn33 = lambda name, argv, dry=False: (_calls.__setitem__("spawn", _calls["spawn"] + 1)
+                                              or {"rc": 0, "out": "ok"})
+    # T33a 桥已可达 ⇒ UP，零起进程
+    st33a, _ = ensure_bridge(probe=lambda: True, runner_pids=lambda: [], spawn=_spawn33)
+    ck(st33a == "UP" and _calls["spawn"] == 0, "T33a 桥可达须 UP 且零 spawn: %s" % st33a)
+    # T33b 冷却窗口内 ⇒ SKIPPED_COOLDOWN，绝不重复拉
+    write_runtime({"bridge_ensure_ts": _now()})
+    st33b, _ = ensure_bridge(probe=lambda: False, runner_pids=lambda: [], spawn=_spawn33)
+    ck(st33b == "SKIPPED_COOLDOWN" and _calls["spawn"] == 0,
+       "T33b 冷却期内须 SKIPPED_COOLDOWN 且零 spawn: %s spawn=%d" % (st33b, _calls["spawn"]))
+    # T33c 冷却过期 ⇒ 真起独立桥，桥起来后 STARTED；且落 bridge_ensure_ts 供下轮冷却
+    write_runtime({"bridge_ensure_ts": 0})
+    _seq = {"n": 0}
+
+    def _probe33():
+        _seq["n"] += 1
+        return _seq["n"] >= 2
+    st33c, _i = ensure_bridge(probe=_probe33, runner_pids=lambda: [], spawn=_spawn33, wait_s=0.05,
+                              sleep_fn=lambda s: None)
+    ck(st33c == "STARTED" and _calls["spawn"] == 1 and float(read_runtime().get("bridge_ensure_ts") or 0) > 0,
+       "T33c 冷却过期须起独立桥并落冷却戳: %s spawn=%d" % (st33c, _calls["spawn"]))
+    # T33d 起桥后仍不可达 ⇒ START_FAILED（不得假报成功）
+    st33d, _i = ensure_bridge(probe=lambda: False, runner_pids=lambda: [], spawn=_spawn33, wait_s=0.05,
+                              sleep_fn=lambda s: None, now=_now() + BRIDGE_ENSURE_COOLDOWN_S + 1)
+    ck(st33d == "START_FAILED", "T33d 起桥后仍不可达须 START_FAILED（fail-closed）: %s" % st33d)
+    # T33e 监督进程已在跑但仍探不到 ⇒ ALREADY_RUNNING（不重复起）
+    _calls["spawn"] = 0
+    st33e, _i = ensure_bridge(probe=lambda: False, runner_pids=lambda: [12345], spawn=_spawn33,
+                              wait_s=0.05, sleep_fn=lambda s: None)
+    ck(st33e == "ALREADY_RUNNING" and _calls["spawn"] == 0,
+       "T33e 监督进程在跑须不重复起: %s spawn=%d" % (st33e, _calls["spawn"]))
+    # T33f 生产默认（不注入 pids/probe）：真探本机桥 ⇒ UP 且零 spawn（不得干扰座舱桥）
+    _calls["spawn"] = 0
+    st33f, _u = ensure_bridge(probe=lambda: True, spawn=_spawn33, runner_pids=lambda: [])
+    ck(st33f == "UP" and _calls["spawn"] == 0, "T33f 生产桥在时零动作: %s" % st33f)
+    # ---- T33g/T33h one_round 联动：桥恢复后本轮继续按 RESTART 走；起桥失败则维持 BRIDGE_DOWN
+    sandbox_state(_sb)
+    _c33 = {"spawn": 0, "notify": []}
+    _snap33 = {"pids": [], "last_done": None, "now": _now(), "quiet": False,
+               "bridge_ok": False, "last_restart_ts": 0}
+    r33 = one_round(dry=False,
+                    spawn=lambda dry=False: (_c33.__setitem__("spawn", _c33["spawn"] + 1) or {"rc": 0}),
+                    notify_fn=lambda t: _c33["notify"].append(t), snapshot=dict(_snap33),
+                    ensure=lambda dry=False: ("STARTED", {}))
+    ck(r33["action"] == "RESTART" and _c33["spawn"] == 1,
+       "T33g 桥自动拉起后本轮须恢复重启守护: %s spawn=%d" % (r33["action"], _c33["spawn"]))
+    sandbox_state(_sb)
+    _c33b = {"spawn": 0, "notify": []}
+    r33b = one_round(dry=False,
+                     spawn=lambda dry=False: (_c33b.__setitem__("spawn", _c33b["spawn"] + 1) or {"rc": 0}),
+                     notify_fn=lambda t: _c33b["notify"].append(t), snapshot=dict(_snap33),
+                     ensure=lambda dry=False: ("START_FAILED", {"err": "x"}))
+    ck(r33b["action"] == "BRIDGE_DOWN" and _c33b["spawn"] == 0 and len(_c33b["notify"]) == 1,
+       "T33h 起桥失败须维持 BRIDGE_DOWN（不空转重启）: %s spawn=%d notify=%d"
+       % (r33b["action"], _c33b["spawn"], len(_c33b["notify"])))
+    # T33i 负控：dry 模式下 ensure 不得真起桥（先清零上一用例落的冷却戳）
+    sandbox_state(_sb)
+    write_runtime({"bridge_ensure_ts": 0})
+    st33i, _i = ensure_bridge(dry=True, probe=lambda: False, runner_pids=lambda: [], spawn=_spawn33)
+    ck(st33i == "DRY" and _calls["spawn"] == 0, "T33i dry-run 不得真起桥: %s" % st33i)
+
     # 复原生产路径（防后续用例误写沙箱）
     STATE_DIR = os.path.join(ROOT, "temp", "linuxdo_watch")
     EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")
