@@ -75,6 +75,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from urllib.parse import urlparse
 
 # ---- 拟人层单一源（2026-10-05）：浏览路径必须与 acts（回复/点赞/发帖）共用同一内核，
 #      否则「浏览」是独立实现、参数漂移，用户要求的通用抽象就不成立。
@@ -89,6 +90,25 @@ except Exception:                                       # 非 tools/ 目录被 i
 
 GA_ROOT = os.environ.get("GA_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 BASE = os.path.join(GA_ROOT, "temp", "linuxdo_browse_daemon")
+
+# ---- 主站 host 判据单一源（2026-10-06 停摆事故）-------------------------------
+# 事故：唯一 linux.do 标签被导航到 connect.linux.do 后，pick_session 判「无候选」而
+# try_ensure_tab 用子串 "linux.do" 判「已有」⇒ 自愈不触发、空转 64min 零产出。
+# 两处共用下面这一份判据，禁止再写 `in "linux.do"` 之类子串判据。
+MAIN_HOSTS = ("linux.do", "www.linux.do")
+
+
+def _url_host(u):
+    """从 URL 串取 host（小写，带 userinfo/端口也能取对）；解析失败回空串。"""
+    try:
+        return (urlparse(str(u)).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_main_host(host):
+    """是否 linux.do 主站（connect./sharedchat 等含 "linux.do" 子串但非主站）。"""
+    return isinstance(host, str) and host.strip().lower() in MAIN_HOSTS
 BRIDGE = os.environ.get("LJQ_BRIDGE", "http://127.0.0.1:18766")
 HINT = "linux.do"
 
@@ -312,9 +332,9 @@ def pick_session(prefer=None, timeout=20):
     for s in ordered:
         probe = run_js(s["id"], "(()=>location.host)()", timeout=15)
         host = probe.get("raw") if isinstance(probe, dict) else probe
-        # 精确 host 判定：connect.linux.do 也含 "linux.do" 子串但无 Discourse 环境
-        # （2026-10-05 实测误选 connect Error 页 tab → routeTo 永远 need_loc）
-        if isinstance(host, str) and host.strip().lower() in ("linux.do", "www.linux.do"):
+        # 精确 host 判定（单一源 _is_main_host）：connect.linux.do 也含 "linux.do" 子串但
+        # 无 Discourse 环境（2026-10-05 实测误选 connect Error 页 tab → routeTo 永远 need_loc）
+        if _is_main_host(host):
             return s, ""
     return None, "候选标签页 %s 均不在 %s（可能已被导航走）" % ([s["id"] for s in ordered], HINT)
 
@@ -1107,19 +1127,29 @@ CONNECT_JS = r"""
 def check_level(session, timeout=40):
     """读一次等级。返回 (level|None, note)。先 connect，失败回落首页卡。"""
     # 1) connect 顶层导航（分区 cookie 使其可能 CF 挑战——SOP 处置顺序）
-    run_js(session["id"], "location.href='https://connect.linux.do/'", timeout=20)
-    time.sleep(8)
-    res = run_js(session["id"], CONNECT_JS, timeout=timeout)
-    lvl = parse_connect_dom(res)
-    if lvl:
+    # ★(2026-10-06) 还原主站改由 finally 兜底：原实现只在「读到等级」那条路径还原，
+    #   一旦 CONNECT_JS/解析/进程中断就把唯一的 linux.do 标签永久留在 connect 页
+    #   （当次事故：标签停在 connect ⇒ 浏览停摆 64min）。任何退出路径都必须还原。
+    _nav_connect = False
+    try:
+        run_js(session["id"], "location.href='https://connect.linux.do/'", timeout=20)
+        _nav_connect = True
+        time.sleep(8)
+        res = run_js(session["id"], CONNECT_JS, timeout=timeout)
+        lvl = parse_connect_dom(res)
+        if lvl:
+            return lvl, "connect"
+    except Exception as e:
+        print("[warn] check_level connect 阶段异常: %s" % str(e)[:120], flush=True)
+    finally:
         # ★(2026-10-05) 读完必须还原主站：否则守护把唯一的 linux.do 标签页变成 connect 页,
         #   下一轮 pick_session 再也找不到可浏览的标签 ⇒ 自毁供应、永久 batch done=0
-        try:
-            run_js(session["id"], "location.href='https://linux.do/'", timeout=20)
-            time.sleep(6)
-        except Exception as e:
-            print("[warn] check_level 还原主站失败: %s" % str(e)[:120], flush=True)
-        return lvl, "connect"
+        if _nav_connect:
+            try:
+                run_js(session["id"], "location.href='https://linux.do/'", timeout=20)
+                time.sleep(6)
+            except Exception as e:
+                print("[warn] check_level 还原主站失败: %s" % str(e)[:120], flush=True)
     # 2) 回落首页等级卡
     run_js(session["id"], "location.href='https://linux.do/'", timeout=20)
     time.sleep(9)
@@ -1343,11 +1373,13 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
     # 的 document.visibilityState 变 visible，用户前台保护随即每 5min 判「用户在看」而永远跳过。
     # 故建完立刻把原先的活动标签换回来（新标签留在后台），既补上供给也不打扰用户。
     script = ("tell application \"Google Chrome\"\n"
+              "  set _u to \"\"\n"
               "  repeat with w in windows\n"
               "    repeat with tb in tabs of w\n"
-              "      if (URL of tb) contains \"linux.do\" then return \"EXISTS\"\n"
+              "      if (URL of tb) contains \"linux.do\" then set _u to _u & (URL of tb) & linefeed\n"
               "    end repeat\n"
               "  end repeat\n"
+              "  if _u is not \"\" then return \"URLS:\" & _u\n"
               "  if (count of windows) = 0 then make new window\n"
               "  set _prev to (active tab index of window 1)\n"
               "  tell window 1 to make new tab with properties {URL:\"https://linux.do/\"}\n"
@@ -1360,9 +1392,13 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=25)
         ok = (r.returncode == 0)
-        note = (r.stdout or r.stderr or "").strip()[:120]
-        if ok and note.upper().startswith("EXISTS"):
-            return False, "已有 linux.do 标签(仅等驱动重连)"
+        note = (r.stdout or r.stderr or "").strip()
+        if ok and note.upper().startswith("URLS:"):
+            # ★精确 host 判据（2026-10-06）：只认主站；connect.linux.do 不算「已有」；
+            #   否则标签被导航走时自愈恒不触发（当次空转 64min、零产出）。
+            _urls = [u.strip() for u in note[5:].splitlines() if u.strip()]
+            if any(_is_main_host(_url_host(u)) for u in _urls):
+                return False, "已有 linux.do 主站标签(仅等驱动重连)"
         if ok:
             try:
                 prev_idx = int(str(note).strip() or 0) or None
@@ -1423,6 +1459,13 @@ def browse_batch(session, st, batch=25):
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
                                        "pose": res.get("pose") if isinstance(res, dict) else None})
+        # ★会话级故障即中止本批（2026-10-06）：标签被导航走/驱动回落错标签时，逐帖重试
+        #   会把本批 19 次机会全烧在同一个故障上（当次 21:52–22:56 零产出）。交回主循环自愈。
+        if (not ok) and str(_why).startswith("non-linuxdo-tab"):
+            log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "ABORT",
+                                           "why": "session_drift:" + str(_why)[:80],
+                                           "n_left": len(cand) - i - 1})
+            break
         if ok:
             done += 1
             seen.add(int(tid))
@@ -1916,11 +1959,12 @@ def _selftest_impl():
     _pb, _psub = globals()["BASE"], globals()["subprocess"]
     _sd = tempfile.mkdtemp(prefix="ljq_selftest_tab_")
     class _ShimSub(object):
-        @staticmethod
-        def run(*a, **k):
+        out = "URLS:https://linux.do/"      # 默认=主站标签在（短路分支）
+        @classmethod
+        def run(cls, *a, **k):
             class _R(object):
                 returncode = 0
-                stdout = "EXISTS"
+                stdout = _ShimSub.out
                 stderr = ""
             return _R()
     try:
@@ -1928,9 +1972,23 @@ def _selftest_impl():
         globals()["subprocess"] = _ShimSub
         _okx, _notex = try_ensure_tab(now=time.time())
         if _okx or "已有" not in str(_notex):
-            fails.append("T7p EXISTS 应短路不新建: %r/%r" % (_okx, _notex))
+            fails.append("T7p 主站标签应短路不新建: %r/%r" % (_okx, _notex))
         if os.path.exists(os.path.join(_sd, "ensure_tab.jsonl")):
-            fails.append("T7p EXISTS 分支不应写 ensure_tab 台账")
+            fails.append("T7p 短路分支不应写 ensure_tab 台账")
+        # T7r 负控（2026-10-06 停摆根因）：只有 connect./sharedchat 这类「含 linux.do 子串但非主站」
+        #     的标签时，必须判「无主站标签」并新建；被子串骗过则自愈恒不触发、浏览空转。
+        _ShimSub.out = "URLS:https://connect.linux.do/\nhttps://sharedchat.example/room/1"
+        _ok_r, _note_r = try_ensure_tab(now=time.time())
+        if not _ok_r:
+            fails.append("T7r 仅 connect/非主站标签应判无主站并新建: %r/%r" % (_ok_r, _note_r))
+        if os.path.exists(os.path.join(_sd, "ensure_tab.jsonl")) is False:
+            fails.append("T7r 新建分支应写 ensure_tab 台账")
+        if _is_main_host("connect.linux.do") or _is_main_host("sharedchat.linux.do.evil.example"):
+            fails.append("T7r _is_main_host 子串误判(应精确匹配)")
+        if not (_is_main_host("linux.do") and _is_main_host("www.linux.do")):
+            fails.append("T7r _is_main_host 主站识别错")
+        if _url_host("https://connect.linux.do/x?y=1") != "connect.linux.do":
+            fails.append("T7r _url_host 解析错: %r" % _url_host("https://connect.linux.do/x?y=1"))
         _day = time.strftime("%Y-%m-%d")
         with io.open(os.path.join(_sd, "ensure_tab.jsonl"), "w", encoding="utf-8") as _f:
             for _i in range(6):
@@ -1944,6 +2002,15 @@ def _selftest_impl():
     finally:
         globals()["BASE"], globals()["subprocess"] = _pb, _psub
         shutil.rmtree(_sd, ignore_errors=True)
+    # T7s 结构闸门（2026-10-06 三处停摆修复的回归锚点；读源码不绑现场内容）
+    import inspect as _insp
+    _src_cl = _insp.getsource(check_level)
+    if "finally:" not in _src_cl or "location.href='https://linux.do/'" not in _src_cl:
+        fails.append("T7s check_level 缺 finally 还原主站")
+    if "non-linuxdo-tab" not in _insp.getsource(browse_batch):
+        fails.append("T7s browse_batch 缺会话漂移即中止")
+    if "_is_main_host" not in _insp.getsource(try_ensure_tab):
+        fails.append("T7s try_ensure_tab 未用精确 host 判据")
     cases += 1
     # T8 cap 抖动 / T9 晨抖（纯函数断言，传局部 dict，不触真 state）
     cst = {"cap": {}}

@@ -118,3 +118,26 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 - **短退避**：Chrome 冷启动仅 1–2min，旧码无会话首轮睡 10–20min 纯属浪费 ⇒ 新增 `SESS_RETRY_SHORT=(20,40)s`、前 `SESS_RETRY_SHORT_MAX=6` 次短退避，用尽才走原长退避（新码日志可取证 `1/8，睡 40s`）。
 - ★真缺陷：`try_ensure_tab` 用 `io.open` 读写台账但模块从未 `import io` ⇒ 每次抛 NameError 被 `except` 吞 ⇒ **补开限额从未生效**（可无限堆标签）。修=补 `import io` + 用例 T7o/T7p/T7q（限额/EXISTS 去重/短退避边界）。★判据：`except` 兜底的路径必须先证明「正常路径能走通」。
+
+## 事故：主站标签被导航至 connect 后自愈失效（2026-10-06 R557）
+
+**症状**：浏览停摆 64min（21:52–22:56），`browse_log` 连出 19 轮 `FAIL why=non-linuxdo-tab:connect.linux.do`；当日计数停在 53（上限 180 ⇒ **不是限额**）。
+
+**根因 A（直接因）**：会话漂移后两条判据互相矛盾——
+- `pick_session()` 用精确 host（`in ("linux.do","www.linux.do")`）⇒ 无候选、判「没有可用标签」；
+- `try_ensure_tab()` 的 AppleScript EXISTS 判据用**子串** `contains "linux.do"` ⇒ 被 `connect.linux.do` 骗过、判「已有主站标签」⇒ **不自愈**，两边僵持空转。
+修法=判据单一源：`MAIN_HOSTS` + `_url_host()` + `_is_main_host()`，`pick_session`/`try_ensure_tab` **共用**；AppleScript 改为回传全部命中 URL（`URLS:` 前缀）再由 Python 精确判 host。**禁再写 `in "linux.do"` 之类子串判据。**
+
+**根因 B（诱因）**：`check_level()` 会把唯一主站标签导航到 `connect.linux.do`，旧码只在「读到等级」那条路径还原 ⇒ 一旦 `CONNECT_JS`/解析异常或进程被打断，标签**永久留在 connect**（本次事故现场即此）。修法=`try/finally` 兜底还原 + `_nav_connect` 标记（没导航过不乱跳）。
+
+**另修**：`browse_batch` 遇 `non-linuxdo-tab` 即中止本批（原先逐帖重试把 19 次机会烧在同一故障上），交回主循环走自愈。
+
+**自测**：33→35。新增 T7r 负控（只有 connect/sharedchat 标签时必须判「无主站」并新建；`_is_main_host` 子串误判必 FAIL）与 T7s 结构闸门（读源码断言三处补丁仍在，**不绑现场内容**）。
+
+**现场恢复**：`osascript` 补一个后台 `https://linux.do/` 标签 ⇒ 会话注册、`pick_session` 立即可选；重启 daemon（新 pid 80887）载入新码 ⇒ 连续 `ROUND OK`。
+
+**教训（通用）**：
+1. 同一语义禁两份判据——子串匹配会被同族子域骗过；host 判定必须精确且**单一源**。
+2. 「有标签」≠「能用」：自愈判据必须与消费侧（`pick_session`）用同一个函数，否则出现「一边说没有、一边说有」的永久空转。
+3. 把主站标签导航去别处的分支都要 `try/finally` 还原，并留可观测证据。
+4. 判停摆是否「到上限」先看 `state.daily` 与当日 cap，别凭感觉。
