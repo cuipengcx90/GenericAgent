@@ -24,6 +24,8 @@
   - 去重键 = 链接 URL（空 URL 的条目直接丢弃，不写台账）
   - seen 台账 temp/pan_search/seen.json：digest 只报"新增"条目（幂等，可反复跑）
   - 推送仅 digest --notify 时发生；未推送不推进基线（同 project_update 惯例）
+  - seen 只在条目**真正进入本轮推送**时写入；当日零新增会回捞近 30 天未推送过的
+    合格条目（--backlog-days/--backlog-max/--no-backlog 可调）
   - esoua_js() 为浏览器后备后端的 JS 生成器（需 GA 浏览器会话时人工配合用）
 """
 import argparse
@@ -267,12 +269,16 @@ def save_seen(seen):
 
 
 def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
-           cache_raw=True):
+           cache_raw=True, backlog_days=30, backlog_max=6):
     """按主题组搜关键词，判相关后去重汇总。返回 (新增条目列表, 报告文本)。
 
     相关性判决由 judge() 完成（单一源 haisou_relevance + 资源站噪声面）。
     stats 每项 = (主题, 关键词, 命中, 原始新增, 保留新增, 剔噪, 剔不相关)，
     其中「原始新增」= 关闭判据时的旧行为计数 ⇒ 同一次抓取内即可完成 A/B。
+
+    积压兜底：若当日窗口（days）零新增，则从**本次已抓到的原始响应**里回捞
+    近 backlog_days 天内仍然相关、且尚未推送过的条目（最多 backlog_max 条）——
+    零额外网络请求；被推送过的条目写入 seen，不会重复推送。
     """
     ensure_dir()
     keys = (topics or DEFAULT_TOPICS).split(",")
@@ -306,13 +312,44 @@ def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
                         di += 1
                     continue
                 n_keep += 1
-                seen[key] = now_str()
+                # ★只有真正进入本轮推送的才写 seen（超预算的合格条目留待下轮，
+                # 否则会被标成"已见"却从未推送 ⇒ 永久丢单）
                 if n_keep <= max_per_kw:
+                    seen[key] = now_str()
                     r["topic"] = k
                     fresh.append(r)
             stats.append((k, kw, len(rows), n_all, n_keep, dn, di))
             print("[digest] %-12s %-14s 命中 %-5d 原始新增 %-4d 保留 %-3d "
                   "(剔噪 %d / 不相关 %d)" % (k, kw, len(rows), n_all, n_keep, dn, di))
+    note = None
+    if not fresh and backlog_days:
+        cut2 = (datetime.datetime.now() -
+                datetime.timedelta(days=backlog_days)).strftime("%Y-%m-%dT00:00:00")
+        for k in keys:
+            k = k.strip()
+            if k not in TOPICS:
+                continue
+            for kw in TOPICS[k]:
+                for r in raw.get(kw, []):
+                    if len(fresh) >= backlog_max:
+                        break
+                    key = r["url"]
+                    if not key or key in seen:
+                        continue
+                    if r["datetime"] and r["datetime"] < cut2:
+                        continue
+                    if not judge(kw, r)[0]:
+                        continue
+                    rr = dict(r)
+                    rr["topic"] = k
+                    rr["backlog"] = True
+                    fresh.append(rr)
+                    seen[key] = now_str()
+        if fresh:
+            note = ("本轮无当日新增；以下 %d 条为近 %d 天积压（此前未推送过，"
+                    "按相关性留存）" % (len(fresh), backlog_days))
+            if mark:
+                save_seen(seen)
     if mark:
         save_seen(seen)
     if cache_raw and raw:
@@ -323,7 +360,7 @@ def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
             print("[digest] raw 落盘 %s" % p)
         except Exception as e:
             print("[digest] raw 落盘失败: %s" % e)
-    return fresh, render(fresh, stats)
+    return fresh, render(fresh, stats, note=note)
 
 
 def ab_from_raw(path, max_per_kw=None):
@@ -357,7 +394,7 @@ def ab_from_raw(path, max_per_kw=None):
             100.0 * tot_keep / tot_all, 100.0 * (tot_dn + tot_di) / tot_all))
     return 0
 
-def render(fresh, stats):
+def render(fresh, stats, note=None):
     if not stats:
         stats = []
     def _f(st, i, dflt):
@@ -365,6 +402,9 @@ def render(fresh, stats):
     total_new = sum(_f(s, 4, _f(s, 3, 0)) for s in stats)
     total_raw = sum(_f(s, 3, 0) for s in stats)
     L = ["📦 网盘资源发现 · %s" % now_str(), ""]
+    if note:
+        L.append("ℹ️ %s" % note)
+        L.append("")
     if not fresh:
         L.append("本轮无新增条目（关键词 %d 组，命中 0）" % len(stats))
     by_topic = {}
@@ -494,6 +534,36 @@ def _selftest():
              "code": "", "datetime": "2026-10-05T00:00:00", "channel": "c", "note": ""}]
         f4, _ = digest(topics="ai_solo", days=3)
         ck("负控B 空 url 被剔", len(f4) == 0)
+
+        # 4-1) ★超预算的合格条目不得写 seen（否则标"已见"却从未推送＝永久丢单）
+        globals()["api_search"] = lambda kw, **k: [
+            {"kw": kw, "title": "AI一人公司实战训练营 %d" % i, "pan": "quark",
+             "url": "https://pan.quark.cn/s/b%d" % i, "code": "",
+             "datetime": datetime.datetime.now().strftime("%Y-%m-%dT12:00:00"),
+             "channel": "c", "note": ""} for i in range(1, 4)]
+        f6a, _ = digest(topics="ai_solo", days=3, max_per_kw=1)
+        f6b, _ = digest(topics="ai_solo", days=3, max_per_kw=1)
+        ck("超预算条目不写 seen(下轮补推)", len(f6a) == 1 and len(f6b) == 1)
+
+        # 4-2) 积压兜底：当日窗口零新增时回捞近 30 天内未推送过的合格条目
+        old_dt = (datetime.datetime.now() -
+                  datetime.timedelta(days=10)).strftime("%Y-%m-%dT12:00:00")
+        globals()["api_search"] = lambda kw, **k: [
+            {"kw": kw, "title": "AI一人公司知识库训练营：一个人用AI做副业变现",
+             "pan": "quark", "url": "https://pan.quark.cn/s/bk1", "code": "",
+             "datetime": old_dt, "channel": "c", "note": ""}]
+        f7a, t7a = digest(topics="ai_solo", days=3, backlog_days=30)
+        f7b, _ = digest(topics="ai_solo", days=3, backlog_days=30)
+        ck("积压兜底回捞 1 条", len(f7a) == 1 and f7a[0].get("backlog") is True)
+        ck("积压兜底幂等(已推送不重复)", len(f7b) == 0)
+        ck("积压兜底报告标注", "积压" in t7a)
+        # 负控 D：--no-backlog 时窗口外条目不回捞
+        globals()["api_search"] = lambda kw, **k: [
+            {"kw": kw, "title": "AI一人公司知识库训练营：一个人用AI做副业变现",
+             "pan": "quark", "url": "https://pan.quark.cn/s/bk2", "code": "",
+             "datetime": old_dt, "channel": "c", "note": ""}]
+        f8, _ = digest(topics="ai_solo", days=3, backlog_days=0)
+        ck("负控D --no-backlog 不回捞", len(f8) == 0)
     finally:
         globals()["api_search"] = api_search
         globals()["SEEN"] = g_seen_path
@@ -568,6 +638,7 @@ USAGE = """用法:
   python3 tools/pan_search.py digest --notify       # 汇总并推送飞书/钉钉
   python3 tools/pan_search.py selftest              # 自测(不联网)
 可选: --topics ai_coding,ai_solo --days 14 --max-per-kw 8 --res all
+      --backlog-days 30 --backlog-max 6 | --no-backlog   # 当日零新增时的积压兜底
 """
 
 
@@ -618,7 +689,10 @@ def main(argv):
         fresh, text = digest(topics=opt("--topics", DEFAULT_TOPICS),
                              max_per_kw=int(opt("--max-per-kw", 8)),
                              days=int(opt("--days", 14)),
-                             mark="--no-mark" not in args)
+                             mark="--no-mark" not in args,
+                             backlog_days=(0 if "--no-backlog" in args else
+                                           int(opt("--backlog-days", 30))),
+                             backlog_max=int(opt("--backlog-max", 6)))
         print(text)
         if "--notify" in args and fresh:
             print("[notify] %s" % notify(text))
