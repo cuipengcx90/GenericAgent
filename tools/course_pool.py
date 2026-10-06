@@ -1068,6 +1068,36 @@ def selftest() -> int:
               and n2 == n1 and ap3["candidates"] == 0)
         check("T53 已挂资源的课程不再重复匹配（负控）",
               cmd_match(apply=False, hits_path=str(hpath), include_pan=False)["candidates"] == 0)
+        # ---- T54–T58 看板候选面板 + 快照读取（fail-loud vs 静默降级）----
+        h_none = render_html({"courses": []}, cands=None)
+        check("T54 无候选快照时不得上面板（负控）", "网盘命中候选" not in h_none)
+        fake = {"ts": "2026-01-01 00:00:00", "schema": "course_match_candidates/v1",
+                "min_score": 0.62,
+                "all_matches": [{"course_title": "C1", "hit_title": "H1", "score": 0.9,
+                                 "src": "haisou", "url": "https://example.com/x", "kw": "AI"}]}
+        h_some = render_html({"courses": []}, cands=fake)
+        check("T55 有快照时面板计数=实际条数",
+              "网盘命中候选" in h_some and "共 1" in h_some
+              and h_some.count("<tr>") - h_none.count("<tr>") == 2
+              and h_some.count("<tr>") > h_none.count("<tr>"))
+        miss = Path(td2) / "no_cands.json"
+        got, warn = load_candidates(miss)
+        check("T56 快照缺失默认静默降级（带 warn）", got is None and bool(warn))
+        try:
+            load_candidates(miss, explicit=True)
+            check("T57 explicit=True 缺文件须报错（负控）", False)
+        except FileNotFoundError:
+            check("T57 explicit=True 缺文件须报错（负控）", True)
+        bad = Path(td2) / "bad_cands.json"
+        bad.write_text('{"schema": "wrong-schema"}', encoding="utf-8")
+        got2, warn2 = load_candidates(bad)
+        try:
+            load_candidates(bad, explicit=True)
+            raise_ok = False
+        except ValueError:
+            raise_ok = True
+        check("T58 格式不符须拒绝（默认降级/显式抛错，负控）",
+              got2 is None and bool(warn2) and raise_ok)
     finally:
         globals()["POOL_PATH"], globals()["USER_PATH"] = old2
 
