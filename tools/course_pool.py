@@ -26,7 +26,11 @@
   words [--limit N] [--out path] [--merge-into path|--no-merge]
                                         产出搜索词文件（默认 birdie_monitor/pool_keywords.json）
                                         并默认合并进 haisou 动态词表（birdie_monitor/quangneng_keywords.json）
-  render [--out path]                   渲染看板（默认 archive/courses/index.html，8899 静态站直接可见）
+  match [--min-score S] [--max-per-course N] [--json-out P] [--apply]
+                                        把海搜/盘搜命中按标题相似度挂到课程（默认 dry-run 只预览）
+                                        --json-out 写全量候选快照（供看板上「网盘命中候选」面板）
+  render [--out path] [--candidates P]  渲染看板（默认 archive/courses/index.html，8899 静态站直接可见）
+                                        --candidates 候选快照（默认 temp/course_pool/match_candidates.json，存在才上板）
   stats
   selftest                              内置自测（负控+夹具，不触碰生产数据）
 """
@@ -61,6 +65,11 @@ PAN_RAW_GLOB = os.environ.get("COURSE_PAN_RAW_GLOB") or "temp/pan_search/raw_*.j
 MATCH_MIN_SCORE = 0.62          # 标题 bigram 覆盖率阈值（低于此不挂，宁缺勿滥）
 MATCH_MAX_PER_COURSE = 3        # 单课程最多挂几条命中
 MATCH_EXTRA_RX = re.compile(r"(网盘|资源|下载|课程|教程|合集|打包|分享|学习资料)")
+# match 干跑快照落点：看板（render）读它上「网盘命中候选」面板；快照本身是只读视图，
+# 与 resources（真挂载）完全两回事——挂载必须人工跑 match --apply。
+CAND_OUT = Path(os.environ.get("COURSE_CAND_OUT")
+                or BASE / "temp/course_pool/match_candidates.json")
+CAND_BOARD_LIMIT = 200          # 看板最多展示多少条候选（快照里仍是全量）
 
 NEW_DAYS = 7            # 首次发现多少天内算「新课」
 RESEARCH_GAP_DAYS = 3   # 同一课程两次进搜索词的间隔
@@ -512,7 +521,7 @@ def stats(merged: dict) -> dict:
     }
 
 
-def render_html(merged: dict, st: dict | None = None) -> str:
+def render_html(merged: dict, st: dict | None = None, cands: dict | None = None) -> str:
     st = st or stats(merged)
     rows = []
     for c in sorted(merged.get("courses", []),
@@ -533,6 +542,32 @@ def render_html(merged: dict, st: dict | None = None) -> str:
             f'<td>{_esc(c.get("level"))}</td><td>{c.get("students", 0)}</td><td>{price}</td>'
             f'<td>{links}</td></tr>')
     chips = " ".join(f"<span class=chip>{k}:{v}</span>" for k, v in sorted(st["by_status"].items()))
+    cand_html = ""
+    if cands is not None:
+        allm = cands.get("all_matches") or []
+        shown = allm[:CAND_BOARD_LIMIT]
+        crows = []
+        for m in shown:
+            try:
+                sc = f"{float(m.get('score') or 0):.2f}"
+            except (TypeError, ValueError):
+                sc = "?"
+            pwd = f' 提取码 {_esc(m.get("pwd"))}' if m.get("pwd") else ""
+            crows.append(
+                "<tr>"
+                f'<td>{_esc(m.get("course_title"))}</td>'
+                f'<td><a href="{_esc(m.get("url"))}" target="_blank">{_esc(m.get("hit_title"))}</a>{pwd}</td>'
+                f'<td>{sc}</td><td>{_esc(m.get("src"))}</td><td>{_esc(m.get("kw"))}</td></tr>')
+        more = "" if len(allm) <= len(shown) else f"（仅显示前 {len(shown)} 条）"
+        cand_html = (
+            f"<h2>网盘命中候选 <span class=chip>共 {len(allm)}</span>"
+            f"<span class=chip>快照 {_esc(cands.get('ts'))}</span>"
+            f"<span class=chip>min_score {cands.get('min_score')}</span></h2>\n"
+            "<p class=cav>此表由 <b>match 干跑</b>生成，<b>尚未挂载</b>到课程资源；"
+            "确认后执行 <code>python3 tools/course_pool.py match --apply</code> 才会写入。"
+            f"{more}</p>\n"
+            "<table id=ct><thead><tr><th>课程</th><th>命中</th><th>分</th><th>源</th><th>词</th></tr></thead>\n"
+            f"<tbody>{''.join(crows)}</tbody></table>\n")
     return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
 <title>AI 课程资源台</title>
 <style>
@@ -540,6 +575,8 @@ body{{font:14px/1.5 -apple-system,"PingFang SC",sans-serif;background:#111;color
 h1{{font-size:20px}} .chip{{background:#222;border:1px solid #333;border-radius:12px;padding:2px 10px;margin-right:6px}}
 table{{border-collapse:collapse;width:100%;margin-top:12px}} td,th{{border-bottom:1px solid #262626;padding:6px 8px;text-align:left}}
 a{{color:#6cf;text-decoration:none}} .n{{color:#e33;font-size:11px}} .d{{color:#a83;font-size:11px}}
+.cav{{color:#9a8;font-size:12px;margin:6px 0 0}}
+code{{background:#222;border:1px solid #333;border-radius:4px;padding:1px 5px;font-size:12px}}
 input{{background:#1b1b1b;color:#ddd;border:1px solid #333;border-radius:6px;padding:6px 10px;width:280px}}
 </style>
 <h1>AI 课程资源台 <span class=chip>共 {st['total']}</span>{chips}
@@ -548,9 +585,10 @@ input{{background:#1b1b1b;color:#ddd;border:1px solid #333;border-radius:6px;pad
 <input id=q placeholder="过滤：标题/来源/难度" oninput="f()">
 <table id=t><thead><tr><th>标记</th><th>课程</th><th>来源</th><th>难度</th><th>报名</th><th>价格</th><th>资源</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
-<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
+{cand_html}<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
 <script>function f(){{var v=q.value.toLowerCase();
-for(var r of t.tBodies[0].rows) r.style.display = r.innerText.toLowerCase().includes(v)?'':'none';}}</script>
+for(var tb of document.querySelectorAll('table tbody')) for(var r of tb.rows)
+  r.style.display = r.innerText.toLowerCase().includes(v)?'':'none';}}</script>
 </html>"""
 
 
@@ -653,13 +691,40 @@ def load_hits(include_pan: bool = True, haisou_path=None, pan_glob: str = "") ->
     return hits
 
 
+def load_candidates(path: Path, explicit: bool = False):
+    """读 match 干跑快照（只读，供看板上「网盘命中候选」面板）。
+
+    返回 (payload|None, warn|None)。文件缺失/损坏时默认返回 (None, 原因) 静默降级；
+    explicit=True（用户显式指定 --candidates）时直接抛错，避免把坏路径当"没有候选"。
+    """
+    p = Path(path)
+    if not p.exists():
+        if explicit:
+            raise FileNotFoundError(f"候选快照不存在: {p}")
+        return None, f"候选快照不存在: {p}"
+    try:
+        data = load_json(p, None)
+    except Exception as e:                      # noqa: BLE001
+        if explicit:
+            raise ValueError(f"候选快照无法解析: {p}: {e}")
+        return None, f"候选快照无法解析: {p}: {e}"
+    if not isinstance(data, dict) or "all_matches" not in data:
+        if explicit:
+            raise ValueError(f"候选快照格式不符(schema=course_match_candidates/v1): {p}")
+        return None, f"候选快照格式不符: {p}"
+    return data, None
+
+
 def cmd_match(min_score: float = MATCH_MIN_SCORE, max_per_course: int = MATCH_MAX_PER_COURSE,
               apply: bool = False, hits_path: str = "", include_pan: bool = True,
-              limit: int = 20, include_found: bool = False) -> dict:
+              limit: int = 20, include_found: bool = False, json_out: str = "") -> dict:
     """把搜索命中按标题相似度挂到课程上（默认 dry-run，只预览不写盘）。
 
     策略：每个课程取分数最高的前 max_per_course 条命中；同一 (course_id, pan_url)
     已挂过即跳过（幂等）；默认跳过「已有资源」的课程（只补空缺），--include-found 可放开。
+
+    json_out：把**全量**候选写成快照 JSON（看板 render 消费它上「网盘命中候选」面板）。
+    写快照 ≠ 挂载：只有 apply=True 才碰 user_state.json 的 resources。
     """
     hits = load_hits(include_pan=include_pan, haisou_path=hits_path or None)
     merged = apply_user(load_pool(), load_user())
@@ -701,10 +766,19 @@ def cmd_match(min_score: float = MATCH_MIN_SCORE, max_per_course: int = MATCH_MA
             else:
                 rec["dry_run"] = True
             cands.append(rec)
-    return {"hits": len(hits), "courses": len(merged.get("courses", [])),
-            "min_score": min_score, "apply": bool(apply),
-            "applied": applied, "skipped_existing": skipped,
-            "candidates": len(cands), "matches": cands[:max(0, int(limit))]}
+    payload = {"hits": len(hits), "courses": len(merged.get("courses", [])),
+               "min_score": min_score, "apply": bool(apply),
+               "applied": applied, "skipped_existing": skipped,
+               "candidates": len(cands), "matches": cands[:max(0, int(limit))]}
+    if json_out:
+        snap = dict(payload)
+        snap.update({"ts": now(), "schema": "course_match_candidates/v1",
+                     "all_matches": cands})
+        p = Path(json_out)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        save_json(p, snap)
+        payload["json_out"] = str(p)
+    return payload
 
 
 def selftest() -> int:
@@ -1523,6 +1597,10 @@ def main(argv=None) -> int:
 
     sub.add_parser("stats")
     p = sub.add_parser("render"); p.add_argument("--out", default="")
+    p.add_argument("--candidates", default="",
+                   help=f"候选快照路径（默认 {CAND_OUT}；不存在则跳过面板）")
+    p.add_argument("--no-candidates", dest="no_candidates", action="store_true",
+                   help="不渲染「网盘命中候选」面板")
     p = sub.add_parser("sources", help="列出跨源采集注册表")
     p.add_argument("--json", dest="as_json", action="store_true")
 
@@ -1561,6 +1639,8 @@ def main(argv=None) -> int:
                    help="已挂过资源的课程也参与匹配（默认只补空缺）")
     p.add_argument("--limit", type=int, default=20, help="只列前 N 条候选明细")
     p.add_argument("--apply", action="store_true", help="真正写入 user_state.json（默认只预览）")
+    p.add_argument("--json-out", dest="json_out", default="",
+                   help=f"把全量候选写成快照给看板读（建议 {CAND_OUT}）")
 
     sub.add_parser("selftest")
 
@@ -1619,7 +1699,7 @@ def main(argv=None) -> int:
         _print(attach_resource(a.course_id, a.pan_url, a.title, a.via)); return 0
     if a.cmd == "match":
         _print(cmd_match(a.min_score, a.max_per_course, a.apply, a.hits,
-                         not a.no_pan, a.limit, a.include_found))
+                         not a.no_pan, a.limit, a.include_found, a.json_out))
         return 0
     merged = apply_user(load_pool(), load_user())
     if a.cmd == "list":
@@ -1630,11 +1710,20 @@ def main(argv=None) -> int:
     if a.cmd == "stats":
         _print(stats(merged)); return 0
     if a.cmd == "render":
-        html = render_html(merged)
+        cands, warn = (None, None)
+        if not a.no_candidates:
+            cands, warn = load_candidates(Path(a.candidates) if a.candidates else CAND_OUT,
+                                          explicit=bool(a.candidates))
+        html = render_html(merged, cands=cands)
         out = Path(a.out) if a.out else DASH_OUT
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(html, encoding="utf-8")
-        _print({"out": str(out), "bytes": len(html.encode("utf-8"))})
+        res = {"out": str(out), "bytes": len(html.encode("utf-8"))}
+        if cands is not None:
+            res["candidates"] = len(cands.get("all_matches") or [])
+        if warn:
+            res["candidates_warn"] = warn
+        _print(res)
         return 0
     ap.print_help()
     return 2
