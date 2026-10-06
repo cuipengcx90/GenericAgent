@@ -42,7 +42,7 @@ import time
 # rest_p / rest_min_gap = 随机休息日概率与两次休息最小间隔（天）
 ACTION_PROFILES = {
     # 浏览：基数最大（TL3 需「已读帖子 20000」，是长期主战场）
-    "browse": dict(daily_cap=160, cap_jitter=20, seg_n=(3, 5), seg_len=(45, 110),
+    "browse": dict(daily_cap=160, cap_jitter=20, seg_n=(5, 7), seg_len=(75, 150),
                    gap=(110, 260), gap_long=(300, 600), gap_long_p=0.30,
                    rest_p=1.0 / 7.0, rest_min_gap=3, quiet=(1, 0, 7, 30),
                    morning_jitter=(0, 3600)),
@@ -328,34 +328,28 @@ def next_wait(st, now_ts, kind, done_today=0, rng=None):
 LEVEL_CHECK_PER_DAY = 1
 LEVEL_CHECK_TTL_S = 20 * 3600          # 两次检查最小间隔（防重启/多入口同日重查）
 LEVEL_MIN_GAP_S = 90 * 60              # 与上一次检查至少隔 90min（避免连着两天同一时刻）
+# ★2026-10-06 用户口径：等级检测**只在上午 08:00–10:00 之间**随机触发（(起,止) 小时）。
+#   历史问题：原实现取「当日首段→23:50」的对数正态 ⇒ 常落到傍晚/夜间（实测 10-07 18:00），
+#   判级结果出来时活动窗只剩几小时，缺项路由（浏览/回帖/点赞）根本补不完。
+LEVEL_CHECK_WINDOW = (8.0, 10.0)
 
 
 def level_check_ts(day, prev_ts=None, kind="browse"):
-    """返回该日等级检查的时刻（epoch 秒）：落在活动窗内、避开静默窗、错峰。
+    """返回该日等级检查的时刻（epoch 秒）：**固定档在上午 LEVEL_CHECK_WINDOW 窗内随机**。
 
-    错峰做法：在「当日第一段起点→窗尾」之间抽一个**对数正态**主导 + 90min 最小间隔。
+    错峰做法：窗内均匀抽点 + ±10min 抖动（仍落在窗口内）⇒ 每天不同、恒不在固定钟点；
+    与上一次检查冲突时顺延到「上次 + 90min」之后再抽（同一日只顺延一次）。
+    ★2026-10-06 用户口径：不再取「首段→23:50」的对数正态（那会落到傍晚/夜间）。
     """
-    p = profile(kind)
-    segs = day_segments(day, kind)
-    if not segs:
-        return _ts(day, 12.0) + _rng(day, "level", "ts").randint(-1800, 1800)
-    lo = segs[0]["start"]
-    hi = min(segs[-1]["end"], _ts(day, 23.5))
-    if hi <= lo:
-        hi = lo + 3600.0
     r = _rng(day, "level", "ts")
-    # 中位数放在窗口 35% 处，sigma 大 ⇒ 早晚都可能，右侧拖尾
-    cand = lo + _logn((hi - lo) * 0.35, 0.7, 0.0, hi - lo, r)
-    cand += r.uniform(-900, 900)
+    wl, wh = LEVEL_CHECK_WINDOW
+    lo, hi = _ts(day, wl), _ts(day, wh)
+    cand = lo + r.random() * (hi - lo) + r.uniform(-600, 600)
     cand = max(lo, min(hi, cand))
-    if prev_ts:
-        # 与上次检查冲突 ⇒ 顺延到「上次+最小间隔」之后再抽一次（同日只顺延一次）
-        if cand < prev_ts + LEVEL_MIN_GAP_S:
-            room_lo = max(lo, prev_ts + LEVEL_MIN_GAP_S)
-            if room_lo < hi:
-                cand = room_lo + _logn((hi - room_lo) * 0.5, 0.6, 0.0, hi - room_lo, r)
-            else:
-                cand = lo + r.uniform(0, 600)
+    if prev_ts and cand < prev_ts + LEVEL_MIN_GAP_S:
+        room_lo = max(lo, prev_ts + LEVEL_MIN_GAP_S)
+        cand = min(hi, room_lo + r.random() * max(0.0, hi - room_lo))
+        cand = max(lo, cand)
     return round(cand, 1)
 
 
@@ -556,8 +550,8 @@ def _selftest():
     t1 = level_check_ts(lday)
     t1b = level_check_ts(lday)
     chk("T23 错峰时刻确定性", t1 == t1b)
-    segs_l = day_segments(lday, "browse")
-    chk("T23b 时刻落在当日活动窗", segs_l[0]["start"] <= t1 <= min(segs_l[-1]["end"], _ts(lday, 23.5)) + 1)
+    chk("T23b 时刻落在上午窗 08:00–10:00", _ts(lday, LEVEL_CHECK_WINDOW[0]) - 1 <= t1 <= _ts(lday, LEVEL_CHECK_WINDOW[1]) + 1)
+    chk("T23b2 上午窗常量合理", 6.0 <= LEVEL_CHECK_WINDOW[0] < LEVEL_CHECK_WINDOW[1] <= 12.0)
     # 跨天两两不同 + 与上次 ≥90min（连抽 10 天）
     days10 = ["2026-10-%02d" % d for d in range(5, 15)]
     ts10 = []

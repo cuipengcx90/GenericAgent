@@ -277,7 +277,7 @@ def quiet_now(now=None):
 def spawn_daemon(bg=DEFAULT_BG, name=BG_NAME, cwd=ROOT, dry=False):
     """用 bg_task 拉起守护（幂等：已存在同名任务时 bg_task 会自行处置）。"""
     cmd = [sys.executable, bg, "start", "--name", name, "--cwd", cwd,
-           "--", "python3", "tools/linuxdo_browse_daemon.py", "watch"]
+           "--", "python3", "-u", "tools/linuxdo_browse_daemon.py", "watch"]
     if dry:
         return {"dry": True, "cmd": " ".join(cmd)}
     try:

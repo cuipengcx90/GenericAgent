@@ -42,9 +42,10 @@ linuxdo_browse_daemon — L站 TL3 维护型只读浏览后台守护
   - 静默窗结束后随机晨抖 0–60min 再开工（防每天准点开工的机械特征）
   - --max-session-min 单段运行上限（默认 110min），跑满休息 25–53min 再继续
   - 静默窗默认 01:00–07:30 不浏览、不查等级
-  - 等级前置检查：**每天 1 次**、错峰随机时刻（2026-10-05 用户要求；节奏由内核
-    linuxdo_antidetect.level_check_ts 单一源决定：活动窗内对数正态抽点 + 90min 最小间隔，
-    恒不在固定钟点。LEVEL_CHECK_GAP 仅作内核缺席时的兜底）
+  - 等级前置检查：**每天 1 次**、**上午 08:00–10:00 内随机**（2026-10-06 用户要求：原
+    对数正态会抽到傍晚/夜间，判级后活动窗只剩几小时，缺项（浏览/回帖/点赞）补不完；
+    节奏仍由内核 linuxdo_antidetect.level_check_ts 单一源决定，窗内抽点且守 90min 最小间隔。
+    LEVEL_CHECK_GAP 仅作内核缺席时的兜底）
 
 用法:
   python3 tools/linuxdo_browse_daemon.py status            # 只读：state+最近等级
@@ -458,6 +459,33 @@ def _day_segments_cached(day=None):
         return None
     _SEG_CACHE["day"], _SEG_CACHE["segs"] = d, segs
     return segs
+
+
+MAX_SEG_WAIT_S = 1800.0   # 段间单次等待上限：分段睡，每 ≤30min 回主循环（保心跳/保响应）
+
+
+def segment_gate(now_ts=None, segs=None):
+    """段闸门（单一源）：→ (可干活, 需等秒数, 原因)。
+
+    ★ 2026-10-06 修（R548）：内核 in_segment() 返回 (bool, 段末ts)，旧写法
+    `if not _ad.in_segment(...)` 里元组恒真 ⇒ not 恒假 ⇒ 段闸门从未生效
+    （实测 daemon 在段外 12:40 仍落 DONE，「段间空档」行日志从未出现）；
+    同一处的 `float(_ad.wait_hint(...))` 对 (秒, 原因) 元组取 float 必 TypeError，
+    被上一坑掩盖成死代码。现两处均按内核签名解包，并由自测 T15g/T15h 负控锁死。
+    内核缺席（_ad 为 None 或段表为空）⇒ (True, 0.0, "no_kernel")，保持「回退旧行为」。
+    """
+    if _ad is None:
+        return True, 0.0, "no_kernel"
+    if segs is None:
+        segs = _day_segments_cached()
+    if not segs:
+        return True, 0.0, "no_kernel"
+    t = time.time() if now_ts is None else now_ts
+    ok, _end = _ad.in_segment(t, segs)          # 契约：元组
+    if ok:
+        return True, 0.0, "in_segment"
+    w, why = _ad.wait_hint(t, segs)             # 契约：元组
+    return False, max(60.0, min(float(w), MAX_SEG_WAIT_S)), why
 
 
 def rest_day_today(st):
@@ -1277,6 +1305,64 @@ def browse_one(session, tid, state, cand=None):
     return ok, res
 
 
+def try_ensure_tab(now=None, max_per_day=2, min_gap_s=1800):
+    """无 linux.do 标签时补一个**后台**标签（有界自愈）。
+
+    2026-10-06 实测事故：浏览器里 linux.do 标签消失后，守护 pick_session 恒失败
+    ⇒ 日志只刷 RC_NO_SESSION_RETRY，10.5h 零产出却「看着健康」。这里做有界自愈：
+    仅当*完全没有* linux.do 标签时尝试、每天最多 max_per_day 次、两次间隔 ≥ min_gap_s。
+    返回 (ok, note)。全程只读+建标签，不导航既有标签（避免顶掉等级检查页）。
+    """
+    led = os.path.join(BASE, "ensure_tab.jsonl")
+    now_ts = now or time.time()
+    day = time.strftime("%Y-%m-%d", time.localtime(now_ts))
+    tries = []
+    if os.path.exists(led):
+        try:
+            for ln in io.open(led, encoding="utf-8"):
+                ln = ln.strip()
+                if ln:
+                    tries.append(json.loads(ln))
+        except Exception:
+            tries = []
+    todays = [t for t in tries if str(t.get("day")) == day]
+    if len(todays) >= max_per_day:
+        return False, "已达本日自愈上限(%d)" % max_per_day
+    if todays and now_ts - float(todays[-1].get("ts") or 0) < min_gap_s:
+        return False, "距上次自愈不足 %dmin" % (min_gap_s // 60)
+    # 2026-10-06 二次实测：新建标签会**顶到前台**（Chrome 新建即激活）⇒ linux.do 标签
+    # 的 document.visibilityState 变 visible，用户前台保护随即每 5min 判「用户在看」而永远跳过。
+    # 故建完立刻把原先的活动标签换回来（新标签留在后台），既补上供给也不打扰用户。
+    script = ("tell application \"Google Chrome\"\n"
+              "  if (count of windows) = 0 then make new window\n"
+              "  set _prev to (active tab index of window 1)\n"
+              "  tell window 1 to make new tab with properties {URL:\"https://linux.do/\"}\n"
+              "  try\n"
+              "    set active tab index of window 1 to _prev\n"
+              "  end try\n"
+              "  return (_prev as text)\n"
+              "end tell")
+    prev_idx = None
+    try:
+        r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=25)
+        ok = (r.returncode == 0)
+        note = (r.stdout or r.stderr or "").strip()[:120]
+        if ok:
+            try:
+                prev_idx = int(str(note).strip() or 0) or None
+            except Exception:
+                prev_idx = None
+    except Exception as e:
+        ok, note = False, repr(e)[:120]
+    try:
+        with io.open(led, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now_ts, "day": day, "ok": ok, "note": note,
+                                "restored_active": prev_idx}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return ok, note
+
+
 def browse_batch(session, st, batch=25):
     """浏览一批。返回 (done, skipped)"""
     LAST_FETCH_DIAG.clear()
@@ -1310,7 +1396,13 @@ def browse_batch(session, st, batch=25):
             log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "LOITER", "note": "latest"})
         ok, res = browse_one(session, tid, st)
         title = (res.get("title", "") if isinstance(res, dict) else "")[:36]
+        _why = ""
+        if not ok and isinstance(res, dict):
+            _why = str(res.get("fail") or res.get("err") or res.get("need_loc") or "unknown")[:100]
+        elif not ok:
+            _why = "no-result"
         log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "DONE" if ok else "FAIL",
+                                       "why": _why,
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
@@ -1366,6 +1458,14 @@ def watch(args):
                 time.sleep(min((gate - now).total_seconds(), 1800))
                 continue
         session, note = pick_session()
+        if not session:
+            _ok, _note = try_ensure_tab()
+            if _ok:
+                print("[%s] 无 linux.do 标签 ⇒ 已自愈补一个后台标签（%s），12s 后重试" % (now_str(), _note), flush=True)
+                time.sleep(12)
+                session, note = pick_session()
+            elif _note:
+                print("[%s] 无 linux.do 标签，自愈跳过：%s" % (now_str(), _note), flush=True)
         if not session:
             sess_fails += 1
             if sess_fails >= SESS_RETRY_MAX:
@@ -1451,9 +1551,10 @@ def watch(args):
         # 段满事件几乎永不发生，长休档形同虚设）。内核缺席时回落旧行为。
         _segs = _day_segments_cached()
         if _segs:
-            if not _ad.in_segment(time.time(), _segs):
-                _w = max(60.0, min(float(_ad.wait_hint(time.time(), _segs)), 1800.0))
-                print("[%s] 段间空档（当日 %d 段），等 %.0fmin 进下一段" % (now_str(), len(_segs), _w / 60), flush=True)
+            _go, _w, _why = segment_gate(segs=_segs)
+            if not _go:
+                print("[%s] 段间空档（当日 %d 段，%s），等 %.0fmin 进下一段" % (
+                    now_str(), len(_segs), _why, _w / 60), flush=True)
                 time.sleep(_w)
                 continue
         elif (time.time() - start) / 60 >= args.max_session_min:
@@ -1544,7 +1645,16 @@ def main(argv=None):
 
 
 # ---------------------------------------------------------------- selftest
+_SANDBOX_ACTIVE = False
+
+
 def _selftest_impl():
+    # 2026-10-06：自测卫生 - 直调本函数（不经 selftest() 包装）会写到**生产** BASE，
+    # 且 T6c6/T6c9 会在 BASE/linuxdo_post_drafts 留下 d1.json/d2.json ⇒ 下一次跑
+    # T6c7「无草稿仍排 post」必假红（草稿是上次自测自己留下的）。修法=兜底沙箱，
+    # 幂等可重入：已在沙箱内（selftest() 或本兜底）则直接跑本体。
+    if not globals().get("_SANDBOX_ACTIVE"):
+        return _run_selftest_sandboxed()
     fails = []
     cases = 0
     cases += 1
@@ -1890,6 +2000,29 @@ def _selftest_impl():
                 w, why = _ad.wait_hint(outside, segs)
                 if not (w > 0):
                     fails.append("T15e 段外 wait_hint 应为正: %s" % why)
+            # T15g/T15h：段闸门必须真按内核返回值决策（2026-10-06 修：元组真值坑）
+            _g_out = segment_gate(outside, segs)
+            if _g_out[0] is not False or not (_g_out[1] > 0) or not _g_out[2]:
+                fails.append("T15g 段闸门未拦段外: %s" % (_g_out,))
+            _g_in = segment_gate(mid, segs)
+            if _g_in[0] is not True or _g_in[1] != 0.0:
+                fails.append("T15h 段内应放行且零等待: %s" % (_g_in,))
+            if not isinstance(_ad.in_segment(mid, segs), tuple):
+                fails.append("T15h2 内核 in_segment 契约变更（须返回元组）")
+            _keep_is = _ad.in_segment
+            _ad.in_segment = lambda ts, sg: True          # 退化内核：裸 bool（旧坑形态）
+            try:
+                _loud = False
+                try:
+                    segment_gate(outside, segs)
+                except Exception:
+                    _loud = True
+                if not _loud:
+                    fails.append("T15h3 内核契约退化时须响亮失败，不得静默放行")
+            finally:
+                _ad.in_segment = _keep_is
+            if segment_gate(outside, segs)[0] is not False:
+                fails.append("T15h4 负控后未恢复")
         # 跨天不重排（同日稳定 + 不同日一般不同），且每个段都在静默窗外 [07:30, 23:59)
         other = _day_segments_cached("2026-10-07")
         if (not other) or [_bad_seg(segs), _bad_seg(other)] != [[], []]:
@@ -2023,6 +2156,21 @@ def _state_fp():
     return hashlib.sha256(data).hexdigest()[:16], len(data)
 
 
+def _run_selftest_sandboxed():
+    """直调 _selftest_impl 的兜底沙箱（与 selftest() 同口径，幂等可重入）。"""
+    global BASE, _SANDBOX_ACTIVE
+    orig = BASE
+    sb = tempfile.mkdtemp(prefix="ldo_selftest_")
+    _SANDBOX_ACTIVE = True
+    try:
+        BASE = sb
+        return _selftest_impl()
+    finally:
+        BASE = orig
+        _SANDBOX_ACTIVE = False
+        shutil.rmtree(sb, ignore_errors=True)
+
+
 def selftest():
     """沙箱化自测 + 生产面零污染自证（T14）。
 
@@ -2030,15 +2178,18 @@ def selftest():
     局部 dict 直接写成生产 state.json，抹掉 daily/seen_ids/browsed_total ⇒ watch 崩。
     根修：整个 self-test 在临时 BASE 内跑；并比对前后生产 state.json 指纹（不一致即 FAIL）。
     """
-    global BASE
+    global BASE, _SANDBOX_ACTIVE
     orig = BASE
     sb = tempfile.mkdtemp(prefix="ldo_selftest_")
     before = _state_fp()
+    prev_sb = _SANDBOX_ACTIVE
     try:
         BASE = sb
+        _SANDBOX_ACTIVE = True
         fails, cases = _selftest_impl()
     finally:
         BASE = orig
+        _SANDBOX_ACTIVE = prev_sb
         shutil.rmtree(sb, ignore_errors=True)
     cases += 1
     after = _state_fp()
