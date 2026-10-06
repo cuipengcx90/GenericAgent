@@ -10,7 +10,7 @@
 
 | 动作 | 角色 | 谁执行 | 触发方式 | 日量级（默认，见 `profiles`） |
 |---|---|---|---|---|
-| 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1 次（错峰；内核 LEVEL_CHECK_PER_DAY=1） | 零动作，仅读等级卡 |
+| 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1 次（**上午 08:00–10:00 窗内随机**；内核 `LEVEL_CHECK_WINDOW=(8,10)`，env `LJQ_LEVEL_WINDOW` 可覆盖；见坑 §11） | 零动作，仅读等级卡 |
 | 浏览 | 补量（缺「已读帖子/浏览比例」时） | daemon `browse_batch` | daemon 自动，或提示词触发（拉起 daemon） | cap 140–180（日抖） |
 | 回帖 | 补量（缺「回复话题数」时） | `tools/linuxdo_acts.py` reply | **等级路由排队**（daemon 随机消费）/ 提示词 | cap 6（±2 抖） |
 | 点赞 | 补量（缺「获赞/送赞」时） | `tools/linuxdo_acts.py` like | 同上 | cap 12（±4 抖） |
@@ -27,7 +27,7 @@
 
 五个动作共用同一套随机化，禁止各写一套：
 
-- **多段切分**：一天分 2–4 段，段长 6–25 分钟随机（`seg_n/seg_len`）。
+- **多段切分**：一天分若干段，段长随机（`seg_n/seg_len`）。**浏览档**默认 5–7 段 × 75–150 分钟（2026-10-06 按 10-05 实测自然节奏上调；旧值 2–4 段 × 6–25 分钟只适用于回帖/点赞/发帖）。段位由日期种子派生（同日重启不重排），段间空档由 daemon `maybe_segment_gate()` 等待。
 - **段内间隔**：`gap` 240–600s（回帖）/180–600s（点赞），另有 25–35% 概率走 `gap_long`（13–40min）。
 - **日限抖动**：`daily_cap ± cap_jitter`，每天重新摇。
 - **静默窗**：01:00–07:30 绝不动手；**晨抖** 0–90min（开启时刻每天不同）。
@@ -104,7 +104,7 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 ## 八、自测与验收
 
 - `python3 tools/linuxdo_humanize.py --selftest`（25/25）。
-- `python3 tools/linuxdo_antidetect.py --selftest`（56/56，含 T27 跨层自洽）。
+- `python3 tools/linuxdo_antidetect.py --selftest`（59/59，含 T27 跨层自洽；2026-10-06 R548 新增 T23b2 上午窗断言与段闸门解包用例）。
 - `python3 tools/linuxdo_acts.py --selftest`（53/53；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d、deai 回帖闸门；自测把 state/lock/通知全部重定向到沙箱）。
 - `python3 tools/linuxdo_deai.py selftest`（21 checks / 0 failed；★子命令是**位置参数**，写 `--selftest` 报 unrecognized）。
 - `python3 tools/linuxdo_post_forge.py selftest`（21 checks / 0 failed；同上位置参数）。
@@ -150,6 +150,10 @@ R546 修好了「重启风暴」与「长休不可达」，但事后**看不见*
 8. **同一份常量在两个文件里各写一份 = 死常量**（R546）：旧 daemon 自带 `GAP_LONG_RANGE/GAP_LONG_P` 常量副本，只在自测断言里被引用，真实节奏走的是另一套 ⇒「五动作共用同一随机内核」名存实亡。修法：帖间/批间间隔一律走内核 `gap_seconds('browse')`，`_batch_gap()` 只在内核缺席时回落（回落值同为内核镜像）。★判据：凡「单一源」承诺，必须能用 grep 证明生产路径确实调到该源，自测里的常量不算。
 9. **台账被高频分支污染 ⇒ 频次不可取证**（R546）：等级检查的**节流分支**（每 301s 走到一次）照样写 `level_log.jsonl` 并把 `st["level"].ts` 刷成当前时刻 ⇒ 台账里塞满 `throttled` 记录、无法据此判断「上次真检查是何时」。修法：节流分支只打印日志，**不写台账、不刷 `level.ts`**；真检查记录（含 `source`）才落 `level_log`。
 10. **改判据必须同批回填文档数字**：SOP/规格里内嵌的「工具真跑输出」（`selftest 25/25` 之类）会随实现变化失配 ⇒ R546 把 §八 的 daemon `28/28`→`32/32`、watchd `25/25`→`52 checks`；R547 做 #5/#7 只读视图后同批复填 daemon `32/32`→`33/33`、watchd `52`→`60 checks`。
+
+11. **`if not tup:` 元组恒真 ⇒ 段闸门静默失效（P0，2026-10-06 R548）**：内核 `linuxdo_antidetect.in_segment()` 返回 `(in_seg, idx)` 元组，daemon 调用处写成 `if not in_segment(day, "browse"): 等空档` ⇒ 元组永远为真值、判断永走同一支 ⇒ **「段间空档」从未生效**，实际是连续浏览（10-05 全天 102 帖 / 21.05h、帖间隔中位 404s 即铁证；R545 把同一现象只归因于「重启风暴摧毁节律」，实为两因并存）。修法=daemon 新增 `maybe_segment_gate()` 显式解包 `in_seg, idx = ...`。★判据：单测要断言「空档期真的返回等待」，而不是只断言函数返回类型/真假。
+
+12. **自测沙箱必须覆盖所有调用入口（同一事故二次发生，2026-10-06 R548）**：`--selftest` 走 CLI 时会把 state/lock/通知重定向到沙箱，但 `_selftest_impl()` 被**直接调用**（本会话为定位 T6c7 而跑 `python3 -c "import ...; _selftest_impl()"`）时无沙箱 ⇒ 12:50 把生产 `temp/linuxdo_browse_daemon/state.json` 覆盖成 66B 空态、并把 `browse_log.jsonl` 截断到 5 行测试垃圾（**真实历史行不可重建**，只剩事故后新写的 DONE）。修法=把沙箱**下沉进 `_selftest_impl`**（幂等，CLI 与直调同安全）；恢复源=`state.json.bak-*`（daemon 每轮自备份，实测 `bak-20261006-122955` 3106B 为 11:52 完整真态，用它精确回填 daily/seen 并打 `_recovered` 标记）。★铁律延续 R545：「自测/金丝雀禁写生产状态」**不能只在 CLI 层挡**。
 
 ## 十一、发帖锻造 + 去AI味闸门（2026-10-06 新增，用户要求「发帖要去AI味儿，要像人写的、人想的」）
 
