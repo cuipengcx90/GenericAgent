@@ -109,7 +109,7 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 - `python3 tools/linuxdo_deai.py selftest`（21 checks / 0 failed；★子命令是**位置参数**，写 `--selftest` 报 unrecognized）。
 - `python3 tools/linuxdo_post_forge.py selftest`（21 checks / 0 failed；同上位置参数）。
 - `python3 tools/linuxdo_browse_daemon.py --selftest`（33/33；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线 + 等级路由 T6c6–T6c9：earn 有草稿排 post / 无草稿绝不排 post / 无缺项不排 / 多缺项并行；2026-10-06 R546 新增 T15/T15b/T15c 段表用例：同日段表确定性、重启（清缓存）后段位不变、段表结构无乱序/重叠/零长；T18 段级审计视图用例，含「非 DONE / 坏时间戳 / 昨天」行不得计入、空台账零覆盖、缺台账零覆盖、内核缺席返 note+null 四组负控）。
-- `python3 tools/linuxdo_daemon_watchd.py --selftest`（60 checks / 0 failed，零站点流量；R546 新增冷启动/多源心跳/环境忙不重启用例；T27 重启审计视图用例，含缺台账零计数+note、全坏行零计数两组负控）。
+- `python3 tools/linuxdo_daemon_watchd.py --selftest`（**77 checks / 0 failed**，零站点流量；R546 新增冷启动/多源心跳/环境忙不重启用例；T27 重启审计视图用例（含缺台账零计数+note、全坏行零计数两组负控）；R555 新增桥探活 T29 系列——桥不可达⇒`BRIDGE_DOWN` **不重启**（T29a 有守护/T29b 无守护两种组合）、告警同类 6h 合并（T30 窗口内 5 次⇒1 条且带累计）、恢复闸 ≥300s（T31 停机 100s⇒不发 / 1000s⇒发），以及 `sandbox_state` 助手 + T32 负控：自测前后断言生产 `watchd.jsonl`/`runtime` 指纹**逐字不变**）。
 - `python3 tools/sche_tasks_lint.py --only linuxdo_trust_level_check` ⇒ FAIL 0（四个动作任务已删；该器会扫全量 `sche_tasks/`）。
 - 判活：`python3 tools/linuxdo_daemon_watchd.py status`（watchd/daemon 两 pid + last_browse）；`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
 
@@ -120,7 +120,7 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 解决：`tools/linuxdo_daemon_watchd.py`（零站点请求、零 LLM token、只读本地进程表与日志）：
 
 - 子命令：`ensure`（兜底入口，已在跑则原样返回）/ `run [--max-hours 26]` / `status` / `--selftest`（60 checks / 0 failed 绿）。
-- 三件事：① 探活——守护进程不在 ⇒ 用 `tools/bg_task.py start --name linuxdo_browse -- python3 tools/linuxdo_browse_daemon.py watch` 拉起（幂等）；② 停滞——活动窗内超过 `STALL_S`（3h）**无任何心跳** ⇒ 判卡死并重启；③ 留痕 + 告警——事件写 `temp/linuxdo_watch/watchd.jsonl`，重启/恢复各发一次飞书私信（冷却 `NOTIFY_COOLDOWN_H`=6h，连续重启失败 `FAIL_STREAK_NOTIFY`=3 次再告警并继续重试）。
+- 四件事：① **桥探活（R555 新增，最前置）**——`bridge_ok()` 探 `127.0.0.1:18765`（TMWebDriver 桥）；不可达 ⇒ 判 `BRIDGE_DOWN`，**只告警、绝不重启**（桥不在时 daemon 起来也取不到会话：典型是起来即退=被误判「死亡」、或空转=被误判「停滞」，两者都只会变成「重启→再死」的无限循环，今日实测 64 次即此形态）；② 探活——守护进程不在（且桥通）⇒ 用 `tools/bg_task.py start --name linuxdo_browse -- python3 tools/linuxdo_browse_daemon.py watch` 拉起（幂等）；③ 停滞——活动窗内超过 `STALL_S`（3h）**无任何心跳** ⇒ 判卡死并重启；④ 留痕 + 告警——事件写 `temp/linuxdo_watch/watchd.jsonl`，重启/恢复各发一次飞书私信（冷却 `NOTIFY_COOLDOWN_H`=6h，连续重启失败 `FAIL_STREAK_NOTIFY`=3 次再告警并继续重试；R555：**同类告警 6h 合并**——同一原因窗口内只发一条、文案带累计次数，避免每 6 分钟一次私信刷屏）。  〔判据方向不可反〕桥不可达时**不重启**是刻意的：重启解决不了外部前置，只会白搭冷启动并制造日志噪声。
 - ★**心跳判据是「多源取最大」而非只看 `browse_log`**（R546 修复，2026-10-06）：`last_progress_ts()` = max(`browse_log.jsonl` 末条 DONE, `state.json` mtime, `level_log.jsonl` mtime, **daemon 进程启动时刻**)。理由=① `browse_log` 只在**整帖跑完**才追加一行，而单帖含深读驻留 + 长驻留 JS（单次 `timeout` ≤215s）⇒ 批内静默 3–4 分钟属**正常**；② 冷启动时 `browse_log` 末条可能是**上一次会话**留下的（实测 00:15 的旧末条距 11:14 已 11h）⇒ 只看它会把**刚起 1 分钟的新进程**当卡死再杀一次，正是「重启风暴」的根因（实测 9h20m 内重启 35 次，`STALLED_38069s` 与日志时间差逐秒相符）。取进程启动时刻即天然获得**冷启动宽限期**（新进程在 `STALL_S` 内永不判停滞）。
 - ★**判停滞 ≠ 一律重启**：若停滞的成因是**外部环境不可用**（`browse_busy_hint()` 在 `BUSY_LOG_S`=20min 窗口内读到 daemon 自报的 `RC_NO_SESSION_RETRY`（无 linux.do 会话）/`前台被占`（浏览器被用户占用））⇒ 判 `BLOCKED_ENV`，只留痕 + 告警，**不重启**（重启解决不了，还白搭一次冷启动）。区分目的是「进程死了」与「世界不给干活」。
 - 节奏参数（`--interval` 类）只影响**巡检**频率（`CHECK_INTERVAL`=60s），**绝不改动**日限/静默窗/休息日/段间隔——那些仍由 `linuxdo_antidetect` 内核独占决定；本器只重启进程，不重排行为。
@@ -134,7 +134,7 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 R546 修好了「重启风暴」与「长休不可达」，但事后**看不见**两件事：今天到底按段跑了几段、长休有没有发生；以及守护到底重启过几次、最近一次为什么。这两件都是纯只读视图，**不改任何节奏参数、不发站点请求**：
 
 - `python3 tools/linuxdo_browse_daemon.py status` 新增 `segments` 块（字段名以实测输出为准）：`theoretical`（今天理论几段）/`current_index`（现在第几段，1-based；段间空档为 `null`）/`current_window`（`[起HH:MM, 止HH:MM, 段长分钟]`）/`next_segment`（空档时下一段起点）/`browsed_in_segment`（本段内已浏览帖数）/`segments_seen` 与 `segments_seen_idx`（今天**实际**进过的段数/段号，与 `theoretical` 对照即知节律是否真按段走）/`rests_n`·`rests_long_n`·`rests[{from,to,minutes,long}]`（相邻帖间隔 ≥15min 的休息，`long=true` 即真长休 `SESSION_REST`）。判据=段位由内核 `day_segments(day, kind)` 日期种子派生 ⇒ **同日重启后段位不变**（视图里能直接看出「重启没重置节律」）。
-- `python3 tools/linuxdo_daemon_watchd.py status` 新增 `restarts` 块：`restarts_total`/`restarts_today`/`restarts_ok`/`restarts_failed`/`restarts_last_hour`（近一小时，对照上限 `rate_limit_per_hour`）/`last_restart{ts,reason,ok}`（最近一次的**时间与原因**，如 `STALLED_39527s`）/`last_start`。判据=逐条重算自 `temp/linuxdo_watch/watchd.jsonl`，**不依赖运行期计数器** ⇒ 守护重启后历史计数不丢。
+- `python3 tools/linuxdo_daemon_watchd.py status` 新增 `restarts` 块：`restarts_total`/`restarts_today`/`restarts_ok`/`restarts_failed`/`restarts_last_hour`（近一小时，对照上限 `rate_limit_per_hour`）/`last_restart{ts,reason,ok}`（最近一次的**时间与原因**，如 `STALLED_39527s`）/`last_start`；R555 另加 `bridge_reachable`（`127.0.0.1:18765` 是否可达——**判「今天的重启是环境问题还是本器问题」的第一眼字段**：`bridge_reachable=false` 且 `last_restart.reason=DAEMON_DEAD/STALLED` ⇒ 属外部前置，不是守护误杀）。判据=逐条重算自 `temp/linuxdo_watch/watchd.jsonl`，**不依赖运行期计数器** ⇒ 守护重启后历史计数不丢。
 - ★口径两条：①段级视图只统计**当日**且只认 `DONE` 行的**真实时间戳**（非 DONE / 坏时间戳 / 昨天的行一律不计）；②重启视图里的 `restarts_ok`（真的把子进程拉起来）与 `restarts_failed`（如 `HOLD_BUSY` 让位）分列——`restarts_failed` 是**判据档**不是「异常档」：重启风暴期的 41/4 恰是风暴证据（R545 缺陷①的量化面），修好之后该值应停止增长。
 - ★负控：缺台账/空台账 ⇒ 计数 0 且带 `note`，绝不伪造；内核缺席 ⇒ 段级视图返 `null`+note（自测 T18 四组、watchd T27 两组）。
 
@@ -154,6 +154,10 @@ R546 修好了「重启风暴」与「长休不可达」，但事后**看不见*
 11. **`if not tup:` 元组恒真 ⇒ 段闸门静默失效（P0，2026-10-06 R548）**：内核 `linuxdo_antidetect.in_segment()` 返回 `(in_seg, idx)` 元组，daemon 调用处写成 `if not in_segment(day, "browse"): 等空档` ⇒ 元组永远为真值、判断永走同一支 ⇒ **「段间空档」从未生效**，实际是连续浏览（10-05 全天 102 帖 / 21.05h、帖间隔中位 404s 即铁证；R545 把同一现象只归因于「重启风暴摧毁节律」，实为两因并存）。修法=daemon 新增 `maybe_segment_gate()` 显式解包 `in_seg, idx = ...`。★判据：单测要断言「空档期真的返回等待」，而不是只断言函数返回类型/真假。
 
 12. **自测沙箱必须覆盖所有调用入口（同一事故二次发生，2026-10-06 R548）**：`--selftest` 走 CLI 时会把 state/lock/通知重定向到沙箱，但 `_selftest_impl()` 被**直接调用**（本会话为定位 T6c7 而跑 `python3 -c "import ...; _selftest_impl()"`）时无沙箱 ⇒ 12:50 把生产 `temp/linuxdo_browse_daemon/state.json` 覆盖成 66B 空态、并把 `browse_log.jsonl` 截断到 5 行测试垃圾（**真实历史行不可重建**，只剩事故后新写的 DONE）。修法=把沙箱**下沉进 `_selftest_impl`**（幂等，CLI 与直调同安全）；恢复源=`state.json.bak-*`（daemon 每轮自备份，实测 `bak-20261006-122955` 3106B 为 11:52 完整真态，用它精确回填 daily/seen 并打 `_recovered` 标记）。★铁律延续 R545：「自测/金丝雀禁写生产状态」**不能只在 CLI 层挡**。
+
+13. **「进程不健康」与「外部前置不可用」混为一谈 ⇒ 无限重启循环（R555，2026-10-06）**：看门狗只看「进程在不在 + 心跳新不新」，而 TMWebDriver 桥（`127.0.0.1:18765`）缺席时，daemon 要么起来即退（判 `DAEMON_DEAD`）、要么空转（判 `STALLED`）⇒ 重启解决不了任何事，只会每 6 分钟一次：实测今日 `RESTART` 事件 **64 次全同源=桥缺席**（`STALLED_*` 37 条 07:31→11:14 每 360s 且 `ok=false`，`DAEMON_DEAD` 27 条），且 6h 冷却被打成每 6 分钟一条私信。修法=① 重启前先探桥，不可达即 `BRIDGE_DOWN` 只告警不重启；② 同类告警在冷却窗内合并（带累计）；③ 恢复通知加「停机 ≥300s」闸（<5min 属抖动，不发）。★判据：**修「重启风暴」先分清是「进程真掉」还是「环境不给干活」**——两者日志形态相同，唯桥探活能区分。
+
+14. **演练/自测的沙箱必须覆盖「所有输出常量」，不能按名字猜（R555）**：首轮八项沙盒演练用真函数 `one_round()`，脚本把 `LOG`/`STATE`/`RUNTIME` 都重定向了，唯独漏了 `EVENTS`（事件台账 `temp/linuxdo_watch/watchd.jsonl`——**名字里没有 `LOG`**，旧白名单没覆盖）⇒ 20 行假事件真的写进了**生产**台账（全部落在 `18:17:03` 同秒）。处置=按 append-only 原则追加三条 `ANNOTATION` 行如实标注（不改历史行），并把 `sandbox_state()` 助手固化进工具（重定向 EVENTS/RUNTIME/LOCK）+ T32 负控（自测前后断言生产 jsonl/runtime 指纹逐字不变）。★判据：演练脚本落盘后先自证「生产文件指纹未变」再继续；**同名不同义的常量（日志 vs 台账）是漏点高发区**。
 
 ## 十一、发帖锻造 + 去AI味闸门（2026-10-06 新增，用户要求「发帖要去AI味儿，要像人写的、人想的」）
 

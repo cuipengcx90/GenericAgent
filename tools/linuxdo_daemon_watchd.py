@@ -6,10 +6,11 @@
 一旦进程死掉，只能等下一个定时入口（09:30 / 12:40）才被拉起 ⇒ 最长空窗可达 ~21h，
 期间「浏览/等级检查/排队动作」全部停摆，且**用户看不见**（静默失效）。
 
-本器只做三件事（全部本地、零站点请求、零 LLM token）：
-  1. 探活：守护进程不在 ⇒ 用 bg_task 拉起（幂等）；
-  2. 停滞：在活动窗内长时间没有浏览产出（browse_log 无新增 DONE）⇒ 判为卡死并重启；
-  3. 留痕 + 告警：事件写 temp/linuxdo_watch/watchd.jsonl，重启/恢复各发一次私信（带冷却，防刷屏）。
+本器只做四件事（全部本地、零站点请求、零 LLM token）：
+  1. 探活：守护进程不在 ⇒ 先探工作台桥；桥不可达 ⇒ 判 BRIDGE_DOWN（**不重启**、长冷却告警），桥可达才用 bg_task 拉起（幂等）；
+  2. 停滞：在活动窗内长时间没有浏览产出（browse_log 无新增 DONE）⇒ 判为卡死并重启；近 1h 已重启超频则抑制（RESTART_SKIP）；
+  3. 留痕 + 告警：事件写 temp/linuxdo_watch/watchd.jsonl，重启/恢复各发一次私信；
+  4. 合并告警（R551）：同类事件在 6h 窗口内只发一条汇总（含累计次数），防刷屏但仍看得见。
 
 防检测前提（用户要求）：
   · 本器**不发任何站点请求**（不 import 浏览器驱动、不跑 JS）——只读本地进程表与日志；
@@ -25,6 +26,7 @@
 
 import argparse
 import glob
+import http.client
 import json
 import os
 import random
@@ -52,6 +54,11 @@ NOTIFY_COOLDOWN_H = 6        # 同类告警冷却（小时）
 RESTART_RATE_PER_HOUR = 3    # 每小时重启上限（超限改「跳过」；防重启风暴，见 R545 缺陷①）
 BUSY_LOG_S = 20 * 60         # 环境忙信号回看窗口（秒）：daemon 日志近 N 分钟含忙标记 ⇒ 判 BLOCKED_ENV
 FAIL_STREAK_NOTIFY = 3       # 连续重启失败达 N 次 ⇒ 告警（并继续重试）
+BRIDGE_TARGETS = [("127.0.0.1", int(os.environ.get("LJQ_BRIDGE_PORT", "18766"))),
+                  ("127.0.0.1", 18765)]  # 工作台桥(TMWebDriver)：18766=守护默认 / 18765=兼容
+BRIDGE_TIMEOUT = 2.0                     # 桥探活超时（秒）
+ALERT_MERGE_WINDOW_H = 6                 # 同类重启告警合并窗口（小时）：窗口内只发一条汇总
+RECOVERY_NOTIFY_MIN_S = 300              # 停机 ≥ 该秒数才发「已恢复」（一闪而过不打扰）
 DEFAULT_MAX_HOURS = 26.0     # 长驻上限；由每日入口重新武装（对齐 anyrouter watchd 模式）
 
 
@@ -70,6 +77,20 @@ def _parse_ev_ts(s):
         return time.mktime(time.strptime(str(s), "%Y-%m-%d %H:%M:%S"))
     except Exception:
         return None
+
+
+def sandbox_state(path):
+    """把运行态整体重定向到沙盒目录（STATE_DIR/EVENTS/LOCK 一并切换），返回 (old, new)。
+
+    ★R551 教训：EVENTS/LOCK 是导入时冻结的独立常量，只改 STATE_DIR 会让日志/锁仍写生产文件
+    （外来演练脚本曾据此把 8 行假事件写进生产 watchd.jsonl）。自测与演练一律走本助手。
+    """
+    global STATE_DIR, EVENTS, LOCK
+    old = (STATE_DIR, EVENTS, LOCK)
+    STATE_DIR = path
+    EVENTS = os.path.join(path, "watchd.jsonl")
+    LOCK = os.path.join(path, "watchd.lock")
+    return old, (STATE_DIR, EVENTS, LOCK)
 
 
 def _log_event(kind, **kw):
@@ -288,6 +309,34 @@ def spawn_daemon(bg=DEFAULT_BG, name=BG_NAME, cwd=ROOT, dry=False):
         return {"rc": -1, "err": repr(e)[:200]}
 
 
+def bridge_ok(targets=None, timeout=None):
+    """工作台桥探活（只读本地回环，零站点流量）。
+
+    为什么要它：L站浏览守护（linuxdo_browse_daemon）依赖 Galley 工作台桥（TMWebDriver）。
+    桥不在时守护启动即 ECONNREFUSED 退出 ⇒ 「重启守护」纯属空转，还会每 5 分钟刷一条告警
+    （2026-10-06 实测 27 次）。故先探桥：不可达 ⇒ 判 BRIDGE_DOWN（按环境不可用处理，
+    不重启、按冷却告警、桥回来自动恢复）。
+
+    口径：只连 127.0.0.1 的回环端口（BRIDGE_TARGETS）；有 HTTP 响应即视为可达（不判正文）。
+    任何异常都返回 False（fail-closed：**宁可不重启**，也不空转刷告警）。
+    """
+    timeout = BRIDGE_TIMEOUT if timeout is None else timeout
+    for host, port in (targets or BRIDGE_TARGETS):
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn.request("GET", "/")
+            conn.getresponse().read(1)      # 读 1 字节即可证有响应；正文内容不判
+            return True
+        except Exception:
+            continue
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+    return False
 def browse_busy_hint(now=None):
     """只读判「环境不可用」：daemon stdout 日志近 BUSY_LOG_S 秒内是否出现忙标记。
 
@@ -384,8 +433,8 @@ def decide(snapshot):
 
     snapshot 键：pids(list) / last_done(ts|None) / started(ts|None) / now / quiet(bool) /
                  last_restart_ts / fail_streak / busy_hint(bool) / busy_reason(str) /
-                 restart_times(list[ts])
-    返回 {action:'OK'|'RESTART'|'RESTART_SKIP'|'BLOCKED_ENV', reason:str}
+                 restart_times(list[ts]) / bridge_ok(bool|None；None=未探，按旧行为处理)
+    返回 {action:'OK'|'RESTART'|'RESTART_SKIP'|'BLOCKED_ENV'|'BRIDGE_DOWN', reason:str}
 
     ★心跳 = max(最近一次实质产出, 本进程启动时刻)：冷启动时 last_done 可能来自**上一次
     会话**（数小时前）⇒ 只按它判会把刚拉起 1 分钟的新进程当卡死再杀（丢正在跑的那一帖）。
@@ -399,6 +448,9 @@ def decide(snapshot):
     cooldown_ok = (now - lr) >= RESTART_MIN_GAP
 
     if not pids:
+        if snapshot.get("bridge_ok") is False:
+            # 桥不在 ⇒ 拉起也立刻 ECONNREFUSED 退出：不空转、不刷告警（R551）
+            return {"action": "BRIDGE_DOWN", "reason": "BRIDGE_UNREACHABLE"}
         if not cooldown_ok:
             return {"action": "RESTART_SKIP", "reason": "RESTART_COOLDOWN"}
         return {"action": "RESTART", "reason": "DAEMON_DEAD"}
@@ -407,6 +459,9 @@ def decide(snapshot):
         return {"action": "OK", "reason": "NO_LOG_YET"}
     age = now - hb
     if age > STALL_S and not quiet:
+        if snapshot.get("bridge_ok") is False:
+            # 桥不在：重启必空转（守护起来就拒连）⇒ 按环境不可用处理，不动进程（R551）
+            return {"action": "BRIDGE_DOWN", "reason": "BRIDGE_UNREACHABLE_STALL_%.0fs" % age}
         if snapshot.get("busy_hint"):
             # 停滞原因是**外部环境不可用**（无会话/前台被占）⇒ 重启无用，标 BLOCKED_ENV
             return {"action": "BLOCKED_ENV",
@@ -422,6 +477,42 @@ def decide(snapshot):
     return {"action": "OK", "reason": "ALIVE_FRESH_%.0fs" % age}
 
 
+def _alert_restart(d, ok, handled, notify_fn, rt):
+    """重启类告警合并（R551）：首次立即发，此后同类在窗口内只发一条汇总（含累计次数）。
+
+    handled 结构（存 runtime.json 的 alerts 段，按 kind 分桶）：
+      {"RESTART": {"first_ts": 首见, "count": 窗口内累计, "summarized_ts": 上次汇总时刻}, ...}
+    口径：kind=RESTART（重启成功）/ RESTART_FAIL（重启失败达阈值）。首见立即告警；
+    此后每 ALERT_MERGE_WINDOW_H 小时最多再发一条「累计 N 次」；恢复时由调用方清空 alerts。
+    返回 (是否已发, 更新后的 handled)。
+    """
+    now = _now()
+    kind = "RESTART" if ok else "RESTART_FAIL"
+    rec = dict(handled.get(kind) or {})
+    if not rec:
+        rec = {"first_ts": now, "count": 0}
+    rec["count"] = int(rec.get("count") or 0) + 1
+    rec["last_ts"] = now
+    win = ALERT_MERGE_WINDOW_H * 3600
+    last_sum = float(rec.get("summarized_ts") or 0)
+    first = float(rec.get("first_ts") or now)
+    send = (last_sum == 0 and now - first < win) or (last_sum > 0 and (now - last_sum) >= win)
+    if send:
+        if rec["count"] <= 1:
+            if ok:
+                notify_fn("⚠️ L站浏览守护被看门狗重启：%s（%s）已拉起，节奏参数未变。"
+                          % (d.get("reason"), _ts()))
+            else:
+                notify_fn("⚠️ L站浏览守护重启失败 1 次（%s）：已尝试拉起但未成功，将退避重试。· %s"
+                          % (d.get("reason"), _ts()))
+        else:
+            notify_fn("⚠️ L站浏览守护%s累计 %d 次（最近：%s）——已按 %dh 窗口合并告警，"
+                      "不再逐条推送。· %s"
+                      % ("" if ok else "重启失败", rec["count"], d.get("reason"),
+                         ALERT_MERGE_WINDOW_H, _ts()))
+        rec["summarized_ts"] = now
+    handled[kind] = rec
+    return send, handled
 def read_runtime():
     """只读快照（不写守护 state）。"""
     try:
@@ -457,17 +548,30 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None):
         snap.setdefault("now", _now())
     else:
         bh, bwhy = browse_busy_hint()
+        _bridge = bridge_ok()                 # R551：桥探活（桥不在则一切重启都是空转）
         _pids = daemon_pids()
         snap = {"pids": _pids, "last_done": last_progress_ts(),
                 "started": daemon_started_ts(_pids), "now": _now(),
                 "quiet": quiet_now(), "last_restart_ts": rt.get("last_restart_ts"),
                 "fail_streak": rt.get("fail_streak") or 0,
                 "busy_hint": bh, "busy_reason": bwhy,
+                "bridge_ok": _bridge,
                 "restart_times": rt.get("restart_times") or []}
     d = decide(snap)
     _log_event("ROUND", action=d["action"], reason=d["reason"],
                n_pids=len(snap["pids"]), quiet=snap["quiet"],
                last=snap.get("last_done"))
+    if d["action"] == "BRIDGE_DOWN":
+        # 桥不可达：守护根本起不来（不是它的错）⇒ 不重启，按 6h 冷却告警一次（R551）
+        last_n = float(rt.get("bridge_notified_ts") or 0)
+        if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
+            notify_fn("⛔ L站浏览守护已停：工作台桥（127.0.0.1:18766/18765）不可达，"
+                      "看门狗**不重启**（重启也起不来，避免空转刷屏）。"
+                      "恢复 Galley 工作台后我会自动继续。· %s" % _ts())
+            write_runtime({"bridge_notified_ts": _now(), "notified_down": True,
+                           "down_since": _now()})
+        _log_event("BRIDGE_DOWN", reason=d["reason"])
+        return dict(d, pids=snap["pids"])
     if d["action"] == "BLOCKED_ENV":
         last_n = float(rt.get("blocked_notified_ts") or 0)
         if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
@@ -478,25 +582,35 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None):
         _log_event("BLOCKED_ENV", reason=d["reason"])
         return dict(d, pids=snap["pids"])
     if d["action"] != "RESTART":
-        if d["action"] == "OK" and (rt.get("notified_down") or rt.get("blocked_notified_ts")):
-            notify_fn("✅ L站浏览守护已恢复（看门狗）· %s" % _ts())
-            write_runtime({"notified_down": False, "blocked_notified_ts": 0, "fail_streak": 0})
+        if d["action"] == "OK" and (rt.get("notified_down") or rt.get("blocked_notified_ts")
+                                    or rt.get("bridge_notified_ts")):
+            # R551：停机时间太短（一闪而过）就不打扰；恢复时清空合并计数，下一轮重新计数
+            # 时长闸只针对「重启造成的停机」（一闪而过的重启不打扰）；
+            # 环境不可用/桥不可达属真停机，其恢复通知不受闸门限制
+            _ds = float(rt.get("down_since") or 0)
+            if (not _ds) or (_now() - _ds) >= RECOVERY_NOTIFY_MIN_S:
+                notify_fn("✅ L站浏览守护已恢复（看门狗）· %s" % _ts())
+            write_runtime({"notified_down": False, "blocked_notified_ts": 0,
+                           "bridge_notified_ts": 0, "down_since": 0, "alerts": {},
+                           "fail_streak": 0})
         return dict(d, pids=snap["pids"])
     res = spawn(dry=dry)
     ok = (res.get("rc") == 0) or res.get("dry")
     _rt_hist = [t for t in (rt.get("restart_times") or []) if t and (_now() - t) <= 3600]
     _rt_hist.append(_now())
-    write_runtime({"restart_times": _rt_hist, "last_restart_ts": _now(),
-                   "fail_streak": 0 if ok else (rt.get("fail_streak") or 0) + 1})
+    fs = 0 if ok else (rt.get("fail_streak") or 0) + 1
+    write_runtime({"restart_times": _rt_hist, "last_restart_ts": _now(), "fail_streak": fs,
+                   "notified_down": True if ok else rt.get("notified_down"),
+                   "down_since": _now() if ok else rt.get("down_since")})
     _log_event("RESTART", reason=d["reason"], ok=bool(ok), res=res)
-    if ok and not dry:
-        notify_fn("⚠️ L站浏览守护被看门狗重启：%s（%s）已拉起，节奏参数未变。"
-                  % (d["reason"], _ts()))
-    elif not ok and not dry:
-        fs = (read_runtime().get("fail_streak") or 0)
-        if fs >= FAIL_STREAK_NOTIFY:
-            notify_fn("❌ L站浏览守护重启失败 ×%d：%s（详见 temp/linuxdo_watch/watchd.jsonl）"
-                      % (fs, res))
+    if not dry:
+        # R551 合并告警：首见立即发，其后同类在窗口内只发一条汇总（防刷屏）
+        if ok:
+            _sent, _handled = _alert_restart(d, True, rt.get("alerts") or {}, notify_fn, rt)
+            write_runtime({"alerts": _handled})
+        elif fs >= FAIL_STREAK_NOTIFY:
+            _sent, _handled = _alert_restart(d, False, rt.get("alerts") or {}, notify_fn, rt)
+            write_runtime({"alerts": _handled})
     return dict(d, pids=snap["pids"], restart=res)
 
 
@@ -604,7 +718,9 @@ def cmd_status(args):
            "daemon_started": _ts(daemon_started_ts()) if daemon_started_ts() else None,
            "quiet_now": quiet_now(), "runtime": rt,
            # 只读派生（R546 #7）：重启风暴一眼可见 —— 对照 rate_limit_per_hour 上限
-           "restarts": restart_audit()}
+           "restarts": restart_audit(),
+           # R551：桥可达性（桥不可达时守护必然起不来；此字段让 status 一眼可判）
+           "bridge_reachable": bridge_ok()}
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0
 
@@ -888,6 +1004,87 @@ def _selftest():
     _tf26 = _tf.mkdtemp(prefix="ljqnotify")      # 负控：候选目录里没有 reflect_common.py ⇒ None
     ck(_reflect_scripts_dir([_tf26]) is None, "T26c 负控：空候选目录须返回 None")
 
+    # ---- T28 桥探活（R551）：真起一个回环 HTTP 服务 ⇒ True；关掉 ⇒ False（fail-closed）
+    import http.server as _hs
+    import threading as _th
+    class _H(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass
+    _srv = _hs.HTTPServer(("127.0.0.1", 0), _H)
+    _sport = _srv.server_address[1]
+    _th.Thread(target=_srv.serve_forever, daemon=True).start()
+    ck(bridge_ok([("127.0.0.1", _sport)]) is True, "T28 回环服务在 ⇒ 桥判可达")
+    _srv.shutdown(); _srv.server_close()
+    ck(bridge_ok([("127.0.0.1", _sport)], timeout=0.5) is False,
+       "T28b 服务关闭 ⇒ 判不可达（fail-closed：宁可不重启）")
+    ck(all(h == "127.0.0.1" for h, _p in BRIDGE_TARGETS),
+       "T28c 默认桥目标必须全为回环: %s" % (BRIDGE_TARGETS,))
+    # ---- T29/T30 桥不可达 ⇒ BRIDGE_DOWN：不重启、只告警一次（R551 核心修复）
+    ck(decide({"pids": [], "now": _now(), "last_done": None, "quiet": False,
+               "bridge_ok": False})["action"] == "BRIDGE_DOWN",
+       "T29 无进程且桥不可达 ⇒ BRIDGE_DOWN（不得空转重启）")
+    ck(decide({"pids": [], "now": _now(), "last_done": None, "quiet": False,
+               "bridge_ok": True, "last_restart_ts": 0})["action"] == "RESTART",
+       "T29b 桥可达才允许重启守护")
+    ck(decide({"pids": [1], "last_done": _now() - STALL_S - 100, "now": _now(),
+               "quiet": False, "busy_hint": False, "bridge_ok": False})["action"] == "BRIDGE_DOWN",
+       "T29c 停滞但桥不可达 ⇒ BRIDGE_DOWN（不重启）")
+    ck(decide({"pids": [], "now": _now(), "last_done": None, "quiet": False,
+               "last_restart_ts": 0})["action"] == "RESTART",
+       "T29d 负控：旧注入形态（无 bridge_ok 键）行为与修复前逐字一致")
+    with tempfile.TemporaryDirectory() as td30:
+        STATE_DIR = os.path.join(td30, "watch"); EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")
+        LOCK = os.path.join(STATE_DIR, "watchd.lock")
+        c30 = {"spawn": 0, "notify": []}
+        _snap30 = {"pids": [], "last_done": None, "now": _now(), "quiet": False,
+                   "bridge_ok": False, "last_restart_ts": 0}
+        r30 = one_round(dry=True,
+                        spawn=lambda **k: (c30.__setitem__("spawn", c30["spawn"] + 1),
+                                           {"rc": 0})[1],
+                        notify_fn=lambda t: c30["notify"].append(t), snapshot=dict(_snap30))
+        ck(r30["action"] == "BRIDGE_DOWN" and c30["spawn"] == 0,
+           "T30 桥不可达须零 spawn: %s spawn=%d" % (r30, c30["spawn"]))
+        ck(len(c30["notify"]) == 1 and "桥" in c30["notify"][0],
+           "T30b 桥不可达须告警一次: %s" % (c30["notify"],))
+        one_round(dry=True, spawn=lambda **k: {"rc": 0},
+                  notify_fn=lambda t: c30["notify"].append(t), snapshot=dict(_snap30))
+        ck(len(c30["notify"]) == 1, "T30c 同因冷却期内不得重复告警: %s" % (c30["notify"],))
+    # ---- T31 合并告警（R551）：同类窗口内只发一条；窗口到期发一条含累计次数的汇总
+    c31 = {"n": []}
+    _h31 = {}
+
+    def _col31(t):
+        c31["n"].append(t)
+    for _ in range(3):
+        _alert_restart({"reason": "STALLED_9000s"}, True, _h31, _col31, {})
+    ck(len(c31["n"]) == 1 and "已拉起" in c31["n"][0],
+       "T31 同类 3 次只发 1 条（防刷屏）: %s" % (c31["n"],))
+    _h31["RESTART"]["summarized_ts"] = _now() - ALERT_MERGE_WINDOW_H * 3600 - 1
+    _alert_restart({"reason": "STALLED_9000s"}, True, _h31, _col31, {})
+    ck(len(c31["n"]) == 2 and "累计 4 次" in c31["n"][1],
+       "T31b 窗口到期发汇总且含累计次数: %s" % (c31["n"],))
+    _alert_restart({"reason": "SPAWN_RC4"}, False, _h31, _col31, {})
+    ck(len(c31["n"]) == 3 and "重启失败" in c31["n"][2],
+       "T31c 失败类独立计数且首见即发: %s" % (c31["n"],))
+    ck(_h31["RESTART"]["count"] == 4 and _h31["RESTART_FAIL"]["count"] == 1,
+       "T31d 计数按 kind 分桶: %s" % (_h31,))
+    # ---- T32 沙盒助手（R551）：必须同步重定向 STATE_DIR/EVENTS/LOCK，且可复原
+    _sb32 = _tf.mkdtemp(prefix="ljqsb32")
+    _old32, _new32 = sandbox_state(_sb32)
+    ck(EVENTS == os.path.join(_sb32, "watchd.jsonl") and LOCK == os.path.join(_sb32, "watchd.lock"),
+       "T32 助手须同步重定向 EVENTS/LOCK: %s" % (_new32,))
+    ck(EVENTS != os.path.join(ROOT, "temp", "linuxdo_watch", "watchd.jsonl"),
+       "T32b 重定向后不得仍指生产日志路径")
+    sandbox_state(_old32[0])
+    ck(EVENTS == os.path.join(_old32[0], "watchd.jsonl") and STATE_DIR == _old32[0],
+       "T32c 复原后应回到生产路径: %s" % (STATE_DIR,))
+    # 复原生产路径（防后续用例误写沙箱）
+    STATE_DIR = os.path.join(ROOT, "temp", "linuxdo_watch")
+    EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")
+    LOCK = os.path.join(STATE_DIR, "watchd.lock")
     print("selftest: %d checks, %d failed" % (checks, len(fails)))
     for f in fails:
         print("  FAIL:", f)
