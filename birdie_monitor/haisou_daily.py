@@ -40,6 +40,11 @@ CURSOR_PATH = Path(__file__).with_name("haisou_cursor.json")
 # 额度按请求数计：一轮硬扫 147 个请求必被 403 截断，且前面已扫的重复扫、后面的永远扫不到。
 # 默认 45 ⇒ 约 4 轮走完一遍 147，并按游标轮转 ⇒ 覆盖率可证明。
 DEFAULT_MAX_TASKS = int(os.environ.get("HAISOU_MAX_TASKS", "45"))
+# 静态词每日轮转配额（2026-10-06）：静态词（AI测试/柠檬班…）历史上每天被 72 请求全量重搜、
+# 增量≈0；改为每天只轮转一部分，把预算让给课程词。
+DEFAULT_STATIC_DAILY = int(os.environ.get("HAISOU_STATIC_DAILY", "15"))
+# 课程词平台优先级：先 quark（网盘资源最集中），baidu/ali 用剩余预算补齐。
+DYNAMIC_PLATFORM_ORDER = ("quark", "baidu", "ali")
 # 站点额度口径（2026-10-06 实测）：daily_quota=200「点」，operation_costs.search=2 点/次搜索请求
 # ⇒ 每天只有 100 次搜索。默认每轮最多吃掉剩余额度的 50%，把另一半留给用户手动搜。
 QUOTA_URL = BASE + "/api/v2/credits/membership/status"
@@ -86,13 +91,59 @@ def load_state():
     return json.loads(STATE_PATH.read_text(encoding="utf-8"))
 
 
+def core_query(title):
+    """把课程全名压成「更适合网盘搜索」的核心词。
+
+    网盘上传命名常与课程原名不一致（年份/期数/「完结无密」等修饰被改），全名当 query 常 0 命中；
+    去修饰后的核心词命中率更高。此处只做保守剥离（括号内容/年份/期数/常见后缀），不猜简称。
+    """
+    q = re.sub(r"[（(【\[][^）)】\]]*[）)】\]]", " ", title or "")
+    q = re.sub(r"(20\d{2}\s*年?|第[一二三四五六七八九十百\d]+期|完结|无密|完整版|全套|高清|"
+               r"视频\+?代码|视频教程|更新完|新课|首发)", " ", q)
+    q = re.sub(r"\s+", " ", q).strip(" -_·|、,，")
+    return q
+
+
 def load_dynamic_keywords():
-    """加载动态关键词（全能IT课程标题），仅返回未找到的课程"""
+    """加载动态关键词（全能IT课程标题）。
+
+    返回 list[dict]={title, query, published_at}，仅含尚未 found 的课程；
+    按发布时间倒序（新课程优先），query 取文件里登记的核心词、缺失则现算。
+    """
     if not DYNAMIC_KEYWORDS_PATH.exists():
         return []
     data = json.loads(DYNAMIC_KEYWORDS_PATH.read_text(encoding="utf-8"))
-    # 仅返回未找到的课程标题
-    return [title for title, info in data.items() if not info.get("found", False)]
+    rows = []
+    for title, info in data.items():
+        if not isinstance(info, dict):
+            info = {}
+        if info.get("found", False):
+            continue
+        q = (info.get("query") or "").strip() or core_query(title) or title
+        rows.append({"title": title, "query": q, "published_at": info.get("published_at") or ""})
+    rows.sort(key=lambda r: r["published_at"], reverse=True)
+    return rows
+
+
+def record_keyword_attempt(title, queries):
+    """把「今天用什么 query 搜过、各命中多少条原始结果」写回课程词文件。
+
+    旧版从不递增 search_count ⇒ 「超期未找到自动清理」永不触发、进度也不可观测。
+    进度写回失败绝不影响主流程。
+    """
+    if not title or not DYNAMIC_KEYWORDS_PATH.exists():
+        return
+    try:
+        data = json.loads(DYNAMIC_KEYWORDS_PATH.read_text(encoding="utf-8"))
+        if title not in data or not isinstance(data[title], dict):
+            return
+        info = data[title]
+        info["search_count"] = int(info.get("search_count", 0) or 0) + 1
+        info["last_search_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        info["last_queries"] = queries
+        DYNAMIC_KEYWORDS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[warn] 课程词进度写回失败（不影响扫描）: {exc}")
 
 
 def mark_keyword_found(keyword):
@@ -224,7 +275,7 @@ def fetch_quota(session):
             "used_today": data.get("used_today"), "expires_at": data.get("expires_at")}
 
 
-def run(max_tasks=None):
+def run(max_tasks=None, static_daily=None):
     """按「轮转游标 + 每轮请求预算」扫描，避免每轮从头发 147 个请求被 403 截断。
 
     返回 (additions, first_run, error) 与旧版一致；额外把本轮进度写进
@@ -263,71 +314,122 @@ def run(max_tasks=None):
     # 提取已有标题用于去重
     existing_titles = [r.get("title", "") for r in state.values() if isinstance(r, dict)]
 
-    # 合并静态关键词 + 动态关键词（全能IT课程标题）
-    all_keywords = list(STATIC_KEYWORDS) + load_dynamic_keywords()
-    tasks = [(kw, pf) for kw in all_keywords for pf in PLATFORMS]
-    total = len(tasks)
+    # 任务优先级（2026-10-06 重排，修「搜不出东西却把额度烧光」）：
+    #   P0 课程词 × quark      —— 用户主诉求（排行榜站新课程）必须每天先跑
+    #   P1 静态词轮转窗口      —— 老词增量极低，每天只轮转一部分
+    #   P2 课程词 × baidu/ali  —— 仅用剩余预算补齐
+    dynamic = load_dynamic_keywords()
+    dyn_quark = [(d["query"], "quark", True, d["title"]) for d in dynamic]
+    static_tasks = [(kw, pf, False, None) for kw in STATIC_KEYWORDS for pf in PLATFORMS]
+    dyn_other = [(d["query"], pf, True, d["title"])
+                 for pf in DYNAMIC_PLATFORM_ORDER[1:] for d in dynamic]
+    total = len(dyn_quark) + len(static_tasks) + len(dyn_other)
     if total == 0:
         save_state(state)
         return additions, first_run, None
 
     requested = DEFAULT_MAX_TASKS if max_tasks is None else int(max_tasks)
+    static_daily = DEFAULT_STATIC_DAILY if static_daily is None else int(static_daily)
     remaining_searches = max(0, quota["remaining_today"] // COST_PER_SEARCH)
     quota_cap = max(1, int(remaining_searches * BUDGET_SHARE))
     budget = max(1, min(requested, total, quota_cap))
     cursor = load_cursor()
-    start = int(cursor.get("index", 0) or 0) % total
+    static_total = len(static_tasks)
+    start = int(cursor.get("index", 0) or 0) % max(1, static_total)
+    plan = list(dyn_quark[:budget])
+    remaining = max(0, budget - len(plan))
+    # 静态词窗口：至少 static_daily，至多占剩余预算的一半（另一半留给课程词的 baidu/ali 补齐）
+    static_n = min(static_total, remaining, max(static_daily, remaining // 2))
+    plan += [static_tasks[(start + i) % static_total] for i in range(static_n)]
+    remaining = budget - len(plan)
+    if remaining > 0:
+        plan += dyn_other[:remaining]
+    remaining = budget - len(plan)
+    if remaining > 0:   # 课程词余额用不完 ⇒ 继续轮转静态词，不让当日额度空转
+        more = min(static_total - static_n, remaining)
+        plan += [static_tasks[(start + static_n + i) % static_total] for i in range(more)]
     started_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
     done = 0
     error = None
     scanned = []
-    try:
-        while done < budget:
-            idx = (start + done) % total
-            keyword, platform = tasks[idx]
-            new_here = 0
-            for item in search(session, keyword, platform):
-                hsid = item.get("hsid")
-                if not hsid or hsid in state:
-                    continue
-                # 标题去重检查
-                title = clean(item.get("share_name"))
-                # 相关性校验：过滤 haisou 分词模糊匹配带来的无关垃圾结果
-                if not is_relevant(keyword, title):
-                    continue
-                if is_title_duplicate(title, existing_titles):
-                    continue
-                record = make_item(keyword, item)
-                state[hsid] = record
-                existing_titles.append(title)  # 添加到已有标题列表
+    dyn_hits = {}
+    static_used = 0
+    for keyword, platform, is_dyn, course_title in plan:
+        if done >= budget:
+            break
+        variants = [keyword]
+        if is_dyn and platform == DYNAMIC_PLATFORM_ORDER[0]:
+            core = core_query(course_title or keyword)
+            if core and core != keyword:
+                variants.append(core)  # 全名 0 原始命中时回落核心词（多花 1 次搜索）
+        new_here = 0
+        queries = []
+        try:
+            for q in variants:
+                if done >= budget:
+                    break
+                items = search(session, q, platform)
+                done += 1
+                new_from_q = 0
+                for item in items:
+                    hsid = item.get("hsid")
+                    if not hsid or hsid in state:
+                        continue
+                    # 标题去重检查
+                    title = clean(item.get("share_name"))
+                    # 相关性校验：过滤 haisou 分词模糊匹配带来的无关垃圾结果
+                    if not is_relevant(q, title):
+                        continue
+                    if is_title_duplicate(title, existing_titles):
+                        continue
+                    record = make_item(q, item)
+                    state[hsid] = record
+                    existing_titles.append(title)  # 添加到已有标题列表
+                    if not first_run:
+                        additions.append(record)
+                    new_from_q += 1
+                    new_here += 1
+                queries.append({"q": q, "platform": platform,
+                                "items": len(items), "new": new_from_q})
+                if items:  # 该 query 有原始命中 ⇒ 不必再试下一个形态
+                    break
+        except Exception as exc:
+            error = str(exc)
+            scanned.append({"idx": len(scanned), "kw": keyword, "platform": platform,
+                            "new": new_here, "is_dynamic": is_dyn, "error": str(exc)})
+            break
+        if not is_dyn:
+            static_used += 1
+        elif course_title:
+            dyn_hits.setdefault(course_title, []).extend(queries)
+            if any(q["new"] > 0 for q in queries):
+                mark_keyword_found(course_title)
+        scanned.append({"idx": len(scanned), "kw": keyword, "platform": platform,
+                        "new": new_here, "is_dynamic": is_dyn, "queries": queries})
 
-                # 如果是动态关键词（全能IT课程），标记为已找到
-                if keyword not in STATIC_KEYWORDS:
-                    mark_keyword_found(keyword)
+    for course_title, queries in dyn_hits.items():
+        record_keyword_attempt(course_title, queries)
 
-                if not first_run:
-                    additions.append(record)
-                new_here += 1
-            done += 1
-            scanned.append({"idx": idx, "kw": keyword, "platform": platform, "new": new_here})
-    except Exception as exc:
-        error = str(exc)
-
-    next_index = (start + done) % total
-    cycle = int(cursor.get("cycle", 0) or 0) + (1 if next_index == 0 and done else 0)
+    next_index = (start + static_used) % max(1, static_total)
+    cycle = int(cursor.get("cycle", 0) or 0) + (1 if next_index == 0 and static_used else 0)
     save_cursor({
         "index": next_index,
-        "total": total,
+        "total": static_total,
         "cycle": cycle,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "last_run": {"start": started_at, "done": done, "error": error},
+        "last_run": {"start": started_at, "done": done, "error": error,
+                     "static_used": static_used, "plan_len": len(plan)},
     })
     # 已完成的搜索结果必须落库并随异常通知发送；未扫描部分由游标留待下次执行。
     save_state(state)
     log_progress({
         "ts": started_at,
         "total_tasks": total,
+        "dyn_total": len(dyn_quark),
+        "static_total": static_total,
+        "plan_len": len(plan),
+        "static_used": static_used,
         "budget": budget,
         "quota_before": quota,
         "quota_after": fetch_quota(session),
@@ -432,15 +534,16 @@ def _selftest():
             ck("T1 进度 scanned 明细=5", len(rec["scanned"]) == 5)
 
             # T2: 轮转覆盖 —— 让 budget 整除 total，跑满一圈后 index 精确回到起点 0 且 cycle+1
+            # 契约（2026-10-06 改）：静态词按窗口轮转，多轮累计覆盖全量后才回到起点
             save_cursor({"index": 0, "total": total, "cycle": 0})
             seen_calls.clear()
             per = total // 4
             for _ in range(4):
-                run(max_tasks=per)
-            ck("T2 一圈后 index=0", load_cursor().get("index") == 0)
+                run(max_tasks=per, static_daily=per)
+            ck("T2 一盘后 index=0", load_cursor().get("index") == 0)
             ck("T2 cycle=1", load_cursor().get("cycle") == 1)
             ck("T2 关键词全覆盖", {c[0] for c in seen_calls} == set(STATIC_KEYWORDS))
-            ck("T2 请求数=一圈总量", len(seen_calls) == total and len(seen_calls) == 4 * per)
+            ck("T2 请求数=一盘总量", len(seen_calls) == total and len(seen_calls) == 4 * per)
 
             # T3: 异常不丢进度 —— 第 3 个任务抛错 ⇒ 前 2 个任务的游标前进量保留
             before = load_cursor().get("index")
@@ -491,9 +594,40 @@ def _selftest():
             globals()["CURSOR_PATH"] = td / "cursor4.json"
             save_cursor({"index": 0})
             n0 = len(seen_calls)
-            a6, f6, e6 = run(max_tasks=999)
+            a6, f6, e6 = run(max_tasks=999)   # 无课程词 ⇒ 余额全部轮转静态词，仍受份额封顶
             expect6 = max(1, min(999, total, int((200 // COST_PER_SEARCH) * BUDGET_SHARE)))
             ck(f"T6 份额封顶={expect6} 请求", len(seen_calls) - n0 == expect6)
+            # T8 课程词优先 + 全名 0 命中回落核心词 + 逐词留痕写回
+            dyn_path = td / "dyn.json"
+            long_name = "新课程（第3期）完结无密"
+            dyn_path.write_text(json.dumps(
+                {long_name: {"source_url": "u", "query": long_name, "search_count": 0, "found": False}},
+                ensure_ascii=False), encoding="utf-8")
+            globals()["DYNAMIC_KEYWORDS_PATH"] = dyn_path
+            globals()["STATE_PATH"] = td / "state8.json"
+            globals()["CURSOR_PATH"] = td / "cursor8.json"
+            save_cursor({"index": 0})
+            calls8 = []
+
+            def search8(session, q, platform):
+                calls8.append((q, platform))
+                return []          # 全 0 命中 ⇒ 必须回落核心词
+
+            globals()["search"] = search8
+            a8, f8, e8 = run(max_tasks=4, static_daily=1)
+            cq = core_query(long_name)
+            ck("T8 课程词原样先搜", calls8 and calls8[0] == (long_name, "quark"))
+            ck("T8 0 命中回落核心词", len(calls8) > 1 and calls8[1] == (cq, "quark"))
+            ck("T8 静态词排在其后", len(calls8) > 2 and calls8[2][0] in STATIC_KEYWORDS)
+            back = json.loads(dyn_path.read_text(encoding="utf-8"))[long_name]
+            ck("T8 进度写回 attempts", back.get("search_count") == 1)
+            lq8 = back.get("last_queries") or []
+            ck("T8 进度写回 queries", [q["q"] for q in lq8][:2] == [long_name, cq])
+            ck("T8 落痕含平台", [q["platform"] for q in lq8][:2] == ["quark", "quark"])
+            ck("T8 未找到不置 found", back.get("found") is False)
+            globals()["DYNAMIC_KEYWORDS_PATH"] = td / "dyn_missing.json"   # 复原：不存在
+            globals()["search"] = fake_search
+
             # T7 额度接口失败 ⇒ fail-closed（不发请求）
             globals()["fetch_quota"] = lambda session: None
             n1 = len(seen_calls)
