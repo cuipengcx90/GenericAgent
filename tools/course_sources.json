@@ -1,42 +1,101 @@
 {
-  "version": 1,
-  "sources": [
-    {
-      "id": "imooc",
-      "name": "慕课网实战",
-      "enabled": true,
-      "channel": [
-        "browser",
-        "jina"
-      ],
-      "parser": "imooc_list",
-      "detail": "imooc_detail",
-      "kind": "course",
-      "note": "全站反爬：仅真实浏览器通道可过（实测）",
-      "urls": [
-        "https://coding.imooc.com/?page=1",
-        "https://coding.imooc.com/?page=2",
-        "https://coding.imooc.com/?page=3"
-      ],
-      "parser_by_channel": {
-        "jina": "imooc_md_list"
-      }
-    },
-    {
-      "id": "quangneng",
-      "name": "全能资源网",
-      "enabled": true,
-      "channel": [
-        "http",
-        "browser"
-      ],
-      "parser": "quangneng_list",
-      "detail": "quangneng_detail",
-      "kind": "course",
-      "note": "WordPress 服务端渲染，http 直取即可",
-      "urls": [
-        "https://www.quangneng.com/"
-      ]
-    }
-  ]
+ "version": 1,
+ "sources": [
+  {
+   "id": "imooc",
+   "name": "慕课网实战",
+   "enabled": true,
+   "channel": [
+    "browser",
+    "jina"
+   ],
+   "parser": "imooc_list",
+   "detail": "imooc_detail",
+   "kind": "course",
+   "note": "全站反爬：仅真实浏览器通道可过（实测）",
+   "urls": [
+    "https://coding.imooc.com/?page=1",
+    "https://coding.imooc.com/?page=2",
+    "https://coding.imooc.com/?page=3"
+   ],
+   "parser_by_channel": {
+    "jina": "imooc_md_list"
+   }
+  },
+  {
+   "id": "quangneng",
+   "name": "全能资源网",
+   "enabled": true,
+   "channel": [
+    "http",
+    "browser"
+   ],
+   "parser": "quangneng_list",
+   "detail": "quangneng_detail",
+   "kind": "course",
+   "note": "WordPress 服务端渲染，http 直取即可",
+   "urls": [
+    "https://www.quangneng.com/"
+   ]
+  },
+  {
+   "id": "imooc_class",
+   "name": "慕课体系课",
+   "enabled": true,
+   "channel": [
+    "jina",
+    "http"
+   ],
+   "parser": "imooc_md_any",
+   "parser_by_channel": {
+    "http": "imooc_md_any",
+    "jina": "imooc_md_any"
+   },
+   "kind": "course",
+   "note": "体系课列表（反爬：http 只回 JS 壳，走 r.jina.ai 渲染 markdown）",
+   "urls": [
+    "https://class.imooc.com/",
+    "https://class.imooc.com/?page=2"
+   ]
+  },
+  {
+   "id": "imooc_free",
+   "name": "慕课免费课",
+   "enabled": true,
+   "channel": [
+    "jina",
+    "http"
+   ],
+   "parser": "imooc_md_any",
+   "parser_by_channel": {
+    "http": "imooc_md_any",
+    "jina": "imooc_md_any"
+   },
+   "kind": "course",
+   "note": "免费课列表（反爬，走 jina；解析 /learn/N 内链）",
+   "urls": [
+    "https://www.imooc.com/course/list",
+    "https://www.imooc.com/course/list?page=2"
+   ]
+  },
+  {
+   "id": "imooc_home",
+   "name": "慕课首页（含轮播推荐）",
+   "enabled": true,
+   "channel": [
+    "jina",
+    "http"
+   ],
+   "parser": "imooc_md_any",
+   "parser_by_channel": {
+    "http": "imooc_md_any",
+    "jina": "imooc_md_any"
+   },
+   "kind": "course",
+   "note": "首页轮播/推荐位（含三类课内链），补列表页看不到的新上架投放",
+   "urls": [
+    "https://www.imooc.com/"
+   ]
+  }
+ ]
 }

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import subprocess
 import hashlib
 import json
 import os
@@ -70,6 +71,13 @@ MATCH_EXTRA_RX = re.compile(r"(网盘|资源|下载|课程|教程|合集|打包|
 CAND_OUT = Path(os.environ.get("COURSE_CAND_OUT")
                 or BASE / "temp/course_pool/match_candidates.json")
 CAND_BOARD_LIMIT = 200          # 看板最多展示多少条候选（快照里仍是全量）
+
+# 采集面新鲜度台账（R552 看板 v2）：每次真跑 fetch 落一次摘要，看板读它上「采集面」面板。
+# 只记真实抓取（dry-run 不落）；通道 mode 分布/缓存回退 stale 由此可见——「今天抓了吗、
+# 抓的是真页面还是 last-good 缓存」一眼可判，不再靠翻日志。
+FETCH_LOG = Path(os.environ.get("COURSE_FETCH_LOG")
+                 or BASE / "temp/course_pool/fetch_log.json")
+FETCH_STALE_HOURS = 48          # 台账超过此时长未刷新 = 看板标「台账过期」
 
 NEW_DAYS = 7            # 首次发现多少天内算「新课」
 RESEARCH_GAP_DAYS = 3   # 同一课程两次进搜索词的间隔
@@ -234,6 +242,7 @@ def upsert(source: str, records: list, pool: dict | None = None) -> dict:
                 "id": cid, "source": source, "source_id": sid, "title": title,
                 "url": rec.get("url") or "", "type": rec.get("type") or "",
                 "category": rec.get("category") or "", "price": rec.get("price"),
+                "price_orig": rec.get("price_orig"),
                 "students": int(rec.get("students") or 0), "level": rec.get("level") or "",
                 "tags": sorted(set(rec.get("tags") or [])),
                 "first_seen": today(), "last_seen": today(), "last_words_at": None,
@@ -251,6 +260,8 @@ def upsert(source: str, records: list, pool: dict | None = None) -> dict:
                     cur[k] = rec[k]
             if rec.get("price") is not None:
                 cur["price"] = rec["price"]
+            if rec.get("price_orig") is not None:
+                cur["price_orig"] = rec["price_orig"]
             if rec.get("students"):
                 cur["students"] = int(rec["students"])
             cur["tags"] = sorted(set(cur.get("tags") or []) | set(rec.get("tags") or []))
@@ -467,6 +478,131 @@ def parse_imooc_page(text: str) -> list:
     return out
 
 
+# ---------------------------------------------------------------- 分类归类口径
+# 统一分类口径：任何源（慕课三类/全能/后续新增）都走这一张表，
+# 站点自报分类优先（parse_*_list 里带 category 就用），否则按标题+元信息关键词兜底。
+CATEGORY_RULES = (
+    ("AI/大模型", ("ai", "人工智能", "aigc", "大模型", "llm", "langchain", "agent",
+                   "智能体", "rag", "mcp", "机器学习", "深度学习", "神经网络",
+                   "nlp", "prompt", "midjourney", "stable diffusion", "sora", "copilot")),
+    ("数据分析", ("数据分析", "数据挖掘", "大数据", "spark", "hadoop", "flink", "hive",
+                  "clickhouse", "bi", "可视化", "sql", "pandas", "数仓", "指标体系")),
+    ("前端/客户端", ("html", "css", "javascript", "js", "typescript", "vue", "react",
+                     "node", "webpack", "vite", "小程序", "前端", "uniapp", "flutter",
+                     "android", "ios", "鸿蒙", "harmonyos", "electron")),
+    ("后端/架构", ("java", "python", "golang", "go语言", "c++", "rust", "php", "后端",
+                   "架构", "微服务", "spring", "django", "mysql", "redis", "kafka",
+                   "rocketmq", "linux", "运维", "docker", "k8s", "kubernetes", "nginx")),
+    ("测试/工程", ("测试", "自动化测试", "devops", "ci/cd", "git", "重构", "性能优化",
+                   "算法", "数据结构", "leetcode", "设计模式")),
+    ("产品/运营", ("产品经理", "运营", "增长", "电商", "营销", "新媒体", "短视频",
+                   "私域", "创业", "副业", "自媒体", "一人公司", "出海", "变现")),
+    ("设计/办公", ("设计", "ui", "ux", "ps", "ppt", "excel", "word", "office",
+                   "剪辑", "摄影", "英语", "职场", "办公")),
+    ("安全/网络", ("网络安全", "渗透", "漏洞", "逆向", "加固", "等保", "安全")),
+)
+
+
+def classify_category(*texts) -> str:
+    """按关键词命中数归类（纯本地、确定性、无网络）。无命中返回「未分类」。"""
+    s2 = " ".join(str(t or "") for t in texts).lower()
+    best, best_n = "", 0
+    for name, kws in CATEGORY_RULES:
+        n = sum(1 for k in kws if k in s2)
+        if n > best_n:
+            best, best_n = name, n
+    return best or "未分类"
+
+
+# ------------------------------------------------ 慕课任意页（首页/体系课/免费课）
+# 一站三内链：实战课 /class/N、体系课 /sale/<slug>、免费课 /learn/N
+# 页面反爬，走 r.jina.ai 渲染出的 markdown（首页 53KB、体系课列表含 35 门）。
+PRICE2_RX = re.compile(r"[\u00a5\uffe5]\s*([0-9]+(?:\.[0-9]+)?)")
+_IMOOC_ANY_LINK = re.compile(
+    r"\[([^\]]{2,140})\]\((https://(?:"
+    r"coding\.imooc\.com/class/(?P<cid>\d+)\.html"
+    r"|class\.imooc\.com/sale/(?P<slug>[A-Za-z0-9_\-]+)"
+    r"|www\.imooc\.com/learn/(?P<lid>\d+)"
+    r"))(?:\?[^)]*)?\)")
+_LEVEL_RX = re.compile(r"(零基础|初阶|进阶|中阶|高阶|入门|初级|中级|高级|专业)")
+
+
+_TITLE_TRIM_RX = re.compile(
+    r"\s+(?=[0-9]+人报名|实战课|实战|体系课|体系|免费课|免费|零基础|初阶|初级|入门|进阶|"
+    r"中级|中阶|高级|高阶|专业|[0-9]+月特惠)"
+)
+_NOISE_TITLE_RX = re.compile(
+    r"^(?:优惠倒计时|立即购买|免费试听|了解详情|查看更多|更多|查看详情|试看|立即学习|"
+    r"马上抢|立即抢购|课程咨询|咨询客服|限时优惠|开学季|抢购|领取)"
+)
+
+
+def parse_imooc_md_any(text, source_hint=""):
+    """慕课任意页 markdown -> 课程记录（实战课/体系课/免费课三态统一）。
+
+    同一 slug 在页面里常有多个锚点（优惠倒计时/立即购买/真描述行），先滤营销锚点，
+    再按 slug 取最长标题当课程名。元信息取所选中锚点后 300 字符窗口：
+      - 免费课：`零基础 · 1123人报名 免费`
+      - 体系课：`332 80 小时 108 优惠价 ¥ 2399 ¥ 2999`（首数=学员、中数=课时）
+    两个价时取首个为现价、末个为原价，与 parse_imooc_page 同口径。
+    """
+    t = text or ""
+    groups, order = {}, []
+    for m in _IMOOC_ANY_LINK.finditer(t):
+        title = _clean(m.group(1)).strip()
+        if m.group("cid"):
+            sid, ctype = m.group("cid"), "实战课"
+            url = "https://coding.imooc.com/class/%s.html" % m.group("cid")
+        elif m.group("slug"):
+            sid, ctype = "sale-" + m.group("slug"), "体系课"
+            url = "https://class.imooc.com/sale/%s" % m.group("slug")
+        else:
+            sid, ctype = "learn-" + m.group("lid"), "免费课"
+            url = "https://www.imooc.com/learn/%s" % m.group("lid")
+        if (not title or len(title) < 5 or title.endswith("：") or title.endswith(":")
+                or _NOISE_TITLE_RX.match(title)):
+            continue
+        g = groups.get(sid)
+        if g is None:
+            g = {"sid": sid, "type": ctype, "url": url, "cands": []}
+            groups[sid] = g
+            order.append(sid)
+        g["cands"].append((len(title), title, m.end()))
+    out = []
+    for sid in order:
+        g = groups[sid]
+        _n, title, endpos = max(g["cands"], key=lambda x: x[0])
+        _tm = _TITLE_TRIM_RX.search(title, 5)
+        if _tm:
+            title = title[:_tm.start()].strip()
+        tail = t[endpos:endpos + 300].replace("\n", " ")
+        hm = re.search(r"([0-9]+)\s*小时", tail)
+        hours = int(hm.group(1)) if hm else 0
+        s3 = re.search(r"([0-9]+)\s+([0-9]+)\s*小时\s+([0-9]+)", tail)
+        sm = STU_RX.search(tail) or re.search(r"([0-9]+)\s*人(?:报名|学习|学过)", tail)
+        if sm:
+            students = int(sm.group(1))
+        elif s3:
+            students = int(s3.group(1))
+        else:
+            students = 0
+        prices = PRICE2_RX.findall(tail)
+        price = float(prices[0]) if prices else None
+        price_orig = float(prices[-1]) if len(prices) >= 2 else None
+        if price is None and "免费" in tail[:90]:
+            price = 0.0
+        lm = _LEVEL_RX.search(tail)
+        level = lm.group(1) if lm else ""
+        cat = classify_category(title, tail)
+        out.append({
+            "source_id": sid, "title": title, "url": g["url"], "type": g["type"],
+            "category": cat, "level": level, "students": students, "hours": hours,
+            "price": price, "price_orig": price_orig,
+            "tags": [w for w in (g["type"], cat) if w],
+        })
+    return out
+
+
 def imooc_page_url(direction: str, page: int) -> str:
     return f"https://coding.imooc.com/?c={direction}&sort=0&unlearn=0&page={page}"
 
@@ -521,7 +657,8 @@ def stats(merged: dict) -> dict:
     }
 
 
-def render_html(merged: dict, st: dict | None = None, cands: dict | None = None) -> str:
+def render_html(merged: dict, st: dict | None = None, cands: dict | None = None,
+                flock: dict | None = None) -> str:
     st = st or stats(merged)
     rows = []
     for c in sorted(merged.get("courses", []),
@@ -542,6 +679,52 @@ def render_html(merged: dict, st: dict | None = None, cands: dict | None = None)
             f'<td>{_esc(c.get("level"))}</td><td>{c.get("students", 0)}</td><td>{price}</td>'
             f'<td>{links}</td></tr>')
     chips = " ".join(f"<span class=chip>{k}:{v}</span>" for k, v in sorted(st["by_status"].items()))
+    fetch_html, fetch_chip = "", ""
+    if flock:
+        fts = flock.get("ts")
+        age_h = None
+        try:
+            age_h = (time.time() - float(fts)) / 3600.0
+        except (TypeError, ValueError):
+            age_h = None
+        frows, n_stale_src = [], 0
+        for sid, v in sorted((flock.get("sources") or {}).items()):
+            modes = {}
+            for u in (v.get("per_url") or []):
+                modes[u.get("mode") or "?"] = modes.get(u.get("mode") or "?", 0) + 1
+            if v.get("stale"):
+                n_stale_src += 1
+            up = v.get("upsert") or {}
+            ups = (f"+{up.get('added', 0)}/{up.get('updated', 0)}"
+                   if up else "-")
+            flag = ("<b class=n>缓存回退</b>" if v.get("stale") else "OK")
+            frows.append(
+                "<tr>"
+                f'<td>{_esc(sid)} {_esc(v.get("name"))}</td>'
+                f'<td>{_esc(",".join(v.get("channel") or []))}</td>'
+                f'<td>{v.get("records", 0)}</td><td>{ups}</td>'
+                f'<td>{_esc(" ".join(f"{k}×{n}" for k, n in sorted(modes.items())))}</td>'
+                f'<td>{flag}</td></tr>')
+        if age_h is None:
+            age_txt = "?"
+        elif age_h < 24:
+            age_txt = f"{age_h:.1f}h 前"
+        else:
+            age_txt = f"{age_h / 24:.1f}d 前"
+        age_flag = ("<b class=n>台账过期</b>" if (age_h or 0) > FETCH_STALE_HOURS else "")
+        fetch_chip = (f"<span class=chip>采集 {age_txt}</span>"
+                      + (f"<span class=chip>缓存回退 {n_stale_src} 源</span>"
+                         if n_stale_src else ""))
+        fetch_html = (
+            f"<h2>采集面 <span class=chip>抓取 {_esc(flock.get('ts_str'))}"
+            f"（{age_txt}）{age_flag}</span>"
+            f"<span class=chip>本批入库 {flock.get('fetched', 0)} 条</span></h2>\n"
+            "<p class=cav>「通道分布」= 本轮每个 URL 实际生效的抓取通道；"
+            "<b>缓存回退</b>= 站点不可达时用 last-good 缓存兜底（<code>mode=cache</code>），"
+            "数据仍可用但非当日新鲜。</p>\n"
+            "<table id=ft><thead><tr><th>源</th><th>通道</th><th>记录</th>"
+            "<th>新增/更新</th><th>通道分布</th><th>状态</th></tr></thead>\n"
+            f"<tbody>{''.join(frows)}</tbody></table>\n")
     cand_html = ""
     if cands is not None:
         allm = cands.get("all_matches") or []
@@ -579,13 +762,13 @@ a{{color:#6cf;text-decoration:none}} .n{{color:#e33;font-size:11px}} .d{{color:#
 code{{background:#222;border:1px solid #333;border-radius:4px;padding:1px 5px;font-size:12px}}
 input{{background:#1b1b1b;color:#ddd;border:1px solid #333;border-radius:6px;padding:6px 10px;width:280px}}
 </style>
-<h1>AI 课程资源台 <span class=chip>共 {st['total']}</span>{chips}
+<h1>AI 课程资源台 <span class=chip>共 {st['total']}</span>{chips}{fetch_chip}
 <span class=chip>新课 {st['new']}</span><span class=chip>已有资源 {st['with_resource']}</span>
 <span class=chip>跨源重复组 {st['dup_groups']}</span></h1>
 <input id=q placeholder="过滤：标题/来源/难度" oninput="f()">
 <table id=t><thead><tr><th>标记</th><th>课程</th><th>来源</th><th>难度</th><th>报名</th><th>价格</th><th>资源</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
-{cand_html}<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
+{fetch_html}{cand_html}<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
 <script>function f(){{var v=q.value.toLowerCase();
 for(var tb of document.querySelectorAll('table tbody')) for(var r of tb.rows)
   r.style.display = r.innerText.toLowerCase().includes(v)?'':'none';}}</script>
@@ -1101,6 +1284,115 @@ def selftest() -> int:
     finally:
         globals()["POOL_PATH"], globals()["USER_PATH"] = old2
 
+    # ---- last-good 缓存回退（R550）：兜底可用 + 三类负控 ----
+    with tempfile.TemporaryDirectory() as tdc:
+        oldc = globals().get("CACHE_DIR")
+        globals()["CACHE_DIR"] = Path(tdc) / "cache"
+        try:
+            cu = "https://class.imooc.com/"
+            # 夹具须 > min_bytes(200)：缓存回退与通道同样受 min_bytes 门禁，短正文会被判空
+            cbody = ("*   [Agent 工程化+ AI 编程深度实战营 进阶 · 85人报名 _10月特惠_￥1299￥1480.00 "
+                     "加购物车](https://coding.imooc.com/class/1013.html)\n"
+                     "*   [从0到1 转型 Agent应用开发工程师 零基础 · 29人报名 ￥499￥599.00 加购物车]"
+                     "(https://coding.imooc.com/class/1040.html)\n"
+                     "*   [AI 大模型应用开发实战 中级 · 12人报名 ￥899￥999.00 加购物车]"
+                     "(https://coding.imooc.com/class/1055.html)\n"
+                     "Copyright 2026 imooc.com\n")
+            check("T59 缓存缺失读空（负控）", cache_get(cu)[0] is None)
+            cache_put(cu, cbody, "jina")
+            got, meta = cache_get(cu)
+            check("T60 缓存写入可读且带 age/mode",
+                  got == cbody and bool(meta) and meta.get("mode") == "jina"
+                  and meta.get("age_hours", 9.0) < 1.0)
+            cp = CACHE_DIR / (_cache_key(cu) + ".txt")
+            cp.with_suffix(".meta.json").write_text(
+                _json.dumps({"url": cu, "ts": time.time() - 240 * 3600, "mode": "jina"}),
+                encoding="utf-8")
+            check("T61 超期缓存不得回退（负控）", cache_get(cu, max_hours=168)[0] is None)
+            check("T62 max_hours=0 表示不限龄", cache_get(cu, max_hours=0)[0] == cbody)
+            saved_ch = (globals()["_http_text"], globals()["_jina_text"])
+
+            def _boom(*_a, **_k):
+                raise RuntimeError("offline")
+
+            globals()["_http_text"] = _boom
+            globals()["_jina_text"] = _boom
+            cache_put(cu, cbody, "jina")   # T61 已把它置过期，这里恢复成新鲜缓存
+            try:
+                mode, txt, errs = fetch_one(cu, prefer=("http", "jina"),
+                                            parser=parse_imooc_md_any)
+                check("T63 通道全灭回退缓存并标 mode=cache",
+                      mode == "cache" and txt == cbody
+                      and any(e.get("mode") == "cache" for e in errs))
+                try:
+                    fetch_one("https://class.imooc.com/?nohit=1", prefer=("http",),
+                              parser=parse_imooc_md_any)
+                    check("T64 无缓存仍失败（负控）", False)
+                except RuntimeError:
+                    check("T64 无缓存仍失败（负控）", True)
+                cache_put("https://class.imooc.com/?shell=1",
+                          "<html>反爬壳页</html>", "http")
+                try:
+                    fetch_one("https://class.imooc.com/?shell=1", prefer=("http",),
+                              parser=parse_imooc_md_any)
+                    check("T65 缓存解析 0 条不冒充成功（负控）", False)
+                except RuntimeError:
+                    check("T65 缓存解析 0 条不冒充成功（负控）", True)
+                r = collect_source({"id": "t_src", "name": "t", "channel": ["http"],
+                                    "parser": "imooc_md_any", "urls": [cu]}, sleep=0)
+                check("T66 collect_source 标记 stale 且条数正确",
+                      r["per_url"][0]["mode"] == "cache"
+                      and r["per_url"][0].get("stale") is True
+                      and len(r["records"]) == 3)
+            finally:
+                globals()["_http_text"], globals()["_jina_text"] = saved_ch
+        finally:
+            if oldc is not None:
+                globals()["CACHE_DIR"] = oldc
+
+    # ---- T67-T70 采集面台账 + 看板「采集面」面板（R552 看板 v2）----
+    with tempfile.TemporaryDirectory() as td:
+        saved_fl = globals().get("FETCH_LOG")
+        globals()["FETCH_LOG"] = Path(td) / "fetch_log.json"
+        try:
+            info = {
+                "imooc": {"name": "慕课", "channel": ["direct"], "records": 3, "stale": False,
+                          "per_url": [{"url": "u1", "mode": "direct", "stale": False, "records": 3}],
+                          "upsert": {"added": 2, "updated": 1}},
+                "quangneng": {"name": "全能", "channel": ["cache"], "records": 5, "stale": True,
+                              "per_url": [{"url": "u2", "mode": "cache", "stale": True, "records": 5}],
+                              "upsert": {"added": 0, "updated": 5}}}
+            lp = save_fetch_log(info, 8)
+            d = load_fetch_log()
+            check("T67 台账落盘可读（源/通道/入库数齐）",
+                  lp is not None and d is not None and d["fetched"] == 8
+                  and set(d["sources"]) == {"imooc", "quangneng"}
+                  and d["sources"]["quangneng"]["stale"] is True
+                  and d["sources"]["quangneng"]["per_url"][0]["mode"] == "cache")
+            check("T68 干跑不落台账（负控）", save_fetch_log(info, 8, dry_run=True) is None)
+            b1 = Path(td) / "bad1.json"; b1.write_text("{not json", encoding="utf-8")
+            b2 = Path(td) / "bad2.json"; b2.write_text('{"schema":"other/v1","sources":{}}', encoding="utf-8")
+            b3 = Path(td) / "bad3.json"; b3.write_text('{"schema":"course.fetch_log/v1","sources":[]}', encoding="utf-8")
+            check("T69 坏台账不冒充（负控：坏JSON/错schema/源非dict 三态归一）",
+                  load_fetch_log(Path(td) / "absent.json") is None
+                  and load_fetch_log(b1) is None and load_fetch_log(b2) is None
+                  and load_fetch_log(b3) is None)
+            # 看板：带台账⇒出现「采集面」面板与缓存回退标记；不带⇒无面板、不崩溃
+            env = dict(os.environ, COURSE_FETCH_LOG=str(globals()["FETCH_LOG"]))
+            r1 = subprocess.run([sys.executable, __file__, "render", "--out", str(Path(td) / "a.html")],
+                                capture_output=True, text=True, env=env)
+            h1 = (Path(td) / "a.html").read_text(encoding="utf-8") if (Path(td) / "a.html").exists() else ""
+            env2 = dict(os.environ, COURSE_FETCH_LOG=str(Path(td) / "nope.json"))
+            r2 = subprocess.run([sys.executable, __file__, "render", "--out", str(Path(td) / "b.html")],
+                                capture_output=True, text=True, env=env2)
+            h2 = (Path(td) / "b.html").read_text(encoding="utf-8") if (Path(td) / "b.html").exists() else ""
+            check("T70 看板采集面面板（有台账上面板/缓存回退可见；缺台账静默不崩）",
+                  r1.returncode == 0 and "采集面" in h1 and "缓存回退" in h1
+                  and r2.returncode == 0 and "采集面" not in h2 and len(h2) > 200)
+        finally:
+            if saved_fl is not None:
+                globals()["FETCH_LOG"] = saved_fl
+
     print(f"selftest: {ok} passed, {len(failed)} failed")
     for f in failed:
         print("  FAIL", f)
@@ -1132,8 +1424,32 @@ def _http_text(url, timeout=30):
 
 
 def _jina_text(url, timeout=60):
-    """jina 通道：r.jina.ai 渲染取文（部分站点可用；远端 401/超时时自动降级到 browser）。"""
-    return _http_text("https://r.jina.ai/" + url, timeout=timeout)
+    """jina 通道：r.jina.ai 渲染取文（部分站点可用；远端 401/超时时自动降级到 browser）。
+
+    ★实测：不带 UA 时 r.jina.ai 直接 401（class.imooc.com 等），必须显式带浏览器 UA。
+    """
+    req = urllib.request.Request("https://r.jina.ai/" + url, headers={"User-Agent": UA,
+                                                                     "Accept": "text/plain"})
+    last = None
+    for att, wait in enumerate((0, 20, 45)):
+        if wait:
+            time.sleep(wait)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                txt = r.read().decode("utf-8", "replace")
+            # ★实测：r.jina.ai 自身会被 CF 挑战（返回「Just a moment...」HTML，HTTP 403），
+            # 属分钟级窗口非永久封禁 ⇒ 视为可重试，退避后重打。
+            if txt.lstrip().startswith("<!DOCTYPE html") or "Just a moment" in txt[:400]:
+                last = RuntimeError("jina CF challenge")
+                continue
+            return txt
+        except urllib.error.HTTPError as e:  # noqa: PERF203
+            last = e
+            if e.code not in (403, 429, 500, 502, 503, 504):
+                raise
+        except Exception as e:  # 超时/连接错误同样可重试
+            last = e
+    raise last if last else RuntimeError("jina failed")
 
 
 def _driver_cmd(payload, timeout=60):
@@ -1335,6 +1651,53 @@ def parse_quangneng_detail(html, rec):
     return rec
 
 
+# ==================== last-good 抓取缓存（反爬兜底，R550） ====================
+# 反爬站点（如慕课列表页必须走 jina）在远端被 CF 挑战时通道可能全灭 ⇒ 回退「最近一次
+# 成功抓取的正文」并标 mode=cache，保证每日采集不空、且可取证（不伪装成新抓取）。
+# 有效期由 COURSE_CACHE_MAX_HOURS 控制（默认 168h/7 天，0=不限龄）。
+CACHE_DIR = Path(os.environ.get("COURSE_CACHE_DIR") or BASE / "temp/course_pool_cache")
+CACHE_MAX_HOURS = float(os.environ.get("COURSE_CACHE_MAX_HOURS") or 168.0)
+
+
+def _cache_key(url):
+    return hashlib.sha1(str(url).encode("utf-8")).hexdigest()[:16]
+
+
+def cache_get(url, max_hours=None):
+    """取该 URL 最近一次成功抓取的正文 → (text, meta)；过期/缺失返 (None, meta|None)。"""
+    p = CACHE_DIR / (_cache_key(url) + ".txt")
+    m = p.with_suffix(".meta.json")
+    if not p.exists():
+        return None, None
+    try:
+        txt = p.read_text(encoding="utf-8", errors="replace")
+        meta = json.loads(m.read_text(encoding="utf-8")) if m.exists() else {}
+    except Exception:
+        return None, None
+    age = (time.time() - float(meta.get("ts") or p.stat().st_mtime)) / 3600.0
+    lim = CACHE_MAX_HOURS if max_hours is None else float(max_hours)
+    info = {"age_hours": round(age, 2), "ts": meta.get("ts"), "mode": meta.get("mode"),
+            "url": meta.get("url") or url}
+    if lim > 0 and age > lim:
+        info["expired"] = True
+        return None, info
+    return txt, info
+
+
+def cache_put(url, text, mode=""):
+    """成功抓取后落缓存；写失败绝不影响主流程。"""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        p = CACHE_DIR / (_cache_key(url) + ".txt")
+        p.write_text(text, encoding="utf-8")
+        p.with_suffix(".meta.json").write_text(json.dumps(
+            {"url": url, "ts": time.time(), "mode": mode, "bytes": len(text)},
+            ensure_ascii=False), encoding="utf-8")
+        return str(p)
+    except Exception:
+        return None
+
+
 def fetch_one(url, prefer=None, min_bytes=200, parser=None, parser_map=None):
     """通道链：按源声明的 prefer 顺序尝试（http→jina→browser），取第一个可用结果。
 
@@ -1362,9 +1725,22 @@ def fetch_one(url, prefer=None, min_bytes=200, parser=None, parser_map=None):
                 errs.append({"mode": mode,
                              "err": "parsed_0_bytes(%d)" % len(last_html)})
                 continue
+            cache_put(url, last_html, mode)
             return mode, last_html, errs
         except Exception as e:
             errs.append({"mode": mode, "err": str(e)[:200]})
+    # 通道全灭 ⇒ 退回 last-good 缓存（按其原始通道选解析器；解析 0 条不算成功）
+    txt, cmeta = cache_get(url)
+    if txt and len(txt) >= int(min_bytes):
+        cmode = (cmeta or {}).get("mode") or ""
+        pr = (parser_map or {}).get(cmode) or parser
+        if pr is None or pr(txt):
+            errs.append({"mode": "cache",
+                         "err": "fallback_last_good(age=%sh)" % (cmeta or {}).get("age_hours")})
+            return "cache", txt, errs
+        errs.append({"mode": "cache", "err": "parsed_0_bytes(%d)" % len(txt)})
+    elif cmeta and cmeta.get("expired"):
+        errs.append({"mode": "cache", "err": "expired(age=%sh)" % cmeta.get("age_hours")})
     raise RuntimeError("全部通道失败 %s :: %s" % (url, errs))
 
 
@@ -1383,6 +1759,31 @@ DEFAULT_SOURCES = {
             ],
         },
         {
+            "id": "imooc_class", "name": "慕课体系课", "enabled": True,
+            "channel": ["jina", "http"], "parser": "imooc_md_any",
+            "parser_by_channel": {"http": "imooc_md_any", "jina": "imooc_md_any"},
+            "kind": "course",
+            "note": "体系课列表（站点反爬：http 直取只回 JS 壳，走 r.jina.ai 渲染 markdown）",
+            "urls": ["https://class.imooc.com/", "https://class.imooc.com/?page=2"],
+        },
+        {
+            "id": "imooc_free", "name": "慕课免费课", "enabled": True,
+            "channel": ["jina", "http"], "parser": "imooc_md_any",
+            "parser_by_channel": {"http": "imooc_md_any", "jina": "imooc_md_any"},
+            "kind": "course",
+            "note": "免费课列表（反爬，走 jina；解析 /learn/N 内链）",
+            "urls": ["https://www.imooc.com/course/list",
+                     "https://www.imooc.com/course/list?page=2"],
+        },
+        {
+            "id": "imooc_home", "name": "慕课首页（含轮播推荐）", "enabled": True,
+            "channel": ["jina", "http"], "parser": "imooc_md_any",
+            "parser_by_channel": {"http": "imooc_md_any", "jina": "imooc_md_any"},
+            "kind": "course",
+            "note": "首页轮播/推荐位（含三类课内链），补列表页看不到的新上架投放",
+            "urls": ["https://www.imooc.com/"],
+        },
+        {
             "id": "quangneng", "name": "全能资源网", "enabled": True,
             "channel": ["http", "browser"], "parser": "quangneng_list",
             "detail": "quangneng_detail", "kind": "course",
@@ -1396,6 +1797,8 @@ _PARSERS = {
     "imooc_list": parse_imooc_list, "quangneng_list": parse_quangneng_list,
     # jina 通道返回 markdown（非 HTML），必须用 md 版解析器，否则静默 0 条
     "imooc_md_list": parse_imooc_page,
+    # 首页/体系课/免费课：一站三内链（/class/N、/sale/<slug>、/learn/N）
+    "imooc_md_any": parse_imooc_md_any,
 }
 _DETAILS = {
     "imooc_detail": parse_imooc_detail, "quangneng_detail": parse_quangneng_detail,
@@ -1453,6 +1856,10 @@ def collect_source(src, max_urls=None, with_detail=False, min_bytes=200, sleep=2
     by_ch = {k: _PARSERS[v] for k, v in (src.get("parser_by_channel") or {}).items()}
 
     def parser_for(mode):
+        if mode == "cache":
+            cm = (cache_get(cur_url, max_hours=0)[1] or {}).get("mode") or ""
+            if cm in by_ch:
+                return by_ch[cm]
         return by_ch.get(mode, parser)
 
     urls = list(src.get("urls") or [])
@@ -1460,6 +1867,7 @@ def collect_source(src, max_urls=None, with_detail=False, min_bytes=200, sleep=2
         urls = urls[: int(max_urls)]
     recs, seen, per_url, errors = [], set(), [], []
     for u in urls:
+        cur_url = u
         item = {"url": u, "mode": None, "errs": []}
         try:
             # 多通道源也必须逐通道用「该通道的解析器」做 0 条探针，否则首通道
@@ -1469,6 +1877,9 @@ def collect_source(src, max_urls=None, with_detail=False, min_bytes=200, sleep=2
                                          parser_map=by_ch)
             item["mode"] = mode
             item["errs"] = errs
+            if mode == "cache":
+                item["stale"] = True
+                item["cache_age_hours"] = (cache_get(u, max_hours=0)[1] or {}).get("age_hours")
             items = parser_for(mode)(html)
             fresh = []
             for r in items:
@@ -1571,6 +1982,45 @@ def cmd_sources(json_out=False):
     return sources_summary(data)
 
 
+def save_fetch_log(info: dict, fetched: int, dry_run: bool = False):
+    """把一次 fetch 的采集面摘要落盘（看板 render 读）。dry-run 一律不落（负控 T69）。"""
+    if dry_run:
+        return None
+    srcs = {}
+    for sid, v in (info or {}).items():
+        per = []
+        for u in (v.get("per_url") or []):
+            rec = u.get("records")
+            n_rec = rec if isinstance(rec, int) else len(rec or [])
+            per.append({"url": u.get("url"), "mode": u.get("mode"),
+                        "stale": bool(u.get("stale")), "records": n_rec})
+        srcs[sid] = {"name": v.get("name"), "channel": v.get("channel"),
+                     "records": int(v.get("records") or 0),
+                     "stale": bool(v.get("stale")), "per_url": per,
+                     "upsert": v.get("upsert"), "errors": v.get("errors") or []}
+    doc = {"schema": "course.fetch_log/v1", "ts": time.time(),
+           "ts_str": time.strftime("%Y-%m-%d %H:%M:%S"),
+           "fetched": int(fetched), "sources": srcs}
+    FETCH_LOG.parent.mkdir(parents=True, exist_ok=True)
+    FETCH_LOG.write_text(_json.dumps(doc, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    return FETCH_LOG
+
+
+def load_fetch_log(path=None) -> dict | None:
+    """读采集面台账；缺失/坏格式一律返回 None（看板静默不上面板，负控 T68/T70）。"""
+    p = Path(path) if path else FETCH_LOG
+    try:
+        d = _json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or d.get("schema") != "course.fetch_log/v1":
+        return None
+    if not isinstance(d.get("sources"), dict):
+        return None
+    return d
+
+
 def cmd_fetch(sid=None, max_urls=None, with_detail=False, dry_run=False,
               sleep=2.0, enabled_only=True):
     """按源抓取 → 解析 → 幂等入库。sid=None 表示抓所有启用源。"""
@@ -1585,12 +2035,21 @@ def cmd_fetch(sid=None, max_urls=None, with_detail=False, dry_run=False,
         r = collect_source(s, max_urls=max_urls, with_detail=with_detail, sleep=sleep)
         n = len(r["records"])
         total += n
+        stale = [x["url"] for x in r["per_url"] if x.get("stale")]
         info[s["id"]] = {"name": r.get("name"), "channel": r.get("channel"),
                          "per_url": r["per_url"], "records": n,
+                         "stale_urls": stale, "stale": bool(stale),
                          "errors": r["errors"][:5]}
         if not dry_run and n:
             info[s["id"]]["upsert"] = upsert(s["id"], r["records"])
-    return {"sources": info, "fetched": total, "dry_run": bool(dry_run)}
+    n_stale = sum(1 for v in info.values() if v.get("stale"))
+    log_path = save_fetch_log(info, total, dry_run)
+    out = {"sources": info, "fetched": total, "dry_run": bool(dry_run),
+           "stale_sources": n_stale,
+           "stale_urls": sum(len(v.get("stale_urls") or []) for v in info.values())}
+    if log_path:
+        out["fetch_log"] = str(log_path)
+    return out
 
 
 def main(argv=None) -> int:
@@ -1627,6 +2086,10 @@ def main(argv=None) -> int:
 
     sub.add_parser("stats")
     p = sub.add_parser("render"); p.add_argument("--out", default="")
+    p.add_argument("--fetch-log", dest="fetch_log", default="",
+                   help=f"采集面台账路径（默认 {FETCH_LOG}；不存在则跳过面板）")
+    p.add_argument("--no-fetch-log", dest="no_fetch_log", action="store_true",
+                   help="不渲染「采集面」面板（负控/隔离用）")
     p.add_argument("--candidates", default="",
                    help=f"候选快照路径（默认 {CAND_OUT}；不存在则跳过面板）")
     p.add_argument("--no-candidates", dest="no_candidates", action="store_true",
@@ -1744,7 +2207,9 @@ def main(argv=None) -> int:
         if not a.no_candidates:
             cands, warn = load_candidates(Path(a.candidates) if a.candidates else CAND_OUT,
                                           explicit=bool(a.candidates))
-        html = render_html(merged, cands=cands)
+        flock = None if a.no_fetch_log else load_fetch_log(
+            Path(a.fetch_log) if a.fetch_log else FETCH_LOG)
+        html = render_html(merged, cands=cands, flock=flock)
         out = Path(a.out) if a.out else DASH_OUT
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(html, encoding="utf-8")
@@ -1753,6 +2218,11 @@ def main(argv=None) -> int:
             res["candidates"] = len(cands.get("all_matches") or [])
         if warn:
             res["candidates_warn"] = warn
+        if flock is not None:
+            res["fetch_log"] = {"ts": flock.get("ts_str"),
+                               "sources": len(flock.get("sources") or {})}
+            res["stale_sources"] = sum(1 for v in (flock.get("sources") or {}).values()
+                                       if v.get("stale"))
         _print(res)
         return 0
     ap.print_help()
