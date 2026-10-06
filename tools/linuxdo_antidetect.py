@@ -42,7 +42,10 @@ import time
 # rest_p / rest_min_gap = 随机休息日概率与两次休息最小间隔（天）
 ACTION_PROFILES = {
     # 浏览：基数最大（TL3 需「已读帖子 20000」，是长期主战场）
-    "browse": dict(daily_cap=160, cap_jitter=20, seg_n=(5, 7), seg_len=(75, 150),
+    # 2026-10-06 R548 用户要求「日上限调高一点、节奏不变」：160→200（日上限 180–220），
+    # 段数/段长同步加宽（6–8 段 × 85–160min）⇒ 提高的是**占空比**与日总量，段内间隔
+    # （gap 110–260s、长休 300–600s）保持不变 ⇒ 瞬时密度不升，只把一天铺得更满。
+    "browse": dict(daily_cap=200, cap_jitter=20, seg_n=(6, 8), seg_len=(85, 160),
                    gap=(110, 260), gap_long=(300, 600), gap_long_p=0.30,
                    rest_p=1.0 / 7.0, rest_min_gap=3, quiet=(1, 0, 7, 30),
                    morning_jitter=(0, 3600)),
@@ -106,8 +109,8 @@ def day_segments(day, kind, rng=None):
     # 段长按档位抽样，再按窗口容量收敛
     mins = [r.uniform(p["seg_len"][0], p["seg_len"][1]) for _ in range(n)]
     total = sum(m / 60.0 for m in mins)
-    if total > span * 0.75:                      # 段总长不超过活动窗 75%
-        k = span * 0.75 / total
+    if total > span * 0.80:                      # 段总长不超过活动窗 80%（R548：75%→80%，给高日上限留占空比）
+        k = span * 0.80 / total
         mins = [m * k for m in mins]
     # 随机放置：在剩余空隙里随机撒点（顺序保持）
     free = span - sum(m / 60.0 for m in mins)
@@ -526,11 +529,27 @@ def _selftest():
     caps = {k: profile(k)["daily_cap"] for k in ACTION_PROFILES}
     chk("T20 档位基数序", caps["browse"] > caps["like"] > caps["reply"] >= caps["post"])
     # T21 next_wait：任何 due/why 组合下都必须给出正数等待（执行器自调度不会拿到 0/负数）
+    # ★2026-10-06 修：原断言把「12:00 必在活动段内」当既成事实 ⇒ 段预算一改(160→200 / 6–8 段)
+    #   当日 12:00 恰落在段间空档(11:41–12:03)，T21/T21b 双双假红。改为**从当日真段动态派生**
+    #   取样点（判据不绑死某天某时刻，见 SOP §十 坑#13）。
     st7 = {"cap": {}, "rest": {}, "jitter": {}}
-    w1, why1 = next_wait(st7, now, "browse", 0)
+    _segs7 = day_segments(day, "browse")
+    # 取样点必须同时满足：在活动段内 ∧ 已越过 morning_jitter（该抖动只作用于当日首段）
+    # ⇒ 取**第二段**起点+60s（段预算 6–8 段，恒存在第二段）。
+    _t_in = int(_segs7[1]["start"]) + 60 if len(_segs7) > 1 else \
+        int(_segs7[0]["start"]) + int(morning_jitter(st7, day, "browse")) + 60
+    w1, why1 = next_wait(st7, _t_in, "browse", 0)
     chk("T21 next_wait 段内为正", w1 > 0 and why1 == "in_segment_gap")
-    w2, why2 = next_wait(st7, now, "browse", 10 ** 6)
+    w2, why2 = next_wait(st7, _t_in, "browse", 10 ** 6)
     chk("T21b next_wait 日限后为正且跨日", w2 > 0 and "next_day" in why2)
+    # 段间空档（新段预算的副产品）：取当日真布局里最宽的空档中点，须给正等待且不误判为段内
+    _gaps = [(_segs7[i]["end"], _segs7[i + 1]["start"]) for i in range(len(_segs7) - 1)
+             if _segs7[i + 1]["start"] - _segs7[i]["end"] > 120]
+    _t_out = int(max(_gaps, key=lambda g: g[1] - g[0])[0]) + 60 if _gaps \
+        else int(_segs7[0]["start"]) - 60
+    w4, why4 = next_wait(st7, _t_out, "browse", 0)
+    chk("T21f next_wait 段外给正等待(段间空档/静默窗均不为零)",
+        w4 > 0 and why4 in ("wait_next_segment", "wait_quiet_end"))
     st8 = {"cap": {}, "rest": {"browse": {_day_of(now): True}}, "jitter": {}}
     w3, why3 = next_wait(st8, now, "browse", 0)
     chk("T21c next_wait 休息日仍给正等待", w3 > 0)

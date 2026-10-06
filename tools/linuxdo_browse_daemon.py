@@ -89,7 +89,8 @@ HINT = "linux.do"
 
 RC_OK, RC_GAPS, RC_NO_SESSION, RC_UNJUDGEABLE, RC_USAGE, RC_SELFTEST = 0, 1, 2, 3, 4, 5
 
-# 防检测参数（后台版）——2026-10-05 二轮：日上限 120→160(每日±20 抖动) + 帖内节奏放慢
+# 防检测参数（后台版）——2026-10-06 三轮：日上限 160→200(每日±20 抖动；段预算 6–8 段×85–160min)
+# 注:以下是**内核缺席时的回退档**，正常路径一律走 tools/linuxdo_antidetect.py 单一源(见 _profiles)。
 GAP_RANGE = (110, 260)
 GAP_LONG_RANGE = (300, 600)
 SCROLL_STEPS = (22, 30)      # 慢滚多步：步长<半楼 ⇒ 每楼≥2个 tick 覆盖
@@ -102,7 +103,7 @@ LIGHT_P = 0.25              # 25% 浅读（刷到不感兴趣划走型）：每�
 LIGHT_STEPS = (4, 6)
 LIGHT_DWELL = (15, 30)      # 浅读驻留秒
 BATCH_DEFAULT = 20
-DAILY_CAP_DEFAULT = 160
+DAILY_CAP_DEFAULT = 200
 DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固定同一数字=机械特征
 SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入迷的真人，提高占空比）
 SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
