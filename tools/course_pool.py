@@ -55,6 +55,13 @@ DASH_OUT = Path(os.environ.get("COURSE_DASH_OUT") or BASE / "archive/courses/ind
 # 池词合并进去 = 课程池直接给海搜供词，无需 haisou 侧改代码。
 MERGE_INTO = Path(os.environ.get("COURSE_MERGE_INTO") or BASE / "birdie_monitor/quangneng_keywords.json")
 
+# ---- 搜索命中 → 课程自动匹配（match 子命令）----
+HAISOU_SEEN = Path(os.environ.get("COURSE_HAISOU_SEEN") or BASE / "birdie_monitor/haisou_seen_items.json")
+PAN_RAW_GLOB = os.environ.get("COURSE_PAN_RAW_GLOB") or "temp/pan_search/raw_*.json"
+MATCH_MIN_SCORE = 0.62          # 标题 bigram 覆盖率阈值（低于此不挂，宁缺勿滥）
+MATCH_MAX_PER_COURSE = 3        # 单课程最多挂几条命中
+MATCH_EXTRA_RX = re.compile(r"(网盘|资源|下载|课程|教程|合集|打包|分享|学习资料)")
+
 NEW_DAYS = 7            # 首次发现多少天内算「新课」
 RESEARCH_GAP_DAYS = 3   # 同一课程两次进搜索词的间隔
 DUP_RATIO = 0.72        # 跨源标题判重阈值
@@ -579,6 +586,127 @@ def cmd_list(merged: dict, kw: str = "", status: str = "", source: str = "",
     return out[:limit]
 
 
+def title_score(a: str, b: str) -> float:
+    """标题相似度（0–1，下界口径）：归一化后按「短侧 bigram 被覆盖率」。
+
+    只用 norm_title（已剥噪声词/标点/括号）+ 额外剥「网盘/资源/下载/课程/教程/合集」类
+    营销词。两侧归一名长度 <6 时一律判 0（负控：`C++`/`AI` 这类短标题不得乱配）。
+    """
+    na = MATCH_EXTRA_RX.sub("", norm_title(a))
+    nb = MATCH_EXTRA_RX.sub("", norm_title(b))
+    if len(na) < 6 or len(nb) < 6:
+        return 0.0
+    A = {na[i:i + 2] for i in range(len(na) - 1)}
+    B = {nb[i:i + 2] for i in range(len(nb) - 1)}
+    if not A or not B:
+        return 0.0
+    return len(A & B) / float(min(len(A), len(B)))
+
+
+def load_hits(include_pan: bool = True, haisou_path=None, pan_glob: str = "") -> list:
+    """读「搜索命中」语料（只读，从不写盘）：
+
+    * haisou：birdie_monitor/haisou_seen_items.json（key→{title,link,share_pwd,...}）
+    * pan：temp/pan_search/raw_*.json（kw→[{title,url,code,...}]，按文件名倒序取新）
+
+    坏文件 must-fail：命中库不可读时抛错，绝不静默当空（否则会得出「今天无命中」的假结论）。
+    """
+    hits = []
+    hp = Path(haisou_path) if haisou_path else HAISOU_SEEN
+    if hp.exists():
+        try:
+            d = json.loads(Path(hp).read_text(encoding="utf-8"))
+        except Exception as e:                                   # noqa: BLE001
+            raise RuntimeError(f"命中库不可读，拒绝静默当空：{hp}: {e}")
+        if not isinstance(d, dict):
+            raise RuntimeError(f"命中库结构不是 dict：{hp}")
+        for _k, v in d.items():
+            if isinstance(v, dict) and v.get("title") and v.get("link"):
+                hits.append({"src": "haisou", "title": v["title"], "url": v["link"],
+                             "pwd": v.get("share_pwd") or "", "kw": v.get("keyword") or "",
+                             "at": v.get("seen_at") or ""})
+    elif haisou_path:
+        raise RuntimeError(f"显式指定的命中库不存在：{hp}")
+    if include_pan:
+        files = sorted(BASE.glob(pan_glob or PAN_RAW_GLOB), reverse=True)
+        seen_url = set()
+        for fp in files:
+            try:
+                d = json.loads(Path(fp).read_text(encoding="utf-8"))
+            except Exception:                                     # noqa: BLE001 - 单份坏 raw 不拖垮全量
+                continue
+            if not isinstance(d, dict):
+                continue
+            for kw, items in d.items():
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    u, t = (it.get("url") or "").strip(), (it.get("title") or "").strip()
+                    if not u or not t or u in seen_url:
+                        continue
+                    seen_url.add(u)
+                    hits.append({"src": "pan:" + str(it.get("pan") or "?"), "title": t,
+                                 "url": u, "pwd": it.get("code") or "",
+                                 "kw": it.get("kw") or kw, "at": it.get("datetime") or ""})
+    return hits
+
+
+def cmd_match(min_score: float = MATCH_MIN_SCORE, max_per_course: int = MATCH_MAX_PER_COURSE,
+              apply: bool = False, hits_path: str = "", include_pan: bool = True,
+              limit: int = 20, include_found: bool = False) -> dict:
+    """把搜索命中按标题相似度挂到课程上（默认 dry-run，只预览不写盘）。
+
+    策略：每个课程取分数最高的前 max_per_course 条命中；同一 (course_id, pan_url)
+    已挂过即跳过（幂等）；默认跳过「已有资源」的课程（只补空缺），--include-found 可放开。
+    """
+    hits = load_hits(include_pan=include_pan, haisou_path=hits_path or None)
+    merged = apply_user(load_pool(), load_user())
+    user = load_user()
+    have = {(r.get("course_id"), (r.get("pan_url") or "").strip())
+            for r in user.get("resources", [])}
+    cands, skipped, applied = [], 0, 0
+    for c in merged.get("courses", []):
+        cid = c.get("id")
+        if not cid or c.get("status") == "ignore":
+            continue
+        if c.get("resources") and not include_found:
+            continue
+        rows = []
+        for h in hits:
+            sc = title_score(c.get("title") or "", h.get("title") or "")
+            if sc >= min_score:
+                rows.append((sc, h))
+        rows.sort(key=lambda x: (-x[0], x[1].get("title") or ""))
+        used_url = set()
+        for sc, h in rows[:max(1, int(max_per_course))]:
+            url = (h.get("url") or "").strip()
+            if not url or url in used_url:
+                continue
+            used_url.add(url)
+            key = (cid, url)
+            if key in have:
+                skipped += 1
+                continue
+            rec = {"course_id": cid, "course_title": c.get("title") or "",
+                   "hit_title": h.get("title") or "", "score": round(sc, 3),
+                   "src": h.get("src") or "", "url": url, "pwd": h.get("pwd") or "",
+                   "kw": h.get("kw") or "", "hits_at": h.get("at") or ""}
+            if apply:
+                attach_resource(cid, url, title=h.get("title") or "",
+                                via="auto:" + str(h.get("src") or ""))
+                have.add(key)
+                applied += 1
+            else:
+                rec["dry_run"] = True
+            cands.append(rec)
+    return {"hits": len(hits), "courses": len(merged.get("courses", [])),
+            "min_score": min_score, "apply": bool(apply),
+            "applied": applied, "skipped_existing": skipped,
+            "candidates": len(cands), "matches": cands[:max(0, int(limit))]}
+
+
 def selftest() -> int:
     import tempfile
     ok = 0
@@ -806,6 +934,68 @@ def selftest() -> int:
                 check("T30 坏词表拒写（负控）", haisou_like.read_text(encoding="utf-8") == "{not json")
         finally:
             globals()["POOL_PATH"], globals()["USER_PATH"], globals()["WORDS_OUT"] = old
+
+    import tempfile as _tf
+    td2 = _tf.mkdtemp(prefix="cp_match_")
+    old2 = globals()["POOL_PATH"], globals()["USER_PATH"]
+    try:
+        globals()["POOL_PATH"] = Path(td2) / "pool.json"
+        globals()["USER_PATH"] = Path(td2) / "user.json"
+        save_json(Path(td2) / "pool.json", {"courses": [
+            {"id": "imooc:1013", "source": "imooc", "title": "Agent 工程化 + AI 编程深度实战营 进阶",
+             "status": "hunting", "star": 3, "students": 900, "first_seen": today(), "last_seen": today(),
+             "resources": []},
+            {"id": "pan:p1", "source": "quangneng", "title": "Agent 工程化 + AI 编程深度实战营 (2026)",
+             "status": "hunting", "star": 0, "students": 0, "first_seen": today(), "last_seen": today(),
+             "resources": []},
+        ]})
+        hpath = Path(td2) / "hits.json"
+        hpath.write_text(_json.dumps({
+            "h1": {"title": "Agent 工程化 + AI 编程深度实战营（全套）视频教程",
+                   "link": "https://pan.example/s/aaa", "keyword": "AI",
+                   "seen_at": "2026-10-06 10:00:00"},
+            "h2": {"title": "完全无关的考研英语阅读真题精讲", "link": "https://pan.example/s/bbb"},
+        }, ensure_ascii=False), encoding="utf-8")
+        hh = load_hits(include_pan=False, haisou_path=hpath)
+        check("T46 命中库解析（title/link 齐备才收）", len(hh) == 2 and hh[0]["src"] == "haisou"
+              and hh[0]["url"] == "https://pan.example/s/aaa")
+        check("T47 噪声词差异不降分（视频教程/全套/括号年份）",
+              title_score("Agent 工程化 + AI 编程深度实战营 (2026)",
+                          "Agent 工程化 + AI 编程深度实战营（全套）视频教程") >= MATCH_MIN_SCORE)
+        check("T48 不相关标题低于阈值（负控）",
+              title_score("Agent 工程化 + AI 编程深度实战营", "完全无关的考研英语阅读真题精讲") < MATCH_MIN_SCORE)
+        check("T49 过短标题不得乱配（负控）",
+              title_score("AI", "AI Agent 实战训练营课程") == 0.0
+              and title_score("C++", "C++ 高级编程实战大全") == 0.0)
+        try:
+            load_hits(include_pan=False, haisou_path=Path(td2) / "nope.json")
+            check("T50 命中库缺失须报错（负控：禁静默当空）", False)
+        except RuntimeError:
+            check("T50 命中库缺失须报错（负控：禁静默当空）", True)
+        before_user = Path(td2).joinpath("user.json").read_bytes() if Path(td2).joinpath("user.json").exists() else None
+        dry = cmd_match(apply=False, hits_path=str(hpath), include_pan=False, limit=10)
+        after_user = Path(td2).joinpath("user.json").read_bytes() if Path(td2).joinpath("user.json").exists() else None
+        check("T51 dry-run 零写盘且能出候选（负控）",
+              dry["applied"] == 0 and dry["candidates"] >= 1 and before_user == after_user)
+        ap1 = cmd_match(apply=True, hits_path=str(hpath), include_pan=False, limit=10)
+        usr1 = load_user()
+        n1 = len([r for r in usr1.get("resources", []) if r.get("via", "").startswith("auto:")])
+        # 第二遍放开 include_found，才能走到 (course_id,url) 去重分支：
+        # 默认策略下「已有资源」的课程会被前置跳过（skipped_existing 恒 0），这是两回事。
+        ap2 = cmd_match(apply=True, hits_path=str(hpath), include_pan=False,
+                        include_found=True, limit=10)
+        ap3 = cmd_match(apply=False, hits_path=str(hpath), include_pan=False,
+                        include_found=True, limit=10)
+        usr2 = load_user()
+        n2 = len([r for r in usr2.get("resources", []) if r.get("via", "").startswith("auto:")])
+        check("T52 apply 写盘且幂等（负控：重复不追加）",
+              ap1["applied"] >= 1 and n1 == ap1["applied"]
+              and ap2["applied"] == 0 and ap2["skipped_existing"] >= 1
+              and n2 == n1 and ap3["candidates"] == 0)
+        check("T53 已挂资源的课程不再重复匹配（负控）",
+              cmd_match(apply=False, hits_path=str(hpath), include_pan=False)["candidates"] == 0)
+    finally:
+        globals()["POOL_PATH"], globals()["USER_PATH"] = old2
 
     print(f"selftest: {ok} passed, {len(failed)} failed")
     for f in failed:
@@ -1361,6 +1551,17 @@ def main(argv=None) -> int:
     p = sub.add_parser("remove-url", help="从源移除 URL")
     p.add_argument("id"); p.add_argument("urls", nargs="+")
 
+    p = sub.add_parser("match", help="把海搜/盘搜命中按标题相似度挂到课程（默认 dry-run）")
+    p.add_argument("--min-score", dest="min_score", type=float, default=MATCH_MIN_SCORE)
+    p.add_argument("--max-per-course", dest="max_per_course", type=int,
+                   default=MATCH_MAX_PER_COURSE)
+    p.add_argument("--hits", default="", help="显式命中 JSON（默认读海搜 seen + 盘搜 raw）")
+    p.add_argument("--no-pan", dest="no_pan", action="store_true", help="不读盘搜 raw 命中")
+    p.add_argument("--include-found", dest="include_found", action="store_true",
+                   help="已挂过资源的课程也参与匹配（默认只补空缺）")
+    p.add_argument("--limit", type=int, default=20, help="只列前 N 条候选明细")
+    p.add_argument("--apply", action="store_true", help="真正写入 user_state.json（默认只预览）")
+
     sub.add_parser("selftest")
 
     a = ap.parse_args(argv)
@@ -1416,6 +1617,10 @@ def main(argv=None) -> int:
         _print(set_status(a.course_id, a.status)); return 0
     if a.cmd == "attach":
         _print(attach_resource(a.course_id, a.pan_url, a.title, a.via)); return 0
+    if a.cmd == "match":
+        _print(cmd_match(a.min_score, a.max_per_course, a.apply, a.hits,
+                         not a.no_pan, a.limit, a.include_found))
+        return 0
     merged = apply_user(load_pool(), load_user())
     if a.cmd == "list":
         for c in cmd_list(merged, a.kw, a.status, a.source, a.limit):
