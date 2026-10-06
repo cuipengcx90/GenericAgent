@@ -13,6 +13,8 @@
   - prompt 头插 `${GA_ROOT}` 锚定行，再 `python3 tools/bg_task.py start --name agentrouter_watch_<slot> -- /opt/anaconda3/bin/python3 tools/agentrouter_quota_watch.py --watch --notify`
   - 因 sche_tasks 粒度只到 `HH:MM`，**分钟级高频靠 `--watch` 自轮询**，而不是靠 60 项 `StartCalendarInterval`
   - 观察：`python3 tools/bg_task.py status --name agentrouter_watch_am`；日志 `temp/bg_task/logs/agentrouter_watch_am.log`
+  - ★回执报告定稿前**必先回读 `status` + 日志尾部**：首轮即命中时 watch 会立刻退出 rc=0（2026-10-06 10:01:35 首轮三模型 `http=200 AVAILABLE`、已双通道推送、进程退出），
+    照抄 prompt 里的「后台巡检已挂起，命中会自动私信」就会与事实相反 ⇒ 报告须写**实测终态**（命中轮次/退出码），勿写计划态
   - ⚠️ 不要再往 `~/Library/LaunchAgents/` 写 plist（历史遗留 `com.cuip.genericagent-agentrouter-quota.plist` 已删除，副本在废纸篓；勿再写回）
 - Key：keychain 名 `agentrouter_api_key`（脚本回退顺序 env `AGENTROUTER_API_KEY` → keychain → `~/.config/agentrouter/key`）
 - 状态/账本：`temp/agentrouter_watch/state.json`（批次幂等）、`ledger.jsonl`（每次探测一行）
