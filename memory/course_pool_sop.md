@@ -18,7 +18,8 @@
 ## 二、常用命令
 
 ```bash
-python3 tools/course_pool.py selftest        # 自测（46/46）
+python3 tools/course_pool.py selftest        # 自测（84/84，含 T84「不写生产库」负控）
+python3 tools/course_pool.py db              # 统一落库：全量重建 + JSON 摘要（幂等）
 python3 tools/course_pool.py stats           # 池统计 JSON
 python3 tools/course_pool.py list --kw AI --limit 20
 python3 tools/course_pool.py fetch --source quangneng --dry-run
@@ -82,3 +83,44 @@ P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；�
 - 8899 的服务根目录是 `archive/`（output-archive 站的 `http.server --directory archive`）⇒ 课程看板的正确 URL 是 **`http://127.0.0.1:8899/courses/index.html`**；访问裸 `/` 会拿到另一个站（约 6.9MB、无 `网盘命中候选`），据此判「面板没上」= **假阴性**。
 - 本机 curl 须 `--noproxy "*"`（Clash 接管会返 400/挑战页）；LAN 访问用当前真实 IP（`ifconfig` 取，IP 会变，旧 IP 恒 400）。
 - 判「服务在跑」仍以 pid + 启动命令行核对（历史上有闲置脚本劫持回环 8899 的先例）。
+
+## 九、采集面台账与看板「采集面」面板（v2）
+
+### 9.1 台账（谁在什么时候采到了什么）
+
+- 每次**真跑** `fetch` 落 `temp/course_pool/fetch_log.json`（`COURSE_FETCH_LOG` 可覆盖），**dry-run 不落**（否则台账会被演练污染）。
+- 内容＝`run_ts / duration_s / records / upsert / per_source{source: {ok, urls, records, modes{mode: n}, stale, errors}}`；`modes` 取值 `browser|jina|http|cache`。
+- 读侧三态归一 **fail-closed**：坏 JSON / 错 schema / 源条目非 dict ⇒ `load_fetch_log()` 返 `None`（面板上「台账不可读」），**绝不把坏台账当空台账**。
+- `mode=cache` 或 `stale=true` ⇒ 该源本次是**缓存回退**（走 `temp/course_pool_cache/<sha1(url)[:16]>.txt`（`.meta.json` 记 age），即 last-good 副本），看板打 stale chip。
+
+### 9.2 看板面板
+
+- `render` 在池统计面板下方新增「采集面」节：逐源 最近抓取时间 / 通道分布 / records / upsert / stale 标记；台账 `run_ts` 距今 > 48h ⇒ 整节标「台账过期」。
+- 开关：`--fetch-log <路径>` 显式指定；`--no-fetch-log` 关闭该节（隔离/对比用）。
+- 路径缺失 ⇒ 静默降级（不上板）；**显式**路径坏 ⇒ 抛错（同 §8.1 口径）。
+
+### 9.3 分类与价格字段
+
+- 分类口径单一源＝`CATEGORY_RULES`（模块级常量表）：**站点自报分类优先**，缺则按标题+元信息关键词兜底；新增源只需在解析里带 `category`，不再各写 if-else。
+- 价格：`price`（现价）与 `price_orig`（原价/划线价）分列，缺失写 `None` 而非 0（0 会被误读成免费）。
+
+### 9.4 慕课网三源（反爬：走 r.jina.ai）
+
+`imooc_class`（体系课列表）/`imooc_free`（免费课列表）/`imooc_home`（首页轮播与推荐位，补列表页看不到的新上架）；三者 `channel=[jina,http]`、`parser=imooc_md_any`，http 只回 JS 壳故须 jina 渲染 markdown 后再抽内链。
+
+## 十、统一落库（platform.db＝全站单一数据面）
+
+所有面（采集/搜索/匹配）都落同一库：`temp/course_pool/platform.db`（gitignored）。
+- 表：`courses / resources / candidates / haisou_seen / fetch_runs`（原有）+ `sources / keywords / pan_seen / pan_hits`（四表方案）；`schema_tables=11`。
+- 重建：`python3 tools/course_pool.py db`（幂等全量：池 + 盘搜原始响应 + 海搜已见库）；JSON 摘要即输出。
+- 看板：`render` 输出的「统一落库」面板读 `db_platform_overview`；`db --platform` 可单独出平台概览。
+- 盘搜原始响应：`temp/pan_search/raw_*.json` 为「关键词→行数组」dict 形，按 url 去重写 `pan_hits`（实测 59196 行→11985 条）；**数据源是 raw 响应不是 seen.json**。
+- 匹配：`match --apply` 写 `resources`；海搜已见（仓根 `birdie_monitor/haisou_seen_items.json`）整表同步进 `haisou_seen`。
+
+### 10.1 自测沙箱铁律（R554 事故）
+
+selftest 曾**在进程内**经 `cmd_match→db_build()` 默认参数真写生产库（夹具 2 门课覆盖 215）。铁律：
+1. selftest 内一切写库路径必须进沙箱：`DB_PATH` 重定向到 `<tmp>/platform_default.db`（finally 还原）；
+2. spawn 的子进程（render/db）显式带 `COURSE_DB=<tmp>/...`，不依赖继承；
+3. 负控 T84＝自测前后对生产库做指纹（size+mtime+sha256）比对，不一致即 FAIL——防复发靠断言不靠自觉。
+4. 现场 A/B（2026-10-06）：pre-fix 版对生产库副本 sha 变 + courses 215→2；fixed 版 sha 不变 + 84/84。

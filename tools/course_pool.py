@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 import time
@@ -63,6 +64,7 @@ MERGE_INTO = Path(os.environ.get("COURSE_MERGE_INTO") or BASE / "birdie_monitor/
 # ---- 搜索命中 → 课程自动匹配（match 子命令）----
 HAISOU_SEEN = Path(os.environ.get("COURSE_HAISOU_SEEN") or BASE / "birdie_monitor/haisou_seen_items.json")
 PAN_RAW_GLOB = os.environ.get("COURSE_PAN_RAW_GLOB") or "temp/pan_search/raw_*.json"
+PAN_SEEN = Path(os.environ.get("COURSE_PAN_SEEN") or BASE / "temp/pan_search/seen.json")
 MATCH_MIN_SCORE = 0.62          # 标题 bigram 覆盖率阈值（低于此不挂，宁缺勿滥）
 MATCH_MAX_PER_COURSE = 3        # 单课程最多挂几条命中
 MATCH_EXTRA_RX = re.compile(r"(网盘|资源|下载|课程|教程|合集|打包|分享|学习资料)")
@@ -658,7 +660,7 @@ def stats(merged: dict) -> dict:
 
 
 def render_html(merged: dict, st: dict | None = None, cands: dict | None = None,
-                flock: dict | None = None) -> str:
+                flock: dict | None = None, dbst: dict | None = None) -> str:
     st = st or stats(merged)
     rows = []
     for c in sorted(merged.get("courses", []),
@@ -751,6 +753,36 @@ def render_html(merged: dict, st: dict | None = None, cands: dict | None = None,
             f"{more}</p>\n"
             "<table id=ct><thead><tr><th>课程</th><th>命中</th><th>分</th><th>源</th><th>词</th></tr></thead>\n"
             f"<tbody>{''.join(crows)}</tbody></table>\n")
+    db_html = ""
+    if dbst is not None:
+        if not dbst.get("exists"):
+            db_html = ("<h2>统一落库 <span class=chip>库未建</span></h2>\n"
+                       "<p class=cav>执行 <code>python3 tools/course_pool.py db</code> "
+                       "由 pool.json / user_state.json / 已见库 / 盘搜 raw / 候选快照重建；"
+                       "fetch 与 match 完成后会自动重建。</p>\n")
+        else:
+            chips_db = " ".join(
+                f"<span class=chip>{k} {dbst.get(k, 0)}</span>"
+                for k in ("courses", "resources", "courses_with_res", "haisou_seen",
+                          "pan_hits", "pan_seen", "keywords", "sources",
+                          "candidates", "fetch_runs"))
+            top = " ".join(f'<code>{_esc(x.get("course_id"))}×{x.get("resources")}</code>'
+                           for x in (dbst.get("top_courses") or []))
+            pan_line = " ".join(f'<code>{_esc(x.get("pan"))}×{x.get("n")}</code>'
+                                for x in (dbst.get("pan_by_platform") or []))
+            kw_line = " ".join(f'<code>{_esc(x.get("kw"))}×{x.get("n")}</code>'
+                               for x in (dbst.get("pan_top_kw") or []))
+            pool_line = " ".join(f'<code>{_esc(x.get("pool"))}×{x.get("n")}</code>'
+                                 for x in (dbst.get("kw_pool") or []))
+            db_html = (
+                f"<h2>统一落库 <span class=chip>platform.db</span>{chips_db}</h2>\n"
+                "<p class=cav>所有数据面落到一张 SQLite：课程池 / 已挂资源 / 海搜已见 / "
+                "盘搜原始命中 / 搜索词池 / 采集源注册 / 匹配候选 / 采集运行台账；"
+                "库由工具幂等重建，源文件是唯一事实源。"
+                f"资源最多的课程：{top or '-'}；构建于 {_esc(dbst.get('built_at'))}</p>\n"
+                f"<p class=cav>盘搜命中按网盘：{pan_line or '-'}<br>"
+                f"命中最多的搜索词：{kw_line or '-'}<br>"
+                f"搜索词池：{pool_line or '-'}</p>\n")
     return f"""<!doctype html><html lang="zh"><meta charset="utf-8">
 <title>AI 课程资源台</title>
 <style>
@@ -768,7 +800,7 @@ input{{background:#1b1b1b;color:#ddd;border:1px solid #333;border-radius:6px;pad
 <input id=q placeholder="过滤：标题/来源/难度" oninput="f()">
 <table id=t><thead><tr><th>标记</th><th>课程</th><th>来源</th><th>难度</th><th>报名</th><th>价格</th><th>资源</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table>
-{fetch_html}{cand_html}<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
+{fetch_html}{cand_html}{db_html}<p style="color:#666">更新：{_esc(st.get('updated_at'))}（本页由 tools/course_pool.py 生成，只读视图）</p>
 <script>function f(){{var v=q.value.toLowerCase();
 for(var tb of document.querySelectorAll('table tbody')) for(var r of tb.rows)
   r.style.display = r.innerText.toLowerCase().includes(v)?'':'none';}}</script>
@@ -961,6 +993,11 @@ def cmd_match(min_score: float = MATCH_MIN_SCORE, max_per_course: int = MATCH_MA
         p.parent.mkdir(parents=True, exist_ok=True)
         save_json(p, snap)
         payload["json_out"] = str(p)
+    if apply and "error" not in payload:
+        try:                       # 挂载后刷新落库
+            payload["db"] = db_build()
+        except Exception as e:
+            payload["db_error"] = str(e)
     return payload
 
 
@@ -976,11 +1013,22 @@ def selftest() -> int:
         else:
             failed.append(name)
 
+    def _db_fp(path):
+        """生产库指纹（sha256）；自测结束用它做「未写生产库」负控（R554）。"""
+        p = Path(path)
+        return hashlib.sha256(p.read_bytes()).hexdigest() if p.exists() else None
+
     with tempfile.TemporaryDirectory() as td:
         old = (POOL_PATH, USER_PATH, WORDS_OUT)
         globals()["POOL_PATH"] = Path(td) / "pool.json"
         globals()["USER_PATH"] = Path(td) / "user.json"
         globals()["WORDS_OUT"] = Path(td) / "words.json"
+        # R554：默认 DB_PATH 也必须落沙箱——selftest 内 cmd_match(apply=True) 会走
+        # db_build() 的默认参数真写生产库（曾把 215 门课覆盖成 2 条夹具）。
+        saved_db = DB_PATH
+        prod_db = Path(DB_PATH)
+        prod_db_before = _db_fp(prod_db)
+        globals()["DB_PATH"] = Path(td) / "platform_default.db"
         try:
             sample = (
                 "*   [导航](https://www.imooc.com/course/list)\n"
@@ -1282,7 +1330,9 @@ def selftest() -> int:
         check("T58 格式不符须拒绝（默认降级/显式抛错，负控）",
               got2 is None and bool(warn2) and raise_ok)
     finally:
-        globals()["POOL_PATH"], globals()["USER_PATH"] = old2
+        # 沙箱必须延续：曾在此处还原成生产路径（old2），致其后用例读生产 pool/user 假红（R552 修）
+        globals()["POOL_PATH"] = Path(td2) / "pool.json"
+        globals()["USER_PATH"] = Path(td2) / "user.json"
 
     # ---- last-good 缓存回退（R550）：兜底可用 + 三类负控 ----
     with tempfile.TemporaryDirectory() as tdc:
@@ -1353,6 +1403,7 @@ def selftest() -> int:
     # ---- T67-T70 采集面台账 + 看板「采集面」面板（R552 看板 v2）----
     with tempfile.TemporaryDirectory() as td:
         saved_fl = globals().get("FETCH_LOG")
+        saved_pu = (globals()["POOL_PATH"], globals()["USER_PATH"])
         globals()["FETCH_LOG"] = Path(td) / "fetch_log.json"
         try:
             info = {
@@ -1378,7 +1429,8 @@ def selftest() -> int:
                   and load_fetch_log(b1) is None and load_fetch_log(b2) is None
                   and load_fetch_log(b3) is None)
             # 看板：带台账⇒出现「采集面」面板与缓存回退标记；不带⇒无面板、不崩溃
-            env = dict(os.environ, COURSE_FETCH_LOG=str(globals()["FETCH_LOG"]))
+            env = dict(os.environ, COURSE_FETCH_LOG=str(globals()["FETCH_LOG"]),
+                       COURSE_DB=str(Path(td) / "render_default.db"))
             r1 = subprocess.run([sys.executable, __file__, "render", "--out", str(Path(td) / "a.html")],
                                 capture_output=True, text=True, env=env)
             h1 = (Path(td) / "a.html").read_text(encoding="utf-8") if (Path(td) / "a.html").exists() else ""
@@ -1389,10 +1441,129 @@ def selftest() -> int:
             check("T70 看板采集面面板（有台账上面板/缓存回退可见；缺台账静默不崩）",
                   r1.returncode == 0 and "采集面" in h1 and "缓存回退" in h1
                   and r2.returncode == 0 and "采集面" not in h2 and len(h2) > 200)
+
+            # ---- 统一落库 platform.db（沙箱：库里所有断言只碰 td 下的临时库） ----
+            # 读侧必须同指 td 沙箱，否则 db_build 读生产 pool/user（曾致 T71/T72 假红，R552 修）
+            globals()["POOL_PATH"] = Path(td) / "pool.json"
+            globals()["USER_PATH"] = Path(td) / "user.json"
+            save_json(Path(td) / "pool.json", {"courses": [
+                {"id": "imooc:c1", "source": "imooc", "title": "A", "url": "u1",
+                 "first_seen": today(), "last_seen": today()},
+                {"id": "pan:c2", "source": "quangneng", "title": "B", "url": "u2",
+                 "first_seen": today(), "last_seen": today()},
+            ]})
+            sample_res = [{"course_id": "imooc:c1", "title": "A", "pan_url": "https://pan.x/a",
+                           "need_pass": "", "score": 0.9, "found_at": "2026-10-06 10:00:00"}]
+            save_json(Path(td) / "user.json", {"resources": sample_res})
+            dbp = Path(td) / "db" / "platform.db"
+            d1 = db_build(dbp)
+            d2 = db_build(dbp)
+            check("T71 落库幂等（两次构建计数逐字相同且库真落盘）",
+                  {k: v for k, v in d1.items() if k != "built_at"}
+                  == {k: v for k, v in d2.items() if k != "built_at"}
+                  and dbp.exists() and d1.get("courses", 0) == 2
+                  and d1.get("resources", 0) == 1)
+            check("T72 表计数键齐全且 built_at 非空",
+                  {"exists", "courses", "resources", "courses_with_res", "haisou_seen",
+                   "pan_hits", "candidates", "fetch_runs", "built_at"} <= set(d1)
+                  and d1["courses_with_res"] == 1 and bool(d1["built_at"]))
+            nope = Path(td) / "nope.db"
+            miss = db_stats(nope)
+            check("T73 库不存在不建库（负控 exists=False 且文件未产生）",
+                  miss.get("exists") is False and not nope.exists())
+
+            merged_s = load_pool()
+            h_on = render_html(merged_s, dbst={"exists": True, "courses": 3, "resources": 1,
+                                               "courses_with_res": 1, "haisou_seen": 2,
+                                               "pan_hits": 4, "candidates": 5, "fetch_runs": 1,
+                                               "built_at": "2026-10-06 10:00:00",
+                                               "top_courses": [{"course_id": "c1", "resources": 1}]})
+            check("T75 看板落库面板（计数/构建时间来自库统计）",
+                  "统一落库" in h_on and "courses 3" in h_on and "2026-10-06 10:00:00" in h_on)
+            h_none = render_html(merged_s, dbst={"exists": False})
+            check("T76 库未建显示「库未建」且不崩（负控）",
+                  "统一落库" in h_none and "库未建" in h_none)
+            h_off = render_html(merged_s)
+            check("T77 不传 dbst 时无落库面板（默认隔离）",
+                  "统一落库" not in h_off and len(h_off) > 200)
+
+            env_db = dict(os.environ, COURSE_DB=str(dbp))
+            rdb = subprocess.run([sys.executable, __file__, "db", "--db", str(dbp)],
+                                 capture_output=True, text=True, env=env_db)
+            check("T78 db 子命令真跑（rc=0 且打印 courses 计数）",
+                  rdb.returncode == 0 and "courses" in rdb.stdout and "platform.db" in rdb.stdout)
+            r3 = subprocess.run([sys.executable, __file__, "render", "--out", str(Path(td) / "c.html")],
+                                capture_output=True, text=True, env=env_db)
+            h3 = (Path(td) / "c.html").read_text(encoding="utf-8") if (Path(td) / "c.html").exists() else ""
+            r4 = subprocess.run([sys.executable, __file__, "render", "--no-db",
+                                 "--out", str(Path(td) / "d.html")],
+                                capture_output=True, text=True, env=env_db)
+            h4 = (Path(td) / "d.html").read_text(encoding="utf-8") if (Path(td) / "d.html").exists() else ""
+            check("T79 CLI render 带落库面板 / --no-db 隐藏（负控）",
+                  r3.returncode == 0 and "统一落库" in h3
+                  and r4.returncode == 0 and "统一落库" not in h4)
+
+            # ---- T80–T83 全量落库面（R553）：盘搜 raw 真形态（关键词字典）+ 四新表 ----
+            raw_dir = Path(td) / "panraw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            save_json(raw_dir / "raw_x.json", {
+                "AI 出海": [
+                    {"kw": "AI 出海", "title": "T1", "pan": "quark",
+                     "url": "https://pan.x/1", "code": "ab12",
+                     "datetime": "2026-10-06T12:00:00", "channel": "c",
+                     "note": "", "topic": "ai_overseas"},
+                    {"title": "T2", "pan": "baidu", "url": "https://pan.x/2"},
+                ],
+                "课程甲": [{"title": "T3", "pan": "quark", "url": "https://pan.x/3"}],
+            })
+            save_json(raw_dir / "raw_y.json", {          # 同 url 后写覆盖（去重口径）
+                "课程乙": [{"title": "T3 改", "pan": "quark", "url": "https://pan.x/3"}]})
+            save_json(Path(td) / "pan_seen.json",
+                      {"https://pan.x/1": "2026-10-06 12:00:00"})
+            save_json(Path(td) / "kw_pool.json",
+                      {"池词甲": {"added_at": "2026-10-06", "found": True,
+                                  "source_url": "https://a/1", "published_at": "p1"}})
+            save_json(Path(td) / "kw_qn.json",
+                      {"全能词": {"added_at": "2026-09-05", "found": False,
+                                  "source_url": "https://b/2", "published_at": "p2"}})
+            saved_g = {k: globals()[k] for k in
+                       ("PAN_RAW_GLOB", "PAN_SEEN", "WORDS_OUT", "MERGE_INTO")}
+            globals()["PAN_RAW_GLOB"] = str(raw_dir / "raw_*.json")
+            globals()["PAN_SEEN"] = Path(td) / "pan_seen.json"
+            globals()["WORDS_OUT"] = Path(td) / "kw_pool.json"
+            globals()["MERGE_INTO"] = Path(td) / "kw_qn.json"
+            try:
+                d3 = db_build(dbp)
+                check("T80 盘搜 raw 关键词字典形态可入表（字典键兜底 keyword）",
+                      d3.get("pan_hits") == 3 and d3.get("pan_seen") == 1)
+                con3 = sqlite3.connect("file:%s?mode=ro" % str(dbp), uri=True)
+                try:
+                    rows3 = con3.execute(
+                        "SELECT url,keyword,code,pan,channel,topic FROM pan_hits "
+                        "ORDER BY url").fetchall()
+                finally:
+                    con3.close()
+                check("T81 行字段齐全（keyword/code/pan/channel/topic 不丢）",
+                      len(rows3) == 3 and rows3[0][1] == "AI 出海"
+                      and rows3[0][2] == "ab12" and rows3[0][4] == "c"
+                      and rows3[0][5] == "ai_overseas" and rows3[1][1] == "AI 出海"
+                      and rows3[1][2] == "" and rows3[2][1] == "课程乙")
+                check("T82 重复 url 后写覆盖且总数=去重后（负控：不得重复计数）",
+                      d3.get("pan_hits") == 3)
+                check("T83 搜索词池/源注册落表（两池分列）",
+                      d3.get("keywords") == 2 and d3.get("sources", 0) >= 1
+                      and d3.get("schema_tables", 0) >= 11)
+            finally:
+                for k, v in saved_g.items():
+                    globals()[k] = v
         finally:
             if saved_fl is not None:
                 globals()["FETCH_LOG"] = saved_fl
+            globals()["POOL_PATH"], globals()["USER_PATH"] = saved_pu
+            globals()["DB_PATH"] = saved_db
 
+    check("T84 自测不写生产库（负控：生产 DB 指纹前后一致）",
+          _db_fp(prod_db) == prod_db_before)
     print(f"selftest: {ok} passed, {len(failed)} failed")
     for f in failed:
         print("  FAIL", f)
@@ -2021,6 +2192,314 @@ def load_fetch_log(path=None) -> dict | None:
     return d
 
 
+# ---------- 统一落库（platform.db） ----------
+# 口径：课程 × 网盘资源 × 采集台账 全部落到一张 SQLite（默认 temp/course_pool/platform.db，
+# build 幂等重建（写 .tmp 后原子替换），fetch/match 跑完自动重建；
+# 路径可用 env COURSE_DB 覆盖（自测沙箱走它，绝不碰生产库）。
+DB_PATH = Path(os.environ.get("COURSE_DB") or BASE / "temp/course_pool/platform.db")
+# 该落点在 .gitignore 内（temp/**）；env COURSE_DB 覆盖，自测/演练一律指沙箱。
+
+
+def _md5(s: str) -> str:
+    return hashlib.md5((s or "").encode("utf-8")).hexdigest()
+
+
+def db_build(db_path=None):
+    """从各数据面源幂等重建 platform.db。只读源、不回写源。返回计数 dict。
+
+    源 schema（实测）：
+      pool.json      : {version, updated_at, courses:[{id,source,title,url,students,...}]}
+      user_state.json: {courses:{cid:{status,star,...}}, resources:[{course_id,pan_url,title,via,found_at}]}
+      haisou_seen    : {url: {title, platform, seen_at, score, ...}}
+      pan raw_*.json : {关键词: [{kw,title,pan,url,code,datetime,channel,note,topic}]}
+                       或 [{...}] / {items:[...]}
+      pan_seen.json  : {url: 首见时间}
+      sources.json   : {sources:[{id,name,enabled,channel,kind,urls,...}]}
+      *_keywords.json: {词: {added_at,found,source_url,published_at,...}}
+      match_candidates.json: {..., matches:[{course_id,url,score,src,title}]}
+      fetch_log.json : 单次运行 {schema,ts,ts_str,fetched,sources:{...}} 或列表
+    """
+    db = Path(db_path) if db_path else DB_PATH
+    pool = load_pool()
+    user = load_user()
+    ucourses = user.get("courses") or {}
+
+    courses = [c for c in (pool.get("courses") or []) if isinstance(c, dict)]
+    resources = [r for r in (user.get("resources") or []) if isinstance(r, dict)]
+
+    seen = {}
+    if HAISOU_SEEN.exists():
+        try:
+            _s = json.loads(HAISOU_SEEN.read_text(encoding="utf-8"))
+            seen = _s if isinstance(_s, dict) else {}
+        except Exception:
+            seen = {}
+
+    hits = []
+    import glob as _glob
+    pat = str(PAN_RAW_GLOB)
+    raw_files = sorted(_glob.glob(pat if os.path.isabs(pat) else str(BASE / pat)))
+    for f in raw_files:
+        f = Path(f)
+        try:
+            j = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        rows = []
+        if isinstance(j, dict):
+            if isinstance(j.get("items"), list):
+                rows = j["items"]
+            else:                       # 真实形态：{关键词: [行, ...]}
+                for kw, arr in j.items():
+                    if not isinstance(arr, list):
+                        continue
+                    for it in arr:
+                        if isinstance(it, dict):
+                            it = dict(it)
+                            if not (it.get("kw") or it.get("keyword")):
+                                it["kw"] = str(kw)
+                            rows.append(it)
+        elif isinstance(j, list):
+            rows = j
+        for it in rows:
+            if isinstance(it, dict) and it.get("url"):
+                it = dict(it)
+                it["_src_file"] = f.name
+                hits.append(it)
+
+    pan_seen = {}
+    if PAN_SEEN.exists():
+        try:
+            _ps = json.loads(PAN_SEEN.read_text(encoding="utf-8"))
+            pan_seen = _ps if isinstance(_ps, dict) else {}
+        except Exception:
+            pan_seen = {}
+
+    srcs = []
+    try:
+        srcs = [x for x in (load_sources(create=False).get("sources") or [])
+                if isinstance(x, dict)]
+    except Exception:
+        srcs = []
+
+    kws = {}
+    for pool_name, path in (("pool", WORDS_OUT), ("quangneng", MERGE_INTO)):
+        try:
+            _k = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(_k, dict):
+            for w, v in _k.items():
+                v = v if isinstance(v, dict) else {}
+                kws[str(w)] = {"_pool": pool_name, "added_at": v.get("added_at"),
+                               "found": v.get("found"), "source_url": v.get("source_url"),
+                               "published_at": v.get("published_at")}
+
+    cand = []
+    if CAND_OUT.exists():
+        try:
+            _c = json.loads(CAND_OUT.read_text(encoding="utf-8"))
+        except Exception:
+            _c = None
+        if isinstance(_c, dict):
+            cand = [x for x in (_c.get("matches") or _c.get("all_matches") or [])
+                    if isinstance(x, dict)]
+        elif isinstance(_c, list):
+            cand = [x for x in _c if isinstance(x, dict)]
+
+    fl = []
+    if FETCH_LOG.exists():
+        try:
+            _f = json.loads(FETCH_LOG.read_text(encoding="utf-8"))
+        except Exception:
+            _f = None
+        if isinstance(_f, dict):
+            fl = [_f]
+        elif isinstance(_f, list):
+            fl = [x for x in _f if isinstance(x, dict)]
+
+    db.parent.mkdir(parents=True, exist_ok=True)
+    tmp = db.with_suffix(db.suffix + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    con = sqlite3.connect(str(tmp))
+    try:
+        con.executescript("""
+        CREATE TABLE courses(id TEXT PRIMARY KEY, source TEXT, title TEXT, url TEXT,
+          url_md5 TEXT, students INTEGER, star INTEGER, status TEXT, updated_at TEXT,
+          price REAL, level TEXT, category TEXT, first_seen TEXT, last_seen TEXT);
+        CREATE TABLE resources(course_id TEXT, kind TEXT, url TEXT, url_md5 TEXT,
+          title TEXT, via TEXT, src TEXT, found_at TEXT, PRIMARY KEY(course_id, url_md5));
+        CREATE TABLE haisou_seen(url TEXT PRIMARY KEY, title TEXT, platform TEXT,
+          seen_at TEXT, keywords TEXT, score REAL);
+        CREATE TABLE pan_hits(url TEXT PRIMARY KEY, title TEXT, platform TEXT,
+          keyword TEXT, src_file TEXT, found_at TEXT, code TEXT, channel TEXT,
+          pan TEXT, note TEXT, topic TEXT);
+        CREATE TABLE pan_seen(url TEXT PRIMARY KEY, first_seen TEXT);
+        CREATE TABLE sources(id TEXT PRIMARY KEY, name TEXT, enabled INTEGER,
+          channel TEXT, kind TEXT, urls TEXT, parser TEXT, note TEXT);
+        CREATE TABLE keywords(word TEXT PRIMARY KEY, pool TEXT, added_at TEXT,
+          found INTEGER, source_url TEXT, published_at TEXT);
+        CREATE TABLE candidates(course_id TEXT, url TEXT, url_md5 TEXT, score REAL,
+          src TEXT, title TEXT, PRIMARY KEY(course_id, url_md5));
+        CREATE TABLE fetch_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT,
+          fetched INTEGER, dry_run INTEGER, sources TEXT, raw TEXT);
+        CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+        """)
+        for c in courses:
+            u = c.get("url") or ""
+            cid = str(c.get("id") or "")
+            uc = ucourses.get(cid) or {}
+            star = uc.get("star", c.get("star", 0))
+            status = uc.get("status", c.get("status", ""))
+            con.execute("INSERT OR REPLACE INTO courses VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                cid, str(c.get("source") or ""), str(c.get("title") or ""), u, _md5(u),
+                int(c.get("students") or 0), int(star or 0), str(status or ""),
+                str(uc.get("updated_at") or c.get("last_seen") or ""),
+                float(c.get("price") or 0.0), str(c.get("level") or ""),
+                str(c.get("category") or ""), str(c.get("first_seen") or ""),
+                str(c.get("last_seen") or "")))
+        for r in resources:
+            u = r.get("pan_url") or r.get("url") or ""
+            con.execute("INSERT OR REPLACE INTO resources VALUES(?,?,?,?,?,?,?,?)", (
+                str(r.get("course_id") or ""), str(r.get("kind") or ""), u, _md5(u),
+                str(r.get("title") or ""), str(r.get("via") or ""),
+                str(r.get("src") or ""), str(r.get("found_at") or "")))
+        for u, it in seen.items():
+            it = it if isinstance(it, dict) else {}
+            kw = it.get("keywords")
+            con.execute("INSERT OR REPLACE INTO haisou_seen VALUES(?,?,?,?,?,?)", (
+                str(u), str(it.get("title") or ""), str(it.get("platform") or ""),
+                str(it.get("seen_at") or ""),
+                json.dumps(kw, ensure_ascii=False) if isinstance(kw, list) else str(kw or ""),
+                float(it.get("score") or 0.0)))
+        for h in hits:
+            u = h.get("url") or ""
+            con.execute(
+                "INSERT OR REPLACE INTO pan_hits VALUES(?,?,?,?,?,?,?,?,?,?,?)", (
+                    str(u), str(h.get("title") or ""),
+                    str(h.get("platform") or h.get("pan") or ""),
+                    str(h.get("keyword") or h.get("kw") or ""),
+                    str(h.get("_src_file") or ""),
+                    str(h.get("found_at") or h.get("datetime") or ""),
+                    str(h.get("code") or ""), str(h.get("channel") or ""),
+                    str(h.get("pan") or ""), str(h.get("note") or ""),
+                    str(h.get("topic") or "")))
+        for u, ts in pan_seen.items():
+            if isinstance(ts, dict):
+                ts = ts.get("first_seen") or ts.get("seen_at") or ""
+            con.execute("INSERT OR REPLACE INTO pan_seen VALUES(?,?)",
+                        (str(u), str(ts or "")))
+        for s in srcs:
+            con.execute("INSERT OR REPLACE INTO sources VALUES(?,?,?,?,?,?,?,?)", (
+                str(s.get("id") or ""), str(s.get("name") or ""),
+                1 if s.get("enabled", True) else 0,
+                json.dumps(s.get("channel") or [], ensure_ascii=False),
+                str(s.get("kind") or "course"),
+                json.dumps(s.get("urls") or [], ensure_ascii=False),
+                str(s.get("parser") or ""), str(s.get("note") or "")))
+        for w, v in kws.items():
+            con.execute("INSERT OR REPLACE INTO keywords VALUES(?,?,?,?,?,?)", (
+                w, str(v.get("_pool") or ""), str(v.get("added_at") or ""),
+                1 if v.get("found") else 0, str(v.get("source_url") or ""),
+                str(v.get("published_at") or "")))
+        for c in cand:
+            u = c.get("url") or ""
+            con.execute("INSERT OR REPLACE INTO candidates VALUES(?,?,?,?,?,?)", (
+                str(c.get("course_id") or ""), u, _md5(u),
+                float(c.get("score") or 0.0), str(c.get("src") or ""),
+                str(c.get("title") or "")))
+        for e in fl:
+            ts = str(e.get("ts_str") or e.get("ts") or "").strip()
+            if not ts:
+                continue
+            con.execute("INSERT OR REPLACE INTO fetch_runs(id,ts,fetched,dry_run,sources,raw) "
+                        "VALUES((SELECT id FROM fetch_runs WHERE ts=?),?,?,?,?,?)", (
+                            ts, ts, int(e.get("fetched") or e.get("total") or 0),
+                            1 if e.get("dry_run") else 0,
+                            json.dumps(e.get("sources") or {}, ensure_ascii=False),
+                            json.dumps(e, ensure_ascii=False)))
+        con.execute("INSERT OR REPLACE INTO meta VALUES('built_at',?)", (now(),))
+        con.execute("INSERT OR REPLACE INTO meta VALUES('schema',?)",
+                    ("course_platform/v2",))
+        con.commit()
+    finally:
+        con.close()
+    os.replace(str(tmp), str(db))
+    return db_stats(db)
+
+
+def db_stats(db_path=None):
+    """只读统计（不存在则 exists=False，不建库）。"""
+    db = Path(db_path) if db_path else DB_PATH
+    if not db.exists():
+        return {"db": str(db), "exists": False}
+    con = sqlite3.connect("file:%s?mode=ro" % str(db), uri=True)
+    try:
+        n = lambda q: con.execute(q).fetchone()[0]
+        tbls = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        nt = lambda t: n("SELECT COUNT(*) FROM %s" % t) if t in tbls else 0
+        out = {"db": str(db), "exists": True, "schema_tables": len(tbls),
+               "courses": n("SELECT COUNT(*) FROM courses"),
+               "resources": n("SELECT COUNT(*) FROM resources"),
+               "courses_with_res": n("SELECT COUNT(DISTINCT course_id) FROM resources"),
+               "haisou_seen": n("SELECT COUNT(*) FROM haisou_seen"),
+               "pan_hits": n("SELECT COUNT(*) FROM pan_hits"),
+               "candidates": n("SELECT COUNT(*) FROM candidates"),
+               "fetch_runs": n("SELECT COUNT(*) FROM fetch_runs"),
+               "sources": nt("sources"), "keywords": nt("keywords"),
+               "pan_seen": nt("pan_seen"),
+               "built_at": con.execute(
+                   "SELECT v FROM meta WHERE k='built_at'").fetchone()[0]}
+        return out
+    finally:
+        con.close()
+
+
+def cmd_db(db_path=None):
+    """`db` 子命令：重建并打印计数。"""
+    return db_build(db_path)
+
+
+def db_platform_overview():
+    """给看板用的落库总览（库不存在返回 exists=False，绝不建库）。"""
+    st = db_stats()
+    if not st.get("exists"):
+        return st
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % str(DB_PATH), uri=True)
+        try:
+            top = con.execute(
+                "SELECT course_id, COUNT(*) c FROM resources GROUP BY course_id "
+                "ORDER BY c DESC LIMIT 5").fetchall()
+            st["top_courses"] = [{"course_id": a, "resources": b} for a, b in top]
+            st["with_new"] = con.execute(
+                "SELECT COUNT(*) FROM courses WHERE updated_at <> ''").fetchone()[0]
+            tbls = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "pan_hits" in tbls:
+                st["pan_by_platform"] = [
+                    {"pan": a or "其他", "n": b} for a, b in con.execute(
+                        "SELECT pan, COUNT(*) c FROM pan_hits GROUP BY pan "
+                        "ORDER BY c DESC LIMIT 8").fetchall()]
+                st["pan_top_kw"] = [
+                    {"kw": a, "n": b} for a, b in con.execute(
+                        "SELECT keyword, COUNT(*) c FROM pan_hits WHERE keyword<>'' "
+                        "GROUP BY keyword ORDER BY c DESC LIMIT 8").fetchall()]
+            if "keywords" in tbls:
+                st["kw_pool"] = [{"pool": a or "?", "n": b} for a, b in con.execute(
+                    "SELECT pool, COUNT(*) FROM keywords GROUP BY pool").fetchall()]
+            if "sources" in tbls:
+                st["sources_on"] = con.execute(
+                    "SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
+        finally:
+            con.close()
+    except Exception as e:
+        st["overview_error"] = str(e)
+    return st
+
+
 def cmd_fetch(sid=None, max_urls=None, with_detail=False, dry_run=False,
               sleep=2.0, enabled_only=True):
     """按源抓取 → 解析 → 幂等入库。sid=None 表示抓所有启用源。"""
@@ -2049,6 +2528,11 @@ def cmd_fetch(sid=None, max_urls=None, with_detail=False, dry_run=False,
            "stale_urls": sum(len(v.get("stale_urls") or []) for v in info.values())}
     if log_path:
         out["fetch_log"] = str(log_path)
+    if not dry_run:
+        try:                       # 落库失败不阻断采集链路，只留痕
+            out["db"] = db_build()
+        except Exception as e:
+            out["db_error"] = str(e)
     return out
 
 
@@ -2070,6 +2554,9 @@ def main(argv=None) -> int:
     p.add_argument("--status", default="")
     p.add_argument("--source", default="")
     p.add_argument("--limit", type=int, default=30)
+
+    p = sub.add_parser("db", help="重建统一落库 platform.db 并打印计数")
+    p.add_argument("--db", default="", help="覆盖库路径（默认 %s）" % DB_PATH)
 
     p = sub.add_parser("star"); p.add_argument("course_id"); p.add_argument("n", type=int)
     p.add_argument("--note", default="")
@@ -2094,6 +2581,8 @@ def main(argv=None) -> int:
                    help=f"候选快照路径（默认 {CAND_OUT}；不存在则跳过面板）")
     p.add_argument("--no-candidates", dest="no_candidates", action="store_true",
                    help="不渲染「网盘命中候选」面板")
+    p.add_argument("--no-db", dest="no_db", action="store_true",
+                   help="不渲染「统一落库」面板（负控/隔离用）")
     p = sub.add_parser("sources", help="列出跨源采集注册表")
     p.add_argument("--json", dest="as_json", action="store_true")
 
@@ -2184,6 +2673,8 @@ def main(argv=None) -> int:
         else:
             target = Path(a.merge_into) if a.merge_into else MERGE_INTO
         _print(emit_words(a.limit, a.out or None, target)); return 0
+    if a.cmd == "db":
+        _print(cmd_db(a.db or None)); return 0
     if a.cmd == "star":
         _print(set_star(a.course_id, a.n, a.note)); return 0
     if a.cmd == "status":
@@ -2209,7 +2700,8 @@ def main(argv=None) -> int:
                                           explicit=bool(a.candidates))
         flock = None if a.no_fetch_log else load_fetch_log(
             Path(a.fetch_log) if a.fetch_log else FETCH_LOG)
-        html = render_html(merged, cands=cands, flock=flock)
+        dbst = None if a.no_db else db_platform_overview()
+        html = render_html(merged, cands=cands, flock=flock, dbst=dbst)
         out = Path(a.out) if a.out else DASH_OUT
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(html, encoding="utf-8")
@@ -2218,6 +2710,13 @@ def main(argv=None) -> int:
             res["candidates"] = len(cands.get("all_matches") or [])
         if warn:
             res["candidates_warn"] = warn
+        if dbst is not None:
+            res["db"] = {k: dbst.get(k) for k in ("exists", "schema_tables", "courses",
+                                                  "resources", "courses_with_res",
+                                                  "haisou_seen", "pan_hits", "pan_seen",
+                                                  "keywords", "sources", "candidates",
+                                                  "fetch_runs")
+                         if k in dbst}
         if flock is not None:
             res["fetch_log"] = {"ts": flock.get("ts_str"),
                                "sources": len(flock.get("sources") or {})}
