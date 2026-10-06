@@ -1,0 +1,7 @@
+{
+ "schedule": "11:45",
+ "repeat": "daily",
+ "enabled": true,
+ "max_delay_hours": 6,
+ "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n跑盘搜（PanSou 本机聚合，第二搜索源）每日增量，后台起、轮询收尾，脚本自己负责去重与增量推送：\n\n```python\nimport subprocess, sys, time\n# 步骤1：后台起（全量 15 词真跑约 20 分钟，不能用阻塞式 code_run）\nr1 = subprocess.run([sys.executable, \"tools/bg_task.py\", \"start\", \"--name\", \"pan_search_daily\", \"--\",\n                     sys.executable, \"tools/pan_search.py\", \"digest\", \"--topics\", \"all\",\n                     \"--max-per-kw\", \"8\", \"--days\", \"3\", \"--notify\"],\n                    text=True, capture_output=True, timeout=60)\nprint(r1.stdout, r1.stderr, \"start_rc=\", r1.returncode)\n\n# 步骤2：轮询（每次秒级返回；最多查 12 次，间隔用 sleep 30 只用于本步骤内部，勿长睡）\nfor i in range(12):\n    time.sleep(30)\n    st = subprocess.run([sys.executable, \"tools/bg_task.py\", \"status\", \"--name\", \"pan_search_daily\", \"--json\"],\n                        text=True, capture_output=True, timeout=30)\n    print(\"poll\", i, st.stdout[-400:])\n    if '\"running\": false' in st.stdout or '\"running\":false' in st.stdout:\n        break\n\n# 步骤3：看日志尾部与结果\nt = subprocess.run([sys.executable, \"tools/bg_task.py\", \"tail\", \"--name\", \"pan_search_daily\", \"--lines\", \"60\"],\n                   text=True, capture_output=True, timeout=30)\nprint(t.stdout)\n```\n\n完成后不要额外重复推送；脚本内部已按 URL 去重，仅在确有新增时才推送（飞书私信+钉钉群）。若本次无新增，属正常，日志里会打印「新增 0」。"
+}
