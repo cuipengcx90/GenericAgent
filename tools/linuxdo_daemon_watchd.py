@@ -24,6 +24,7 @@
 """
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -48,6 +49,8 @@ CHECK_INTERVAL = 60          # 巡检间隔（秒）
 STALL_S = 3 * 3600           # 活动窗内超过 3h 无浏览产出 ⇒ 判停滞（正常段间隔最长 ~40min + 长休）
 RESTART_MIN_GAP = 300        # 两次重启最小间隔（秒），防抖/防重启风暴
 NOTIFY_COOLDOWN_H = 6        # 同类告警冷却（小时）
+RESTART_RATE_PER_HOUR = 3    # 每小时重启上限（超限改「跳过」；防重启风暴，见 R545 缺陷①）
+BUSY_LOG_S = 20 * 60         # 环境忙信号回看窗口（秒）：daemon 日志近 N 分钟含忙标记 ⇒ 判 BLOCKED_ENV
 FAIL_STREAK_NOTIFY = 3       # 连续重启失败达 N 次 ⇒ 告警（并继续重试）
 DEFAULT_MAX_HOURS = 26.0     # 长驻上限；由每日入口重新武装（对齐 anyrouter watchd 模式）
 
@@ -73,10 +76,30 @@ def _log_event(kind, **kw):
     return rec
 
 
+def _reflect_scripts_dir(dirs=None):
+    """定位 GA 的 reflect_scripts 目录（reflect_common 的真身在此，非 tools/）。
+
+    ★2026-10-06 修：原实现只把 HERE(=tools/) 插进 sys.path ⇒ `import reflect_common`
+    恒 ModuleNotFoundError ⇒ 重启/恢复告警**静默丢失**（events 里全是 NOTIFY_FAIL，
+    用户侧什么都收不到，正是 R545 缺陷②「告警面呈健康而实际不可用」的同类）。
+    """
+    cands = dirs if dirs is not None else (os.path.join(ROOT, "reflect_scripts"),
+                                           os.path.join(HERE, "reflect_scripts"))
+    for cand in cands:
+        if os.path.isfile(os.path.join(cand, "reflect_common.py")):
+            return cand
+    return None
+
+
 def notify(text):
-    """飞书私信告警（复用 GA 既有通道；失败不致命）。"""
+    """飞书私信告警（复用 GA 既有通道；失败不致命，但必须留痕）。"""
+    rs = _reflect_scripts_dir()
+    if not rs:
+        _log_event("NOTIFY_FAIL", note="reflect_common_not_found")
+        return False
     try:
-        sys.path.insert(0, HERE)
+        if rs not in sys.path:
+            sys.path.insert(0, rs)
         from reflect_common import notify_feishu  # type: ignore
         notify_feishu(text)
         return True
@@ -150,6 +173,90 @@ def last_browse_ts(path=None):
     return None
 
 
+# 守护的其它「还在干活」痕迹（每一步 save_state / 等级检查都会刷新其 mtime）
+PROGRESS_FILES = (
+    os.path.join("temp", "linuxdo_browse_daemon", "state.json"),
+    os.path.join("temp", "linuxdo_browse_daemon", "level_log.jsonl"),
+)
+
+
+def _etime_seconds(s):
+    """解析 ps 的 etime：[[dd-]hh:]mm:ss / mm:ss ⇒ 秒；非法 ⇒ None。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    days = 0
+    if "-" in s:
+        d, s = s.split("-", 1)
+        try:
+            days = int(d)
+        except Exception:
+            return None
+    try:
+        nums = [int(x) for x in s.split(":")]
+    except Exception:
+        return None
+    if len(nums) == 3:
+        h, m, sec = nums
+    elif len(nums) == 2:
+        h, m, sec = 0, nums[0], nums[1]
+    else:
+        return None
+    return ((days * 24 + h) * 60 + m) * 60 + sec
+
+
+def daemon_started_ts(pids=None, now=None):
+    """守护进程启动时刻（epoch 秒）；多个 pid 取最早。读不到 ⇒ None。
+
+    ★冷启动保护用：browse_log 末条可能是**上一次会话**留下的（距今数小时），
+    只按它判停滞会把刚拉起 1 分钟的新进程当卡死再杀一次（R545 缺陷①现场复现）。
+    """
+    now = now if now is not None else _now()
+    pids = list(pids) if pids is not None else daemon_pids()
+    if not pids:
+        return None
+    try:
+        r = subprocess.run(["ps", "-o", "pid=,etime=", "-p", ",".join(str(p) for p in pids)],
+                           capture_output=True, text=True, timeout=20)
+        out = r.stdout
+    except Exception:
+        return None
+    best = None
+    for ln in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\S+)\s*$", ln)
+        if not m:
+            continue
+        secs = _etime_seconds(m.group(2))
+        if secs is None:
+            continue
+        st = now - secs
+        if best is None or st < best:
+            best = st
+    return best
+
+
+def last_progress_ts(browse_ts=None, root=None):
+    """多源「最近一次实质推进」时刻（epoch 秒）：browse_log 末条 ts × 进度文件 mtime，取最大。
+
+    ★为什么不能只看 browse_log：①冷启动时末条来自上一会话（可距今数小时）
+      ②单帖驻留期间只有**完成**才落一行（长驻留 JS 数分钟）⇒ 批内静默属正常
+    ⇒ 守护每推进一步都会刷新 state.json / level_log.jsonl，其 mtime 是更细的心跳。
+    """
+    root = root or ROOT
+    vals = []
+    bts = last_browse_ts() if browse_ts is None else browse_ts
+    if bts:
+        vals.append(float(bts))
+    for rel in PROGRESS_FILES:
+        p = os.path.join(root, rel)
+        try:
+            if os.path.exists(p):
+                vals.append(os.path.getmtime(p))
+        except Exception:
+            pass
+    return max(vals) if vals else None
+
+
 def quiet_now(now=None):
     """复用反检测内核的静默窗判定（不可用则 fail-open：返回 False）。"""
     try:
@@ -171,6 +278,61 @@ def spawn_daemon(bg=DEFAULT_BG, name=BG_NAME, cwd=ROOT, dry=False):
                 "err": (r.stderr or "").strip()[-200:]}
     except Exception as e:
         return {"rc": -1, "err": repr(e)[:200]}
+
+
+def browse_busy_hint(now=None):
+    """只读判「环境不可用」：daemon stdout 日志近 BUSY_LOG_S 秒内是否出现忙标记。
+
+    忙标记（R545 缺陷②所述 10.5h 零产出的两条真实原因）：
+      · RC_NO_SESSION_RETRY —— 浏览器无可用 linux.do 会话（外部前置）
+      · 前台跳过 / NO_FRONT —— 站点前台标签被占用/失焦
+      · 静默窗 —— 内核既定休息，不算坏（由 quiet_now 单独处理）
+    返回 (True, reason) / (False, "")
+    """
+    now = now if now is not None else _now()
+    cands = []
+    for pat in (os.path.join(ROOT, "temp", "bg_task", "*%s*.log" % BG_NAME),
+                os.path.join(ROOT, "temp", "**", "*linuxdo_browse*.log"),
+                os.path.join(ROOT, "logs", "*linuxdo_browse*.log")):
+        cands += glob.glob(pat, recursive=True)
+    marks = ("RC_NO_SESSION_RETRY", "NO_FRONT", "前台跳过", "no_session")
+    newest = None
+    for p in cands:
+        try:
+            m = os.path.getmtime(p)
+        except Exception:
+            continue
+        if now - m > BUSY_LOG_S * 3:            # 日志本身老旧 ⇒ 不作证据
+            continue
+        if newest is None or m > newest[1]:
+            newest = (p, m)
+    if not newest:
+        return (False, "")
+    path = newest[0]
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-65536, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            tail = f.read().decode("utf-8", "ignore").splitlines()
+    except Exception:
+        return (False, "")
+    # 只看近 BUSY_LOG_S 秒内的行（行格式 [YYYY-mm-dd HH:MM:SS] ...）
+    for ln in reversed(tail):
+        if not any(k in ln for k in marks):
+            continue
+        ts = None
+        if ln.startswith("[") and "]" in ln:
+            try:
+                ts = time.mktime(time.strptime(ln[1:ln.index("]")], "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                ts = None
+        if ts is None or (now - ts) <= BUSY_LOG_S:
+            for k in marks:
+                if k in ln:
+                    return (True, k)
+    return (False, "")
 
 
 # ---------------------------------------------------------------- 单实例锁
@@ -212,13 +374,18 @@ def release_lock(pid=None):
 def decide(snapshot):
     """纯函数：由只读快照给出本轮决策。
 
-    snapshot 键：pids(list) / last_done(ts|None) / now / quiet(bool) /
-                 last_restart_ts / fail_streak
-    返回 {action: 'OK'|'RESTART'|'RESTART_SKIP' , reason: str}
+    snapshot 键：pids(list) / last_done(ts|None) / started(ts|None) / now / quiet(bool) /
+                 last_restart_ts / fail_streak / busy_hint(bool) / busy_reason(str) /
+                 restart_times(list[ts])
+    返回 {action:'OK'|'RESTART'|'RESTART_SKIP'|'BLOCKED_ENV', reason:str}
+
+    ★心跳 = max(最近一次实质产出, 本进程启动时刻)：冷启动时 last_done 可能来自**上一次
+    会话**（数小时前）⇒ 只按它判会把刚拉起 1 分钟的新进程当卡死再杀（丢正在跑的那一帖）。
     """
     now = snapshot["now"]
     pids = snapshot.get("pids") or []
     last = snapshot.get("last_done")
+    started = float(snapshot.get("started") or 0)
     quiet = bool(snapshot.get("quiet"))
     lr = float(snapshot.get("last_restart_ts") or 0)
     cooldown_ok = (now - lr) >= RESTART_MIN_GAP
@@ -227,10 +394,18 @@ def decide(snapshot):
         if not cooldown_ok:
             return {"action": "RESTART_SKIP", "reason": "RESTART_COOLDOWN"}
         return {"action": "RESTART", "reason": "DAEMON_DEAD"}
-    if last is None:
+    hb = max([v for v in (last, started) if v]) if (last or started) else None
+    if hb is None:
         return {"action": "OK", "reason": "NO_LOG_YET"}
-    age = now - last
+    age = now - hb
     if age > STALL_S and not quiet:
+        if snapshot.get("busy_hint"):
+            # 停滞原因是**外部环境不可用**（无会话/前台被占）⇒ 重启无用，标 BLOCKED_ENV
+            return {"action": "BLOCKED_ENV",
+                    "reason": "ENV_BUSY_%s_%.0fs" % (snapshot.get("busy_reason") or "UNKNOWN", age)}
+        recent = [t for t in (snapshot.get("restart_times") or []) if t and (now - t) <= 3600]
+        if len(recent) >= RESTART_RATE_PER_HOUR:
+            return {"action": "RESTART_SKIP", "reason": "RESTART_RATELIMIT_%d/h" % len(recent)}
         if not cooldown_ok:
             return {"action": "RESTART_SKIP", "reason": "RESTART_COOLDOWN"}
         return {"action": "RESTART", "reason": "STALLED_%.0fs" % age}
@@ -273,21 +448,37 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None):
         snap.setdefault("fail_streak", rt.get("fail_streak") or 0)
         snap.setdefault("now", _now())
     else:
-        snap = {"pids": daemon_pids(), "last_done": last_browse_ts(), "now": _now(),
+        bh, bwhy = browse_busy_hint()
+        _pids = daemon_pids()
+        snap = {"pids": _pids, "last_done": last_progress_ts(),
+                "started": daemon_started_ts(_pids), "now": _now(),
                 "quiet": quiet_now(), "last_restart_ts": rt.get("last_restart_ts"),
-                "fail_streak": rt.get("fail_streak") or 0}
+                "fail_streak": rt.get("fail_streak") or 0,
+                "busy_hint": bh, "busy_reason": bwhy,
+                "restart_times": rt.get("restart_times") or []}
     d = decide(snap)
     _log_event("ROUND", action=d["action"], reason=d["reason"],
                n_pids=len(snap["pids"]), quiet=snap["quiet"],
                last=snap.get("last_done"))
+    if d["action"] == "BLOCKED_ENV":
+        last_n = float(rt.get("blocked_notified_ts") or 0)
+        if _now() - last_n >= NOTIFY_COOLDOWN_H * 3600:
+            notify_fn("⛔ L站浏览守护停滞=外部环境不可用（%s），看门狗**不重启**（重启无用）。"
+                      "请在浏览器保留一个已登录且前台的 linux.do 标签；恢复后我会自动继续。· %s"
+                      % (d["reason"], _ts()))
+            write_runtime({"blocked_notified_ts": _now()})
+        _log_event("BLOCKED_ENV", reason=d["reason"])
+        return dict(d, pids=snap["pids"])
     if d["action"] != "RESTART":
-        if d["action"] == "OK" and (rt.get("notified_down")):
+        if d["action"] == "OK" and (rt.get("notified_down") or rt.get("blocked_notified_ts")):
             notify_fn("✅ L站浏览守护已恢复（看门狗）· %s" % _ts())
-            write_runtime({"notified_down": False, "fail_streak": 0})
+            write_runtime({"notified_down": False, "blocked_notified_ts": 0, "fail_streak": 0})
         return dict(d, pids=snap["pids"])
     res = spawn(dry=dry)
     ok = (res.get("rc") == 0) or res.get("dry")
-    write_runtime({"last_restart_ts": _now(),
+    _rt_hist = [t for t in (rt.get("restart_times") or []) if t and (_now() - t) <= 3600]
+    _rt_hist.append(_now())
+    write_runtime({"restart_times": _rt_hist, "last_restart_ts": _now(),
                    "fail_streak": 0 if ok else (rt.get("fail_streak") or 0) + 1})
     _log_event("RESTART", reason=d["reason"], ok=bool(ok), res=res)
     if ok and not dry:
@@ -351,6 +542,8 @@ def cmd_status(args):
     out = {"watchd_pids": daemon_pids("linuxdo_daemon_watchd.py run"),
            "daemon_pids": daemon_pids(),
            "last_browse": _ts(last_browse_ts()) if last_browse_ts() else None,
+           "last_progress": _ts(last_progress_ts()) if last_progress_ts() else None,
+           "daemon_started": _ts(daemon_started_ts()) if daemon_started_ts() else None,
            "quiet_now": quiet_now(), "runtime": rt}
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0
@@ -479,6 +672,122 @@ def _selftest():
            "T17 status 进程不得自匹配为看门狗: %s" % (daemon_pids("linuxdo_daemon_watchd.py run"),))
     finally:
         globals()["_ps_lines"] = _orig_ps
+
+    # T18 停滞但环境忙（无会话/前台被占）⇒ BLOCKED_ENV（不重启，重启无用）
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+                "quiet": False, "last_restart_ts": 0,
+                "busy_hint": True, "busy_reason": "RC_NO_SESSION_RETRY"})
+    ck(d["action"] == "BLOCKED_ENV" and "ENV_BUSY_RC_NO_SESSION_RETRY" in d["reason"],
+       "T18 环境忙应判 BLOCKED_ENV: %s" % d)
+    # T18b 环境忙但静默窗 ⇒ 仍按静默窗处理（不误报）
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+                "quiet": True, "last_restart_ts": 0, "busy_hint": True, "busy_reason": "X"})
+    ck(d["action"] == "OK", "T18b 静默窗优先: %s" % d)
+    # T19 一小时内已重启 N 次 ⇒ RESTART_SKIP（防重启风暴，缺陷①）
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+                "quiet": False, "last_restart_ts": 0, "busy_hint": False,
+                "restart_times": [_now() - 60, _now() - 120, _now() - 180]})
+    ck(d["action"] == "RESTART_SKIP" and d["reason"].startswith("RESTART_RATELIMIT"),
+       "T19 超频应抑制: %s" % d)
+    # T19b 超一小时的旧重启不计入
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+                "quiet": False, "last_restart_ts": 0, "busy_hint": False,
+                "restart_times": [_now() - 3700, _now() - 7200, _now() - 10800]})
+    ck(d["action"] == "RESTART", "T19b 旧记录不应计入限速: %s" % d)
+    # T20 环境忙单轮：不 spawn、告警一次且带冷却
+    with tempfile.TemporaryDirectory() as td2:
+        STATE_DIR = os.path.join(td2, "watch"); EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")
+        LOCK = os.path.join(STATE_DIR, "watchd.lock")
+        c20 = {"spawn": 0, "notify": []}
+        sp = lambda dry=False: (c20.__setitem__("spawn", c20["spawn"] + 1) or {"rc": 0})
+        snap_busy = {"pids": [7], "last_done": _now() - STALL_S - 100, "quiet": False,
+                     "busy_hint": True, "busy_reason": "前台跳过"}
+        r = one_round(dry=False, spawn=sp, notify_fn=lambda t: c20["notify"].append(t), snapshot=dict(snap_busy))
+        ck(r["action"] == "BLOCKED_ENV" and c20["spawn"] == 0, "T20 环境忙不得重启: %s" % r)
+        ck(len(c20["notify"]) == 1 and "不重启" in c20["notify"][0], "T20b 应告警一次: %s" % c20["notify"])
+        one_round(dry=False, spawn=sp, notify_fn=lambda t: c20["notify"].append(t), snapshot=dict(snap_busy))
+        ck(len(c20["notify"]) == 1, "T20c 同类告警应冷却: %s" % c20["notify"])
+        # T21 环境恢复 ⇒ 发一次「已恢复」并清旗标
+        msgs21 = []
+        one_round(dry=False, spawn=sp, notify_fn=lambda t: msgs21.append(t),
+                  snapshot={"pids": [7], "last_done": _now() - 30, "quiet": False, "busy_hint": False})
+        ck(any("已恢复" in m for m in msgs21), "T21 恢复应通知: %s" % msgs21)
+        ck(not read_runtime().get("blocked_notified_ts"), "T21b 恢复应清零告警旗标")
+    STATE_DIR = os.path.join(ROOT, "temp", "linuxdo_watch")
+    EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")
+    LOCK = os.path.join(STATE_DIR, "watchd.lock")
+    # T22 busy 探针：真日志（近窗含忙标记）⇒ True；过期日志 / 无标记 ⇒ False
+    _o_root, _o_bg = globals()["ROOT"], globals()["BG_NAME"]
+    try:
+        with tempfile.TemporaryDirectory() as td3:
+            d3 = os.path.join(td3, "temp", "bg_task"); os.makedirs(d3, exist_ok=True)
+            globals()["ROOT"] = td3; globals()["BG_NAME"] = "zzprobe"
+            lp = os.path.join(d3, "zzprobe.log")
+            open(lp, "w", encoding="utf-8").write("[%s] RC_NO_SESSION_RETRY 无会话\n" % _ts())
+            bh, why = browse_busy_hint()
+            ck(bh and why == "RC_NO_SESSION_RETRY", "T22 近窗忙标记应命中: %s/%s" % (bh, why))
+            open(lp, "w", encoding="utf-8").write("[%s] all good, browsing\n" % _ts())
+            ck(browse_busy_hint()[0] is False, "T22b 无忙标记不得误报")
+            open(lp, "w", encoding="utf-8").write("[%s] RC_NO_SESSION_RETRY old\n"
+                                                  % _ts(_now() - BUSY_LOG_S * 5))
+            ck(browse_busy_hint()[0] is False, "T22c 过期忙标记不得计入")
+    finally:
+        globals()["ROOT"], globals()["BG_NAME"] = _o_root, _o_bg
+
+    # T23 冷启动不得误杀：browse_log 末条来自上一会话（很旧）但本进程刚起 ⇒ OK（R545 缺陷①）
+    d = decide({"pids": [123], "last_done": _now() - STALL_S * 3, "started": _now() - 60,
+                "now": _now(), "quiet": False, "last_restart_ts": 0})
+    ck(d["action"] == "OK" and d["reason"].startswith("ALIVE_FRESH"),
+       "T23 冷启动（进程刚起/旧末条）不得判停滞: %s" % d)
+    # T23b 启动即已在窗口内静默但未满一个窗口 ⇒ 仍 OK
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 5, "started": _now() - (STALL_S - 5),
+                "now": _now(), "quiet": False, "last_restart_ts": 0})
+    ck(d["action"] == "OK", "T23b 窗口未满不得重启: %s" % d)
+    # T24 进程起得够久且真无产出 ⇒ 仍判停滞（放宽不得吞掉真卡死）
+    d = decide({"pids": [123], "last_done": _now() - STALL_S * 2, "started": _now() - STALL_S * 2,
+                "now": _now(), "quiet": False, "last_restart_ts": 0})
+    ck(d["action"] == "RESTART" and d["reason"].startswith("STALLED"),
+       "T24 老进程真停滞仍须重启: %s" % d)
+    # T24b 无 started 字段（旧注入形态）⇒ 行为与修复前逐字一致
+    d = decide({"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+                "quiet": False, "last_restart_ts": 0})
+    ck(d["action"] == "RESTART" and d["reason"].startswith("STALLED"),
+       "T24b 无 started 时行为不变: %s" % d)
+    # T25 多源心跳：取 browse_log 末条与进度文件 mtime 的最大值
+    import tempfile as _tf
+    _tp = _tf.mkdtemp(prefix="ljqhb")
+    os.makedirs(os.path.join(_tp, "temp", "linuxdo_browse_daemon"), exist_ok=True)
+    sj = os.path.join(_tp, "temp", "linuxdo_browse_daemon", "state.json")
+    open(sj, "w").write("{}")
+    old_b = _now() - 10000
+    got = last_progress_ts(browse_ts=old_b, root=_tp)
+    ck(abs(got - os.path.getmtime(sj)) < 2, "T25 进度文件较新应取胜: %s" % got)
+    fut = _now() + 5000                                   # 比任何 mtime 都新的 browse 末条
+    ck(abs(last_progress_ts(browse_ts=fut, root=_tp) - fut) < 1,
+       "T25b browse_log 较新应取胜")
+    ck(last_progress_ts(browse_ts=0, root=_tp) is not None, "T25c 至少返回进度文件 mtime")
+    # T25d 两个来源都无 ⇒ None（不得伪造时间）；browse_ts=0 表示「无 browse 来源」
+    ck(last_progress_ts(browse_ts=0, root=_tf.mkdtemp(prefix="ljqhb2")) is None,
+       "T25d 无任何来源须 None")
+    # T26 etime 解析（ps 两格式 + 非法）
+    ck(_etime_seconds("06:39") == 399, "T26 mm:ss: %s" % _etime_seconds("06:39"))
+    ck(_etime_seconds("01:02:03") == 3723, "T26b hh:mm:ss")
+    ck(_etime_seconds("2-01:00:00") == 176400, "T26c dd-hh:mm:ss")
+    ck(_etime_seconds("oops") is None, "T26d 非法须 None")
+
+    # ---- T26 通知通道：必须解析到 reflect_scripts/reflect_common.py 且真能 import
+    _rs = _reflect_scripts_dir()
+    ck(bool(_rs) and os.path.isfile(os.path.join(_rs, "reflect_common.py")),
+       "T26 须解析到 reflect_scripts (reflect_common.py 存在)")
+    if _rs:
+        _r = subprocess.run([sys.executable, "-c",
+                             "import sys;sys.path.insert(0,%r);import reflect_common;print('OK')" % _rs],
+                            capture_output=True, text=True, timeout=60)
+        ck(_r.returncode == 0 and "OK" in _r.stdout,
+           "T26b reflect_common 须可 import（否则告警静默丢失）")
+    # 负控：把候选目录指向空目录 ⇒ 必须返回 None（不得伪造通道）
+    _tf26 = _tf.mkdtemp(prefix="ljqnotify")      # 负控：候选目录里没有 reflect_common.py ⇒ None
+    ck(_reflect_scripts_dir([_tf26]) is None, "T26c 负控：空候选目录须返回 None")
 
     print("selftest: %d checks, %d failed" % (checks, len(fails)))
     for f in fails:

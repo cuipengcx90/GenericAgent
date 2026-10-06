@@ -91,7 +91,6 @@ RC_OK, RC_GAPS, RC_NO_SESSION, RC_UNJUDGEABLE, RC_USAGE, RC_SELFTEST = 0, 1, 2, 
 # 防检测参数（后台版）——2026-10-05 二轮：日上限 120→160(每日±20 抖动) + 帖内节奏放慢
 GAP_RANGE = (110, 260)
 GAP_LONG_RANGE = (300, 600)
-GAP_LONG_P = 0.30
 SCROLL_STEPS = (22, 30)      # 慢滚多步：步长<半楼 ⇒ 每楼≥2个 tick 覆盖
 SCROLL_DT = (1.4, 2.0)
 SCROLL_AMP = (300, 440)
@@ -145,7 +144,7 @@ CONNECT_ITEM_MAP = (
     (4, 30, "点赞"),
     (5, 20, "获赞"),
 )
-INTER_BATCH_GAP = (420, 900)
+BATCH_GAP_MULT = 1.5                    # 批间休息 = 内核 gap_long 档 ×1.5（同一来源的批级放大）
 SESS_RETRY_MAX = 6                      # pick_session/判级连续失败达上限才退出（断链重试≈1h+）
 SESS_RETRY_SLEEP = (600, 1200)          # 断链重试间隔 10–20min
 FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
@@ -169,6 +168,44 @@ RISK_TEXT_HINTS = (
 RISK_STRONG = ("BANNED", "RATE_LIMIT", "FORBIDDEN", "LOGIN_REQUIRED")
 REST_DAY_P = 1.0 / 7.0           # 随机休息日：平均每周 1 天完全不浏览（降总量+拟人）
 REST_MIN_GAP_DAYS = 3            # 两次休息日至少间隔 3 天（不连休）
+
+# ---- 内核单一源（2026-10-06 R546，修 R545 缺陷③）--------------------------------
+# 节奏参数一律以 linuxdo_antidetect.profile("browse") 为**唯一来源**：daemon 不再自带
+# 第二份常量（旧实现里 GAP_LONG_RANGE/GAP_LONG_P 只被自测断言引用＝死常量，实际节奏
+# 与内核漂移不自知）。内核缺席时保留上面的本地默认值（fail-safe，绝不静默改行为）。
+if _ad is not None:
+    try:
+        _P = _ad.profile("browse")
+        GAP_RANGE = tuple(_P["gap"])
+        GAP_LONG_RANGE = tuple(_P["gap_long"])
+        DAILY_CAP_DEFAULT = int(_P["daily_cap"])
+        DAILY_CAP_JITTER = int(_P["cap_jitter"])
+        MORNING_JITTER = tuple(_P["morning_jitter"])
+        QUIET_WINDOW = tuple(_P["quiet"])
+        REST_DAY_P = float(_P["rest_p"])
+        REST_MIN_GAP_DAYS = int(_P["rest_min_gap"])
+        SEG_N = tuple(_P["seg_n"])
+        SEG_LEN = tuple(_P["seg_len"])
+    except Exception as _e:                 # 内核结构变了 ⇒ 明示，不静默
+        print("[warn] antidetect profile 读取失败，沿用本地默认节奏: %s" % _e, flush=True)
+
+
+def _batch_gap():
+    """批间休息（秒）：内核长休档（gap_long）×BATCH_GAP_MULT，保持「同一随机内核」单一源。
+
+    R545 缺陷③：旧实现自持 INTER_BATCH_GAP=(420,900) 第二份常量，与内核漂移不自知。
+    内核缺席时回落到本地 GAP_LONG_RANGE（同为内核实测值的镜像，非另立口径）。
+    """
+    rng_lo_hi = None
+    if _ad is not None:
+        try:
+            lo, hi = _ad.profile("browse")["gap_long"]
+            if hi > lo:
+                rng_lo_hi = (lo, hi)
+        except Exception:
+            rng_lo_hi = None
+    lo, hi = rng_lo_hi or tuple(GAP_LONG_RANGE)
+    return round(random.uniform(lo, hi) * BATCH_GAP_MULT, 1)
 
 
 def _bridge(payload, timeout=90):
@@ -292,6 +329,7 @@ def load_state():
     st.setdefault("browsed_total", 0)
     st.setdefault("rest_days", {})
     st.setdefault("pending_acts", {})       # 等级缺项排队的回帖/点赞（由 acts 随机节奏消费）
+    st.setdefault("level_skip", 0)          # 等级检查「节流轮次」计数（≠真实检查次数，见 R545 缺陷④）
     return st
 
 
@@ -397,6 +435,29 @@ def handle_risk(st, kind, detail=""):
     print("[%s] 风控信号 %s → 暂停 %.0f 分钟" % (now_str(), kind, pause / 60), flush=True)
     time.sleep(pause)
     return True
+
+
+_SEG_CACHE = {"day": None, "segs": None}
+
+
+def _day_segments_cached(day=None):
+    """当日活动段表（内核确定性派生，按天缓存）——重启安全。
+
+    返回 None 表示内核缺席（调用方回落旧行为）。同一天内重复调用结果逐字一致；
+    跨天自动重算。缓存只在内存，不落盘（段表本身由 day seed 决定，无需持久化）。
+    """
+    if _ad is None:
+        return None
+    d = day or today()
+    if _SEG_CACHE.get("day") == d and _SEG_CACHE.get("segs") is not None:
+        return _SEG_CACHE["segs"]
+    try:
+        segs = _ad.day_segments(d, "browse")
+    except Exception as e:
+        print("[warn] day_segments 失败，回落旧段计时: %s" % e, flush=True)
+        return None
+    _SEG_CACHE["day"], _SEG_CACHE["segs"] = d, segs
+    return segs
 
 
 def rest_day_today(st):
@@ -1151,7 +1212,8 @@ def browse_batch(session, st, batch=25):
         else:
             skipped += 1
         # 帖间随机间隔（防检测核心）：统一走 humanize，含 25-35% 长休
-        time.sleep(hu.action_gap("browse", base=random.uniform(*GAP_RANGE)))
+        _base_gap = _ad.gap_seconds("browse") if _ad is not None else random.uniform(*GAP_RANGE)
+        time.sleep(hu.action_gap("browse", base=_base_gap))
     return done, skipped
 
 
@@ -1162,7 +1224,7 @@ def now_str():
 # ---------------------------------------------------------------- watch
 def watch(args):
     st = load_state()
-    start = time.time()
+    start = time.time()     # 仅作 _ad 缺席时的兜底计时（有内核时按当日段表驱动，见下）
     sess_fails = 0      # pick_session 连续失败（断链重试）
     lvl_fails = 0       # check_level 连续失败
     front_none = 0      # 前台探测连续失败
@@ -1204,10 +1266,12 @@ def watch(args):
         if level_check_due(st):
             lvl, src = check_level(session)
         else:
-            lvl = {"pending": int(st["level"].get("pending") or 1), "met": st["level"].get("met")}
+            _prev = st.get("level") or {}
+            lvl = {"pending": int(_prev.get("pending") or 1), "met": _prev.get("met")}
             src = "throttled"
-            print("[%s] 等级前置检查节流中（下次 %s），沿用上次判定 pending=%s 继续补足" % (
-                now_str(), _ts_str(st.get("level_next_ts")), lvl["pending"]), flush=True)
+            print("[%s] 等级前置检查节流中（下次 %s），沿用上次判定 pending=%s 继续补足（本日节流 %d 次）" % (
+                now_str(), _ts_str(st.get("level_next_ts")), lvl["pending"],
+                int(st.get("level_skip") or 0)), flush=True)
             lvl_fails = 0
         if lvl is None:
             m = re.search(r"\[risk=([A-Z_]+)\]", src or "")
@@ -1226,11 +1290,18 @@ def watch(args):
             time.sleep(random.uniform(*SESS_RETRY_SLEEP))
             continue
         lvl_fails = 0
-        log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "OK", "source": src,
-                                      "met": lvl.get("met"), "pending": lvl.get("pending"), "items": lvl.get("items")})
-        st["level"] = {"ts": now_str(), "met": lvl.get("met"), "pending": lvl.get("pending")}
-        level_check_mark(st)
-        save_state(st)
+        if src == "throttled":
+            # 节流轮次只是「沿用上次判定继续补足」，**不是一次真实等级检查**：
+            # 旧实现照样写 level_log / 刷 st["level"].ts / 推进 level_check_mark ⇒ 台账被每 301s 的
+            # 节流行污染、检查频次不可取证（R545 缺陷④）。改为只计 level_skip。
+            st["level_skip"] = int(st.get("level_skip") or 0) + 1
+            save_state(st)
+        else:
+            log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "OK", "source": src,
+                                          "met": lvl.get("met"), "pending": lvl.get("pending"), "items": lvl.get("items")})
+            st["level"] = {"ts": now_str(), "met": lvl.get("met"), "pending": lvl.get("pending")}
+            level_check_mark(st)
+            save_state(st)
         if lvl.get("pending", 99) == 0:
             print("[%s] ✓ TL3 已满足（pending=0），守护自然退出" % now_str(), flush=True)
             return RC_OK
@@ -1261,7 +1332,18 @@ def watch(args):
                                     for k in ("reply", "like", "post")}), flush=True)
             time.sleep(3600)
             continue
-        if (time.time() - start) / 60 >= args.max_session_min:
+        # ---- 段级节奏（2026-10-06 R546，修 R545 缺陷①）--------------------------------
+        # 当日活动段由内核按「日期种子」确定性派生（day_segments）：守护重启/被杀不重置段位，
+        # 段外一律等（不再有「段满才休息」的进程内计时器——旧实现在 9h20m 内被守护重启 35 次，
+        # 段满事件几乎永不发生，长休档形同虚设）。内核缺席时回落旧行为。
+        _segs = _day_segments_cached()
+        if _segs:
+            if not _ad.in_segment(time.time(), _segs):
+                _w = max(60.0, min(float(_ad.wait_hint(time.time(), _segs)), 1800.0))
+                print("[%s] 段间空档（当日 %d 段），等 %.0fmin 进下一段" % (now_str(), len(_segs), _w / 60), flush=True)
+                time.sleep(_w)
+                continue
+        elif (time.time() - start) / 60 >= args.max_session_min:
             rest = random.uniform(*SESSION_REST)
             print("[%s] 单段运行满 %.0fmin，休息 %.0fmin" % (now_str(), args.max_session_min, rest / 60), flush=True)
             time.sleep(rest)
@@ -1300,7 +1382,7 @@ def watch(args):
         if done == 0 and skipped == 0:
             print("[%s] 无可用候选（候选全重/接口异常），睡 10min 重试" % now_str(), flush=True)
             time.sleep(600)
-        gap = random.uniform(*INTER_BATCH_GAP)
+        gap = _batch_gap()
         print("[%s] 批间休 %.0fs" % (now_str(), gap), flush=True)
         time.sleep(gap)
 
@@ -1553,7 +1635,7 @@ def _selftest_impl():
         globals()["_ad"] = _keep
     cases += 1
     # T6 防检测参数齐全
-    for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "INTER_BATCH_GAP", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):
+    for name in ("GAP_RANGE", "SCROLL_STEPS", "LOITER_P_LIST", "QUIET_WINDOW", "BATCH_GAP_MULT", "LIGHT_P", "LIGHT_STEPS", "LIGHT_DWELL", "SESS_RETRY_MAX", "SESS_RETRY_SLEEP", "FRONT_NONE_TOLERANCE", "FRONT_JS"):
         v = globals().get(name)
         if not v:
             fails.append("T6 %s 缺失" % name)
@@ -1658,6 +1740,100 @@ def _selftest_impl():
         fails.append("T13 最小间隔未生效（可连休）")
     if not (0 < REST_DAY_P <= 0.5 and REST_MIN_GAP_DAYS >= 2):
         fails.append("T13 休息日常量边界错")
+    # T15 段计时持久化：当日段表由内核按日期确定性派生（守护重启/被杀不重置段位，R545 缺陷①）
+    if _ad is None:
+        fails.append("T15 内核缺失：无法保证段计时持久化（回退旧行为）")
+    else:
+        segs = _day_segments_cached("2026-10-06")
+        _SEG_CACHE["day"], _SEG_CACHE["segs"] = None, None      # 模拟「重启」：缓存全丢
+        segs2 = _day_segments_cached("2026-10-06")
+        if not segs or segs != segs2:
+            fails.append("T15 段表不确定（重启后段位会变）: %s vs %s" % (segs, segs2))
+        # 结构判据（内核口径：段是 dict{start,end,minutes}）：
+        def _bad_seg(ss):
+            out = []
+            for i, s in enumerate(ss):
+                if not (s.get("start") and s.get("end") and s["start"] < s["end"]):
+                    out.append(i)
+                elif i and not (ss[i - 1]["end"] <= s["start"]):
+                    out.append(i)
+            return out
+        bad = _bad_seg(segs or [])
+        if bad:
+            fails.append("T15b 段表结构异常（乱序/重叠/零长）: %s" % ([segs[i] for i in bad][:2],))
+        # 段内 ⇒ in_segment True；段外 ⇒ False 且 wait_hint>0（段间空档靠等待，等价于「重启不重置段位」）
+        if segs:
+            mid = (segs[0]["start"] + segs[0]["end"]) / 2.0
+            ok_in, end_in = _ad.in_segment(mid, segs)
+            if not ok_in:
+                fails.append("T15c 段中点应判在段内")
+            outside = segs[-1]["end"] + 60
+            ok_out, _ = _ad.in_segment(outside, segs)
+            if ok_out:
+                fails.append("T15d 段外应判不在段内")
+            else:
+                w, why = _ad.wait_hint(outside, segs)
+                if not (w > 0):
+                    fails.append("T15e 段外 wait_hint 应为正: %s" % why)
+        # 跨天不重排（同日稳定 + 不同日一般不同），且每个段都在静默窗外 [07:30, 23:59)
+        other = _day_segments_cached("2026-10-07")
+        if (not other) or [_bad_seg(segs), _bad_seg(other)] != [[], []]:
+            fails.append("T15f 相邻日段表不可用/结构异常")
+    cases += 1
+    # T16 节奏参数单一源：daemon 不得自带第二份常量（R545 缺陷③：死常量+漂移不自知）
+    if _ad is not None:
+        try:
+            _pf = _ad.profile("browse")
+            pairs = [("gap", GAP_RANGE), ("gap_long", GAP_LONG_RANGE),
+                     ("daily_cap", DAILY_CAP_DEFAULT), ("cap_jitter", DAILY_CAP_JITTER),
+                     ("morning_jitter", MORNING_JITTER), ("quiet", QUIET_WINDOW),
+                     ("rest_p", REST_DAY_P), ("rest_min_gap", REST_MIN_GAP_DAYS)]
+            drift = [(k, v, _pf.get(k)) for k, v in pairs if _pf.get(k) != v]
+            if drift:
+                fails.append("T16 节奏常量与内核漂移: %s" % drift)
+        except Exception as e:
+            fails.append("T16 内核 profile 不可读: %s" % e)
+    cases += 1
+    # T16b 批间休=内核单一源（R545 缺陷③续）：取值必须落在 内核 gap_long×MULT 内，且
+    # 内核缺席时回落本地镜像区间；两态都不许出现「第二份常量」形态的固定区间。
+    try:
+        gs = [_batch_gap() for _ in range(60)]
+        if _ad is not None:
+            _lo, _hi = _ad.profile("browse")["gap_long"]
+            _exp = (_lo * BATCH_GAP_MULT, _hi * BATCH_GAP_MULT)
+        else:
+            _exp = (GAP_LONG_RANGE[0] * BATCH_GAP_MULT, GAP_LONG_RANGE[1] * BATCH_GAP_MULT)
+        if any((g < _exp[0] - 0.05) or (g > _exp[1] + 0.05) for g in gs):
+            fails.append("T16b 批间休越出内核 gap_long×MULT: %s" % (sorted(set(gs))[:3],))
+        if len(set(gs)) < 3:
+            fails.append("T16b 批间休取值退化为常量: %s" % (sorted(set(gs))[:3],))
+    except Exception as e:
+        fails.append("T16b 批间休计算异常: %s" % e)
+    cases += 1
+    # T17 节流行不得污染等级台账（R545 缺陷④）：throttled 分支只计 level_skip，不写 level_log/不刷 ts
+    _src = open(os.path.abspath(__file__), encoding="utf-8").read()
+    # 自指坑：本用例自身若含完整字面量会被算作「第二处」，故分片拼接（NC 自证）
+    _mark = "if src == " + chr(34) + "throttled" + chr(34) + ":"
+    if _src.count(_mark) != 1:
+        fails.append("T17 节流分支定位失败（命中 %d 次）" % _src.count(_mark))
+    else:
+        _lines = _src.split("\n")
+        _i = [k for k, l in enumerate(_lines) if l.strip() == _mark][0]
+        _base = len(_lines[_i]) - len(_lines[_i].lstrip())
+        _body = []
+        for _l in _lines[_i + 1:]:
+            if _l.strip() and (len(_l) - len(_l.lstrip())) <= _base:
+                break
+            _body.append(_l)
+        # 只判代码：注释里复述旧行为（"旧实现照样写 level_log"）不算写入点
+        _code = "\n".join(l for l in _body if not l.strip().startswith("#"))
+        if "log_jsonl(" in _code or "level_check_mark(" in _code or ('st["level"] =' in _code):
+            fails.append("T17 节流分支仍在写等级台账/刷 ts（污染检查频次口径）")
+        if ("level" + "_skip") not in _code:
+            fails.append("T17 节流分支未计 level_skip")
+        if ("level" + "_log.jsonl") not in _src:
+            fails.append("T17 台账写入点整体消失（过度删除）")
+    cases += 1
     return fails, cases
 
 
