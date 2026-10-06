@@ -69,3 +69,16 @@ P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；�
 - 相似度：标题归一（`norm_title`：去噪声词/平台前缀/符号，ASCII 词边界）后 `title_score`（token 覆盖 + 序列比）≥ `min_score` 才收；同课程同 URL 去重。
 - 入库口径：**只补空缺**（课程已有 resources 默认跳过）；`--include-found` 才走 (cid,url) 去重路径。
 - 坏库 must-fail：命中库不可读/结构非 dict ⇒ 抛错，绝不静默当空（否则得「今天无命中」假结论）。
+
+### 8.1 候选面板（干跑结果上看板，只预览不落库）
+
+- 快照：`match --json-out <路径>` 写**全量**候选（`schema=course_match_candidates/v1`，键 `all_matches` 为全量、`matches` 仅前 `--limit` 条）；默认落点 `temp/course_pool/match_candidates.json`（`COURSE_CAND_OUT` 可改）。
+- 上板：`render` 默认读该默认快照，存在即渲染「网盘命中候选」节（chip：`共 N` / `快照 <ts>` / `min_score`，正文行数 = `all_matches` 条数，最多 `CAND_BOARD_LIMIT=200` 条）。
+- 只预览：面板自带「**尚未挂载**」提示，写 `resources[]` 须显式 `match --apply`（阈值 `--min-score` 待人工确认）。
+- fail-loud 边界：默认路径缺失/坏文件 ⇒ 静默降级（不上板 + 提示）；**显式** `--candidates <路径>` 缺失/坏 ⇒ 直接抛错，绝不把坏路径当「没有候选」。
+
+### 8.2 看板访问（8899）
+
+- 8899 的服务根目录是 `archive/`（output-archive 站的 `http.server --directory archive`）⇒ 课程看板的正确 URL 是 **`http://127.0.0.1:8899/courses/index.html`**；访问裸 `/` 会拿到另一个站（约 6.9MB、无 `网盘命中候选`），据此判「面板没上」= **假阴性**。
+- 本机 curl 须 `--noproxy "*"`（Clash 接管会返 400/挑战页）；LAN 访问用当前真实 IP（`ifconfig` 取，IP 会变，旧 IP 恒 400）。
+- 判「服务在跑」仍以 pid + 启动命令行核对（历史上有闲置脚本劫持回环 8899 的先例）。
