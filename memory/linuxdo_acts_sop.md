@@ -133,9 +133,9 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 
 R546 修好了「重启风暴」与「长休不可达」，但事后**看不见**两件事：今天到底按段跑了几段、长休有没有发生；以及守护到底重启过几次、最近一次为什么。这两件都是纯只读视图，**不改任何节奏参数、不发站点请求**：
 
-- `python3 tools/linuxdo_browse_daemon.py status` 新增 `segments` 块：`segment_index`（今天第几段）/`segment_start`/`segment_end`/`consumed_in_segment`（本段已消费几个动作）/`theoretical_segments` 与 `actual_segments`（理论段数 vs 台账里真实出现的段数）/`long_rest_happened`（当日是否发生 `SESSION_REST`）。判据=段位由内核 `day_segments(day, kind)` 日期种子派生 ⇒ **同日重启后段位不变**（视图里能直接看出「重启没重置节律」）。
-- `python3 tools/linuxdo_daemon_watchd.py status` 新增 `restarts` 块：`restarts_total`/`restarts_today`/`restarts_ok`/`restarts_failed`/`restarts_last_hour`/`last_restart{ts,reason,ok}`/`rate_limit_per_hour`。判据=逐条重算自 `temp/linuxdo_watch/watchd.jsonl`，**不依赖运行期计数器** ⇒ 守护重启后历史计数不丢。
-- ★口径两条：①段级视图只统计**当日**且只认 `DONE` 行的**真实时间戳**（非 DONE / 坏时间戳 / 昨天的行一律不计）；②重启视图把「非 DONE 事件」与「OK 事件」分列，`restarts_failed` 是**判据档**不是「异常档」——重启失败率高（如 R546 修复前的 41/4）恰是风暴证据，修好之后该值应停止增长。
+- `python3 tools/linuxdo_browse_daemon.py status` 新增 `segments` 块（字段名以实测输出为准）：`theoretical`（今天理论几段）/`current_index`（现在第几段，1-based；段间空档为 `null`）/`current_window`（`[起HH:MM, 止HH:MM, 段长分钟]`）/`next_segment`（空档时下一段起点）/`browsed_in_segment`（本段内已浏览帖数）/`segments_seen` 与 `segments_seen_idx`（今天**实际**进过的段数/段号，与 `theoretical` 对照即知节律是否真按段走）/`rests_n`·`rests_long_n`·`rests[{from,to,minutes,long}]`（相邻帖间隔 ≥15min 的休息，`long=true` 即真长休 `SESSION_REST`）。判据=段位由内核 `day_segments(day, kind)` 日期种子派生 ⇒ **同日重启后段位不变**（视图里能直接看出「重启没重置节律」）。
+- `python3 tools/linuxdo_daemon_watchd.py status` 新增 `restarts` 块：`restarts_total`/`restarts_today`/`restarts_ok`/`restarts_failed`/`restarts_last_hour`（近一小时，对照上限 `rate_limit_per_hour`）/`last_restart{ts,reason,ok}`（最近一次的**时间与原因**，如 `STALLED_39527s`）/`last_start`。判据=逐条重算自 `temp/linuxdo_watch/watchd.jsonl`，**不依赖运行期计数器** ⇒ 守护重启后历史计数不丢。
+- ★口径两条：①段级视图只统计**当日**且只认 `DONE` 行的**真实时间戳**（非 DONE / 坏时间戳 / 昨天的行一律不计）；②重启视图里的 `restarts_ok`（真的把子进程拉起来）与 `restarts_failed`（如 `HOLD_BUSY` 让位）分列——`restarts_failed` 是**判据档**不是「异常档」：重启风暴期的 41/4 恰是风暴证据（R545 缺陷①的量化面），修好之后该值应停止增长。
 - ★负控：缺台账/空台账 ⇒ 计数 0 且带 `note`，绝不伪造；内核缺席 ⇒ 段级视图返 `null`+note（自测 T18 四组、watchd T27 两组）。
 
 ## 十、历史坑（禁再犯）
