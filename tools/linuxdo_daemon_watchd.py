@@ -64,6 +64,14 @@ def _ts(t=None):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t if t is not None else _now()))
 
 
+def _parse_ev_ts(s):
+    """台账时间戳 → epoch（坏值返回 None，绝不抛）。"""
+    try:
+        return time.mktime(time.strptime(str(s), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
 def _log_event(kind, **kw):
     rec = {"ts": _ts(), "kind": kind}
     rec.update(kw)
@@ -537,6 +545,56 @@ def cmd_ensure(args):
     return 0
 
 
+def restart_audit(now=None):
+    """重启审计视图（R546 遗留建议 #7，只读派生）。
+
+    动机：R545 缺陷①（9h20m 内重启 41 次）当时只能靠翻 watchd.jsonl 手工数；本视图把
+    「今日重启几次 / 累计 / 最近一次与原因 / 近一小时次数（对照 RESTART_RATE_PER_HOUR 上限）」
+    变成 status 里一眼可读的数。只读本地台账，零站点请求，不改任何判据与节奏。
+    """
+    nowt = _now() if now is None else float(now)
+    day = time.strftime("%Y-%m-%d", time.localtime(nowt))
+    out = {"restarts_total": 0, "restarts_today": 0, "restarts_ok": 0,
+           "restarts_failed": 0, "restarts_last_hour": 0, "last_restart": None,
+           "last_start": None, "rate_limit_per_hour": RESTART_RATE_PER_HOUR,
+           "note": None}
+    try:
+        if not os.path.exists(EVENTS):
+            out["note"] = "no_events_file"
+            return out
+        with open(EVENTS, encoding="utf-8") as f:
+            lines = f.readlines()[-20000:]
+    except Exception as e:
+        out["note"] = "events_unreadable:%s" % e
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        kind = rec.get("kind")
+        if kind == "RESTART":
+            out["restarts_total"] += 1
+            if rec.get("ok"):
+                out["restarts_ok"] += 1
+            else:
+                out["restarts_failed"] += 1
+            t = _parse_ev_ts(rec.get("ts"))
+            if t is not None:
+                if time.strftime("%Y-%m-%d", time.localtime(t)) == day:
+                    out["restarts_today"] += 1
+                if 0 <= (nowt - t) <= 3600:
+                    out["restarts_last_hour"] += 1
+            out["last_restart"] = {"ts": rec.get("ts"), "reason": rec.get("reason"),
+                                   "ok": rec.get("ok")}
+        elif kind == "START":
+            out["last_start"] = rec.get("ts")
+    return out
+
+
 def cmd_status(args):
     rt = read_runtime()
     out = {"watchd_pids": daemon_pids("linuxdo_daemon_watchd.py run"),
@@ -544,7 +602,9 @@ def cmd_status(args):
            "last_browse": _ts(last_browse_ts()) if last_browse_ts() else None,
            "last_progress": _ts(last_progress_ts()) if last_progress_ts() else None,
            "daemon_started": _ts(daemon_started_ts()) if daemon_started_ts() else None,
-           "quiet_now": quiet_now(), "runtime": rt}
+           "quiet_now": quiet_now(), "runtime": rt,
+           # 只读派生（R546 #7）：重启风暴一眼可见 —— 对照 rate_limit_per_hour 上限
+           "restarts": restart_audit()}
     print(json.dumps(out, ensure_ascii=False, indent=1))
     return 0
 
@@ -643,6 +703,45 @@ def _selftest():
         # T13 事件文件可读且含 RESTART
         txt = open(EVENTS, encoding="utf-8").read() if os.path.exists(EVENTS) else ""
         ck("RESTART" in txt, "T13 事件应留痕")
+
+        # ---- T27 重启审计视图（R546 #7，只读派生）：结构判据，不绑现场内容（RULE 25）
+        # 固定锚点=当日 12:00 本地时，使「今日/近一小时」判定与时区无关且确定
+        _day = time.strftime("%Y-%m-%d", time.localtime(_now()))
+        _noon = time.mktime(time.strptime(_day + " 12:00:00", "%Y-%m-%d %H:%M:%S"))
+        _rows27 = [
+            {"kind": "RESTART", "ok": True, "reason": "DAEMON_DEAD", "ts": _ts(_noon - 7200)},
+            {"kind": "START", "ts": _ts(_noon - 3500)},
+            {"kind": "RESTART", "ok": True, "reason": "STALLED_1800s", "ts": _ts(_noon - 60)},
+            {"kind": "RESTART", "ok": False, "reason": "RESTART_EXITED", "ts": _ts(_noon - 86400)},
+            {"kind": "RESTART", "ok": True, "reason": "ENV_RECOVERED", "ts": _ts(_noon - 3 * 86400)},
+            {"kind": "OK", "ts": _ts(_noon)},
+        ]
+        with open(EVENTS, "w", encoding="utf-8") as f:
+            for _r in _rows27:
+                f.write(json.dumps(_r, ensure_ascii=False) + "\n")
+            f.write("not-json\n")           # 负控：坏行不得计入也不得抛
+        ra = restart_audit(now=_noon)
+        ck(ra["restarts_total"] == 4 and ra["restarts_ok"] == 3 and ra["restarts_failed"] == 1,
+           "T27 重启计数口径（只数 RESTART）: %s" % ra)
+        ck(ra["restarts_today"] == 2, "T27b 今日应 2 次（锚点日 11:00/11:59）: %s" % ra["restarts_today"])
+        ck(ra["restarts_last_hour"] == 1, "T27c 近一小时应 1 次: %s" % ra["restarts_last_hour"])
+        ck((ra["last_restart"] or {}).get("reason") == "ENV_RECOVERED"
+           and (ra["last_restart"] or {}).get("ok") is True,
+           "T27d 最近一次取末条 RESTART（含原因）: %s" % ra["last_restart"])
+        ck(ra["last_start"] == _ts(_noon - 3500), "T27e 最近 START: %s" % ra["last_start"])
+        ck(ra["rate_limit_per_hour"] == RESTART_RATE_PER_HOUR and not ra["note"],
+           "T27f 须带对照上限且无 note: %s" % ra)
+        # T27g 负控：台账缺失 ⇒ 零计数 + note（不得伪造）
+        os.remove(EVENTS)
+        ra2 = restart_audit(now=_noon)
+        ck(ra2["restarts_total"] == 0 and ra2["note"] == "no_events_file",
+           "T27g 缺台账须零计数+note: %s" % ra2)
+        # T27h 负控：全坏行 ⇒ 零计数且不抛
+        with open(EVENTS, "w", encoding="utf-8") as f:
+            f.write("garbage\n{}\n")
+        ra3 = restart_audit(now=_noon)
+        ck(ra3["restarts_total"] == 0 and ra3["restarts_failed"] == 0 and not ra3["note"],
+           "T27h 坏行不得计入: %s" % ra3)
 
     STATE_DIR = os.path.join(ROOT, "temp", "linuxdo_watch")
     EVENTS = os.path.join(STATE_DIR, "watchd.jsonl")

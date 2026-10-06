@@ -876,6 +876,119 @@ def daily_count(st):
     return int(st.get("daily", {}).get(today(), 0))
 
 
+# ---------------------------------------------------------------- 段级审计视图
+# R546 遗留建议 #5（2026-10-06）：把「今天按段走了没有」变成一条只读命令能看见的事。
+# 动机：段级节律是整套防检测的核心（段内刷帖 + 段间长休 ≥25min），但此前它**不可观测**——
+# 10-05 全天 102 帖 / 21.05h 几乎无间歇（段计时因重启被反复重置），却只能事后翻 browse_log
+# 时间戳反推才发现。本视图只做「派生 + 展示」：不写盘、不改节奏、不触站点。
+REST_GAP_MIN_S = 900            # 视图中「休息」的最小间隔（15min）；≥SESSION_REST[0] 另标 long
+
+
+def _hhmm(ts):
+    """epoch → HH:MM（仅供展示口径）。"""
+    try:
+        return time.strftime("%H:%M", time.localtime(float(ts)))
+    except Exception:
+        return None
+
+
+def _parse_log_ts(s):
+    try:
+        return time.mktime(time.strptime(str(s), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def _day_done_ts(day, log_name="browse_log.jsonl"):
+    """当日 st=DONE 事件的 epoch 列表（只读；文件缺失/坏行一律跳过，绝不抛）。"""
+    out = []
+    p = os.path.join(BASE, log_name)
+    try:
+        if not os.path.exists(p):
+            return out
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("st") != "DONE":
+                    continue
+                t = _parse_log_ts(rec.get("ts"))
+                if t is None:
+                    continue
+                if time.strftime("%Y-%m-%d", time.localtime(t)) != day:
+                    continue
+                out.append(t)
+    except Exception:
+        return out
+    out.sort()
+    return out
+
+
+def segment_audit(day=None, now=None, log_name="browse_log.jsonl"):
+    """段级审计视图（R546 #5，只读派生）。
+
+    返回字段：
+      theoretical      今天理论几段（内核 day_segments 派生，同日稳定）
+      current_index    现在处于第几段（1-based；段间空档为 null）
+      current_window   [本段起, 本段止, 段长分钟]
+      next_segment     段间空档时下一段起点 HH:MM
+      browsed_in_segment 本段内已浏览帖数（browse_log 的 DONE 归段）
+      segments_seen/segments_seen_idx  今天实际进过的段数/段号（与 theoretical 对照即知节律是否真按段走）
+      rests_n/rests_long_n/rests  相邻 DONE 间隔 ≥15min 的休息（long=≥SESSION_REST[0]，即真长休）
+    内核缺席或无日志时字段置 null 并带 note（不伪造）。
+    """
+    day = day or today()
+    nowt = time.time() if now is None else float(now)
+    out = {"day": day, "theoretical": None, "current_index": None, "current_window": None,
+           "next_segment": None, "browsed_in_segment": None, "segments_seen": None,
+           "segments_seen_idx": [], "rests_n": 0, "rests_long_n": 0, "rests": [], "note": None}
+    segs = _day_segments_cached(day)
+    if not segs:
+        out["note"] = "kernel_absent_or_day_segments_failed"
+        return out
+    out["theoretical"] = len(segs)
+    evs = _day_done_ts(day, log_name)
+    seen = set()
+    for t in evs:
+        for i, s in enumerate(segs):
+            if s["start"] <= t < s["end"]:
+                seen.add(i)
+                break
+    out["segments_seen"] = len(seen)
+    out["segments_seen_idx"] = [i + 1 for i in sorted(seen)]
+    ci = None
+    for i, s in enumerate(segs):
+        if s["start"] <= nowt < s["end"]:
+            ci = i
+            break
+    if ci is not None:
+        s = segs[ci]
+        out["current_index"] = ci + 1
+        out["current_window"] = [_hhmm(s["start"]), _hhmm(s["end"]), s["minutes"]]
+        out["browsed_in_segment"] = len([t for t in evs if s["start"] <= t < s["end"]])
+    elif _ad is not None:
+        try:
+            nxt = _ad.next_seg_start(nowt, segs)
+        except Exception:
+            nxt = None
+        out["next_segment"] = _hhmm(nxt) if nxt else None
+    for a, b in zip(evs, evs[1:]):
+        if b - a >= REST_GAP_MIN_S:
+            out["rests"].append({"from": _hhmm(a), "to": _hhmm(b),
+                                 "minutes": round((b - a) / 60.0, 1),
+                                 "long": (b - a) >= SESSION_REST[0]})
+    out["rests_n"] = len(out["rests"])
+    out["rests_long_n"] = len([r for r in out["rests"] if r["long"]])
+    if out["rests_n"] > 6:
+        out["rests"] = out["rests"][-6:]
+    return out
+
+
 def daily_cap_today(st, base):
     """当日 cap：base±JITTER 内每日随机定一次（先存内存，判级落盘后跨重启稳定）。"""
     caps = st.setdefault("cap", {})
@@ -1404,7 +1517,9 @@ def main(argv=None):
         st = load_state()
         print(json.dumps({"today": today(), "daily_browsed": daily_count(st),
                           "total": st.get("browsed_total", 0), "level": st.get("level"),
-                          "quiet_now": quiet_window_check()}, ensure_ascii=False, indent=1))
+                          "quiet_now": quiet_window_check(),
+                          # 只读派生（R546 #5）：段级节律是否真在走 —— 不写盘、不碰站点
+                          "segments": segment_audit()}, ensure_ascii=False, indent=1))
         return RC_OK
     session, note = pick_session(prefer=args.tab_id)
     if not session and args.cmd != "watch":
@@ -1834,6 +1949,67 @@ def _selftest_impl():
         if ("level" + "_log.jsonl") not in _src:
             fails.append("T17 台账写入点整体消失（过度删除）")
     cases += 1
+
+    # ---- T18 段级审计视图（R546 #5，只读派生）：结构判据，不绑现场内容（RULE 25）
+    _d = today()
+    _segs = _day_segments_cached(_d)
+    if not _segs:
+        fails.append("T18 day_segments 内核缺席（段级审计会退化成 note，节律不可观测）")
+    else:
+        # 用真实段表造合成台账（只落沙箱 BASE）：段内各一条 DONE + 一条真长休
+        _t0 = _segs[0]["start"] + 60
+        _t1 = _segs[1]["start"] + 60 if len(_segs) >= 2 else None
+        _rows = [{"ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_t0)), "st": "DONE"}]
+        if _t1:
+            _rows.append({"ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_t1)), "st": "DONE"})
+        # 负控行：非 DONE / 坏时间戳 / 昨天 —— 一律不得计入
+        _rows.append({"ts": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_t0)), "st": "FAIL"})
+        _rows.append({"ts": "not-a-ts", "st": "DONE"})
+        _rows.append({"ts": "1999-01-01 00:00:00", "st": "DONE"})
+        with open(os.path.join(BASE, "browse_log.jsonl"), "w", encoding="utf-8") as f:
+            for r in _rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        _sa = segment_audit(day=_d, now=_t0 + 120)
+        if _sa["theoretical"] != len(_segs):
+            fails.append("T18 理论段数应=%d: %s" % (len(_segs), _sa["theoretical"]))
+        _exp_seen = 2 if len(_segs) >= 2 else 1
+        if _sa["segments_seen"] != _exp_seen or _sa["segments_seen_idx"] != list(range(1, _exp_seen + 1)):
+            fails.append("T18b 实际进段数/段号错（负控行须被剔除）: %s" % _sa)
+        if _sa["browsed_in_segment"] != 1:
+            fails.append("T18c 段内已浏览应只数本段 DONE: %s" % _sa["browsed_in_segment"])
+        if _sa["current_index"] != 1 or not _sa["current_window"]:
+            fails.append("T18d now 落段内须给 current_index=1+窗口: %s" % _sa)
+        elif _sa["current_window"][2] != _segs[0]["minutes"]:
+            fails.append("T18e 窗口段长须与内核逐字一致: %s" % (_sa["current_window"], _segs[0]["minutes"]))
+        if len(_segs) >= 2:
+            _gap = _t1 - _t0
+            if _sa["rests_n"] != 1 or _sa["rests_long_n"] != (1 if _gap >= SESSION_REST[0] else 0):
+                fails.append("T18f 休息/长休判定错(gap=%.0fs): %s" % (_gap, _sa["rests"]))
+        else:
+            if _sa["rests_n"] != 0:
+                fails.append("T18g 单段日不得有休息: %s" % _sa["rests"])
+        # T18h 负控：空台账 ⇒ 零覆盖、零休息（不得伪造）
+        with open(os.path.join(BASE, "browse_log_empty.jsonl"), "w"):
+            pass
+        _ea = segment_audit(day=_d, now=_t0 + 120, log_name="browse_log_empty.jsonl")
+        if _ea["segments_seen"] != 0 or _ea["rests_n"] != 0 or _ea["browsed_in_segment"] != 0:
+            fails.append("T18h 空台账须零覆盖: %s" % _ea)
+        # T18i 负控：台账缺失 ⇒ 同样零覆盖且不抛
+        _ma = segment_audit(day=_d, now=_t0 + 120, log_name="no_such_log.jsonl")
+        if _ma["segments_seen"] != 0:
+            fails.append("T18i 缺台账须零覆盖: %s" % _ma)
+        # T18j 负控：内核缺席（注入空段表）⇒ note + 字段 null，绝不伪造
+        _g = globals()
+        _keep = _g["_day_segments_cached"]
+        _g["_day_segments_cached"] = lambda day=None: None
+        try:
+            _na = segment_audit(day=_d, now=_t0 + 120)
+        finally:
+            _g["_day_segments_cached"] = _keep
+        if not _na["note"] or _na["theoretical"] is not None or _na["current_index"] is not None:
+            fails.append("T18j 内核缺席须 note+null: %s" % _na)
+    cases += 1
+
     return fails, cases
 
 
