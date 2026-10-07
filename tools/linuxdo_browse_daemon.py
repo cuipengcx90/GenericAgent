@@ -91,6 +91,30 @@ except Exception:                                       # 非 tools/ 目录被 i
 GA_ROOT = os.environ.get("GA_ROOT") or os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 BASE = os.path.join(GA_ROOT, "temp", "linuxdo_browse_daemon")
 
+# ---- 心跳自声明（R558 -------------------------------------------------------
+# 事故：静默窗(01:00–07:30)长睡 6h 期间，state.json/browse_log 都不刷新 ⇒ 看门狗
+# (tools/linuxdo_daemon_watchd.py) 只按 mtime 判「停滞 26645s」⇒ 误重启，而
+# bg_task 见同名任务已在 RUNNING 直接 rc=4 ⇒ 又被告警成「重启失败」。
+# 修法：守护每轮/每次睡前把自己的相位与**下次预计醒来时刻**写进 heartbeat.json，
+# 让「长睡」可被外部自证（只写自己的运行态文件，零站点请求，不影响随机节奏）。
+def heartbeat_path():
+    return os.path.join(BASE, "heartbeat.json")
+
+
+def write_heartbeat(phase, next_wake_ts=None):
+    hb = {"ts": now_str(), "epoch": time.time(), "pid": os.getpid(),
+          "phase": phase, "next_wake_ts": next_wake_ts}
+    try:
+        os.makedirs(BASE, exist_ok=True)
+        tmp = heartbeat_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hb, f, ensure_ascii=False)
+        os.replace(tmp, heartbeat_path())
+    except Exception as e:
+        print("[%s] heartbeat write failed: %r" % (now_str(), e), flush=True)
+    return hb
+
+
 # ---- 主站 host 判据单一源（2026-10-06 停摆事故）-------------------------------
 # 事故：唯一 linux.do 标签被导航到 connect.linux.do 后，pick_session 判「无候选」而
 # try_ensure_tab 用子串 "linux.do" 判「已有」⇒ 自愈不触发、空转 64min 零产出。
@@ -1488,25 +1512,35 @@ def now_str():
 # ---------------------------------------------------------------- watch
 def watch(args):
     st = load_state()
+    write_heartbeat("start")
     start = time.time()     # 仅作 _ad 缺席时的兜底计时（有内核时按当日段表驱动，见下）
     sess_fails = 0      # pick_session 连续失败（断链重试）
     lvl_fails = 0       # check_level 连续失败
     front_none = 0      # 前台探测连续失败
     front_true_cnt = 0  # 前台 True 连续次数（探测失真自检日志用）
+    def _nap(sec, phase="sleep"):
+        """睡 sec 秒；**睡前**把「下次预计醒来时刻」写进心跳 ⇒ 长睡可被看门狗自证。"""
+        try:
+            write_heartbeat(phase, next_wake_ts=time.time() + float(sec))
+        except Exception:
+            pass
+        time.sleep(sec)
+
     while True:
+        write_heartbeat("loop")
         # 风控升级后当日停止（只长睡，不再发请求）
         if st.get("risk_stop_day") == today():
             print("[%s] 风控升级后当日停止浏览，睡 1h 复查" % now_str(), flush=True)
-            time.sleep(3600)
+            _nap(3600)
             continue
         # 随机休息日：平均每周 1 天完全不浏览（降总量 + 拟人）
         if rest_day_today(st):
             print("[%s] 今日为随机休息日，全天不浏览" % now_str(), flush=True)
-            time.sleep(3600)
+            _nap(3600)
             continue
         if quiet_window_check():
             print("[%s] 静默窗内，睡 30min" % now_str(), flush=True)
-            time.sleep(1800)
+            _nap(1800)
             continue
         mj = morning_jitter_sec(st)
         if mj:
@@ -1514,14 +1548,14 @@ def watch(args):
             gate = dt.datetime(now.year, now.month, now.day, QUIET_WINDOW[2], QUIET_WINDOW[3]) + dt.timedelta(seconds=mj)
             if now < gate:
                 print("[%s] 晨间抖动：静默窗后延 %dmin 再开工（先睡 %dmin）" % (now_str(), mj / 60, (gate - now).total_seconds() / 60), flush=True)
-                time.sleep(min((gate - now).total_seconds(), 1800))
+                _nap(min((gate - now).total_seconds(), 1800))
                 continue
         session, note = pick_session()
         if not session:
             _ok, _note = try_ensure_tab()
             if _ok:
                 print("[%s] 无 linux.do 标签 ⇒ 已自愈补一个后台标签（%s），12s 后重试" % (now_str(), _note), flush=True)
-                time.sleep(12)
+                _nap(12)
                 session, note = pick_session()
             elif _note:
                 print("[%s] 无 linux.do 标签，自愈跳过：%s" % (now_str(), _note), flush=True)
@@ -1537,7 +1571,7 @@ def watch(args):
                 wait = random.uniform(*SESS_RETRY_SLEEP)
                 _wu = "%.0fmin" % (wait / 60)
             print("[%s] RC_NO_SESSION_RETRY: %s（%d/%d，睡 %s 后重试）" % (now_str(), note, sess_fails, SESS_RETRY_MAX, _wu), flush=True)
-            time.sleep(wait)
+            _nap(wait)
             continue
         sess_fails = 0
         if level_check_due(st):
@@ -1564,7 +1598,7 @@ def watch(args):
                 log_jsonl("level_log.jsonl", {"ts": now_str(), "st": "UNJUDGEABLE", "note": src})
                 return RC_UNJUDGEABLE
             print("[%s] RC_UNJUDGEABLE_RETRY: %s（%d/%d，睡后重试）" % (now_str(), src, lvl_fails, SESS_RETRY_MAX), flush=True)
-            time.sleep(random.uniform(*SESS_RETRY_SLEEP))
+            _nap(random.uniform(*SESS_RETRY_SLEEP))
             continue
         lvl_fails = 0
         if src == "throttled":
@@ -1607,7 +1641,7 @@ def watch(args):
                 print("[%s] 浏览已到量，仍按随机节奏补做排队动作：%s（剩余 %s）" % (
                     now_str(), _r, {k: int((st.get("pending_acts") or {}).get(k) or 0)
                                     for k in ("reply", "like", "post")}), flush=True)
-            time.sleep(3600)
+            _nap(3600)
             continue
         # ---- 段级节奏（2026-10-06 R546，修 R545 缺陷①）--------------------------------
         # 当日活动段由内核按「日期种子」确定性派生（day_segments）：守护重启/被杀不重置段位，
@@ -1619,12 +1653,12 @@ def watch(args):
             if not _go:
                 print("[%s] 段间空档（当日 %d 段，%s），等 %.0fmin 进下一段" % (
                     now_str(), len(_segs), _why, _w / 60), flush=True)
-                time.sleep(_w)
+                _nap(_w)
                 continue
         elif (time.time() - start) / 60 >= args.max_session_min:
             rest = random.uniform(*SESSION_REST)
             print("[%s] 单段运行满 %.0fmin，休息 %.0fmin" % (now_str(), args.max_session_min, rest / 60), flush=True)
-            time.sleep(rest)
+            _nap(rest)
             start = time.time()
         # 用户前台保护：tab 可见即视为用户在看，绝不抢（宁停勿扰；fail-closed 起步）
         front = tab_is_front(session)
@@ -1635,7 +1669,7 @@ def watch(args):
             print("[%s] ⚠ 前台连续 %d 次为 True——若持续请人工核查探测是否失真" % (now_str(), front_true_cnt), flush=True)
         if skip:
             print("[%s] %s，睡 5min" % (now_str(), why), flush=True)
-            time.sleep(300)
+            _nap(300)
             continue
         # 排队中的回帖/点赞：按 acts 内核的随机段与随机间隔执行（与等级检查时刻解耦）
         _ra = maybe_run_pending_acts(st, session)
@@ -1659,10 +1693,10 @@ def watch(args):
                                              "detail": str(diag)[:300]})
         if done == 0 and skipped == 0:
             print("[%s] 无可用候选（候选全重/接口异常），睡 10min 重试" % now_str(), flush=True)
-            time.sleep(600)
+            _nap(600)
         gap = _batch_gap()
         print("[%s] 批间休 %.0fs" % (now_str(), gap), flush=True)
-        time.sleep(gap)
+        _nap(gap)
 
 
 # ---------------------------------------------------------------- CLI

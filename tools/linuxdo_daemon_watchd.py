@@ -12,7 +12,10 @@
      （**不重启**、长冷却告警）；桥可达才用 bg_task 拉起（幂等）；
   2. 停滞：在活动窗内长时间没有浏览产出（browse_log 无新增 DONE）⇒ 判为卡死并重启；近 1h 已重启超频则抑制（RESTART_SKIP）；
   3. 留痕 + 告警：事件写 temp/linuxdo_watch/watchd.jsonl，重启/恢复各发一次私信；
-  4. 合并告警（R551）：同类事件在 6h 窗口内只发一条汇总（含累计次数），防刷屏但仍看得见。
+  4. 合并告警（R551）：同类事件在 6h 窗口内只发一条汇总（含累计次数），防刷屏但仍看得见；
+  5. 休眠自证（R558）：守护睡前写 heartbeat.json 声明「下次预计醒来时刻」⇒ 静默窗长睡
+     不再被当成停滞（旧：静默窗 6h 长睡 ⇒ 误判 STALLED 26000s ⇒ 误重启 + bg_task rc=4
+     被读成「拉起失败」而告警）；重启前若守护仍在跑，先 bg_task stop 再 start（真自愈）。
 
 防检测前提（用户要求）：
   · 本器**不发任何站点请求**（不 import 浏览器驱动、不跑 JS）——只读本地进程表与日志；
@@ -63,6 +66,9 @@ BRIDGE_RUNNER_PAT = "tmwd_bridge_watch.py"   # 独立桥监督进程（不依赖
 BRIDGE_RUNNER_NAME = "tmwd_bridge"           # bg_task 任务名（同名幂等）
 BRIDGE_ENSURE_WAIT_S = 15                    # 起桥后等桥可达的上限（秒）
 BRIDGE_ENSURE_COOLDOWN_S = 600               # 起桥尝试冷却（秒），防每轮空拉
+RESTING_MAX_S = 12 * 3600                    # 心跳声明的「下次醒来」最远可信窗口（超出视为坏值，回落旧判据）
+HEARTBEAT_REL = os.path.join("temp", "linuxdo_browse_daemon", "heartbeat.json")
+HEARTBEAT_FILE = os.path.join(ROOT, HEARTBEAT_REL)
 ALERT_MERGE_WINDOW_H = 6                 # 同类重启告警合并窗口（小时）：窗口内只发一条汇总
 RECOVERY_NOTIFY_MIN_S = 300              # 停机 ≥ 该秒数才发「已恢复」（一闪而过不打扰）
 DEFAULT_MAX_HOURS = 26.0     # 长驻上限；由每日入口重新武装（对齐 anyrouter watchd 模式）
@@ -212,6 +218,7 @@ def last_browse_ts(path=None):
 PROGRESS_FILES = (
     os.path.join("temp", "linuxdo_browse_daemon", "state.json"),
     os.path.join("temp", "linuxdo_browse_daemon", "level_log.jsonl"),
+    HEARTBEAT_REL,          # R558：守护自声明心跳（mtime 也计入「还在干活」）
 )
 
 
@@ -292,6 +299,25 @@ def last_progress_ts(browse_ts=None, root=None):
     return max(vals) if vals else None
 
 
+def heartbeat_info(path=None, root=None):
+    """读守护自声明心跳（R558）。返回 {phase, next_wake_ts, epoch} 或 None（缺/坏一律 None）。
+
+    ★为什么需要它：只看 mtime 分不清「卡死」与「按设计长睡」（静默窗 01:00–07:30 睡 6h、
+    随机休息日睡整点复查）。守护睡前会把 next_wake_ts=当时刻+睡眠秒数 写进心跳，
+    本器据此判「它在睡，且说得出何时醒」⇒ OK 而非 RESTART。
+    """
+    p = path or HEARTBEAT_FILE
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        if not isinstance(d, dict):
+            return None
+        return {"phase": d.get("phase"), "next_wake_ts": d.get("next_wake_ts"),
+                "epoch": d.get("epoch"), "pid": d.get("pid")}
+    except Exception:
+        return None
+
+
 def quiet_now(now=None):
     """复用反检测内核的静默窗判定（不可用则 fail-open：返回 False）。"""
     try:
@@ -310,6 +336,21 @@ def spawn_daemon(bg=DEFAULT_BG, name=BG_NAME, cwd=ROOT, dry=False):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         return {"rc": r.returncode, "out": (r.stdout or "").strip()[-400:],
+                "err": (r.stderr or "").strip()[-200:]}
+    except Exception as e:
+        return {"rc": -1, "err": repr(e)[:200]}
+
+
+def stop_daemon(bg=DEFAULT_BG, name=BG_NAME, dry=False):
+    """停同名 bg_task 任务（R558）。守护**活着却判停滞**时，直接 start 会被 bg_task 以
+    「同名任务已在 RUNNING」拒绝（rc=4）⇒ 旧码把这当「拉起失败」并连发告警；先停再起才是真自愈。
+    停的是 bg_task 记录的任务（其中含该 daemon 及其子进程）；dry 只回命令不执行。"""
+    cmd = [sys.executable, bg, "stop", "--name", name]
+    if dry:
+        return {"dry": True, "cmd": " ".join(cmd)}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return {"rc": r.returncode, "out": (r.stdout or "").strip()[-200:],
                 "err": (r.stderr or "").strip()[-200:]}
     except Exception as e:
         return {"rc": -1, "err": repr(e)[:200]}
@@ -540,6 +581,13 @@ def decide(snapshot):
     if hb is None:
         return {"action": "OK", "reason": "NO_LOG_YET"}
     age = now - hb
+    # R558：守护自声明「我在睡，且将在 next_wake_ts 醒来」⇒ 停滞判据不适用（静默窗长睡正当）
+    try:
+        nw = float(snapshot.get("next_wake_ts"))
+    except Exception:
+        nw = None
+    if nw and nw > now and (nw - now) <= RESTING_MAX_S:
+        return {"action": "OK", "reason": "RESTING_UNTIL_%s_%.0fm" % (snapshot.get("phase") or "", (nw - now) / 60.0)}
     if age > STALL_S and not quiet:
         if snapshot.get("bridge_ok") is False:
             # 桥不在：重启必空转（守护起来就拒连）⇒ 按环境不可用处理，不动进程（R551）
@@ -618,11 +666,12 @@ def write_runtime(patch):
 
 
 # ---------------------------------------------------------------- 主循环
-def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None):
+def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None, stop=None):
     """一轮巡检。snapshot 非 None 时跳过探针（仅供自测注入，生产恒为探针）。"""
     spawn = spawn or spawn_daemon
     notify_fn = notify_fn or notify
     ensure = ensure or ensure_bridge
+    stop = stop or stop_daemon
     rt = read_runtime()
     if snapshot is not None:
         snap = dict(snapshot)
@@ -640,6 +689,9 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None)
                 "busy_hint": bh, "busy_reason": bwhy,
                 "bridge_ok": _bridge,
                 "restart_times": rt.get("restart_times") or []}
+        _hbi = heartbeat_info() or {}
+        snap["next_wake_ts"] = _hbi.get("next_wake_ts")      # R558：休眠自证
+        snap["phase"] = _hbi.get("phase")
     d = decide(snap)
     _log_event("ROUND", action=d["action"], reason=d["reason"],
                n_pids=len(snap["pids"]), quiet=snap["quiet"],
@@ -683,6 +735,10 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None)
                            "bridge_notified_ts": 0, "down_since": 0, "alerts": {},
                            "fail_streak": 0})
         return dict(d, pids=snap["pids"])
+    if snap.get("pids"):
+        # R558：守护在跑却判停滞 ⇒ 先停同名任务，否则 start 必被 bg_task 拒（rc=4=假「拉起失败」）
+        _stop_res = stop(dry=dry)
+        _log_event("RESTART_STOP", res=_stop_res)
     res = spawn(dry=dry)
     ok = (res.get("rc") == 0) or res.get("dry")
     _rt_hist = [t for t in (rt.get("restart_times") or []) if t and (_now() - t) <= 3600]
@@ -866,6 +922,19 @@ def _selftest():
                 "quiet": False, "last_restart_ts": 0})
     ck(d["action"] == "OK" and d["reason"] == "NO_LOG_YET", "T6 无日志应 OK: %s" % d)
 
+    # T6b 心跳声明长睡 ⇒ OK（R558：静默窗 6h 长睡不再被误判停滞）
+    _hb = {"pids": [123], "last_done": _now() - STALL_S - 100, "now": _now(),
+           "quiet": False, "last_restart_ts": 0, "next_wake_ts": _now() + 3600, "phase": "quiet"}
+    d = decide(_hb)
+    ck(d["action"] == "OK" and d["reason"].startswith("RESTING_UNTIL"),
+       "T6b 心跳声明长睡应 OK: %s" % d)
+    # T6c 心跳已过期（说好的醒来时刻已过）⇒ 仍按停滞处理
+    d = decide(dict(_hb, next_wake_ts=_now() - 10))
+    ck(d["action"] == "RESTART" and d["reason"].startswith("STALLED"), "T6c 过期心跳仍应重启: %s" % d)
+    # T6d 坏值/超远（> RESTING_MAX_S）⇒ 回落旧判据（不无限信任声明）
+    d = decide(dict(_hb, next_wake_ts=_now() + RESTING_MAX_S + 3600))
+    ck(d["action"] == "RESTART", "T6d 超远心跳应回落旧判据: %s" % d)
+
     # T7 单轮：假探针（死）⇒ 调 spawn + 留痕 + 告警
     calls = {"spawn": 0, "notify": []}
     with tempfile.TemporaryDirectory() as td:
@@ -878,6 +947,17 @@ def _selftest():
         ck(r["action"] == "RESTART" and calls["spawn"] == 1, "T7 死进程应触发一次 spawn: %s" % r)
         ck(any("重启" in t for t in calls["notify"]), "T7b 重启应告警")
         ck(read_runtime().get("last_restart_ts"), "T7c 应记录重启时刻")
+        # T7d 停滞但守护在跑 ⇒ 必先 stop 再 start（R558：否则 rc=4 假「拉起失败」）
+        calls["stop"] = 0
+        calls["spawn"] = 0          # 归零：T8 断言的是「T7 起共 spawn 1 次」，本用例自带计数
+        r = one_round(dry=False,
+                      spawn=lambda dry=False: (calls.__setitem__("spawn", calls["spawn"] + 1) or {"rc": 0}),
+                      stop=lambda dry=False: (calls.__setitem__("stop", calls["stop"] + 1) or {"rc": 0}),
+                      notify_fn=lambda t: calls["notify"].append(t),
+                      snapshot={"pids": [123], "last_done": _now() - STALL_S - 100,
+                                "quiet": False, "last_restart_ts": 0})
+        ck(r["action"] == "RESTART" and calls["stop"] == 1 and calls["spawn"] == 1,
+           "T7d 停滞且守护在跑应先停再起: %s %s" % (r, calls))
         # T8 冷却内第二次 ⇒ 不再 spawn
         r2 = one_round(dry=False, spawn=lambda dry=False: (calls.__setitem__("spawn", calls["spawn"] + 1) or {"rc": 0}),
                        notify_fn=lambda t: None,
