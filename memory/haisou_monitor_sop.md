@@ -175,3 +175,24 @@
 
 **判读铁律**：`/api/*/search` 返回 403 时**先查会员端点余量**再断言原因；
 余量 0 属供给侧，重试无用（与 09-24 起连续 403 的表象一致）。
+
+---
+
+## 「只推 AI」结果门 × 词源双闸（2026-10-07 R559）
+
+**背景**：用户反馈「只要 AI 相关，却推来 Hadoop/Docker/Spring 与 2024 年及更早的旧教程」。
+
+**根因（两层，缺一不可）**：
+1. **判据自指**：旧相关性只校验「标题含本查询词 token」（查询词 `hadoop` ⇒ 标题含 hadoop 即放行），对**领域**毫无校验；查询词本身非 AI 时，结果自然非 AI。这是 R441 之外的**第二个独立缺陷**（R441 修的是关键词退化取 `ai`）。
+2. **词源倒灌**：动态词表由课程标题直接并入（`sync_quangneng.py`）⇒ 非 AI 课程名（hadoop/k8s/spring/docker 等）进入查询侧，等于把噪声喂给自己。
+
+**修法（双闸 + 单一源）**：
+- 单一源 `tools/ai_topic.py`（`is_ai_topic()` / `filter_words()`；selftest 42/42）：中英文 AI 领域词表 + 词边界规则，**与查询词无关**。
+- 查询侧：`haisou_daily.py` 构造查询词时先过门（非 AI 词不发请求⇒顺带省额度）；`tools/course_pool.py::pick_for_words`、`birdie_monitor/sync_quangneng.py` 同门。
+- 结果侧：入库/通知前再过一道，命中非 AI 词即 `AI_SKIPPED`；开关 `AI_GATE_ENABLED`（默认 True，`haisou_daily.py` L36 附近）。
+
+**A/B（2026-10-07 当日 37 条命中回放）**：keep 8 / drop 29（hadoop 9、k8s 8、spring 6、docker 5、Go 2，未归类 0）。
+
+**词表清理**：`pool_keywords.json` 12→4 条、`quangneng_keywords.json` 动态 26→20 条（清理前备份留存）。
+
+**判读铁律**：相关性判据**禁自指**——只校验「结果含查询词」等于没校验；凡涉及领域筛选（AI/法律/医疗…）必须引入**独立领域维**，且该领域词表单一源、查询侧与结果侧共用同一实现。
