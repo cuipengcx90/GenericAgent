@@ -1,5 +1,7 @@
 """同步全能IT最近90天课程到海搜监控关键词"""
 import json
+import os
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -10,6 +12,24 @@ from bs4 import BeautifulSoup
 QUANGNENG_BASE = "https://quangneng.com"
 KEYWORDS_FILE = Path(__file__).with_name("quangneng_keywords.json")
 MAX_SEARCH_ATTEMPTS = 30  # 最多搜索30次（约1个月）
+
+# ★2026-10-07 修复：本文件的合并处早已调用 is_ai_topic，但**从未 import**
+# （上一批「只推 AI」接线漏项）⇒ 真跑必 NameError，且被定时任务里的 subprocess
+# 捕获成 stderr（步骤1 静默降级、整轮照跑）。此处补上，并同时接方向门：
+# 只留大模型 / AI Agent / 应用向，剔掉基础慕课向（用户 2026-10-07 口径）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from tools.ai_topic import is_ai_topic, is_direction_ai  # noqa: E402
+except Exception:  # 回退：保守子集（与单一源同口径）
+    def is_ai_topic(text):
+        t = (text or "").lower()
+        return any(p in t for p in ("人工智能", "大模型", "智能体", "机器学习", "深度学习",
+                                    "提示词", "生成式", "文生图", "文生视频", "多模态", "ai"))
+
+    def is_direction_ai(text):
+        # 回退版：只做「基础慕课向」的浅判定（宁松勿误杀，与单一源主判据同向）
+        t = (text or "").lower()
+        return not any(p in t for p in ("基础课", "入门课", "慕课", "导论", "零基础"))
 
 
 def fetch_recent_courses(days=90):
@@ -111,16 +131,23 @@ def sync_keywords():
     # 3. 合并新课程（去重 + AI 主题门 2026-10-07 R559：站内含软考/影视后期等非 AI 课）
     added = 0
     skipped_non_ai = 0
+    skipped_basic = 0
     for title, info in new_courses.items():
         if title in existing:
             continue
         if not is_ai_topic(title):
             skipped_non_ai += 1
             continue
+        if not is_direction_ai(title):  # 方向门（2026-10-07）：只留应用向，剔基础慕课
+            skipped_basic += 1
+            continue
         existing[title] = info
         added += 1
     if skipped_non_ai:
         print(f"🚫 AI主题门跳过: {skipped_non_ai} 个非 AI 课程（如 Hadoop/Docker/软考/影视后期）")
+    if skipped_basic:
+        print(f"🚫 方向门跳过: {skipped_basic} 个 AI 但属基础慕课/非应用向"
+              f"（如 机器学习基础课/零基础入门，2026-10-07）")
 
     # 4. 清理旧关键词
     removed, found_removed = clean_old_keywords(existing)

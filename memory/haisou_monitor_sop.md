@@ -196,3 +196,19 @@
 **词表清理**：`pool_keywords.json` 12→4 条、`quangneng_keywords.json` 动态 26→20 条（清理前备份留存）。
 
 **判读铁律**：相关性判据**禁自指**——只校验「结果含查询词」等于没校验；凡涉及领域筛选（AI/法律/医疗…）必须引入**独立领域维**，且该领域词表单一源、查询侧与结果侧共用同一实现。
+
+---
+
+## 方向门：只留大模型 / AI Agent / 应用向（2026-10-07 R560）
+
+**背景**：R559 的 AI 门只回答「是不是 AI」，基础慕课（Python3 入门人工智能 / 机器学习基础课）照样放行。用户原话「剔基础慕课:只留大模型/AI Agent/应用向(剩3条)」。
+
+**判据（第二道门，与 AI 门同一文件单一源）**：`tools/ai_topic.py::is_direction_ai()`（解释器 `direction_explain()` 出依据）＝ 前向载体词优先（大模型/LLM/AI Agent/智能体/RAG/多智能体/应用开发/部署实战）；命中「入门/零基础/机器学习/深度学习/人工智能」而**无**前向词 ⇒ verdict `FOUNDATION`，拒收；混合语义（「小白玩转AI大模型应用开发」）**保留**。
+
+**三门串联顺序**：`is_relevant`（相关）→ `is_ai_topic`（AI）→ `is_direction_ai`（方向）。
+
+**接线四处**：`birdie_monitor/haisou_daily.py`（词源门 L384-395 + 结果门 L477-478 ⇒ `DIR_SKIPPED` 计数与摘要 `dir_skipped`，开关 `DIRECTION_GATE_ENABLED` L48）· `tools/course_pool.py::pick_for_words`（L346）· `birdie_monitor/sync_quangneng.py`（L141，**并补回 R559 漏掉的 `is_ai_topic` import**，否则合并分支必 NameError）。
+
+**A/B（2026-10-07 当日 37 条命中回放）**：keep **3** / dir_drop 5（全为 Python3 入门人工智能系列）/ ai_drop 29；留下的是「多智能体开发特训营」×2 + 「林粒粒：小白玩转AI大模型应用开发」。
+
+**坑（本批实测）**：① 新增自测用例必须写在**沙盒区间内**——写在 `finally: 恢复沙盒` 之后会真跑生产路径并真发网络请求（实测写脏 cursor/seen/progress，已备份 `temp/haisou_cleanup_backup/<ts>/` 并回滚）；② 用例给**空 state** ⇒ `run()` 的 `first_run=True` 分支不收集 additions ⇒ `kept` 断言恒空假红，必须复用主沙盒 state。

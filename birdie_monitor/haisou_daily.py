@@ -16,7 +16,7 @@ from keychain import keys
 # AI 主题判据单一源（2026-10-07 R559：用户要求海搜只要 AI 结果）
 sys.path.insert(0, "/Users/cuip/projects/GenericAgent")
 try:
-    from tools.ai_topic import is_ai_topic  # noqa: E402
+    from tools.ai_topic import is_ai_topic, is_direction_ai  # noqa: E402
     _AI_SRC = "tools/ai_topic.py (单一源)"
 except Exception:  # 回退：离线内联判据（与单一源同一口径的保守子集）
     _AI_SRC = "inline fallback (保守子集)"
@@ -30,10 +30,22 @@ except Exception:  # 回退：离线内联判据（与单一源同一口径的�
             return True
         return False  # 严格档：无正向信号一律 False（UNKNOWN/NON_AI 同判）
 
+    # 方向门回退版（保守子集，与单一源「FRONTIER 优先/无前沿即 False」同档）
+    _DIR_FWD = ("大模型", "大语言模型", "智能体", "ai应用", "ai开发", "ai产品", "ai工具",
+                "ai变现", "ai编程", "ai创作", "提示词", "提示工程", "多模态", "文生图",
+                "文生视频", "数字人", "llm", "aigc", "gpt", "claude", "codex", "cursor",
+                "agent", "rag", "mcp", "dify", "coze", "vibe coding", "ai coding")
+    def is_direction_ai(text):
+        t = (text or "").lower()
+        return any(k in t for k in _DIR_FWD)
+
 AI_SKIPPED = [0]  # AI 主题门（结果侧）丢弃计数，供运行摘要与统计读取
+DIR_SKIPPED = [0]  # 方向门（2026-10-07 第二批）丢弃计数：AI 但属基础慕课/非应用向
 # AI 门总开关：生产恒 True；自测用合成语料（"接口测试 教程 quark" 等无 AI 语义）
 # 会误伤既有 T1–T10 的预算/轮转断言，故自测期间临时关闭，并由 T11 单独覆盖门控行为。
 AI_GATE_ENABLED = True
+# 方向门总开关（用户口径：只留大模型/AI Agent/应用向；自测同因关闭，T12 单独覆盖）。
+DIRECTION_GATE_ENABLED = True
 
 BASE = "https://haisou.cc"
 KEYCHAIN_NAME = "haisou_hs_web_session"
@@ -365,10 +377,24 @@ def run(max_tasks=None, static_daily=None):
                    if is_ai_topic(d.get("query", "")) or is_ai_topic(d.get("title", ""))]
     if len(dynamic) != n0:
         print(f"[AI查询门] 动态词过滤: {n0} -> {len(dynamic)}（{n0 - len(dynamic)} 个非 AI 词跳过）")
+    # 查询侧方向门（2026-10-07 第二批，用户口径「只留大模型/AI Agent/应用向」）：
+    # AI 词里仍混着基础慕课向（Python 入门/机器学习基础/云计算大数据），发出去只会
+    # 换回一批「24 年入门教程」——在词源层直接不发，省额度也干净。
+    m0 = len(dynamic)
+    if DIRECTION_GATE_ENABLED:
+        dynamic = [d for d in dynamic
+                   if is_direction_ai(d.get("query", "")) or is_direction_ai(d.get("title", ""))]
+    if len(dynamic) != m0:
+        print(f"[方向查询门] 动态词过滤: {m0} -> {len(dynamic)}（{m0 - len(dynamic)} 个非应用向词跳过）")
     s0 = len(STATIC_KEYWORDS)
     static_kws = [kw for kw in STATIC_KEYWORDS if (not AI_GATE_ENABLED) or is_ai_topic(kw)]
     if len(static_kws) != s0:
         print(f"[AI查询门] 静态词过滤: {s0} -> {len(static_kws)}（{s0 - len(static_kws)} 个非 AI 词跳过）")
+    t0 = len(static_kws)
+    if DIRECTION_GATE_ENABLED:
+        static_kws = [kw for kw in static_kws if is_direction_ai(kw)]
+    if len(static_kws) != t0:
+        print(f"[方向查询门] 静态词过滤: {t0} -> {len(static_kws)}（{t0 - len(static_kws)} 个非应用向词跳过）")
     dyn_quark = [(d["query"], "quark", True, d["title"]) for d in dynamic]
     static_tasks = [(kw, pf, False, None) for kw in static_kws for pf in PLATFORMS]
     dyn_other = [(d["query"], pf, True, d["title"])
@@ -446,6 +472,11 @@ def run(max_tasks=None, static_daily=None):
                     if AI_GATE_ENABLED and not is_ai_topic(title):
                         AI_SKIPPED[0] += 1
                         continue
+                    # 方向门（2026-10-07 第二批）：AI 主题但属基础慕课/非应用向 ⇒ 用户口径剔除
+                    # （典型：Python 入门到人工智能、机器学习基础课、云计算大数据教程）。
+                    if DIRECTION_GATE_ENABLED and not is_direction_ai(title):
+                        DIR_SKIPPED[0] += 1
+                        continue
                     if is_title_duplicate(title, existing_titles):
                         continue
                     record = make_item(q, item)
@@ -511,11 +542,14 @@ def run(max_tasks=None, static_daily=None):
         "new_items": sum(s["new"] for s in scanned),
         "additions": len(additions),
         "ai_skipped": AI_SKIPPED[0],
+        "dir_skipped": DIR_SKIPPED[0],
         "error": error,
         "scanned": scanned,
     })
     if AI_SKIPPED[0]:
         print(f"[AI结果门] 丢弃非 AI 命中 {AI_SKIPPED[0]} 条（{_AI_SRC}）")
+    if DIR_SKIPPED[0]:
+        print(f"[方向结果门] 丢弃非应用向（基础慕课类）命中 {DIR_SKIPPED[0]} 条（{_AI_SRC}）")
     return additions, first_run, error
 
 
@@ -565,7 +599,7 @@ def _selftest():
         td = Path(td)
         saved = {k: globals().get(k) for k in
                  ("STATE_PATH", "CURSOR_PATH", "PROGRESS_LOG_PATH", "DYNAMIC_KEYWORDS_PATH", "keys",
-                  "AI_GATE_ENABLED")}
+                  "AI_GATE_ENABLED", "DIRECTION_GATE_ENABLED")}
         globals()["STATE_PATH"] = td / "state.json"
         globals()["CURSOR_PATH"] = td / "cursor.json"
         globals()["PROGRESS_LOG_PATH"] = td / "progress.jsonl"
@@ -573,6 +607,11 @@ def _selftest():
         # 合成语料（"接口测试 教程 quark" 等）无 AI 语义，开闸会把 T1–T10 的预算/轮转断言
         # 全部打成"空结果"⇒ 自测期间关闸，门控行为由 T11 用单元判据单独覆盖。
         globals()["AI_GATE_ENABLED"] = False
+        globals()["DIRECTION_GATE_ENABLED"] = False   # 方向门行为由 T12 用合成语料单独覆盖
+        # 自测零网络：run() 会查站点额度接口，此处一律桩替（sandbox 结束由 saved 还原）
+        saved["fetch_quota"] = globals().get("fetch_quota")
+        globals()["fetch_quota"] = lambda session: {"daily_quota": 200, "remaining_today": 100,
+                                                    "used_today": 100, "expires_at": None}
         fake_keys = types.SimpleNamespace(
             haisou_hs_web_session=types.SimpleNamespace(use=lambda: "fake-cookie"))
         globals()["keys"] = fake_keys
@@ -814,6 +853,67 @@ def _selftest():
         finally:
             for k, v in saved.items():
                 globals()[k] = v
+
+        # ---- T12 方向门（2026-10-07 第二批，用户口径「只留大模型/AI Agent/应用向」）----
+        # 两层断言：①结果门：AI 主题但属基础慕课向（机器学习基础课）须被 DIR_SKIPPED 拦下；
+        #           ②查询门：静态词经方向门后，前沿词留存、基础向词（AI测试）不再发请求。
+        _mix12 = [
+            {"hsid": "t12-keep", "share_name": "DeepSeek 提示工程实战", "share_pwd": "", "url": "u"},
+            {"hsid": "t12-drop", "share_name": "机器学习基础课 2024", "share_pwd": "", "url": "u"},
+        ]
+
+        def search12(session, q, platform):
+            return [dict(h) for h in _mix12]
+
+        # ⚠️ 沙盒（2026-10-07 修）：上面的 finally 已把路径/开关还原成生产值，
+        # 此处若直接 run() 会读生产游标、写生产 seen_items/progress、并真发网络请求
+        # （实测 14:46 一轮：index 7→8、落一条合成条目 t12-keep、写一行 progress）。
+        # 故显式重建沙盒；任何新用例只要 run() 就必须先过这一步。
+        _t12dir = td / "t12"
+        _t12dir.mkdir(exist_ok=True)
+        _sandbox12 = {}
+        # ⚠️ STATE_PATH 必须复用主沙盒那份（已被 T1–T10 写过 ⇒ 非空）。
+        # 若给它一份全新空 state，run() 会判 first_run=True 而**不收集 additions**
+        # （首轮只建基线不推送），断言 kept 恒为空 ⇒ 假红（2026-10-07 实测踩到）。
+        for _k, _v in (("STATE_PATH", td / "state.json"),
+                       ("CURSOR_PATH", _t12dir / "cursor.json"),
+                       ("PROGRESS_LOG_PATH", _t12dir / "progress.jsonl"),
+                       ("DYNAMIC_KEYWORDS_PATH", _t12dir / "dyn_missing.json")):
+            _sandbox12[_k] = globals().get(_k)
+            globals()[_k] = _v
+        _sandbox12["fetch_quota"] = globals().get("fetch_quota")
+        globals()["fetch_quota"] = lambda session: {"daily_quota": 200, "remaining_today": 100,
+                                                    "used_today": 100, "expires_at": None}
+        _saved_rel12 = globals()["is_relevant"]
+        _saved_search12 = globals()["search"]
+        globals()["search"] = search12
+        globals()["is_relevant"] = lambda q, title: True   # 隔离上游门，只测方向结果门
+        globals()["AI_GATE_ENABLED"] = True
+        globals()["DIRECTION_GATE_ENABLED"] = True
+        AI_SKIPPED[0] = 0
+        DIR_SKIPPED[0] = 0
+        try:
+            _a12, _f12, _e12 = run(max_tasks=1)
+            _sk12, _dsk12 = AI_SKIPPED[0], DIR_SKIPPED[0]
+        finally:
+            globals()["AI_GATE_ENABLED"] = False
+            globals()["DIRECTION_GATE_ENABLED"] = False
+            globals()["is_relevant"] = _saved_rel12
+            globals()["search"] = _saved_search12
+            for _k, _v in _sandbox12.items():
+                globals()[_k] = _v
+        _kept12 = [r.get("title", "") for r in (_a12 or [])]
+        print(f"[dbg T12] kept={_kept12} ai_skipped={_sk12} dir_skipped={_dsk12}")
+        ck("T12 方向结果门:只留应用向(基础慕课向被 DIR_SKIPPED 拦下)",
+           len(_kept12) == 1 and "DeepSeek" in _kept12[0] and "机器学习" not in _kept12[0]
+           and _dsk12 == 1 and _sk12 == 0)
+        # 查询侧方向门：用与生产同一函数（单一源）直算词表存活面
+        _dir_kw = [k for k in STATIC_KEYWORDS if _at.is_direction_ai(k)]
+        ck("T12 方向查询门:前沿词留存、基础向词不发请求",
+           "AI Agent" in _dir_kw and "AI测试" not in _dir_kw
+           and 0 < len(_dir_kw) < len([k for k in STATIC_KEYWORDS if _at.is_ai_topic(k)]))
+        globals()["AI_SKIPPED"][0] = 0
+        globals()["DIR_SKIPPED"][0] = 0
     ok = sum(1 for _, c in checks if c)
     print(f"\nselftest: {ok}/{len(checks)} checks passed")
     return 0 if ok == len(checks) else 1
