@@ -1,11 +1,15 @@
 {
-  "index": 0,
-  "total": 147,
+  "index": 7,
+  "total": 72,
   "cycle": 0,
-  "updated_at": "2026-10-06 12:24:15",
+  "dyn_index": 28,
+  "dyn_total": 37,
+  "updated_at": "2026-10-07 11:23:00",
   "last_run": {
-    "start": "2026-10-06 12:24:14",
-    "done": 0,
-    "error": "HTTP 403: 今日额度已用完，请明天再试"
+    "start": "2026-10-07 11:22:30",
+    "done": 35,
+    "error": null,
+    "static_used": 7,
+    "plan_len": 35
   }
 }

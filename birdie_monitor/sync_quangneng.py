@@ -108,12 +108,19 @@ def sync_keywords():
     new_courses = fetch_recent_courses(days=90)
     print()
 
-    # 3. 合并新课程（去重）
+    # 3. 合并新课程（去重 + AI 主题门 2026-10-07 R559：站内含软考/影视后期等非 AI 课）
     added = 0
+    skipped_non_ai = 0
     for title, info in new_courses.items():
-        if title not in existing:
-            existing[title] = info
-            added += 1
+        if title in existing:
+            continue
+        if not is_ai_topic(title):
+            skipped_non_ai += 1
+            continue
+        existing[title] = info
+        added += 1
+    if skipped_non_ai:
+        print(f"🚫 AI主题门跳过: {skipped_non_ai} 个非 AI 课程（如 Hadoop/Docker/软考/影视后期）")
 
     # 4. 清理旧关键词
     removed, found_removed = clean_old_keywords(existing)

@@ -316,13 +316,27 @@ def attach_resource(course_id: str, pan_url: str, title: str = "", via: str = ""
     return rec
 
 
+# AI 主题判据单一源（2026-10-07 R559）：课程池天然含 imooc「云计算&大数据」等非 AI 方向，
+# 未找到资源的课名会被当作搜索词 ⇒ 必须在选词处过滤。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from tools.ai_topic import is_ai_topic  # noqa: E402
+except Exception:  # 回退：保守子集（与单一源同口径的白名单式判定）
+    def is_ai_topic(text):
+        t = (text or "").lower()
+        return any(p in t for p in ("人工智能", "大模型", "智能体", "机器学习", "深度学习",
+                                    "提示词", "生成式", "文生图", "文生视频", "多模态", "ai"))
+
+
 def pick_for_words(merged: dict, limit: int, gap_days: float = RESEARCH_GAP_DAYS) -> list:
-    """挑选进入搜索词的课程：未找到、未忽略、且（新课 或 距上次搜索超过 gap 天）。"""
+    """挑选进入搜索词的课程：未找到、未忽略、AI 主题、且（新课 或 距上次搜索超过 gap 天）。"""
     cands = []
     for c in merged.get("courses", []):
         if c.get("status") in ("found", "ignore"):
             continue
         if c.get("resources"):
+            continue
+        if not is_ai_topic(c.get("title") or ""):  # AI 主题门（R559）
             continue
         last = c.get("last_words_at") or ""
         fresh = days_since(c.get("first_seen", "")) <= NEW_DAYS

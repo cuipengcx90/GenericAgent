@@ -13,6 +13,28 @@ import requests
 sys.path.insert(0, "/Users/cuip/projects/GenericAgent/memory")
 from keychain import keys
 
+# AI 主题判据单一源（2026-10-07 R559：用户要求海搜只要 AI 结果）
+sys.path.insert(0, "/Users/cuip/projects/GenericAgent")
+try:
+    from tools.ai_topic import is_ai_topic  # noqa: E402
+    _AI_SRC = "tools/ai_topic.py (单一源)"
+except Exception:  # 回退：离线内联判据（与单一源同一口径的保守子集）
+    _AI_SRC = "inline fallback (保守子集)"
+    _AI_POS = ("人工智能", "大模型", "智能体", "机器学习", "深度学习", "提示词",
+               "生成式", "文生图", "文生视频", "多模态", "具身", "ai")
+    _AI_NEG = ("hadoop", "docker", "kubernetes", "k8s", "spring", "微服务",
+               "软考", "影视后期", "剪辑")
+    def is_ai_topic(text):
+        t = (text or "").lower()
+        if any(p in t for p in _AI_POS):
+            return True
+        return False  # 严格档：无正向信号一律 False（UNKNOWN/NON_AI 同判）
+
+AI_SKIPPED = [0]  # AI 主题门（结果侧）丢弃计数，供运行摘要与统计读取
+# AI 门总开关：生产恒 True；自测用合成语料（"接口测试 教程 quark" 等无 AI 语义）
+# 会误伤既有 T1–T10 的预算/轮转断言，故自测期间临时关闭，并由 T11 单独覆盖门控行为。
+AI_GATE_ENABLED = True
+
 BASE = "https://haisou.cc"
 KEYCHAIN_NAME = "haisou_hs_web_session"
 # 静态关键词（手动维护）
@@ -335,8 +357,20 @@ def run(max_tasks=None, static_daily=None):
     #   P1 静态词轮转窗口      —— 老词增量极低，每天只轮转一部分
     #   P2 课程词 × baidu/ali  —— 仅用剩余预算补齐
     dynamic = load_dynamic_keywords()
+    # 查询侧 AI 门（2026-10-07 R559）：非 AI 词根本不发请求（词源含 imooc 云计算&大数据
+    # 方向与全能IT排行站，天然混入 Hadoop/Docker/K8s/Spring 等；发出去必然自证命中）。
+    n0 = len(dynamic)
+    if AI_GATE_ENABLED:
+        dynamic = [d for d in dynamic
+                   if is_ai_topic(d.get("query", "")) or is_ai_topic(d.get("title", ""))]
+    if len(dynamic) != n0:
+        print(f"[AI查询门] 动态词过滤: {n0} -> {len(dynamic)}（{n0 - len(dynamic)} 个非 AI 词跳过）")
+    s0 = len(STATIC_KEYWORDS)
+    static_kws = [kw for kw in STATIC_KEYWORDS if (not AI_GATE_ENABLED) or is_ai_topic(kw)]
+    if len(static_kws) != s0:
+        print(f"[AI查询门] 静态词过滤: {s0} -> {len(static_kws)}（{s0 - len(static_kws)} 个非 AI 词跳过）")
     dyn_quark = [(d["query"], "quark", True, d["title"]) for d in dynamic]
-    static_tasks = [(kw, pf, False, None) for kw in STATIC_KEYWORDS for pf in PLATFORMS]
+    static_tasks = [(kw, pf, False, None) for kw in static_kws for pf in PLATFORMS]
     dyn_other = [(d["query"], pf, True, d["title"])
                  for pf in DYNAMIC_PLATFORM_ORDER[1:] for d in dynamic]
     total = len(dyn_quark) + len(static_tasks) + len(dyn_other)
@@ -406,6 +440,12 @@ def run(max_tasks=None, static_daily=None):
                     # 相关性校验：过滤 haisou 分词模糊匹配带来的无关垃圾结果
                     if not is_relevant(q, title):
                         continue
+                    # AI 主题门（2026-10-07 R559）：is_relevant 是自指判据（标题含查询词即真），
+                    # 非 AI 词（Hadoop/Docker/K8s/Spring/软考/影视后期…）一旦发出去必然自证命中，
+                    # 故此处再做一次与词源无关的独立判定，只放行 AI 主题。
+                    if AI_GATE_ENABLED and not is_ai_topic(title):
+                        AI_SKIPPED[0] += 1
+                        continue
                     if is_title_duplicate(title, existing_titles):
                         continue
                     record = make_item(q, item)
@@ -470,9 +510,12 @@ def run(max_tasks=None, static_daily=None):
         "cycle": cycle,
         "new_items": sum(s["new"] for s in scanned),
         "additions": len(additions),
+        "ai_skipped": AI_SKIPPED[0],
         "error": error,
         "scanned": scanned,
     })
+    if AI_SKIPPED[0]:
+        print(f"[AI结果门] 丢弃非 AI 命中 {AI_SKIPPED[0]} 条（{_AI_SRC}）")
     return additions, first_run, error
 
 
@@ -521,11 +564,15 @@ def _selftest():
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         saved = {k: globals().get(k) for k in
-                 ("STATE_PATH", "CURSOR_PATH", "PROGRESS_LOG_PATH", "DYNAMIC_KEYWORDS_PATH", "keys")}
+                 ("STATE_PATH", "CURSOR_PATH", "PROGRESS_LOG_PATH", "DYNAMIC_KEYWORDS_PATH", "keys",
+                  "AI_GATE_ENABLED")}
         globals()["STATE_PATH"] = td / "state.json"
         globals()["CURSOR_PATH"] = td / "cursor.json"
         globals()["PROGRESS_LOG_PATH"] = td / "progress.jsonl"
         globals()["DYNAMIC_KEYWORDS_PATH"] = td / "dyn.json"   # 不存在 ⇒ 只有静态词
+        # 合成语料（"接口测试 教程 quark" 等）无 AI 语义，开闸会把 T1–T10 的预算/轮转断言
+        # 全部打成"空结果"⇒ 自测期间关闸，门控行为由 T11 用单元判据单独覆盖。
+        globals()["AI_GATE_ENABLED"] = False
         fake_keys = types.SimpleNamespace(
             haisou_hs_web_session=types.SimpleNamespace(use=lambda: "fake-cookie"))
         globals()["keys"] = fake_keys
@@ -709,6 +756,61 @@ def _selftest():
             ck("T10 空列表安全", rotate_window([], 0, 5) == [] and next_dyn_index(0, 5, 0) == 0)
             # 边界：窗口刚好等于词数 ⇒ 每轮同一批（全量覆盖不丢）
             ck("T10 窗口=全量时不轮转", next_dyn_index(28, 28, 7) == 0)
+
+            # T11 AI 主题门（起因：09-29 推送 37 条里 29 条非 AI，来自 imooc 池词 Hadoop/Docker/K8s）
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "ai_topic_probe", str(Path(__file__).resolve().parent.parent / "tools" / "ai_topic.py"))
+            _at = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_at)
+            ck("T11 非AI:Hadoop 标题被拒",
+               _at.is_ai_topic("Hadoop 系统入门+核心精讲") is False)
+            ck("T11 非AI:Docker/K8s 标题被拒",
+               _at.is_ai_topic("Docker+Kubernetes 实战") is False)
+            ck("T11 非AI:软件测试 标题被拒",
+               _at.is_ai_topic("软件测试 教程 quark") is False)
+            ck("T11 AI:AI agent 标题放行", _at.is_ai_topic("AI agent大师之路") is True)
+            ck("T11 AI:Claude Code 标题放行", _at.is_ai_topic("Claude Code 实战") is True)
+            _n_ai = [k for k in STATIC_KEYWORDS if _at.is_ai_topic(k)]
+            ck("T11 静态词门:确有非 AI 词被砍", 0 < len(_n_ai) < len(STATIC_KEYWORDS))
+            ck("T11 静态词门:AI 词全部保留",
+               all(k in _n_ai for k in ("AI Agent", "Claude Code", "AI测试")))
+            # 结果门接线（2026-10-07 重写）：用固定混合语料（1 条 AI + 1 条非 AI）单测结果门本体。
+            # 不能复用 fake_search：其标题由查询词拼成，而查询侧门已把静态词收窄成 AI 词
+            # ⇒ 合成标题全是 AI 标题、结果门无事可做（旧断言因此假红）。故同时钉住
+            # is_relevant（上游相关性门）以隔离被测对象，只留结果门这一层判据。
+            # ⚠️ 语料标题须与旧用例的合成标题（形如 "<kw> 教程"）低相似：实测
+            # "AI Agent 实战课程" 与 T 系列早前落库的 "AI Agent 教程" 相似度 ≥0.85
+            # ⇒ 被 is_title_duplicate 静默丢弃（真因在去重、不在结果门），断言假红。
+            _mix11 = [
+                {"hsid": "t11-ai", "share_name": "大模型微调实战", "share_pwd": "", "url": "u"},
+                {"hsid": "t11-cc", "share_name": "Excel 函数实战", "share_pwd": "", "url": "u"},
+            ]
+
+            def search11(session, q, platform):
+                return [dict(h) for h in _mix11]
+
+            _saved_rel = globals()["is_relevant"]
+            _saved_search11 = globals()["search"]
+            globals()["search"] = search11
+            globals()["is_relevant"] = lambda q, title: True   # 隔离上游门，只测结果门
+            globals()["AI_GATE_ENABLED"] = True
+            AI_SKIPPED[0] = 0
+            try:
+                _a11, _f11, _e11 = run(max_tasks=1)
+                _sk11 = AI_SKIPPED[0]
+            finally:
+                globals()["AI_GATE_ENABLED"] = False
+                globals()["is_relevant"] = _saved_rel
+                globals()["search"] = _saved_search11
+            _kept11 = [r.get("title", "") for r in (_a11 or [])]
+            _k11 = [k for k in (load_state() or {}) if str(k).startswith("t11")]
+            print(f"[dbg T11] kept={_kept11} keys={_k11} skipped={_sk11}")
+            ck(f"T11 结果门接线:开闸只留 AI 命中"
+               f"(kept={_kept11} skipped={_sk11} first={_f11} err={_e11})",
+               len(_kept11) == 1 and "大模型" in _kept11[0]
+               and "Excel" not in _kept11[0] and _sk11 == 1)
+            globals()["AI_SKIPPED"][0] = 0
         finally:
             for k, v in saved.items():
                 globals()[k] = v

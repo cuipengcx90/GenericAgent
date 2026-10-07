@@ -1,42 +1,6 @@
 {
-  "Python3入门机器学习 经典算法与应用": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/169.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:169"
-  },
-  "Docker环境下的企业级前后端分离项目部署与运维": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/219.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:219"
-  },
-  "Hadoop 系统入门+核心精讲": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/301.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:301"
-  },
-  "Spring Cloud微服务架构 设计实现广告系统": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/310.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:310"
-  },
   "Python3入门人工智能 掌握机器学习+深度学习": {
-    "added_at": "2026-10-06 14:11:51",
+    "added_at": "2026-10-07 11:22:22",
     "found": false,
     "source_url": "https://coding.imooc.com/class/418.html",
     "published_at": "2026-10-06T00:00:00+08:00",
@@ -44,35 +8,8 @@
     "search_count": 0,
     "origin": "pool:imooc:418"
   },
-  "Docker 系统性入门+进阶实践": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/511.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:511"
-  },
-  "Kubernetes 入门到进阶实战，系统性掌握 K8s 生产实践": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/464.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:464"
-  },
-  "ES7+Spark 构建高匹配度搜索服务+千人千面推荐系统": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/391.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:391"
-  },
   "PyTorch入门到进阶 实战计算机视觉与自然语言处理项目": {
-    "added_at": "2026-10-06 14:11:51",
+    "added_at": "2026-10-07 11:22:22",
     "found": false,
     "source_url": "https://coding.imooc.com/class/440.html",
     "published_at": "2026-10-06T00:00:00+08:00",
@@ -80,31 +17,22 @@
     "search_count": 0,
     "origin": "pool:imooc:440"
   },
-  "Python3+TensorFlow打造人脸识别智能小程序": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/327.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:327"
-  },
-  "Flink+ClickHouse 玩转企业级实时大数据开发": {
-    "added_at": "2026-10-06 14:11:51",
-    "found": false,
-    "source_url": "https://coding.imooc.com/class/510.html",
-    "published_at": "2026-10-06T00:00:00+08:00",
-    "found_at": null,
-    "search_count": 0,
-    "origin": "pool:imooc:510"
-  },
   "OpenCV三大经典项目实战 一次掌握计算机视觉核心技能": {
-    "added_at": "2026-10-06 14:11:51",
+    "added_at": "2026-10-07 11:22:22",
     "found": false,
     "source_url": "https://coding.imooc.com/class/496.html",
     "published_at": "2026-10-06T00:00:00+08:00",
     "found_at": null,
     "search_count": 0,
     "origin": "pool:imooc:496"
+  },
+  "深度学习之目标检测常用算法原理+实践精讲 高阶 ·": {
+    "added_at": "2026-10-07 11:22:22",
+    "found": false,
+    "source_url": "https://coding.imooc.com/class/298.html",
+    "published_at": "2026-10-06T00:00:00+08:00",
+    "found_at": null,
+    "search_count": 0,
+    "origin": "pool:imooc:298"
   }
 }
