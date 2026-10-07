@@ -216,7 +216,7 @@ function getLikeCount(post) {
 - 交叉证据（判"别人是否已发过私信"）：`grep -n "飞书已送达\|推送飞书私信简报" logs/feishu_agent.log | tail`，命中且紧跟在当期 `归档 2026-09-23` 提交步骤之后即视为已送。
 
 ### 验收脚本要点
-Raw/Wiki/INDEX 三文件存在且非空 → frontmatter `sources` 逐条解析到真实文件 → 正文 wikilink ≥2 且均存在 → 正文中每个 linux.do topic URL **只出现一次**（主帖 URL 只放「参考链接」一处）→ 任一 FAIL 则不推送。
+Raw/Wiki/INDEX 三文件存在且非空 → frontmatter `sources` 逐条解析到真实文件 → 正文 wikilink ≥2 且均存在（★校验按**后缀匹配**：`[[topics/x]]` 实解析到 `60 Wiki/topics/x.md`，直接查 `vault/<link>.md` 恒假 MISS；且初稿常只写 Markdown 相对链接⇒须显式补 `[[…]]`，2026-10-07 实测）→ 正文中每个 linux.do topic URL **只出现一次**（主帖 URL 只放「参考链接」一处）→ 任一 FAIL 则不推送。
 
 ### CF 挑战卡死时的备用取数通道：独立临时 Chrome（2026-09-25 实测）
 - 症状：用户 Chrome 打开 linux.do 主帖停在 Cloudflare 挑战页（`turnstile` iframe status 0，`web_scan` 只拿到挑战壳），驱动注入也过不去 ⇒ **别反复重试、别清 cookie**，换通道。
