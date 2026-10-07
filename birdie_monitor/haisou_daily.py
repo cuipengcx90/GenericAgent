@@ -30,14 +30,21 @@ except Exception:  # 回退：离线内联判据（与单一源同一口径的�
             return True
         return False  # 严格档：无正向信号一律 False（UNKNOWN/NON_AI 同判）
 
-    # 方向门回退版（保守子集，与单一源「FRONTIER 优先/无前沿即 False」同档）
-    _DIR_FWD = ("大模型", "大语言模型", "智能体", "ai应用", "ai开发", "ai产品", "ai工具",
-                "ai变现", "ai编程", "ai创作", "提示词", "提示工程", "多模态", "文生图",
-                "文生视频", "数字人", "llm", "aigc", "gpt", "claude", "codex", "cursor",
-                "agent", "rag", "mcp", "dify", "coze", "vibe coding", "ai coding")
+    # 方向门回退版（2026-10-07 v3 宽档：只挡「纯入门/通识基础课」，AI 应用向全留）
+    _FND_MOD = ("入门", "零基础", "从零", "小白", "导论", "科普", "通识", "速成", "基础")
+    _FND_SUBJ = ("人工智能", "机器学习", "深度学习", "计算机视觉", "自然语言", "神经网络",
+                 "数据科学", "大模型", "智能体", "ai")
+    _FND_APPLIED = ("实战", "项目", "开发", "落地", "搭建", "部署", "变现", "副业", "出海",
+                    "自媒体", "运营", "教育", "绘画", "视频", "编程", "助手", "数字人",
+                    "多智能体", "agent", "rag", "工作流", "案例", "企业级", "产品", "接单",
+                    "创业", "咨询", "客服", "知识库", "翻译", "测试", "运维", "设计", "应用")
     def is_direction_ai(text):
         t = (text or "").lower()
-        return any(k in t for k in _DIR_FWD)
+        if not any(k in t for k in _FND_MOD):
+            return True
+        if not any(k in t for k in _FND_SUBJ):
+            return True
+        return any(k in t for k in _FND_APPLIED)
 
 AI_SKIPPED = [0]  # AI 主题门（结果侧）丢弃计数，供运行摘要与统计读取
 DIR_SKIPPED = [0]  # 方向门（2026-10-07 第二批）丢弃计数：AI 但属基础慕课/非应用向
@@ -582,6 +589,27 @@ def notify(text):
 
 
 # ---------------------------------------------------------------------------
+# 未知参数 fail-closed：真实监控会消耗站点配额(2点/请求)，误传子命令(如裸 "selftest")
+# 会静默当成真跑（2026-10-07 实测误跑 2 次白耗 74 点）⇒ 未知 token 一律拒绝并给用法。
+_KNOWN_FLAGS_VALUE = {"--max-tasks"}
+_KNOWN_FLAGS = {"--selftest"}
+
+def _argv_error(argv):
+    toks = list(argv[1:])
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t in _KNOWN_FLAGS_VALUE:
+            if i + 1 >= len(toks):
+                return f"{t} 缺值"
+            i += 2
+            continue
+        if t in _KNOWN_FLAGS:
+            i += 1
+            continue
+        return f"未知参数 {t!r}（未知 token 会被当成真跑消耗站点配额，已拒绝）"
+    return None
+
 # 自测（--selftest）：沙盒内验证「轮转游标 + 请求预算 + 进度留痕 + 异常不丢进度」。
 # 全程不触网、不写生产 state/游标/进度（全部重定向到 tempfile 沙盒）。
 # ---------------------------------------------------------------------------
@@ -907,13 +935,24 @@ def _selftest():
         ck("T12 方向结果门:只留应用向(基础慕课向被 DIR_SKIPPED 拦下)",
            len(_kept12) == 1 and "DeepSeek" in _kept12[0] and "机器学习" not in _kept12[0]
            and _dsk12 == 1 and _sk12 == 0)
-        # 查询侧方向门：用与生产同一函数（单一源）直算词表存活面
+        # 查询侧方向门：用与生产同一函数（单一源）直算词表存活面（2026-10-07 v3 宽档）
+        _ai_kw = [k for k in STATIC_KEYWORDS if _at.is_ai_topic(k)]
         _dir_kw = [k for k in STATIC_KEYWORDS if _at.is_direction_ai(k)]
-        ck("T12 方向查询门:前沿词留存、基础向词不发请求",
-           "AI Agent" in _dir_kw and "AI测试" not in _dir_kw
-           and 0 < len(_dir_kw) < len([k for k in STATIC_KEYWORDS if _at.is_ai_topic(k)]))
+        # 方向门只挡「纯入门通识」不挡非 AI 词（非 AI 由 AI 门负责）⇒判据=AI 词零误杀
+        _ai_dropped = [k for k in _ai_kw if k not in _dir_kw]
+        ck(f"T12 方向查询门(v3宽档):AI 应用向词零误杀(ai={len(_ai_kw)} dropped={_ai_dropped})、纯入门通识词被剔",
+           "AI Agent" in _dir_kw and "AI测试" in _dir_kw
+           and not _ai_dropped
+           and not _at.is_direction_ai("Python入门人工智能，掌握机器学习+深度学习")
+           and _at.direction_explain("Python入门人工智能，掌握机器学习+深度学习")["verdict"] == "FOUNDATION")
         globals()["AI_SKIPPED"][0] = 0
         globals()["DIR_SKIPPED"][0] = 0
+    # 参数闸门（纯函数，无需沙箱）：未知裸参数报错 / 已知 flag 放行 / 缺值报错
+    ck("T13 参数闸门:未知裸参数拒绝(防误跑烧配额)/已知 flag 放行/--max-tasks 缺值拒绝",
+       _argv_error(["x.py", "selftest"]) is not None
+       and _argv_error(["x.py", "--max-tasks", "9"]) is None
+       and _argv_error(["x.py", "--selftest"]) is None
+       and _argv_error(["x.py", "--max-tasks"]) is not None)
     ok = sum(1 for _, c in checks if c)
     print(f"\nselftest: {ok}/{len(checks)} checks passed")
     return 0 if ok == len(checks) else 1
@@ -922,6 +961,11 @@ def _selftest():
 if __name__ == "__main__":
     if "--selftest" in sys.argv:
         sys.exit(_selftest())
+    _argv_err = _argv_error(sys.argv)
+    if _argv_err:
+        print(f"[fail-closed] {_argv_err}；用法: haisou_daily.py [--max-tasks N] | 自测: --selftest",
+              file=sys.stderr)
+        sys.exit(2)
     _max_tasks = None
     if "--max-tasks" in sys.argv:
         try:

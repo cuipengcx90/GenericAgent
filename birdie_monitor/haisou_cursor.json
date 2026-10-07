@@ -1,15 +1,15 @@
 {
-  "index": 7,
-  "total": 72,
+  "index": 14,
+  "total": 30,
   "cycle": 0,
-  "dyn_index": 28,
-  "dyn_total": 37,
-  "updated_at": "2026-10-07 11:23:00",
+  "dyn_index": 18,
+  "dyn_total": 20,
+  "updated_at": "2026-10-07 15:42:59",
   "last_run": {
-    "start": "2026-10-07 11:22:30",
-    "done": 35,
+    "start": "2026-10-07 15:42:45",
+    "done": 15,
     "error": null,
-    "static_used": 7,
-    "plan_len": 35
+    "static_used": 3,
+    "plan_len": 15
   }
 }

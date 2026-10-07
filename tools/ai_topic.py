@@ -72,12 +72,16 @@ NEGATIVE_CJK = [
     "中间件", "高并发", "分布式", "架构师", "全栈", "服务器", "网络工程",
 ]
 
-# ------------------------------------------------ 方向门（2026-10-07 第二批，用户裁决）
-# 用户口径：「剔基础慕课，只留大模型 / AI Agent / 应用向」（AI 门后仍留的 8 条里 5 条是
-# 「Python3入门人工智能/机器学习+深度学习」这类基础慕课）。判据=先看有无「前沿载体词」
-# （FORWARD），有则保留（即使同时含「小白/入门」，如「小白玩转AI大模型应用开发」）；
-# 无 FORWARD 且命中 BACKWARD（基础/学科/框架）⇒ 剔；两者都无（OTHER_AI）⇒ 一并剔
-# （严格档，宁缺勿滥；命中明细落在 explain 里便于回看误杀）。
+# ------------------------------------------------ 方向门（2026-10-07 第三版，用户口径订正）
+# 用户口径（2026-10-07 追加）：「我关注的就是 AI 方向 —— AI 开发 / AI coding / AI Agent /
+# AI 应用 / AI 多智能体 / AI 自媒体 / AI 教育 / AI 出海 / AI 绘画 / AI 视频 / AI 编程助手 /
+# AI 副业变现 …… 只要是 AI 的都要」。真正不要的只有两类：
+#   ① 非 AI 内容（Hadoop / Spring Cloud / K8s / Docker / 软考 / 影视后期）⇒ 由 AI 门 is_ai_topic 挡；
+#   ② 「纯入门/通识基础课」（Python3入门人工智能 / 人工智能导论 / 机器学习基础 / 零基础学深度学习）
+#      ⇒ 标题同时出现「基础修饰词」与「学科词」且**无**任何「应用/落地/职业方向」信号时剔除。
+# 判据 v3 =  mod ∧ subject ∧ ¬applied ⇒ FOUNDATION（剔）；其余一律放行（宽档，避免误杀 AI 应用向）。
+# 注：本函数只判「方向」；实际使用须与 AI 门叠加（最终判据 = is_ai_topic ∧ is_direction_ai）。
+# 第二版（只留 FORWARD 前沿载体）留存可查：git 8fef781。
 FORWARD_ASCII = [
     "llm", "llms", "genai", "aigc", "gpt", "chatgpt", "openai", "anthropic", "claude",
     "codex", "cursor", "copilot", "windsurf", "agent", "agents", "agentic", "rag",
@@ -104,11 +108,38 @@ BACKWARD_CJK = [
     "语音识别", "语音合成", "推荐算法", "人工智能", "知识图谱",
 ]
 
+# 方向门 v3（2026-10-07 第三版）三个词表 —— 判据单一源，勿在别处复制
+FOUNDATION_MODIFIER = [                 # 基础修饰词：与学科词同现且无应用信号 ⇒ 判基础课
+    "入门", "基础", "零基础", "从零", "小白", "导论", "科普", "通识", "速成", "初学",
+]
+AI_SUBJECT_CJK = [                      # 学科/技术面（「纯理论入门」多落此列）
+    "人工智能", "机器学习", "深度学习", "神经网络", "强化学习", "计算机视觉",
+    "自然语言", "图像识别", "目标检测", "人脸识别", "语音识别", "语音合成",
+    "推荐算法", "知识图谱", "数据挖掘", "模式识别",
+]
+APPLIED_STRONG = [                      # 应用/落地/职业方向信号（任一命中 ⇒ 视为「能用」放行）
+    # 通用落地形态（★不含裸「应用」二字：教材常用「算法与应用」，会假放行基础课）
+    "实战", "项目", "开发", "落地", "工程", "搭建", "部署", "实现", "案例", "企业级",
+    "工作流", "自动化", "提效", "产品", "设计", "测试", "运维", "架构", "课程设计",
+    # 用户列举的 AI 方向（2026-10-07 追加）
+    "编程", "写代码", "助手", "副业", "变现", "出海", "跨境", "自媒体", "运营", "营销",
+    "获客", "增长", "教育", "教学", "培训", "讲师", "咨询", "顾问", "解决方案",
+    "绘画", "插画", "漫画", "漫剧", "视频", "剪辑", "数字人", "口播", "配音", "写作",
+    "文案", "小说", "游戏", "音乐", "音频", "翻译", "办公", "量化", "投资", "电商",
+    "创业", "接单", "外包", "客服", "问答", "检索", "知识库", "推荐", "搜索",
+    # 应用形态/技术载体
+    "智能体", "多智能体", "微调", "提示词", "提示工程", "赋能", "行业",
+]
+APPLIED_ASCII = ["agent", "agents", "agentic", "rag", "coding", "workflow", "saas"]
+
 _FWD_ASCII_RX = re.compile(
     r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in FORWARD_ASCII) + r")(?![a-z0-9])"
 )
 _BWD_ASCII_RX = re.compile(
     r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in BACKWARD_ASCII) + r")(?![a-z0-9])"
+)
+_APP_ASCII_RX = re.compile(
+    r"(?<![a-z0-9])(" + "|".join(re.escape(t) for t in APPLIED_ASCII) + r")(?![a-z0-9])"
 )
 
 _ASCII_RX = re.compile(
@@ -160,30 +191,44 @@ def is_ai_topic(text: str) -> bool:
 
 
 def direction_explain(text: str) -> dict:
-    """方向门明细：forward=前沿载体词（大模型/Agent/应用向）、backward=基础学科/框架/入门词。"""
+    """方向门 v3 明细。
+
+    字段：modifier=基础修饰词、subject=学科/技术面、applied=应用/职业方向信号、
+    forward=前沿载体词（大模型/Agent 等）。backward 为旧字段（= modifier ∪ subject），
+    保留仅为兼容既有调用与排障输出。
+    verdict ∈ {FOUNDATION, APPLIED, FRONTIER, OPEN}：仅 FOUNDATION 判剔。
+    """
     t = (text or "").lower()
+    mod = [x for x in FOUNDATION_MODIFIER if x in t]
+    subj = [x for x in AI_SUBJECT_CJK if x in t]
+    subj += _BWD_ASCII_RX.findall(t)          # pytorch/opencv/nlp 等框架与缩写
+    app = [x for x in APPLIED_STRONG if x in t]
+    app += _APP_ASCII_RX.findall(t)
     fwd = [x for x in FORWARD_CJK if x in t]
     fwd += _FWD_ASCII_RX.findall(t)
     fwd += [x for x, rx in _FWD_PHRASE_RXS if rx.search(t)]
-    bwd = [x for x in BACKWARD_CJK if x in t]
-    bwd += _BWD_ASCII_RX.findall(t)
-    fwd, bwd = sorted(set(fwd)), sorted(set(bwd))
-    if fwd:
+    mod, subj, app, fwd = (sorted(set(x)) for x in (mod, subj, app, fwd))
+    if mod and subj and not app:
+        v = "FOUNDATION"      # 纯入门/通识基础课 ⇒ 剔
+    elif app:
+        v = "APPLIED"
+    elif fwd:
         v = "FRONTIER"
-    elif bwd:
-        v = "FOUNDATION"
     else:
-        v = "OTHER_AI"   # AI 门已过但两侧都没命中（罕见）
-    return {"verdict": v, "forward": fwd, "backward": bwd}
+        v = "OPEN"            # 无基础修饰词、也无强应用词 ⇒ 宽档放行
+    return {"verdict": v, "modifier": mod, "subject": subj, "applied": app,
+            "forward": fwd, "backward": sorted(set(mod) | set(subj))}
 
 
 def is_direction_ai(text: str) -> bool:
-    """方向门（2026-10-07 第二批，用户裁决）：只放行大模型/AI Agent/应用向。
+    """方向门 v3（2026-10-07 第三版，用户口径订正）：只剔「纯入门/通识基础课」，其余放行。
 
-    先于 AI 门使用或叠加使用均可（本函数只看方向，不看是否 AI）。
-    含「小白/入门」但同时命中前沿载体词者**保留**（如「小白玩转AI大模型应用开发」）。
+    ★ 最终判据 = is_ai_topic(text) and is_direction_ai(text)（AI 门 ∧ 方向门）：
+      非 AI 内容（Hadoop / Spring Cloud / K8s / Docker / 软考…）由 AI 门挡；
+      本门只管方向（是否 AI 不在此判）。
+    含「小白/入门」但同时有应用信号者**保留**（如「小白玩转AI大模型应用开发」命中「开发」）。
     """
-    return bool(direction_explain(text)["forward"])
+    return direction_explain(text)["verdict"] != "FOUNDATION"
 
 
 # ---------------------------------------------------------------- 自测
@@ -230,8 +275,9 @@ _BOUNDARY_CASES = [
     None,
 ]
 
-# 方向门用例（2026-10-07 第二批）：用户口径=只留大模型/AI Agent/应用向
+# 方向门用例（2026-10-07 第三版）：用户口径=只剔「纯入门/通识基础课」，AI 各方向全留
 _DIR_KEEP = [
+    # 前沿 / 应用向（第二批已有）
     "mktx-hagent-【Harness&Hermes】多智能体开发特训营",
     "慕课体系课-【Harness&Hermes】多智能体开发特训营",
     "林粒粒：小白玩转AI大模型应用开发",
@@ -243,18 +289,52 @@ _DIR_KEEP = [
     "AIGC 变现实战营",
     "ChatGPT 应用开发与 RAG 知识库搭建",
     "AI Agent 智能体开发",
-    "AI coding 实战营：用 AI 写代码",  # 2026-10-07 补：ASCII 形对齐中文「ai编程」
+    "AI coding 实战营：用 AI 写代码",
+    # 2026-10-07 第三版新增：用户点名要的各 AI 方向（第二批严格档曾误杀）
+    "AI 自媒体运营从0到1",
+    "AI 出海变现实战营",
+    "AI 教育产品设计与落地",
+    "AI 绘画商业插画实战",
+    "AI 视频制作与数字人应用",
+    "AI 编程助手实战：用 Claude Code 干活",
+    "AI 副业变现指南",
+    "大模型应用开发工程师（岗位课）",
+    "AI 电商客服机器人搭建",
+    "AI 翻译工具在企业办公中的应用",
+    # 宽档：AI 技术实操课（无基础修饰词，或带强应用词）⇒ 保留
+    "PyTorch入门到进阶 实战计算机视觉与自然语言处理项目",
+    "OpenCV三大经典项目实战 一次掌握计算机视觉核心技能",
+    "深度学习之目标检测常用算法原理+实践精讲",
 ]
 _DIR_DROP = [
     "Python3入门人工智能，掌握机器学习+深度学习",
     "慕课《Python3系统入门人工智能》：人人都应该学会利用AI这个工具",
     "【Python教程】Python3入门机器学习 经典算法与应用 轻松入行人工智能（完整版）",
-    "PyTorch入门到进阶 实战计算机视觉与自然语言处理项目",
-    "OpenCV三大经典项目实战 一次掌握计算机视觉核心技能",
-    "深度学习之目标检测常用算法原理+实践精讲",
     "人工智能导论",
     "机器学习基础",
     "零基础学深度学习",
+    "零基础学机器学习：从原理到算法",
+    "人工智能通识课",
+]
+# 组合门（最终判据 is_ai_topic ∧ is_direction_ai）回归：非 AI 必剔 / 用户 AI 方向必留
+_COMBO_BAD = [
+    "Hadoop 系统入门+核心精讲",
+    "[尚硅谷]大数据技术之Hadoop视频 - 带源码课件",
+    "Spring Cloud微服务架构 设计实现广告系统",
+    "Kubernetes 入门到进阶实战，系统性掌握 K8s 生产实践",
+    "Docker 系统性入门+进阶实践",
+    "系统规划与管理师（软考高级）一站式通关课2026",
+]
+_COMBO_GOOD = [
+    "AI 自媒体运营从0到1",
+    "AI 出海变现实战营",
+    "AI 教育产品设计与落地",
+    "AI 绘画商业插画实战",
+    "AI 视频制作与数字人应用",
+    "AI 编程助手实战",
+    "AI 副业变现指南",
+    "AI Agent 智能体开发",
+    "大模型应用开发工程师（岗位课）",
 ]
 # 当日事故数据（R559 A/B 后保留的 8 条 AI 结果）⇒ 方向门后应剩 3 条
 _DAY8 = [
@@ -303,16 +383,23 @@ def selftest() -> int:
     ck("短语负控:'video coding 视频编码实战' 不误命中",
        not is_ai_topic("video coding 视频编码实战"))
     ck("短语负控:'encoding 编码原理' 不误命中", not is_ai_topic("encoding 编码原理"))
-    # ---- 方向门（2026-10-07 第二批）----
+    # ---- 方向门 v3（2026-10-07 第三版）----
     for c in _DIR_KEEP:
-        ck(f"方向门应保留(前沿): {c[:26]}", is_direction_ai(c))
+        ck(f"方向门应保留: {c[:26]}", is_direction_ai(c))
     for c in _DIR_DROP:
-        ck(f"方向门应剔(基础/学科): {c[:26]}", not is_direction_ai(c))
+        ck(f"方向门应剔(纯入门/通识基础课): {c[:26]}", not is_direction_ai(c))
     e3 = direction_explain("林粒粒：小白玩转AI大模型应用开发")
-    ck("方向门:前沿优先于基础词(含小白/入门仍留)",
-       e3["verdict"] == "FRONTIER" and "小白" in e3["backward"])
-    ck("方向门:空/None 不崩", direction_explain(None)["verdict"] == "OTHER_AI")
-    ck("方向门:FOUNDATION 明细可见", direction_explain("机器学习基础")["verdict"] == "FOUNDATION")
+    ck("方向门:含小白但有应用信号(开发)仍留",
+       e3["verdict"] == "APPLIED" and "小白" in e3["modifier"] and "开发" in e3["applied"])
+    ck("方向门:空/None 不崩且宽档放行",
+       is_direction_ai(None) and direction_explain(None)["verdict"] == "OPEN")
+    _e4 = direction_explain("机器学习基础")
+    ck("方向门:FOUNDATION 明细可见(mod+subject)",
+       _e4["verdict"] == "FOUNDATION" and "基础" in _e4["modifier"] and "机器学习" in _e4["subject"])
+    for b in _COMBO_BAD:
+        ck(f"组合门:非AI必剔 {b[:22]}", not (is_ai_topic(b) and is_direction_ai(b)))
+    for g in _COMBO_GOOD:
+        ck(f"组合门:用户AI方向必留 {g[:22]}", is_ai_topic(g) and is_direction_ai(g))
     _kept = [t for t in _DAY8 if is_ai_topic(t) and is_direction_ai(t)]
     ck("事故回归:当日 8 条 AI keep 经方向门后剩 3 条", len(_kept) == 3)
     ck("事故回归:余 3 条均为智能体/大模型方向",
