@@ -68,3 +68,4 @@ max_delay_hours（可选，默认6）：超过schedule多少小时后不再触�
 - 判读：`FAIL`=显式 `../` 锚定（在 cwd=repo 根时必失败，实测 3 例：weekly_report_reminder / linuxdo_ai_daily_summary / weekly_inspection）；`WARN`=裸相对名等跨仓歧义；`OK/SKIP` 无需处理。
 - 用法：`--only <id>[,<id>]`（未知 id 直接 rc=2）、`--json <path>`、`--sandbox` 复现 cwd 漂移、`--selftest`。
 - 与 R375 的关系：R375 记录的两类 cwd 吃态事故（PATH_MISSING / CWD_DRIFT）本器已可复现，修法仍待批（见 pending_decisions）。
+- ★**flag 归属须尊重 `--` 载荷分隔符**（R563 修）：prompt 里常见 `python3 tools/bg_task.py start --name X -- <真正的命令> -u`，`--` 之后的 `-u` 属于**载荷内层命令**（`python3 -u …`），**不是** `bg_task.py` 的 flag。旧判据按子句就近归属 ⇒ 误报 `FLAG_UNKNOWN -u for tools/bg_task.py`（假 FAIL）。修法=`_payload_pos()` 先定位 `--` 边界，边界之后的 token 不再归属该脚本；selftest 增至 **27**（含 NC25 `--` 载荷 / NC26 边界后 flag）。**教训**：任何「就近归属」类静态判据都要显式处理壳层分隔符，否则把别人命令的参数算到自己脚本头上。

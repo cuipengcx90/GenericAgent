@@ -74,8 +74,9 @@ return JSON.stringify({fail:true,now:location.pathname});
 - **风控即停（铁律）**：daemon 把 HTTP 码与页面/响应文本两级判据映射到信号类别（`RATE_LIMIT`/`FORBIDDEN`/`BANNED`/`LOGIN_REQUIRED`/`CF_CHALLENGE`）；命中即 **写 state + 落 `risk_log.jsonl` + 飞书私信告警**（`reflect_scripts/reflect_common.notify_feishu`）+ **长暂停 60–120min**，绝不静默重试。
 - 同类信号当日累计 ≥3 ⇒ **当日停止浏览**并强制告警；同类告警有 6h 冷却（防刷屏）。
 - 强信号集 `RISK_STRONG` 只含 `BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED`；`CF_CHALLENGE` 刻意**不**入强信号（常见且多半自愈，否则误伤成小时级停机）。
+- **批内熔断（R563 补，2026-10-08）**：风控判定原先在 `browse_batch` **返回之后**才做 ⇒ 抓取阶段的失败诊断容易被静默吞掉，只有凑齐一个完整批后才轮到风控检查，命中窗口偏晚。10-08 实测时间线（browse_log/risk_log 原始台账）：19:55:37 开机后 daemon 起跑（watchd `DAEMON_NEVER_RUNNING` 补拉）→ 20:00–22:02 正常浏览 **20 帖**（`DONE`×20）→ **22:06:47** 抓到当日唯一一次 `FORBIDDEN page=5 status=403`（risk_log 仅此一条）⇒ `handle_risk` 暂停 → 23:20 恢复（间隔 ~74min，符合 RISK_PAUSE 60–120min）。现改为**抓取阶段**判定：`fetch_verdict()`（纯函数）在「**所有**采样页失败 ∧ 诊断为强风控信号 / 封禁文案」时返回 `ABORT` ⇒ `browse_batch` 抛 `RiskAbort`（`browse_log` 落 `ABORT why=risk_abort:<kind>`，**零帖**）⇒ 主循环走 `handle_risk` 长暂停。部分页失败但仍有候选 ⇒ 只 `NOTE` 留痕（单页抖动不该整批空转）。抓取失败时诊断里额外留**响应正文前 200 字**（`LAST_FETCH_DIAG["detail"]`），用于区分 CF 挑战 / 封禁文案 / 限流。
 - **随机休息日**：平均每 7 天 1 天完全不浏览（`REST_DAY_P=1/7`），两次休息至少隔 3 天不连休；判定一次即落盘（幂等），当日零浏览。
-- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ **14/14 PASS**（含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」）。
+- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ 计数随版本增长，**当前口径以源码/最近一次运行输出为准**（R563 实测 **36/36 PASS**；本行原记 14/14 系 2026-10-05 时点）。含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」。
 
 ## 反检测审查强化（2026-10-05）
 
@@ -141,3 +142,19 @@ return JSON.stringify({fail:true,now:location.pathname});
 2. 「有标签」≠「能用」：自愈判据必须与消费侧（`pick_session`）用同一个函数，否则出现「一边说没有、一边说有」的永久空转。
 3. 把主站标签导航去别处的分支都要 `try/finally` 还原，并留可观测证据。
 4. 判停摆是否「到上限」先看 `state.daily` 与当日 cap，别凭感觉。
+
+## 看门狗告警语义可读化 + 休眠自声明（R563，2026-10-08）
+
+**背景（用户视角）**：开机后连收两条通知——「被看门狗重启：DAEMON_DEAD」与「维护守护已自动重启（daemon 此前不在跑，已由定时任务步骤 3 拉起）」。二者其实描述**同一件事**（机器整天关机 ⇒ 开机后守护按计划补拉 daemon），措辞却像「出了故障」+「重复提醒」。**无异常**，属正常补拉。
+
+**判据（watchd）**：`decide()` 返回 `{"action":"RESTART","reason":"DAEMON_NEVER_RUNNING"}` 时（daemon 从未在跑），台账/通知一律按**启动**而非**重启**呈现：
+
+- `kind` 三分：`STARTED`（首次启动，reason 以 `DAEMON_NEVER_RUNNING` 开头）/ `RESTART`（真重启成功）/ `RESTART_FAIL`（重启失败达阈值）。
+- `STARTED` 文案：「ℹ️ L站浏览守护此前未在运行（<原因>），看门狗已按计划启动它，节奏参数未变。」——**不出现**「重启」「已拉起」字样。
+- 是否「曾经活过」用 `_ever_alive(runtime)` 判（近 6h 内有活记录 ⇒ True）；无记录/坏值一律 fail-closed 判 False ⇒ 归「启动」语义（宁可说启动，不说崩溃）。
+- 真活着又突然消失 ⇒ 仍是 `DAEMON_DEAD` + `RESTART`/`RESTART_FAIL`，**不变**（不许被新分支吞掉）。
+
+**休眠自声明（R558 既有）**：daemon 每次 `_nap` 前写 `temp/linuxdo_browse_daemon/heartbeat.json`（`ts/pid/phase/next_wake_ts`），watchd 见 `next_wake_ts` 在未来且 ≤12h ⇒ `RESTING_UNTIL_<phase>_<min>m` 判 OK 不重启；静默窗长睡不再被误当停滞。
+
+**自测**：daemon `--selftest` **36/36**；watchd `--selftest` **98 checks / 0 failed**（含 T34a–T34h：启动文案须含「此前未在运行/不是崩溃」、真重启文案不得含该串、`_ever_alive` 四态）；沙盒断言，生产 state/台账指纹前后一致。
+

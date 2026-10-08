@@ -71,6 +71,7 @@ HEARTBEAT_REL = os.path.join("temp", "linuxdo_browse_daemon", "heartbeat.json")
 HEARTBEAT_FILE = os.path.join(ROOT, HEARTBEAT_REL)
 ALERT_MERGE_WINDOW_H = 6                 # 同类重启告警合并窗口（小时）：窗口内只发一条汇总
 RECOVERY_NOTIFY_MIN_S = 300              # 停机 ≥ 该秒数才发「已恢复」（一闪而过不打扰）
+EVER_ALIVE_FRESH_S = 6 * 3600            # 「最近见过守护在跑」的有效期（秒）：超出即视为此前未运行（R563）
 DEFAULT_MAX_HOURS = 26.0     # 长驻上限；由每日入口重新武装（对齐 anyrouter watchd 模式）
 
 
@@ -556,7 +557,8 @@ def decide(snapshot):
 
     snapshot 键：pids(list) / last_done(ts|None) / started(ts|None) / now / quiet(bool) /
                  last_restart_ts / fail_streak / busy_hint(bool) / busy_reason(str) /
-                 restart_times(list[ts]) / bridge_ok(bool|None；None=未探，按旧行为处理)
+                 restart_times(list[ts]) / bridge_ok(bool|None；None=未探，按旧行为处理) /
+                 ever_alive(bool|None；R563=最近 EVER_ALIVE_FRESH_S 内是否见过守护在跑)
     返回 {action:'OK'|'RESTART'|'RESTART_SKIP'|'BLOCKED_ENV'|'BRIDGE_DOWN', reason:str}
 
     ★心跳 = max(最近一次实质产出, 本进程启动时刻)：冷启动时 last_done 可能来自**上一次
@@ -576,6 +578,11 @@ def decide(snapshot):
             return {"action": "BRIDGE_DOWN", "reason": "BRIDGE_UNREACHABLE"}
         if not cooldown_ok:
             return {"action": "RESTART_SKIP", "reason": "RESTART_COOLDOWN"}
+        # R563：区分「此前未在运行 ⇒ 正常启动」与「运行中突然没了 ⇒ 异常重启」。
+        #   判据=最近 EVER_ALIVE_FRESH_S 内是否见过守护在跑（seen_alive_ts，由 one_round 落账）。
+        #   动机：关机/重启后开机补拉，文案说「被看门狗重启」会让人误以为守护崩了。
+        if not snapshot.get("ever_alive"):
+            return {"action": "RESTART", "reason": "DAEMON_NEVER_RUNNING"}
         return {"action": "RESTART", "reason": "DAEMON_DEAD"}
     hb = max([v for v in (last, started) if v]) if (last or started) else None
     if hb is None:
@@ -617,7 +624,8 @@ def _alert_restart(d, ok, handled, notify_fn, rt):
     返回 (是否已发, 更新后的 handled)。
     """
     now = _now()
-    kind = "RESTART" if ok else "RESTART_FAIL"
+    _first_start = bool(ok) and str(d.get("reason") or "").startswith("DAEMON_NEVER_RUNNING")
+    kind = "STARTED" if _first_start else ("RESTART" if ok else "RESTART_FAIL")
     rec = dict(handled.get(kind) or {})
     if not rec:
         rec = {"first_ts": now, "count": 0}
@@ -629,8 +637,11 @@ def _alert_restart(d, ok, handled, notify_fn, rt):
     send = (last_sum == 0 and now - first < win) or (last_sum > 0 and (now - last_sum) >= win)
     if send:
         if rec["count"] <= 1:
-            if ok:
-                notify_fn("⚠️ L站浏览守护被看门狗重启：%s（%s）已拉起，节奏参数未变。"
+            if _first_start:
+                notify_fn("ℹ️ L站浏览守护此前未在运行（%s），看门狗已按计划启动它，节奏参数未变。"
+                          "关机/重开后属正常补拉，不是崩溃。· %s" % (d.get("reason"), _ts()))
+            elif ok:
+                notify_fn("⚠️ L站浏览守护曾被看门狗判为中断并重启：%s，已拉起，节奏参数未变。· %s"
                           % (d.get("reason"), _ts()))
             else:
                 notify_fn("⚠️ L站浏览守护重启失败 1 次（%s）：已尝试拉起但未成功，将退避重试。· %s"
@@ -638,11 +649,25 @@ def _alert_restart(d, ok, handled, notify_fn, rt):
         else:
             notify_fn("⚠️ L站浏览守护%s累计 %d 次（最近：%s）——已按 %dh 窗口合并告警，"
                       "不再逐条推送。· %s"
-                      % ("" if ok else "重启失败", rec["count"], d.get("reason"),
-                         ALERT_MERGE_WINDOW_H, _ts()))
+                      % ("启动" if _first_start else ("" if ok else "重启失败"),
+                         rec["count"], d.get("reason"), ALERT_MERGE_WINDOW_H, _ts()))
         rec["summarized_ts"] = now
     handled[kind] = rec
     return send, handled
+def _ever_alive(rt, now=None):
+    """R563：最近 EVER_ALIVE_FRESH_S 内是否**见过守护在跑**（判「正常启动」vs「异常重启」）。
+
+    无记录（新装/清理过 runtime）或记录过期（如关机一整天）⇒ False ⇒ 归为「此前未运行」。
+    """
+    try:
+        ts = float((rt or {}).get("seen_alive_ts") or 0)
+    except Exception:
+        ts = 0
+    if not ts:
+        return False
+    return ((now or _now()) - ts) <= EVER_ALIVE_FRESH_S
+
+
 def read_runtime():
     """只读快照（不写守护 state）。"""
     try:
@@ -678,6 +703,7 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None,
         snap.setdefault("last_restart_ts", rt.get("last_restart_ts"))
         snap.setdefault("fail_streak", rt.get("fail_streak") or 0)
         snap.setdefault("now", _now())
+        snap.setdefault("ever_alive", _ever_alive(rt, snap["now"]))
     else:
         bh, bwhy = browse_busy_hint()
         _bridge = bridge_ok()                 # R551：桥探活（桥不在则一切重启都是空转）
@@ -692,6 +718,11 @@ def one_round(dry=False, spawn=None, notify_fn=None, snapshot=None, ensure=None,
         _hbi = heartbeat_info() or {}
         snap["next_wake_ts"] = _hbi.get("next_wake_ts")      # R558：休眠自证
         snap["phase"] = _hbi.get("phase")
+        snap["ever_alive"] = _ever_alive(rt, snap["now"])
+        if _pids and not snap["ever_alive"]:
+            # R563：真见到守护在跑 ⇒ 记账，供后续「异常重启 vs 正常启动」分类（写盘节流 10min）
+            write_runtime({"seen_alive_ts": _now()})
+            rt["seen_alive_ts"] = _now()
     d = decide(snap)
     _log_event("ROUND", action=d["action"], reason=d["reason"],
                n_pids=len(snap["pids"]), quiet=snap["quiet"],
@@ -899,7 +930,7 @@ def _selftest():
 
     # T1 决策：守护不在 ⇒ RESTART
     d = decide({"pids": [], "last_done": _now() - 10, "now": _now(),
-                "quiet": False, "last_restart_ts": 0})
+                "quiet": False, "last_restart_ts": 0, "ever_alive": True})
     ck(d["action"] == "RESTART" and d["reason"] == "DAEMON_DEAD", "T1 死进程应重启: %s" % d)
     # T2 冷却内 ⇒ 不重启
     d = decide({"pids": [], "last_done": None, "now": _now(),
@@ -943,7 +974,8 @@ def _selftest():
         LOCK = os.path.join(STATE_DIR, "watchd.lock")
         r = one_round(dry=False, spawn=lambda dry=False: (calls.__setitem__("spawn", calls["spawn"] + 1) or {"rc": 0}),
                       notify_fn=lambda t: calls["notify"].append(t),
-                      snapshot={"pids": [], "last_done": _now(), "quiet": False})
+                      snapshot={"pids": [], "last_done": _now(), "quiet": False,
+                                "ever_alive": True})
         ck(r["action"] == "RESTART" and calls["spawn"] == 1, "T7 死进程应触发一次 spawn: %s" % r)
         ck(any("重启" in t for t in calls["notify"]), "T7b 重启应告警")
         ck(read_runtime().get("last_restart_ts"), "T7c 应记录重启时刻")
@@ -1314,6 +1346,37 @@ def _selftest():
     ck(r33b["action"] == "BRIDGE_DOWN" and _c33b["spawn"] == 0 and len(_c33b["notify"]) == 1,
        "T33h 起桥失败须维持 BRIDGE_DOWN（不空转重启）: %s spawn=%d notify=%d"
        % (r33b["action"], _c33b["spawn"], len(_c33b["notify"])))
+    # ---- T34 通知语义（R563）：未运行过 ⇒ 启动而非「崩溃重启」；活过再消失 ⇒ 真重启
+    _h34 = {}
+    _n34 = []
+    _snap_never = {"pids": [], "last_done": None, "now": _now(), "quiet": False,
+                   "last_restart_ts": 0, "ever_alive": False}
+    d34a = decide(dict(_snap_never))
+    ck(d34a["action"] == "RESTART" and d34a["reason"] == "DAEMON_NEVER_RUNNING",
+       "T34a 从未运行过须判 NEVER_RUNNING（非崩溃）: %s" % d34a)
+    _alert_restart(d34a, True, _h34, _n34.append, {})
+    ck(len(_n34) == 1 and "此前未在运行" in _n34[0] and "不是崩溃" in _n34[0],
+       "T34b 启动文案须含「此前未在运行/不是崩溃」: %s" % (_n34,))
+    _h34 = {}
+    _n34 = []
+    d34c = decide({"pids": [], "last_done": None, "now": _now(), "quiet": False,
+                   "last_restart_ts": 0, "ever_alive": True})
+    _alert_restart(d34c, True, _h34, _n34.append, {})
+    ck("此前未在运行" not in _n34[0] and "已拉起" in _n34[0],
+       "T34c 活过再消失须按重启文案（不得说未运行）: %s" % (_n34,))
+    ck(d34c["reason"] == "DAEMON_DEAD", "T34d 活过再消失须仍判 DAEMON_DEAD: %s" % d34c)
+    # T34e ever_alive 判据本身：新鲜（<6h）⇒ True；陈旧/缺失/坏值 ⇒ False
+    _sb34 = _tf.mkdtemp(prefix="ljqsb34")
+    sandbox_state(_sb34)
+    write_runtime({"seen_alive_ts": _now() - 60})
+    ck(_ever_alive(read_runtime()) is True, "T34e 近 6h 内活过须 ever_alive=True")
+    write_runtime({"seen_alive_ts": _now() - EVER_ALIVE_FRESH_S - 10})
+    ck(_ever_alive(read_runtime()) is False, "T34f 超过新鲜窗须 ever_alive=False")
+    write_runtime({})
+    ck(_ever_alive(read_runtime()) is False, "T34g 无记录须 ever_alive=False（fail-closed 到「启动」语义）")
+    write_runtime({"seen_alive_ts": "garbage"})
+    ck(_ever_alive(read_runtime()) is False, "T34h 坏值不得崩且须 False")
+
     # T33i 负控：dry 模式下 ensure 不得真起桥（先清零上一用例落的冷却戳）
     sandbox_state(_sb)
     write_runtime({"bridge_ensure_ts": 0})

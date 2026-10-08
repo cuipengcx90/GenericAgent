@@ -265,6 +265,15 @@ FLAG_RE = re.compile(r"(?<![\w-])(--?[A-Za-z][A-Za-z0-9\-]*)")
 CLAUSE_SEP_RE = re.compile(r"[，。；、（）()【】\[\]{}：:!！?？\"“”'‘’|]+|\s{2,}")
 
 
+def _payload_pos(cl: str):
+    """返回子句中 `--`（载荷分隔符）之后的起始偏移；无则 None。
+
+    `cmd -- payload` 语义：`--` 之后的 flag 属内层命令，不能归属外层脚本。
+    """
+    m = re.search(r"(?:^|\s)--(?:\s|$)", cl)
+    return m.end() if m else None
+
+
 def split_clauses(ln: str):
     """把一行切成子句（保留原序，不跨标点）⇒ flag 只归同子句内且在其前的脚本。"""
     out, start = [], 0
@@ -403,13 +412,22 @@ def lint_task(tid, data, root, home, idx, proof):
     orphans = []
     for ln in prompt_lines(prompt):
         for cl in split_clauses(ln):
+            # `--` 是「外层命令 / 载荷命令」的分隔符（如 bg_task start -- python3 -u x.py）：
+            # 载荷内的 flag 属于内层命令，绝不能归属外层脚本，否则报假 FLAG_UNKNOWN
+            # （实测：tools/bg_task.py 被安上 -u，而 -u 实为内层 python3 解释器开关）。
+            bp = _payload_pos(cl)
             for m in FLAG_RE.finditer(cl):
                 f, pos = m.group(1), m.start()
                 hit, best = None, -1
                 for raw, path in resolved_scripts.items():
                     for tok in (raw, os.path.basename(path)):
                         p = cl.find(tok)
-                        if 0 <= p < pos and p > best:
+                        if not (0 <= p < pos):
+                            continue
+                        # 脚本与 flag 必须同侧（都在 `--` 之前，或都在其后）
+                        if bp is not None and (p < bp) != (pos < bp):
+                            continue
+                        if p > best:
                             best, hit = p, path
                 if hit is None:
                     orphans.append(f)
@@ -580,6 +598,10 @@ def run_selftest():
            "import argparse\np=argparse.ArgumentParser()\np.add_argument('--alpha')\n"
            "p.add_argument('-b','--beta')\n")
     _write(os.path.join(root, "temp", "noargs.py"), "print('no cli options')\n")
+    # 载荷分隔符夹具：外层命令脚本（bg_task 形态），载荷内再起一个内层解释器+脚本
+    _write(os.path.join(root, "temp", "wrapper.py"),
+           "import argparse\np=argparse.ArgumentParser()\np.add_argument('--name')\n"
+           "p.add_argument('--grace')\n")
     _write(os.path.join(home, "temp", "elsewhere.py"), "# only under home/temp\n")
     # PATH_PREFIX 夹具：目录名含空格 ⇒ 绝对路径 token 会被空格截断
     os.makedirs(os.path.join(root, "temp", "notes dir"), exist_ok=True)
@@ -651,7 +673,16 @@ def run_selftest():
     T(NC + "24_flag_before_script", "git log --since=2026-09-01 之后运行 python3 %s/temp/good.py --alpha" % root,
       ["FLAG_UNATTRIBUTED"], ["FLAG_UNKNOWN"])
 
-    os.makedirs(tasks, exist_ok=True)
+    # NC25 `--` 载荷分隔符：`cmd -- payload` 里的 flag 属内层命令，不得归属外层脚本
+    #      （真实样本：linuxdo_trust_level_check 的 `bg_task.py start -- python3 -u xxx.py watch`
+    #        曾被误判 bg_task.py 有 -u ⇒ 假 FAIL）
+    T(NC + "25_payload_sep",
+      "运行 python3 %s/temp/wrapper.py start --name x -- python3 -u %s/temp/good.py watch" % (root, root),
+      ["FLAG_UNATTRIBUTED"], ["FLAG_UNKNOWN"])
+    # NC26 反向：载荷内的 flag 若确实属内层脚本，应归属内层而非外层（外层同样不得报 FLAG_UNKNOWN）
+    T(NC + "26_payload_inner_flag",
+      "运行 python3 %s/temp/wrapper.py start --name x -- python3 %s/temp/good.py --gamma" % (root, root),
+      ["FLAG_UNKNOWN"], [])
     for tid, d, _, _ in cases:
         p = os.path.join(tasks, tid + ".json")
         if d == "<<<BADJSON>>>":

@@ -441,6 +441,20 @@ def risk_kind_from_text(txt):
     return None
 
 
+class RiskAbort(Exception):
+    """批内风控熔断（R563）：候选抓取阶段确认强风控信号 ⇒ 立即中止本批。
+
+    旧行为：风控判定在 browse_batch **返回之后**才做，403 发生时本批照跑
+    （2026-10-08 实测：19:56 抓到 403，20:00–22:02 仍浏览 20 帖，22:06 才暂停）
+    ⇒ 违背「命中即停、绝不硬撞」。新行为：抓取阶段判定，批内零帖即熔断。
+    """
+
+    def __init__(self, kind, detail=""):
+        Exception.__init__(self, "%s: %s" % (kind, str(detail)[:200]))
+        self.kind = kind
+        self.detail = detail
+
+
 def note_risk(st, kind, detail=""):
     """记风控信号 + 去重告警 + 当日计数。返回 (count_today, alert_sent)。"""
     t = today()
@@ -1198,7 +1212,8 @@ LATEST_JS = r"""
   try {
     const r = await fetch('/latest.json?no_definitions=true&page=' + page + '&order=created',
                           {credentials: 'include', cache: 'no-store'});
-    if (!r.ok) return JSON.stringify({ok: false, status: r.status});
+    if (!r.ok) { let _b=''; try { _b=(await r.text()).slice(0,200); } catch(e){}
+                 return JSON.stringify({ok: false, status: r.status, body: _b}); }
     const j = await r.json();
     const topics = (j && j.topic_list && j.topic_list.topics) || [];
     return JSON.stringify({ok: true, topics: topics.map(t => ({
@@ -1209,21 +1224,51 @@ LATEST_JS = r"""
 
 
 LAST_FETCH_DIAG = {}
+LAST_FETCH_STATS = {"pages": 0, "ok": 0}   # R563：本批候选抓取的页数/成功页数（供 fetch_verdict 判定）
 
 
 def fetch_candidates(session, page):
     code = LATEST_JS.replace("__PAGE__", str(int(page)))
     res = run_js(session["id"], code, timeout=30)
+    LAST_FETCH_STATS["pages"] = int(LAST_FETCH_STATS.get("pages", 0)) + 1
     if isinstance(res, dict) and res.get("ok"):
+        LAST_FETCH_STATS["ok"] = int(LAST_FETCH_STATS.get("ok", 0)) + 1
         return res.get("topics") or []
     # 失败：留下诊断（供风控保险丝判 HTTP 429/403 等）
+    # R563：非 2xx 时连响应正文前 200 字一起留（区分 CF 挑战 / 封禁文案 / 限流），
+    #       旧实现只有 status 码 ⇒ 「是站点抖动还是账号级拦截」不可分。
     if isinstance(res, dict):
+        _body = str(res.get("body") or "")[:200]
         LAST_FETCH_DIAG.update({"ts": now_str(), "page": page, "status": res.get("status"),
+                                "body": _body,
+                                "detail": "page=%s status=%s body=%s err=%s" % (
+                                    page, res.get("status"), _body.replace("\n", " "),
+                                    str(res.get("err"))[:120]),
                                 "diag": "page=%s status=%s err=%s" % (page, res.get("status"), str(res.get("err"))[:120])})
     else:
         LAST_FETCH_DIAG.update({"ts": now_str(), "page": page, "status": None,
+                                "body": "",
+                                "detail": "page=%s raw=%s" % (page, str(res)[:120]),
                                 "diag": "page=%s raw=%s" % (page, str(res)[:120])})
     return []
+
+
+def fetch_verdict(pages_total, pages_ok, diag):
+    """批内候选抓取后的风控判定（纯函数，便于离线自测；R563）。
+
+    返回 (action, kind)：action ∈ {"ABORT", "NOTE", None}
+      ABORT：**所有**采样页都失败 ∧ 诊断为强风控信号（403/429/401/封禁文案）
+             ⇒ 本批立即熔断（零浏览），交由主循环长暂停
+      NOTE ：部分页失败但仍有候选 ⇒ 只留痕（不打断本批：单页抖动不该整批空转）
+      None ：无风控信号（含「全成功」与「非风控码失败」）
+    """
+    d = diag or {}
+    rk = risk_kind_from_http(d.get("status")) or risk_kind_from_text(d.get("body") or d.get("detail") or "")
+    if rk in RISK_STRONG and pages_ok == 0:
+        return ("ABORT", rk)
+    if rk:
+        return ("NOTE", rk)
+    return (None, None)
 
 
 # ---------------------------------------------------------------- 浏览动作
@@ -1442,6 +1487,7 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
 def browse_batch(session, st, batch=25):
     """浏览一批。返回 (done, skipped)"""
     LAST_FETCH_DIAG.clear()
+    LAST_FETCH_STATS.update({"pages": 0, "ok": 0})
     done = skipped = 0
     loiter_n = random.randint(*LOITER_P_LIST)
     pages = random.sample(range(0, LATEST_PAGE_MAX + 1), min(LATEST_PAGE_MAX + 1, 4))
@@ -1449,6 +1495,18 @@ def browse_batch(session, st, batch=25):
     for p in pages:
         cand += fetch_candidates(session, p)
         time.sleep(random.uniform(1.5, 4.0))
+    # ★R563 批内风控熔断：抓取阶段已确认强风控（403/429/401/封禁文案）⇒ 零帖中止。
+    #   旧行为把风控判定放在本函数返回之后，403 时仍照跑整批（2026-10-08 实测多浏览 20 帖）。
+    _act, _rk = fetch_verdict(LAST_FETCH_STATS["pages"], LAST_FETCH_STATS["ok"], LAST_FETCH_DIAG)
+    if _act == "ABORT":
+        log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "ABORT",
+                                       "why": "risk_abort:" + str(_rk),
+                                       "detail": str(LAST_FETCH_DIAG.get("detail"))[:200],
+                                       "pages": LAST_FETCH_STATS["pages"],
+                                       "pages_ok": LAST_FETCH_STATS["ok"]})
+        raise RiskAbort(_rk, LAST_FETCH_DIAG.get("detail") or "")
+    if _act == "NOTE":
+        print("[%s] 部分页风控信号 %s（仍有候选）⇒ 本批继续，仅留痕" % (now_str(), _rk), flush=True)
     seen = set(st.get("seen_ids", []))
     cand = [c for c in cand if c.get("id") and int(c["id"]) not in seen]
     random.shuffle(cand)
@@ -1677,7 +1735,15 @@ def watch(args):
             print("[%s] 排队动作执行：%s（剩余 %s）" % (
                 now_str(), _ra, {k: int((st.get("pending_acts") or {}).get(k) or 0)
                                  for k in ("reply", "like", "post")}), flush=True)
-        done, skipped = browse_batch(session, st, batch=args.batch)
+        # ★R563：抓取阶段命中强风控 ⇒ browse_batch 内部抛 RiskAbort（零帖熔断）。
+        #   旧行为把判定放在本块之后 ⇒ 403 仍照跑整批（2026-10-08 实测多浏览 20 帖）。
+        try:
+            done, skipped = browse_batch(session, st, batch=args.batch)
+        except RiskAbort as e:
+            print("[%s] ⛔ 批内风控熔断 %s（零浏览）：%s ⇒ 转风控处置" % (
+                now_str(), e.kind, str(e.detail)[:200]), flush=True)
+            handle_risk(st, e.kind, "batch_abort: %s" % e.detail)
+            continue
         print("[%s] batch done=%d skipped=%d total_browsed=%d" % (now_str(), done, skipped, st.get("browsed_total", 0)), flush=True)
         # 候选抓取失败时留了诊断 ⇒ 先判是不是风控（HTTP 429/403 / 封禁文案）
         diag = LAST_FETCH_DIAG.get("diag")
@@ -1734,7 +1800,12 @@ def main(argv=None):
         print(json.dumps({"source": src, "pending": lvl.get("pending"), "met": lvl.get("met")}, ensure_ascii=False))
         return RC_OK
     if args.cmd == "browse":
-        done, skipped = browse_batch(session, st, batch=args.batch)
+        try:
+            done, skipped = browse_batch(session, st, batch=args.batch)
+        except RiskAbort as e:
+            print("RISK_ABORT %s: %s" % (e.kind, str(e.detail)[:200]))
+            handle_risk(st, e.kind, "browse_abort: %s" % e.detail)
+            return RC_GAPS
         print("browse done=%d skipped=%d" % (done, skipped))
         return RC_GAPS if done else RC_NO_SESSION
     if args.cmd == "watch":
@@ -2046,7 +2117,35 @@ def _selftest_impl():
     if "_is_main_host" not in _insp.getsource(try_ensure_tab):
         fails.append("T7s try_ensure_tab 未用精确 host 判据")
     cases += 1
-    # T8 cap 抖动 / T9 晨抖（纯函数断言，传局部 dict，不触真 state）
+    # T15 批内风控熔断（R563，2026-10-08 回归）：抓取阶段即判，强风控 ∧ 零成功页 ⇒ ABORT
+    if fetch_verdict(4, 0, {"status": 403}) != ("ABORT", "FORBIDDEN"):
+        fails.append("T15 全页 403 应判 ABORT")
+    if fetch_verdict(4, 0, {"status": 429}) != ("ABORT", "RATE_LIMIT"):
+        fails.append("T15 全页 429 应判 ABORT")
+    if fetch_verdict(4, 0, {"body": "您的账号已被封禁"}) != ("ABORT", "BANNED"):
+        fails.append("T15 封禁文案应判 ABORT")
+    if fetch_verdict(4, 3, {"status": 403}) != ("NOTE", "FORBIDDEN"):
+        fails.append("T15n 部分页成功不得整批熔断（应仅 NOTE）")
+    if fetch_verdict(4, 0, {"status": 500, "body": "internal"}) != (None, None):
+        fails.append("T15n 非风控码全失败不得判 ABORT")
+    if fetch_verdict(4, 4, {"status": 200}) != (None, None):
+        fails.append("T15n 全成功不得判风控")
+    if fetch_verdict(4, 0, {"body": "Just a moment..."}) != ("NOTE", "CF_CHALLENGE"):
+        fails.append("T15n CF 挑战非强信号（只 NOTE 不熔断）")
+    _ra = RiskAbort("FORBIDDEN", "page=5 status=403")
+    if _ra.kind != "FORBIDDEN" or "403" not in _ra.detail:
+        fails.append("T15 RiskAbort 未携带 kind/detail")
+    # 结构闸门：熔断必须发生在候选抓取之后（否则等于没做），且两处调用点都接住
+    _src_bb = _insp.getsource(browse_batch)
+    if "raise RiskAbort" not in _src_bb:
+        fails.append("T15s browse_batch 缺批内 raise RiskAbort")
+    elif _src_bb.index("raise RiskAbort") < _src_bb.index("fetch_candidates(session, p)"):
+        fails.append("T15s raise 位置早于抓取循环（形同未熔断）")
+    if "except RiskAbort" not in _insp.getsource(watch):
+        fails.append("T15s watch 未接住 RiskAbort")
+    if "except RiskAbort" not in _insp.getsource(main):
+        fails.append("T15s main/browse 未接住 RiskAbort")
+    cases += 1
     cst = {"cap": {}}
     c1 = daily_cap_today(cst, 250)
     c2 = daily_cap_today(cst, 250)
