@@ -88,10 +88,16 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 - 单元格样式 wrap_text=True、vertical=center；填多行文本用 `\n` 换行即可，样式自动继承。
 - I 列/C 列均为合并单元格，写入左上角坐标（I7/C15/C16）即可。
 - 保存前确认 J 列上级评分占位（通常 100），勿覆盖。
+- **写表必须用 `/opt/anaconda3/bin/python3`**：默认 `python3` 无 openpyxl（2026-10-08 Q3 实测 ModuleNotFoundError）；写前先备份 xlsx 到 temp/。
+- **git 取数必须按 `git-common-dir` 去重**：bar-smyze 各仓下存在 `.git` 子目录 / 主仓+worktree 并存 ⇒ 直接遍历 `.git` 会把同一提交（尤其 root 仓）重复计一遍（Q3 实测去重后 1717 ← 未去重虚高）；`--no-merges` + `--author=崔朋` + 带时区 since/until。
+- **跨季雷同度机械比对**：写完用 difflib 对 Q2 的 I7–I9/C15/C16 逐句算相似度，取 max；>0.5 的句子必改写（Q3 实测 I9 总评 0.58、I8 总评 0.47、I7 交付段 0.52 三处返工）。业务名词（点单平台/交付准时率/重大事故）造成的相似度属正常锚点，可保留。
+
+## 已用锚点（写新季度时作起点，须当场复算）
+- Q3（2026-07-01~09-30）：提交 1717（跨 12 仓）；opserver docs `*.md` 855 份 / 本季新增 196 份；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
 
 ## 工具
 - 取数+归类：见会话内 git 扫描脚本（os.listdir 扫 .git + git log --pretty=%s + prefix 分类 Counter）。
-- 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验。
+- 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验（保存后必核 H12/J12/H13 三公式仍在、J7..J11=100 未被覆盖）。
 
 ## 触发与复用（每季度照此启动）
 **用户怎么触发**：到季度末/考评期，新建好「绩效考评表-崔朋-{年}-Q{n}.xlsx」（KPI 目标/权重已由公司或上级填好、自评区留空），然后对 GA 说一句：
