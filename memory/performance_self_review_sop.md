@@ -92,12 +92,16 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 - **git 取数必须按 `git-common-dir` 去重**：bar-smyze 各仓下存在 `.git` 子目录 / 主仓+worktree 并存 ⇒ 直接遍历 `.git` 会把同一提交（尤其 root 仓）重复计一遍（Q3 实测去重后 1717 ← 未去重虚高）；`--no-merges` + `--author=崔朋` + 带时区 since/until。
 - **跨季雷同度机械比对**：写完用 difflib 对 Q2 的 I7–I9/C15/C16 逐句算相似度，取 max；>0.5 的句子必改写（Q3 实测 I9 总评 0.58、I8 总评 0.47、I7 交付段 0.52 三处返工）。业务名词（点单平台/交付准时率/重大事故）造成的相似度属正常锚点，可保留。
 
+- **★openpyxl 重写会静默丢掉 WPS 内嵌图片/签名图（2026-10-08 Q3 实测事故）**：load_workbook → save 后体积 48023B → 13632B，`xl/cellimages.xml` + `xl/_rels/cellimages.xml.rels` + `xl/media/image1.png`（单元格内嵌签名图，走 WPS 专有 `DISPIMG("ID_...",1)` 公式）与 `sharedStrings.xml` 全被丢弃，openpyxl **不报错**，数据/公式/合并格却完好 ⇒ 只读回数值校验查不出来，**必须比对 zip 成员清单**（`set(前) - set(后)`）。
+  **修复配方**（本机已验证，保住数据+找回图）：① 用 zipfile 读「写入前备份」取出缺失三部件；② 用 zipfile 重建当前包，把三部件按原路径写回；③ 补 `[Content_Types].xml` 的 `<Default Extension="png" ContentType="image/png"/>` 与 `<Override PartName="/xl/cellimages.xml" .../>`；④ 补 `xl/_rels/workbook.xml.rels` 的 `<Relationship Id="rId4" Type=".../cellImage" Target="cellimages.xml"/>`（Id 取现有最大+1）；⑤ 校验：`ET.fromstring` 全 XML 合法、`image1.png` 字节 sha 与备份一致、`DISPIMG("ID_x"` 的 ID == cellimages cNvPr 的 name、重载后 H/I/C 值与公式仍在。
+  ⇒ **铁律：写任何带内嵌图片/签名图的办公文件前先备份；写后除值校验外必做「部件清单 diff」**（`zipfile.namelist()`），装配件数量与体积双判据（本例 13 部件/46.5KB vs 丢图版 10 部件/13.6KB）。
+
 ## 已用锚点（写新季度时作起点，须当场复算）
 - Q3（2026-07-01~09-30）：提交 1717（跨 12 仓）；opserver docs `*.md` 855 份 / 本季新增 196 份；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
 
 ## 工具
 - 取数+归类：见会话内 git 扫描脚本（os.listdir 扫 .git + git log --pretty=%s + prefix 分类 Counter）。
-- 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验（保存后必核 H12/J12/H13 三公式仍在、J7..J11=100 未被覆盖）。
+- 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验（保存后必核 H12/J12/H13 三公式仍在、J7..J11=100 未被覆盖）；**另必核 zip 部件清单未缩水**（见上「openpyxl 丢内嵌图片」条；丢图后按配方从备份注入回）。
 
 ## 触发与复用（每季度照此启动）
 **用户怎么触发**：到季度末/考评期，新建好「绩效考评表-崔朋-{年}-Q{n}.xlsx」（KPI 目标/权重已由公司或上级填好、自评区留空），然后对 GA 说一句：
