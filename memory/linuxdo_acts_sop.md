@@ -10,7 +10,7 @@
 
 | 动作 | 角色 | 谁执行 | 触发方式 | 日量级（默认，见 `profiles`） |
 |---|---|---|---|---|
-| 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1 次（**上午 08:00–10:00 窗内随机**；内核 `LEVEL_CHECK_WINDOW=(8,10)`，env `LJQ_LEVEL_WINDOW` 可覆盖；见坑 §11） | 零动作，仅读等级卡 |
+| 等级检测 | **前置**（只读） | daemon 内 `check_level` | daemon 每天 1 次（**上午 08:00–10:00 窗内随机**；内核 `LEVEL_CHECK_WINDOW=(8,10)`，env `LJQ_LEVEL_WINDOW` 可覆盖；**窗口是硬口径**：`LEVEL_CHECK_TTL_S=6h` 只防「近邻重复」（重启/多入口/同一上午第二次），错过的窗口当日即刻补跑一次，绝不顺延出窗、也不因「昨天查得晚」而自我延续；见坑 §17） | 零动作，仅读等级卡 |
 | 浏览 | 补量（缺「已读帖子/浏览比例」时） | daemon `browse_batch` | daemon 自动，或提示词触发（拉起 daemon） | cap 180–220（日抖，内核 `daily_cap=200` ± `cap_jitter=20`，当天摇一次且跨重启稳定） |
 | 回帖 | 补量（缺「回复话题数」时） | `tools/linuxdo_acts.py` reply | **等级路由排队**（daemon 随机消费）/ 提示词 | cap 6（±2 抖） |
 | 点赞 | 补量（缺「获赞/送赞」时） | `tools/linuxdo_acts.py` like | 同上 | cap 12（±4 抖） |
@@ -104,12 +104,12 @@ python3 tools/linuxdo_deai.py check --text "文案"               # 去 AI 味�
 ## 八、自测与验收
 
 - `python3 tools/linuxdo_humanize.py --selftest`（25/25）。
-- `python3 tools/linuxdo_antidetect.py --selftest`（59/59，含 T27 跨层自洽；2026-10-06 R548 新增 T23b2 上午窗断言与段闸门解包用例）。
-- `python3 tools/linuxdo_acts.py --selftest`（53/53；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d、deai 回帖闸门；自测把 state/lock/通知全部重定向到沙箱）。
+- `python3 tools/linuxdo_antidetect.py --selftest`（**65/65**，含 T27 跨层自洽；2026-10-06 R548 新增 T23b2 上午窗断言与段闸门解包用例；2026-10-09 R565 新增 T28/T28b–T28e 一组「窗口优先」回归负控：TTL 让位于窗口、抽点恒不越窗、`due` 与 `next_wait` 同口径）。
+- `python3 tools/linuxdo_acts.py --selftest`（**65/65**；含锁 T35–T40、拟人接线 T41–T47、页面事件 T48–T50d、deai 回帖闸门；自测把 state/lock/通知全部重定向到沙箱）。
 - `python3 tools/linuxdo_deai.py selftest`（21 checks / 0 failed；★子命令是**位置参数**，写 `--selftest` 报 unrecognized）。
 - `python3 tools/linuxdo_post_forge.py selftest`（21 checks / 0 failed；同上位置参数）。
-- `python3 tools/linuxdo_browse_daemon.py --selftest`（35/35；R556 补 `io` import 后新增 T7o/T7p/T7q 补标签限额/EXISTS 去重/短退避边界；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线 + 等级路由 T6c6–T6c9：earn 有草稿排 post / 无草稿绝不排 post / 无缺项不排 / 多缺项并行；2026-10-06 R546 新增 T15/T15b/T15c 段表用例：同日段表确定性、重启（清缓存）后段位不变、段表结构无乱序/重叠/零长；T18 段级审计视图用例，含「非 DONE / 坏时间戳 / 昨天」行不得计入、空台账零覆盖、缺台账零覆盖、内核缺席返 note+null 四组负控）。
-- `python3 tools/linuxdo_daemon_watchd.py --selftest`（**90 checks / 0 failed**，零站点流量；R546 新增冷启动/多源心跳/环境忙不重启用例；T27 重启审计视图用例（含缺台账零计数+note、全坏行零计数两组负控）；R555 新增桥探活 T29 系列——桥不可达⇒`BRIDGE_DOWN` **不重启**（T29a 有守护/T29b 无守护两种组合）、告警同类 6h 合并（T30 窗口内 5 次⇒1 条且带累计）、恢复闸 ≥300s（T31 停机 100s⇒不发 / 1000s⇒发），以及 `sandbox_state` 助手 + T32 负控：自测前后断言生产 `watchd.jsonl`/`runtime` 指纹**逐字不变**；R556 新增独立桥自愈 T33 系列——桥不可达⇒`ensure_bridge` 自动拉起 `tools/tmwd_bridge_watch.py`（冷却 600s/等 15s/START_FAILED 三态负控）；R558 新增休眠自声明 T34 系列——daemon 心跳自报 `next_wake_ts` 在未来（≤12h）⇒ 判 `OK / RESTING_UNTIL_<phase>_<min>m` 且**不重启不自愈**、心跳已过期 ⇒ 回落真 `RESTART`、`next_wake_ts` 超 12h ⇒ 当坏值回落旧判据、`phase=loop`（`next_wake_ts=null`）⇒ 不影响；T35 断言重启前先 `stop_daemon`（`bg_task stop --name linuxdo_browse`）再 spawn，且 stop 失败（rc=3）不阻断 spawn）。
+- `python3 tools/linuxdo_browse_daemon.py --selftest`（**36/36**；R556 补 `io` import 后新增 T7o/T7p/T7q 补标签限额/EXISTS 去重/短退避边界；含风控/休息日/LOCK_BUSY 用例 + 拟人计划接线 + 等级路由 T6c6–T6c9：earn 有草稿排 post / 无草稿绝不排 post / 无缺项不排 / 多缺项并行；2026-10-06 R546 新增 T15/T15b/T15c 段表用例：同日段表确定性、重启（清缓存）后段位不变、段表结构无乱序/重叠/零长；T18 段级审计视图用例，含「非 DONE / 坏时间戳 / 昨天」行不得计入、空台账零覆盖、缺台账零覆盖、内核缺席返 note+null 四组负控）。
+- `python3 tools/linuxdo_daemon_watchd.py --selftest`（**98 checks / 0 failed**，零站点流量；R546 新增冷启动/多源心跳/环境忙不重启用例；T27 重启审计视图用例（含缺台账零计数+note、全坏行零计数两组负控）；R555 新增桥探活 T29 系列——桥不可达⇒`BRIDGE_DOWN` **不重启**（T29a 有守护/T29b 无守护两种组合）、告警同类 6h 合并（T30 窗口内 5 次⇒1 条且带累计）、恢复闸 ≥300s（T31 停机 100s⇒不发 / 1000s⇒发），以及 `sandbox_state` 助手 + T32 负控：自测前后断言生产 `watchd.jsonl`/`runtime` 指纹**逐字不变**；R556 新增独立桥自愈 T33 系列——桥不可达⇒`ensure_bridge` 自动拉起 `tools/tmwd_bridge_watch.py`（冷却 600s/等 15s/START_FAILED 三态负控）；R558 新增休眠自声明 T34 系列——daemon 心跳自报 `next_wake_ts` 在未来（≤12h）⇒ 判 `OK / RESTING_UNTIL_<phase>_<min>m` 且**不重启不自愈**、心跳已过期 ⇒ 回落真 `RESTART`、`next_wake_ts` 超 12h ⇒ 当坏值回落旧判据、`phase=loop`（`next_wake_ts=null`）⇒ 不影响；T35 断言重启前先 `stop_daemon`（`bg_task stop --name linuxdo_browse`）再 spawn，且 stop 失败（rc=3）不阻断 spawn）。
 - `python3 tools/sche_tasks_lint.py --only linuxdo_trust_level_check` ⇒ FAIL 0（四个动作任务已删；该器会扫全量 `sche_tasks/`）。
 - 判活：`python3 tools/linuxdo_daemon_watchd.py status`（watchd/daemon 两 pid + last_browse）；`temp/linuxdo_browse_daemon/acts_log.jsonl` 新增行、`state.daily` 增长（`bg_task` 日志 0 字节 ≠ 没跑）。
 
@@ -164,6 +164,8 @@ R546 修好了「重启风暴」与「长休不可达」，但事后**看不见*
 15. **吞异常掩盖缺 import ⇒ 限额静默失效（R556，2026-10-06）**：`tools/linuxdo_browse_daemon.py` 的 `try_ensure_tab` 用 `io.open` 读写台账，但模块从未 `import io` ⇒ 每次抛 NameError 被 `except` 吞 ⇒ **补标签限额从未生效**（Chrome 关掉时会无限堆新标签）。修=补 `import io` + 用例 T7o（限额）/T7p（EXISTS 去重）/T7q（短退避边界），断言台账被真写。★判据：`except` 兜底的路径必须先证明「正常路径能走通」，且台账真被写入；「无报错」≠「生效」。
 
 16. **「有意长睡」被当成「卡死」⇒ 假重启告警（P0，2026-10-07 R558）**：静默窗（01:00–07:30）里 daemon 主动长睡，`state.json` / `browse_log.jsonl` 自然停更 ⇒ 看门狗按 `age > STALL_S(3h)` 判 `STALLED`，而 `bg_task` 见同名任务仍在跑 ⇒ `rc=4` 拒启动 ⇒ 被判「已尝试拉起但未成功」并累计到阈值 ⇒ 07:41 发出「重启失败 1 次（STALLED_26645s）」假告警（同一现象 R546 只归因「进度源不够多」，仍未解）。修法=daemon 写**休眠自声明** `heartbeat.json`（`phase` + `next_wake_ts`，每次 `_nap()` 睡前登记），看门狗新增 `RESTING_UNTIL_<phase>_<min>m` 分支：只要 `next_wake_ts` 在未来（且 ≤12h）就判 OK 且**不重启**；`next_wake_ts` 已过期或超 12h（坏值）⇒ 回落旧判据；daemon 真死（`pids` 空）⇒ 仍走 `DAEMON_DEAD` 立即重启。★判据：**只要监控方把「多久没写文件」当作唯一存活信号，就必须先问「它有没有可能是在合法地睡」**——凡是设计上会主动长睡（静默窗、休息日、退避）的进程，都要有一条「我在睡，几点醒」的自声明通路，否则自愈机制必然变成告警噪音源。★副作用坑：`RESTART` 且 `pids` 非空时若不先 `bg_task stop` 就直接 `spawn`，会因「任务已在运行」被 `rc=4` 拒掉（保护机制非故障），故 `one_round` 改为**先停同名任务再拉起**（stop 失败 rc=3 不阻断）。
+
+17. **滑动 TTL 会把抽点「顶出」硬窗口 ⇒ 出现「昨天查过、今天没查」（R565，2026-10-09）**：等级检查原按 `last + TTL(20h)` 决定下次抽点，而允许动手的窗口是**上午 08:00–10:00**——昨天 09:50 抽过，20h 后落在次日 05:50（静默窗内），一推再推就滑出上午窗，叠加「当日不补查」⇒ 整天没查；同时 `next_wait` 与 `due` 各自算锚点，现场出现「内核判未到期(ttl_16h) 但 next_wait 说 due_now」的自相矛盾。修法（用户批准方案 B）：**窗口优先、TTL 让位**——TTL 降至 6h 只防「近邻重复」（重启/多入口/同一上午第二次）；`level_check_ts()` 抽点**恒不越窗**（`last + TTL` 落窗外 ⇒ 改取窗内抽点；已有整窗覆盖时取离上次更远端）；`due` 与 `next_wait` 同锚同分支，永不互斥。★判据：**「多久后到期」与「什么时候允许动手」是两件事**——两者并存的调度，到期时刻必须先被窗口裁剪（clamp）再输出，否则「未到期」与「现在可以」同时为真，谁也说不清该不该做。★回归负控须用**合成状态**直测 TTL 分支（用真实时刻会被静默窗/已到期分支提前拦截，负控形同虚设）。
 
 ## 十一、发帖锻造 + 去AI味闸门（2026-10-06 新增，用户要求「发帖要去AI味儿，要像人写的、人想的」）
 

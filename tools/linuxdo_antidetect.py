@@ -329,8 +329,12 @@ def next_wait(st, now_ts, kind, done_today=0, rng=None):
 # 用户口径（2026-10-05）：每天只查 **1 次**，且**不在固定时刻**触发（错峰）。
 # 与其它动作一样由确定性种子派生 ⇒ 当天计划稳定可复现、跨天自然不同。
 LEVEL_CHECK_PER_DAY = 1
-LEVEL_CHECK_TTL_S = 20 * 3600          # 两次检查最小间隔（防重启/多入口同日重查）
-LEVEL_MIN_GAP_S = 90 * 60              # 与上一次检查至少隔 90min（避免连着两天同一时刻）
+# ★2026-10-09 用户口径（方案 B）：**窗口优先**——「每天 1 次 ∧ 只在 08:00–10:00 窗内随机」是硬口径，
+#   TTL 只作「近邻重复」防重（重启/多入口），不再充当跨天节流。
+#   旧值 20h 的后果（实测 10-07 12:14 → 10-08 19:56 → 10-09 应等到 15:56）：前一天晚查 ⇒ 次日被 TTL
+#   顶出上午窗，且自我延续（越查越晚），与用户口径直接冲突（R565）。
+LEVEL_CHECK_TTL_S = 6 * 3600           # 仅防近邻重查；跨天场景恒不触发（窗内最早 08:00 距昨日最晚 10:00 已 22h）
+LEVEL_MIN_GAP_S = 90 * 60              # 与上次尽量错开 90min（**软规则**：窗内择远点，绝不把检查顶出窗）
 # ★2026-10-06 用户口径：等级检测**只在上午 08:00–10:00 之间**随机触发（(起,止) 小时）。
 #   历史问题：原实现取「当日首段→23:50」的对数正态 ⇒ 常落到傍晚/夜间（实测 10-07 18:00），
 #   判级结果出来时活动窗只剩几小时，缺项路由（浏览/回帖/点赞）根本补不完。
@@ -349,11 +353,19 @@ def level_check_ts(day, prev_ts=None, kind="browse"):
     lo, hi = _ts(day, wl), _ts(day, wh)
     cand = lo + r.random() * (hi - lo) + r.uniform(-600, 600)
     cand = max(lo, min(hi, cand))
-    if prev_ts and cand < prev_ts + LEVEL_MIN_GAP_S:
-        room_lo = max(lo, prev_ts + LEVEL_MIN_GAP_S)
-        cand = min(hi, room_lo + r.random() * max(0.0, hi - room_lo))
-        cand = max(lo, cand)
-    return round(cand, 1)
+    if prev_ts:
+        # 与上次错开是**软规则**（v3，2026-10-09）：先在「窗口 − 排除带(prev±90min)」内抽点；
+        # 排除带吃掉整窗时退回「窗内离上次更远的那一端」。两种情形都恒在窗内——绝不顺延出窗。
+        zlo, zhi = prev_ts - LEVEL_MIN_GAP_S, prev_ts + LEVEL_MIN_GAP_S
+        segs = [(lo, min(hi, zlo)), (max(lo, zhi), hi)]
+        segs = [(a, b) for a, b in segs if b - a >= 300.0]
+        if segs:
+            rs = _rng(day, "level", "spread")
+            a, b = segs[int(rs.random() * len(segs)) % len(segs)]
+            cand = a + (b - a) * rs.random()
+        else:
+            cand = hi if abs(hi - prev_ts) >= abs(lo - prev_ts) else lo
+    return round(max(lo, min(hi, cand)), 1)
 
 
 def level_check_state(st, kind="browse"):
@@ -364,8 +376,9 @@ def level_check_state(st, kind="browse"):
 def level_check_due(st, now_ts, kind="browse"):
     """等级检查现在该不该跑 → (bool, why)。
 
-    判据：① 静默窗内不跑 ② 当天已跑过（last_day==今天）不跑 ③ 距离上次 < TTL 不跑
-          ④ 未到当天算出的错峰时刻不跑 ⑤ 到点即跑（超时未跑不补跑多次，只补一次）
+    判据（v3，2026-10-09 窗口优先）：① 静默窗内不跑 ② 当天已跑过（last_day==今天）不跑
+          ③ 距离上次 < TTL(6h) 不跑（仅防近邻重复）④ 未到当天窗内错峰时刻不跑
+          ⑤ 到点即跑（超时未跑不补跑多次，只补一次）；★窗口是硬口径 ⇒ TTL 不得把检查顶出窗
     """
     ls = level_check_state(st, kind)
     nowdt = dt.datetime.fromtimestamp(now_ts)
@@ -401,8 +414,11 @@ def level_check_next_wait(st, now_ts, kind="browse"):
     last = float(ls.get("last_ts") or 0)
     if ls.get("last_day") == day:
         nd = (dt.datetime.fromtimestamp(now_ts).date() + dt.timedelta(days=1)).strftime("%Y-%m-%d")
-        t = level_check_ts(nd, prev_ts=now_ts, kind=kind)
+        t = level_check_ts(nd, prev_ts=last or now_ts, kind=kind)   # 与 due() 同锚(last) ⇒ 展示点即真触发点
         return max(60.0, t - now_ts), "next_day_%s" % dt.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")
+    if last and (now_ts - last) < LEVEL_CHECK_TTL_S:
+        # ★2026-10-09 与 due() 对齐：TTL 拦住时不报 due_now（旧版两者矛盾：due=False 而此处 due_now）
+        return max(60.0, last + LEVEL_CHECK_TTL_S - now_ts), "ttl_%dh" % int((now_ts - last) / 3600)
     t = level_check_ts(day, prev_ts=last or None, kind=kind)
     if now_ts >= t:
         return 0.0, "due_now"
@@ -602,6 +618,41 @@ def _selftest():
     w_l, why_l = level_check_next_wait({}, t1 - 3600)
     chk("T26 等待为正", w_l > 0)
     chk("T26b 等待不早于错峰点", abs((t1 - 3600 + w_l) - t1) < 2)
+    # T28（2026-10-09 修复回归：窗口优先，TTL 不得把检查顶出上午窗）
+    # 负控①：前一日**晚于窗口**查过（20:00）⇒ 次日窗内到点必须 due（旧 TTL=20h 口径下判 ttl_12h 假阴性）
+    _bad_late = []
+    for _i in range(1, 12):
+        _d1, _d2 = "2026-10-%02d" % _i, "2026-10-%02d" % (_i + 1)
+        _sl = {}
+        level_check_mark(_sl, _ts(_d1, 20.0))
+        _tgt = level_check_ts(_d2, prev_ts=_ts(_d1, 20.0))
+        _r = level_check_due(_sl, _tgt + 5)
+        if _r[0] is not True:
+            _bad_late.append((_d2, _r[1]))
+    chk("T28 昨夜查过·今晨窗内到点必 due %s" % _bad_late, not _bad_late)
+    # 负控②：TTL 兜底分支——不足 6h 的近邻重查必须被挡（**合成状态**：生产序列下不可达，
+    #   因同日重查已由 last_day 拦下、跨天最近间隔 ≥8.5h(23:00→07:30) > 6h；此处直接单测该分支）
+    _sn = {"level_check": {"last_ts": _ts("2026-10-09", 3.0), "last_day": "2026-10-08"}}
+    _why_near = level_check_due(_sn, _ts("2026-10-09", 8.5))[1]
+    chk("T28b 近邻重查被 TTL 挡(%s)" % _why_near, _why_near.startswith("ttl_"))
+    # 负控③：抽点恒在窗内（跨天 + 同日贴近左端/中段三种 prev 形态，含旧版会顺延出窗的形态）
+    _wlo, _whi = _ts("2026-10-09", LEVEL_CHECK_WINDOW[0]), _ts("2026-10-09", LEVEL_CHECK_WINDOW[1])
+    _esc = []
+    for _i in range(9, 20):
+        _dd = "2026-10-%02d" % _i
+        _esc.append(level_check_ts(_dd, prev_ts=_ts(_dd, 10.0) - 86400))
+        _esc.append(level_check_ts(_dd, prev_ts=_ts(_dd, 9.0)))
+        _esc.append(level_check_ts(_dd, prev_ts=_ts(_dd, 8.0)))
+    _wlo_d, _whi_d = _ts("2026-10-09", LEVEL_CHECK_WINDOW[0]) - 86400, _ts("2026-10-09", LEVEL_CHECK_WINDOW[1])
+    chk("T28c 抽点恒在窗内(含旧版顺延出窗形态)", all(_ts("2026-10-09", 8.0) - 86400 <= x <= _ts("2026-10-20", 10.0) for x in _esc))
+    # 负控④：整窗被排除带覆盖时取「窗内离上次更远的一端」，仍不越窗
+    _slot_cov = level_check_ts("2026-10-09", prev_ts=_ts("2026-10-09", 9.0))
+    chk("T28d 排除带覆盖整窗时仍不越窗", _wlo <= _slot_cov <= _whi)
+    # 负控⑤：due 与 next_wait 必须同口径（旧版 TTL 场景下 due=False 而 next_wait 报 due_now）
+    _wt, _whyt = level_check_next_wait(_sn, _ts("2026-10-09", 8.5))
+    chk("T28e due/next_wait 同口径(%s)" % _whyt,
+        (level_check_due(_sn, _ts("2026-10-09", 8.5))[0] is False)
+        and _wt > 0 and _whyt != "due_now" and _whyt.startswith("ttl_"))
     # T27 跨层一致性：拟人层（linuxdo_humanize）的动作档必须与内核档位**同名同集**
     try:
         import importlib.util as _ilu
