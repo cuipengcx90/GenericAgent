@@ -10,7 +10,7 @@
 - 文件名规律：`绩效考评表-崔朋-{年}-Q{n}.xlsx`，唯一 sheet 名 = `模板`
 - 数据源（git）：根 `/Users/cuip/develop/WorkSpaces/idea/smyze/`（**父工程树**；含 bar-smyze 子树与其兄弟仓 ruoyi-vue-pro-ee/bar-deploy/tools/ui 等，实测 99 个 `.git`、去重 72 个 common-dir），动态递归扫含 `.git` 子目录（worktree/嵌套仓全在内，须按 `git-common-dir` 去重）；author=`崔朋`，`--no-merges`，`--since/--until` **必带 `T00:00:00+08:00`**（裸日期丢当天 commit，致命级）。★只扫 `bar-smyze/` 顶层 12 仓会漏 worktree 分支的 HEAD 提交（Q3 实测少 109 条）。
 - 数据源（产出物，量化亮点用）：`bar_smyze_opserver/docs`（设计文档库，统计 md 数/字数/业务域/模块数，证明架构设计主导）；`bar_smyze_opserver/.claude/skills`（自建 AI 研发 skill 数 + agents/hooks/commands，证明 AI coding 团队引领）。
-- 季度区间：Q1=01-01~03-31，Q2=04-01~06-30，Q3=07-01~09-30，Q4=10-01~12-31（未结束季度用至今日）。
+- 季度区间 / 窗口口径：**单一源 = §时间窗口**（Q1=1–3月、Q2=4–6月、Q3=7–9月、Q4=10–12月；半开区间 [S,E)，每季现算——禁写死日期、禁跨季复用）。
 
 ## 单元格结构红线（严禁自由发挥，禁合并/改名/省略）
 | 单元格 | 含义 | 填什么 |
