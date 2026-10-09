@@ -102,7 +102,12 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 - **★三源口径（2026-10-09 建立；报数必须先声明抽哪一源、并按主线锚点去重，禁三源相加）**：①**git**=本仓父树（`--branches` 口径 1920 条；见上）；②**禅道**=本人 Q3 解决 Bug 32（8月12/9月20）、完成任务 9（156h）、进行中 4、需求池 336（脚本与产物 `temp/zentao_probe/`）；③**飞书**=`lark-cli` 拉 26 个会话的 Q3 消息 11979 条、其中本人发出 2434 条（7月1150/8月975/9月309；脚本 `temp/feishu_q3/collect.py`，产物 `temp/feishu_q3/messages.jsonl`）。三源是**同一主线任务的不同流转面**（飞书沟通 → 禅道派单 → 代码落地），必然交叉重复 ⇒ 按锚点去重：git `<sha>` / 禅道 `Bug|任务 ID` / 飞书 `<message_id>`，**同一需求只在其最后落地处计一次**；写自评时一条 bullet 只引一种锚点，跨源呼应写在同一条的括号内，不得拆成多条凑量。
 
 ## 工具
-- 取数+归类：见会话内 git 扫描脚本（os.listdir 扫 .git + git log --pretty=%s + prefix 分类 Counter）。
+- **取数三源（2026-10-09 建立；命令可直接复跑，勿依赖 temp 产物）**：
+  - **git（仓库根=父工程树，见上「取数口径三维度」）**：`ROOT=~/develop/WorkSpaces/idea/smyze`；`find "$ROOT" -name .git -maxdepth 8 | wc -l`（=99）→ 逐仓按 `git rev-parse --git-common-dir` 去重（=72 仓）后各跑 `git -C <repo> log --branches --author=崔朋 --no-merges --since=2026-07-01T00:00:00+08:00 --until=2026-10-01T00:00:00+08:00 --pretty=%H`，结果按 `<sha>` 全局去重后计数（Q3=1920）；本季汇总产物 `temp/q3_data_scope/{git_scope_matrix.json,git_repos_q3.json,git_layer_delta_by_repo.json}`（temp 易失，仅作对照）。
+  - **禅道（任务流转面）**：本机已登录会话只读抓取，产物 `temp/zentao_probe/{q3_bugs.json,q3_extra.json,dynamic_all.json,endpoints.json}`；口径=本人**解决 Bug** / **完成任务**（含工时）与进行中条数；「需求池 336」含非本人、不入个人产出口径。
+  - **飞书（沟通面）**：`python3 temp/feishu_q3/collect.py`（lark-cli **只读**遍历会话；产物 `temp/feishu_q3/{messages.jsonl,summary_q3.json,chats.json}`，脚本住 temp 属易失）；本人发言须按 sender 过滤后计数，**11979（26 个会话 Q3 消息总量）≠ 2434（本人发言）**，两者不可混用。
+  - **证据与去重规则单一出处**：`temp/q3_data_scope/EVIDENCE_THREE_SOURCES.md`（含口径声明/三层口径/月分布/去重示例/复算命令）；三源共用锚点 `<sha>` / 禅道 `Bug#id` / 飞书 `<message_id>`，同一需求只在其**最后落地处**计一次、**禁三源相加**（见上「三源口径」条）。
+- 归类：commit subject 按前缀分类 Counter（`git log --pretty=%s`）。
 - 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验（保存后必核 H12/J12/H13 三公式仍在、J7..J11=100 未被覆盖）；**另必核 zip 部件清单未缩水**（见上「openpyxl 丢内嵌图片」条；丢图后按配方从备份注入回）。
 
 ## 触发与复用（每季度照此启动）
