@@ -10,7 +10,7 @@
 - 文件名规律：`绩效考评表-崔朋-{年}-Q{n}.xlsx`，唯一 sheet 名 = `模板`
 - 数据源（git）：根 `/Users/cuip/develop/WorkSpaces/idea/smyze/`（**父工程树**；含 bar-smyze 子树与其兄弟仓 ruoyi-vue-pro-ee/bar-deploy/tools/ui 等，实测 99 个 `.git`、去重 72 个 common-dir），动态递归扫含 `.git` 子目录（worktree/嵌套仓全在内，须按 `git-common-dir` 去重）；author=`崔朋`，`--no-merges`，`--since/--until` **必带 `T00:00:00+08:00`**（裸日期丢当天 commit，致命级）。★只扫 `bar-smyze/` 顶层 12 仓会漏 worktree 分支的 HEAD 提交（Q3 实测少 109 条）。
 - 数据源（产出物，量化亮点用）：`bar_smyze_opserver/docs`（设计文档库，统计 md 数/字数/业务域/模块数，证明架构设计主导）；`bar_smyze_opserver/.claude/skills`（自建 AI 研发 skill 数 + agents/hooks/commands，证明 AI coding 团队引领）。
-- 季度区间 / 窗口口径：**单一源 = §时间窗口**（Q1=1–3月、Q2=4–6月、Q3=7–9月、Q4=10–12月；半开区间 [S,E)，每季现算——禁写死日期、禁跨季复用）。
+- 季度区间：Q1=01-01~03-31，Q2=04-01~06-30，Q3=07-01~09-30，Q4=10-01~12-31（未结束季度用至今日）。**窗口口径（半开区间 / 现算 / 三源同窗过滤）单一源=§时间窗口**（禁写死日期、禁跨季复用）。
 
 ## 单元格结构红线（严禁自由发挥，禁合并/改名/省略）
 | 单元格 | 含义 | 填什么 |
@@ -100,8 +100,12 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 ## 时间窗口（每季度现算；禁跨季复用）
 - **规则**：Q1=1/1–3/31、Q2=4/1–6/30、Q3=7/1–9/30、Q4=10/1–12/31（自然季度，全年无缝衔接）。
 - **半开区间**：`since=<本季首日>T00:00:00+08:00`、`until=<下季首日>T00:00:00+08:00`（=本季末 24:00）⇒ 相邻季度**零重叠、零遗漏**（本季末 23:59 归本季、次日 00:00 归下季）。**禁用裸日期**（会丢当天）。
+- **与「未结束季度用至今日」（见「关键路径与对象」季度区间条）等价**：进行中季度取 S=本季首日、E=**下季首日**（是未来日）⇒ `until=<未来日>` 在 git / 时间过滤上与「取到今日」等价；两处口径不冲突，本行即二者的桥。
 - **现算一行**（改 y/q 即可，勿手填日期）：
   `python3 -c "import datetime as d;y=2026;q=4;S=d.date(y,(q-1)*3+1,1);E=d.date(y+1,1,1) if q==4 else d.date(y,q*3+1,1);print(S,E)"`
+- **一把梭（推荐）：直接把 S/E 变成 shell 变量**，供 §工具 的 git 命令引用（四季通用、无字面日期；只改 y/q 两处）：
+  `read -r Q_S Q_E <<< "$(python3 -c 'import datetime as d;y=2026;q=4;S=d.date(y,(q-1)*3+1,1);E=d.date(y+1,1,1) if q==4 else d.date(y,q*3+1,1);print(S,E)')"`
+  ⇒ `Q_S=2026-10-01`、`Q_E=2027-01-01`（Q4 **示例**；已实测 Q1→Q2→Q3→Q4→次年 Q1 首尾相接、**零重叠零遗漏**）。
 - **三源同一窗口**（缺一即报数口径不成立）：git=`--since/--until`；飞书=消息 `create_time` ∈ [S,E)；禅道=Bug 解决日期 / 任务完成日期 ∈ [S,E)；docs/.claude 产出物=mtime ∈ [S,E)。
 - **禁跨季复用**：每季数字须当场重取（如 Q4 不得引用 Q3 的任何数字/结论）；把「窗口 + 取数时刻」写进报告头与证据文件首节。
 
@@ -112,11 +116,11 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 
 ## 工具
 - **取数三源（2026-10-09 建立；命令可直接复跑，勿依赖 temp 产物）**：
-  - **git（仓库根=父工程树，见上「取数口径三维度」）**：`ROOT=~/develop/WorkSpaces/idea/smyze`；`find "$ROOT" -name .git -maxdepth 8 | wc -l`（=99）→ 逐仓按 `git rev-parse --git-common-dir` 去重（=72 仓）后各跑 `git -C <repo> log --branches --author=崔朋 --no-merges --since=${Q_S}T00:00:00+08:00 --until=${Q_E}T00:00:00+08:00 --pretty=%H`（`Q_S/Q_E` 由 §时间窗口 现算，**禁写死日期**），结果按 `<sha>` 全局去重后计数（Q3 示例=1920）；本季汇总产物 `temp/q3_data_scope/{git_scope_matrix.json,git_repos_q3.json,git_layer_delta_by_repo.json}`（temp 易失，仅作对照）。
-  - **禅道（任务流转面）**：本机已登录会话只读抓取，产物 `temp/zentao_probe/{q3_bugs.json,q3_extra.json,dynamic_all.json,endpoints.json}`；口径=本人**解决 Bug** / **完成任务**（含工时）与进行中条数；**窗口过滤=解决日期/完成日期 ∈ [S,E)**（「进行中」为季末快照、不受窗口过滤）；「需求池（Q3 示例 336）」含非本人、不入个人产出口径。
-  - **飞书（沟通面）**：`python3 temp/feishu_q3/collect.py`（lark-cli **只读**遍历会话；产物 `temp/feishu_q3/{messages.jsonl,summary_q3.json,chats.json}`，脚本住 temp 属易失）；**窗口过滤=消息 `create_time` ∈ [S,E)**；本人发言须按 sender 过滤后计数，**11979（26 个会话 Q3 消息总量）≠ 2434（本人发言）**（均为 Q3 示例），两者不可混用。
+  - **git（仓库根=父工程树，见上「取数口径三维度」）**：`ROOT=~/develop/WorkSpaces/idea/smyze`；`find "$ROOT" -name .git -maxdepth 8 | wc -l`（=99）→ 逐仓按 `git rev-parse --git-common-dir` 去重（=72 仓）后各跑 `git -C <repo> log --branches --author=崔朋 --no-merges --since=${Q_S}T00:00:00+08:00 --until=${Q_E}T00:00:00+08:00 --pretty=%H`（`Q_S/Q_E` 见 §时间窗口「一把梭」，**禁写死日期**），结果按 `<sha>` 全局去重后计数（Q3 示例=1920）；本季汇总产物 `temp/q3_data_scope/{git_scope_matrix.json,git_repos_q3.json,git_layer_delta_by_repo.json}`（temp 易失，仅作对照）。
+  - **禅道（任务流转面）**：本机已登录会话只读抓取（无固定脚本、产物住 temp 属易失 ⇒ **下季按同口径重抓，勿跳过该源**），产物 `temp/zentao_probe/{q3_bugs.json,q3_extra.json,dynamic_all.json,endpoints.json}`；口径=本人**解决 Bug** / **完成任务**（含工时）与进行中条数；**窗口过滤=解决日期/完成日期 ∈ [S,E)**（「进行中」为季末快照、不受窗口过滤）；「需求池（Q3 示例 336）」含非本人、不入个人产出口径。
+  - **飞书（沟通面）**：`python3 temp/feishu_q3/collect.py`（lark-cli **只读**遍历会话；产物 `temp/feishu_q3/{messages.jsonl,summary_q3.json,chats.json}`，脚本住 temp 属易失 ⇒ **下季开工先查在否，缺则按本节口径重写，勿以缺脚本为由跳过该源**）；**窗口过滤=消息 `create_time` ∈ [S,E)**；本人发言须按 sender 过滤后计数，**11979（26 个会话 Q3 消息总量）≠ 2434（本人发言）**（均为 Q3 示例），两者不可混用。
   - **证据与去重规则单一出处**：`temp/q3_data_scope/EVIDENCE_THREE_SOURCES.md`（含口径声明/三层口径/月分布/去重示例/复算命令）；三源共用锚点 `<sha>` / 禅道 `Bug#id` / 飞书 `<message_id>`，同一需求只在其**最后落地处**计一次、**禁三源相加**（见上「三源口径」条）。
-- 归类：commit subject 按前缀分类 Counter（`git log --pretty=%s`）。
+- 归类：commit subject 按前缀分类 Counter（`git log --pretty=%s`）；**旧法 `os.listdir` 扫 `.git` 已废止**（同一提交会被重复计一遍，须按 `git-common-dir` 去重，见上）。
 - 写入：openpyxl load_workbook(data_only=False) → 改 H/I/C 单元格 → save → 重新 load 校验（保存后必核 H12/J12/H13 三公式仍在、J7..J11=100 未被覆盖）；**另必核 zip 部件清单未缩水**（见上「openpyxl 丢内嵌图片」条；丢图后按配方从备份注入回）。
 
 ## 触发与复用（每季度照此启动）
@@ -129,7 +133,7 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 
 **GA 自动执行链**（无需用户重复决策，除非冲突）：
 1. 读本 SOP + 上一季度 xlsx（跨期对账，取 C16 改善项做本季呼应）。
-2. **先按 §时间窗口 现算本季 S/E**（半开区间），再扫 git `--since/--until` + 三源同窗过滤（飞书 create_time / 禅道 解决·完成日期 / 产出物 mtime），拿真实数字（**禁引用上季数字**）。
+2. **先按 §时间窗口 现算本季 S/E**（半开区间），再扫 git `--since/--until` + 三源同窗过滤（飞书 create_time / 禅道 解决·完成日期 / 产出物 mtime），拿真实数字（**禁引用上季数字**）；窗口时间戳一律带 `T00:00:00+08:00`，产出物面=`docs` 与 `.claude`（skills/agents/hooks/commands）。
 3. 按 B 列 KPI 域归类 → 填 H（评分 110-120）/I（自评描述）/C15/C16，套用写作规范 10 条。
 4. openpyxl 写入 + 重载校验 + 逐章自检清单过一遍。
 5. 交付摘要，等用户微调（评分档位/亮点取舍/改善项措辞）。
