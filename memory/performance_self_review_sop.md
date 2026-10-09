@@ -90,6 +90,7 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 - 保存前确认 J 列上级评分占位（通常 100），勿覆盖。
 - **写表必须用 `/opt/anaconda3/bin/python3`**：默认 `python3` 无 openpyxl（2026-10-08 Q3 实测 ModuleNotFoundError）；写前先备份 xlsx 到 temp/。
 - **git 取数必须按 `git-common-dir` 去重**：bar-smyze 各仓下存在 `.git` 子目录 / 主仓+worktree 并存 ⇒ 直接遍历 `.git` 会把同一提交（尤其 root 仓）重复计一遍（Q3 实测去重后 1717 ← 未去重虚高）；`--no-merges` + `--author=崔朋` + 带时区 since/until。
+- **★取数口径三维度（2026-10-09 复核实测，报数前必须挑明）**：①**空间**=根目录下递归全扫，所有 worktree（`.worktrees/*`、`bar_*/.ccb/workspaces/*`、`bar_*/.claude/worktrees/*`、`*/.trellis/spec/smyze-spec`）**全在工程内**（实测落在根外 0 个）；深于 3 层的 `.git` 只有第三方插件缓存（`.ccb/shared-cache/codex/plugin-bundles/*`、`*/.claude/plugins/marketplaces/*`），非我方产出须排除。②**分支**=裸 `git log` 为 **HEAD-only 口径**，会漏掉未合入当前分支的 worktree/功能分支提交：Q3 实测 HEAD=1717 vs `--branches`=1920（+203）vs `--all`=1926（+206，远端分支再多 6），差异集中在 bar-deploy-server 57→140、bar_smyze_screen 1→11、bar-deploy-webadmin 40→62、bar_smyze_op 198→215；**保守报数用 HEAD、要体现完整工作量用 `--all`，择一后须在表内与记忆内注明口径**。③**仓外**=`~/develop` 其它仓 Q3 有本人提交者仅 herdr-agents 290、obsidian-note 90（个人基建/知识库，非 smyze 业务，不入主业绩效），另有重复克隆 bar-deploy-server省市区 39、bar-deploy/bar-deploy-client 2 须按 `git-common-dir` 去重；Q3 末未提交改动仅 4 个文件，不构成工作量口径。
 - **跨季雷同度机械比对**：写完用 difflib 对 Q2 的 I7–I9/C15/C16 逐句算相似度，取 max；>0.5 的句子必改写（Q3 实测 I9 总评 0.58、I8 总评 0.47、I7 交付段 0.52 三处返工）。业务名词（点单平台/交付准时率/重大事故）造成的相似度属正常锚点，可保留。
 
 - **★openpyxl 重写会静默丢掉 WPS 内嵌图片/签名图（2026-10-08 Q3 实测事故）**：load_workbook → save 后体积 48023B → 13632B，`xl/cellimages.xml` + `xl/_rels/cellimages.xml.rels` + `xl/media/image1.png`（单元格内嵌签名图，走 WPS 专有 `DISPIMG("ID_...",1)` 公式）与 `sharedStrings.xml` 全被丢弃，openpyxl **不报错**，数据/公式/合并格却完好 ⇒ 只读回数值校验查不出来，**必须比对 zip 成员清单**（`set(前) - set(后)`）。
@@ -97,7 +98,7 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
   ⇒ **铁律：写任何带内嵌图片/签名图的办公文件前先备份；写后除值校验外必做「部件清单 diff」**（`zipfile.namelist()`），装配件数量与体积双判据（本例 13 部件/46.5KB vs 丢图版 10 部件/13.6KB）。
 
 ## 已用锚点（写新季度时作起点，须当场复算）
-- Q3（2026-07-01~09-30）：提交 1717（跨 12 仓）；opserver docs `*.md` 855 份 / 本季新增 196 份；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
+- Q3（2026-07-01~09-30）：提交 1717（跨 12 仓；**HEAD-only 口径** = 各仓当前检出分支；含全部本地分支 1920、含远端分支 1926 —— 见上「取数口径三维度」）；opserver docs `*.md` 855 份 / 本季新增 196 份（口径=跟随符号链接计数 / `git ls-files docs` 854 md）；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
 
 ## 工具
 - 取数+归类：见会话内 git 扫描脚本（os.listdir 扫 .git + git log --pretty=%s + prefix 分类 Counter）。
