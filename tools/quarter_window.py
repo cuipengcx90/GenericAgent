@@ -83,14 +83,28 @@ def bounds(year, quarter):
 
 
 def parse_day(s):
-    """'2026-07-01' 或 '2026-07-01 00:00:00' -> datetime(+08:00)"""
+    """日期串 -> datetime(+08:00)。
+
+    ★接受的形态（2026-10-09 扩面，只加不破）：既有三种 + ISO 带偏移形态
+      '2026-07-01T00:00:00+08:00' / '...Z' / '...+00:00'。
+    为什么要收偏移形态：本文件 docstring 与 SOP/RULES#9 都明文规定窗口口径写
+      `since=<本季首日>T00:00:00+08:00`，而旧实现只认「无偏移」三种形态 ⇒
+      按文档照抄的命令在 git/禅道/飞书三处一律 rc=2「无法解析日期」（实测 2026-10-09）。
+    带偏移者一律**换算到北京时间**（半开区间语义按绝对时刻判定，与 +08:00 口径自洽）。
+    负控：真正非法的串仍抛 ValueError（调用方 rc=2 fail-closed）。
+    """
     s = str(s).strip()
     for fmt in (FMT, "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.datetime.strptime(s, fmt).replace(tzinfo=TZ)
         except ValueError:
             continue
-    raise ValueError("无法解析日期: %r" % (s,))
+    try:  # ISO 8601（含 +08:00 / Z / -05:00 等偏移；Python 3.11 支持 'Z'）
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        raise ValueError("无法解析日期: %r" % (s,))
+    # 裸日期/裸时间（fromisoformat 可解析）按北京时间，与上文三种形态一致
+    return dt.replace(tzinfo=TZ) if dt.tzinfo is None else dt.astimezone(TZ)
 
 
 def resolve(since=None, until=None, quarter=None, offset=0, now=None):
@@ -176,6 +190,17 @@ def selftest():
     cw = resolve("2026-07-01", "2026-10-01")
     ck("custom since", cw["since"] == "2026-07-01 00:00:00")
     ck("custom until", cw["until"] == "2026-10-01 00:00:00")
+    # ★ISO 带偏移形态（2026-10-09 修：SOP/RULES#9 规定写 T00:00:00+08:00，旧实现拒收）
+    ck("ISO+08:00 形态可解析", parse_day("2026-07-01T00:00:00+08:00") ==
+       datetime.datetime(2026, 7, 1, tzinfo=TZ))
+    ck("ISO Z 形态换算到北京时间", parse_day("2026-07-01T00:00:00Z") ==
+       datetime.datetime(2026, 7, 1, 8, 0, 0, tzinfo=TZ))
+    ckw = resolve("2026-07-01T00:00:00+08:00", "2026-10-01T00:00:00+08:00")
+    ck("带偏移 since/until 归一到同一窗口", (ckw["since"], ckw["until"]) ==
+       ("2026-07-01 00:00:00", "2026-10-01 00:00:00"))
+    ck("带偏移与裸日期等价（回归负控）", (ckw["since_ts"], ckw["until_ts"]) ==
+       (resolve("2026-07-01", "2026-10-01")["since_ts"], resolve("2026-07-01", "2026-10-01")["until_ts"]))
+    ck("非法串仍 raise(负控)", _raises(parse_day, "not-a-date"))
     ck("缺 until -> raise(负控)", _raises(resolve, "2026-07-01", None))
     ck("since>=until -> raise(负控)", _raises(resolve, "2026-10-01", "2026-07-01"))
     # 动态性：同一代码在不同“今天”给出不同季度（禁写死）

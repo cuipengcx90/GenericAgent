@@ -268,10 +268,45 @@ def collect(root=DEFAULT_ROOT, author=DEFAULT_AUTHOR, since=None, until=None, mo
     # 而「月分布」传统按 **author 日期**（=提交实际写就时间）。rebase/cherry-pick 会让两者分属
     # 不同月份（实测 1 例 a4d29df: author 2026-06 / committer 2026-09）⇒ 两套分布都给出，
     # 并把 author 日期落在窗口外的条数显式标出（不改动 commits 计数，保持与 git 过滤一致）。
-    def _d(s):
-        return (s or "").replace("T", " ")[:19]
-    out_of_window = [c["sha"][:12] for c in commits_u
-                     if since and until and not (since[:19] <= _d(c.get("date")) < until[:19])]
+    # ★窗口判据精度（2026-10-09 修，负控见 selftest「窗口内月份不得判窗外」）：
+    # log 的日期字段由 `--date=format-local:%Y-%m` 产出 ⇒ **只有月精度**；旧实现把它与
+    # `since[:19]`（形如 "2026-07-01T00:00:00"）做整串比较，两侧前缀长度不同 ⇒ 两向都错
+    # （2026-10-09 A/B 夹具实测，HEAD 版 vs 现版）：
+    #   ①假报：非月对齐窗口（如 08-15~11-15）下，author=c 08-20 的**窗内**提交被判窗外
+    #     （"2026-08" < "2026-08-15 00:00:00"）⇒ HEAD count=1 / 现版 count=0(coarse)。
+    #   ②漏报：月对齐季度窗口下，author=10-05 而 committer=09-20 的提交（rebase 典型）
+    #     作者日期已出窗却因 "2026-10" 是 "2026-10-01 00:00:00" 的前缀而被判窗内
+    #     ⇒ HEAD count=0 / 现版 count=1（selftest 负控 repoZ）。
+    # 现按「双方都截到月」比较（季度这类月对齐窗口语义正确）；非月对齐窗口月粒度不足以判定
+    # ⇒ 标 window_precision=coarse 并按「不误报」处理（宁可漏报不平白假报）。
+    def _w(x):
+        return (x or "").replace("T", " ").strip()[:19]
+
+    def _month(x):
+        return _w(x)[:7]
+
+    def _month_aligned(x):
+        w = _w(x)
+        if len(w) < 10 or w[8:10] != "01":
+            return False
+        rest = w[10:]
+        return rest in ("", " 00:00:00", " 00:00", "00:00:00", "00:00")
+
+    window_precision = "exact"
+    if since and until and not (_month_aligned(since) and _month_aligned(until)):
+        window_precision = "coarse"
+
+    def _in_window(c):
+        if not (since and until) or window_precision == "coarse":
+            return True
+        ds, de, dd = _w(since), _w(until), _w(c.get("date"))
+        if not dd:
+            return False
+        if len(dd) >= 19 and len(ds) >= 19 and len(de) >= 19:
+            return ds <= dd < de                     # 完整时间戳：精确比较
+        return _month(ds) <= _month(dd) < _month(de)  # 月精度：按分钟粒度界比较
+
+    out_of_window = [c["sha"][:12] for c in commits_u if not _in_window(c)]
     tot_ins = sum(c["insertions"] for c in commits)
     tot_del = sum(c["deletions"] for c in commits)
     top_repos = sorted(
@@ -305,6 +340,7 @@ def collect(root=DEFAULT_ROOT, author=DEFAULT_AUTHOR, since=None, until=None, mo
         },
         "top_repos": top_repos,
         "top_repos_unique": top_repos_u,
+        "window_precision": window_precision,
         "errors": errors,
         "repos_picked": [x["path"] for x in picked],
         "commits_detail": commits,
@@ -366,7 +402,16 @@ def main(argv=None):
         md = render_md(res)
         _write(args.md_out, md)
         print("wrote %s (%d bytes)" % (args.md_out, len(md.encode("utf-8"))))
-    return 0 if not res["errors"] else 0
+    return exit_code(res)
+
+
+def exit_code(res):
+    """退出码口径（2026-10-09 修）：取数错误必须反映到 rc，与 zentao/feishu 的 fail-closed 对齐。
+
+    有 errors（某仓 git log 失败等）⇒ rc=3；这仍是「发现」而非失败，但静默=失败。
+    旧实现 `return 0 if not res["errors"] else 0` 两条分支同为 0 ⇒ 错误永远无声。
+    """
+    return 3 if (res.get("errors") or []) else 0
 
 
 def _write(path, text):
@@ -419,6 +464,8 @@ def render_md(res):
                 L.append("%d. %s: %s 次" % (i, x.get("repo") or x.get("name"), x.get("commits")))
             else:
                 L.append("%d. %s" % (i, x))
+    if res.get("window_precision") == "coarse":
+        L.append("- ⚠ 窗口非月对齐 ⇒ author 日期窗外判定为月粒度上界（不逐条判，宁漏不误报）")
     errs = res.get("errors") or []
     if errs:
         L.append("")
@@ -562,6 +609,38 @@ def selftest():
     r_y = collect(repoY, ME, "2026-07-01T00:00:00+08:00", "2026-10-01T00:00:00+08:00", "branches", 4)
     ck("负控:committer 也在窗口外 ⇒ 0 提交", r_y["commits"] == 0)
     ck("负控:无提交时 out_of_window 计数=0", r_y["out_of_window_author"]["count"] == 0)
+
+    # ★2026-10-09 回归负控：①月对齐窗下窗内月份不得假报窗外（coarse 窗亦不得假报）
+    #   ②月对齐窗下「author 出窗、committer 在窗」的提交必须判出（旧实现漏报，见 repoZ）
+    ck("负控:窗口内(2026-08)提交不得判窗外", r_head["out_of_window_author"]["count"] == 0)
+    ck("窗口精度标注=exact(月对齐)", r_head.get("window_precision") == "exact")
+    ck("负控:窗外(2026-05)仍须判出=1", r_x["out_of_window_author"]["count"] == 1)
+    _r_coarse = collect(tmp, ME, "2026-07-15T00:00:00+08:00", "2026-09-15T00:00:00+08:00",
+                        "branches", 4)
+    ck("非月对齐窗口标 coarse", _r_coarse.get("window_precision") == "coarse")
+    ck("负控:coarse 窗口不得假报窗外", _r_coarse["out_of_window_author"]["count"] == 0)
+    # ★跨月漏报负控（旧实现此处恒 0）：author 2026-10 出窗 / committer 2026-09 在窗 ⇒ 必判 1
+    repoZ = os.path.join(tmp, "repoZ")
+    os.makedirs(repoZ)
+    _sh(["git", "init", "-q", "-b", "main"], cwd=repoZ)
+    _sh(["git", "config", "user.email", "t@t"], cwd=repoZ)
+    _sh(["git", "config", "user.name", "t"], cwd=repoZ)
+    _commit(repoZ, ME, "2026-10-05T09:00:00+08:00", "z.txt",
+            cdate="2026-09-20T13:00:00+08:00")
+    r_z = collect(repoZ, ME, "2026-07-01T00:00:00+08:00", "2026-10-01T00:00:00+08:00", "branches", 4)
+    ck("跨月提交按 committer 计入(1)", r_z["commits"] == 1)
+    ck("负控:author 出窗(2026-10)必判出=1", r_z["out_of_window_author"]["count"] == 1)
+    ck("author 月分布=2026-10", list(r_z["by_month"].keys()) == ["2026-10"])
+
+    # ★取数错误 ⇒ rc=3（假仓：.git 指向不存在的 gitdir ⇒ git log 必失败）
+    _repoBad = os.path.join(tmp, "repoBad")
+    os.makedirs(_repoBad, exist_ok=True)
+    with open(os.path.join(_repoBad, ".git"), "w") as _f:
+        _f.write("gitdir: /nonexistent/ga_selftest_gitdir\n")
+    _r_bad = collect(tmp, ME, "2026-07-01T00:00:00+08:00", "2026-10-01T00:00:00+08:00", "head", 4)
+    ck("坏仓计入 errors", len(_r_bad.get("errors") or []) >= 1)
+    ck("负控:有取数错误 ⇒ exit_code=3(旧版恒 0)", exit_code(_r_bad) == 3)
+    ck("无错误 ⇒ exit_code=0", exit_code(r_head) == 0)
 
     # 窗口工具联动
     if qw is not None:

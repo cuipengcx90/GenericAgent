@@ -187,14 +187,26 @@ COLLECT_JS = r"""
     }
   }
   out.bugs = Object.keys(byId).map(k => byId[k]);
-  // 3) my/work（不可翻页：recTotal ≤ 20 才可靠）
-  const myWork = async (mode, type) => parse(await get(
-    '/index.php?m=my&f=work&mode=' + mode + '&type=' + type + '&t=json')) || {};
+  // 3) my/work（★2026-10-09 只捕获不重取：该端点能否靠 recPerPage 翻页未在活体会话实测过，
+  //    故**不改变取数行为**（仍旧只取首页），只把响应里的 pager 留痕进 payload，
+  //    供 aggregate 判「拿到行数是否等于权威上限 recTotal」，不足即告警，避免静默少算。）
+  const num1 = (v) => (v === undefined || v === null || v === '') ? null : Number(v);
+  const myWork = async (mode, type) => {
+    const d = parse(await get(
+      '/index.php?m=my&f=work&mode=' + mode + '&type=' + type + '&t=json')) || {};
+    const pg = d.pager || {};
+    return {d: d, pg: {got: 0, recTotal: num1(pg.recTotal),
+                       recPerPage: num1(pg.recPerPage), pageID: num1(pg.pageID)}};
+  };
   const tf = await myWork('task', 'finishedBy');
-  out.tasks = rows(tf.tasks);
+  out.tasks = rows(tf.d.tasks);
+  tf.pg.got = out.tasks.length;
   const bd = await myWork('bug', 'doing');
   const td = await myWork('task', 'doing');
-  out.doing = rows(bd.bugs).concat(rows(td.tasks));
+  const bd_rows = rows(bd.d.bugs), td_rows = rows(td.d.tasks);
+  out.doing = bd_rows.concat(td_rows);
+  bd.pg.got = bd_rows.length; td.pg.got = td_rows.length;
+  out.mypagers = {finishedBy_task: tf.pg, doing_bug: bd.pg, doing_task: td.pg};
   return JSON.stringify(out);
 })()
 """
@@ -288,6 +300,31 @@ def aggregate(payload, since, until, author=DEFAULT_AUTHOR, page_size=PAGE_SIZE)
                 c[m] = c.get(m, 0) + 1
         return dict(sorted(c.items()))
 
+    #  my/work 面完整性（★2026-10-09 只捕获式：不重取、不改取数行为，只判并告警）
+    #  旧 payload 无 mypagers 键 ⇒ unknown_no_pager（回退，不误报也不冒充 verified）
+    mp = {k: v for k, v in (payload.get("mypagers") or {}).items() if isinstance(v, dict)}
+    my_ok, my_short, my_unknown = {}, {}, {}
+    for face, v in mp.items():
+        got = int(v.get("got") or 0)
+        rt = v.get("recTotal")
+        if rt is None:
+            my_unknown[face] = got
+        elif got >= int(rt):
+            my_ok[face] = {"got": got, "recTotal": int(rt)}
+        else:
+            my_short[face] = {"got": got, "recTotal": int(rt), "recPerPage": v.get("recPerPage")}
+    if not mp:
+        _mystate = "unknown_no_pager"
+    elif my_short:
+        _mystate = "truncated"
+    elif my_unknown:
+        _mystate = "verified_with_unknown"
+    else:
+        _mystate = "verified"
+    my_work_completeness = {
+        "state": _mystate, "method": "my/work pager.recTotal vs got（只捕获，不重取）",
+        "faces_verified": my_ok, "faces_short": my_short, "faces_unknown": my_unknown,
+    }
     return {
         "window": {"since": since, "until": until, "author": author},
         "source": {
@@ -329,6 +366,7 @@ def aggregate(payload, since, until, author=DEFAULT_AUTHOR, page_size=PAGE_SIZE)
             "truncation_risk": trunc,
             "truncation_ok": not trunc,
             "completeness": completeness,
+            "my_work_completeness": my_work_completeness,
             "nothing_dropped": (len(b_win) == len(b_mine) + len(b_other)
                                 and len(t_win) == len(t_mine) + len(t_other)),
         },
@@ -359,6 +397,12 @@ def render_md(s):
             s["assertions"]["completeness"]["products_verified"],
             json.dumps(s["assertions"]["completeness"]["products_short"], ensure_ascii=False) or "无",
             json.dumps(s["assertions"]["completeness"]["retry"], ensure_ascii=False) or "无"), ""]
+    myw = s["assertions"]["my_work_completeness"]
+    _mymark = "⚠ " if myw["state"] == "truncated" else "- "
+    L.append("%smy/work 完整性: %s｜已核 %d 面｜不足 %s｜无 pager %s"
+             % (_mymark, myw["state"], len(myw["faces_verified"]),
+                json.dumps(myw["faces_short"], ensure_ascii=False) or "无",
+                json.dumps(myw["faces_unknown"], ensure_ascii=False) or "无"))
     if s["source"]["fetch_errors"]:
         L.append("- ⚠ 取数告警: %s" % ",".join(map(str, s["source"]["fetch_errors"])))
     return "\n".join(L) + "\n"
@@ -514,6 +558,25 @@ def selftest():
         and "14" in sbig["assertions"]["truncation_risk"])
     chk("旧 payload 无 pagers ⇒ 完整性判 unknown_legacy_payload（回退，不误报也不冒充 verified）",
         s["assertions"]["completeness"]["state"] == "unknown_legacy_payload")
+
+    #  my/work 面完整性（★2026-10-09 只捕获式增强）
+    chk("旧 payload 无 mypagers ⇒ my/work 完整性判 unknown_no_pager（回退，不误报）",
+        s["assertions"]["my_work_completeness"]["state"] == "unknown_no_pager")
+    mshort = dict(payload)
+    mshort["mypagers"] = {"finishedBy_task": {"got": 9, "recTotal": 20, "recPerPage": 20, "pageID": 1}}
+    sms = aggregate(mshort, since, until, "cp")
+    chk("负控: my/work got<recTotal ⇒ truncated 且点名面名",
+        sms["assertions"]["my_work_completeness"]["state"] == "truncated"
+        and "finishedBy_task" in sms["assertions"]["my_work_completeness"]["faces_short"])
+    chk("负控: my/work 截断时渲染出 ⚠ 行（告警可见）", "⚠ my/work" in render_md(sms))
+    mok = dict(payload)
+    mok["mypagers"] = {"finishedBy_task": {"got": 9, "recTotal": 9, "recPerPage": 20, "pageID": 1},
+                       "doing_bug": {"got": 0, "recTotal": 0, "recPerPage": 20, "pageID": 1}}
+    sok = aggregate(mok, since, until, "cp")
+    chk("正控: my/work got>=recTotal ⇒ verified，且不污染既有断言",
+        sok["assertions"]["my_work_completeness"]["state"] == "verified"
+        and sok["assertions"]["nothing_dropped"] is True
+        and "⚠ my/work" not in render_md(sok))
 
     # 完整性闸门（权威判据 = 响应 pager.recTotal）
     p_ok = dict(payload)

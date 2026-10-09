@@ -49,6 +49,11 @@ PAGE_SIZE_DEFAULT = int(os.environ.get("GA_FEISHU_PAGE_SIZE", "50"))
 # ★分块续拉（2026-10-09）：`--page-all` 一把梭在大群上会跑满/超过单次 CLI 超时
 #   （实测单群 3776 条需 >3 分钟），且中途失败整只会话丢数据。改为自管 page_token
 #   逐块拉：每块单独计时与重试、进度可留痕、块间幂等 ⇒ 超时只影响该块，不丢整会话。
+# ★★分块每块必须带 `--page-all`（2026-10-09 真机 A/B 证）：lark-cli 的 `--page-limit`
+#   只对 `--page-all` 生效——不带它时 `--page-limit N` 被忽略、每次只回 1 页
+#   （实测 --page-size 2：不带 ⇒ pagination.pages=1/items=2；带 --page-limit 3 ⇒ pages=3）。
+#   漏带 ⇒ chunk_pages 配置失效、调用次数放大 ~cp 倍（大群数百次子进程），
+#   故下方分块 args 恒定带 `--page-all`，且自测断言该 token 必在（T8c 负控）。
 CHUNK_PAGES_DEFAULT = int(os.environ.get("GA_FEISHU_CHUNK_PAGES", "20"))
 CHAT_LIST_PAGE_LIMIT = int(os.environ.get("GA_FEISHU_CHATLIST_PAGE_LIMIT", "50"))
 
@@ -285,6 +290,7 @@ def chat_messages_chunked(chat_id, since="", until="", timeout=180,
     while pages_done < pl:
         take = min(cp, pl - pages_done)
         args = ["im", "+chat-messages-list", "--chat-id", chat_id,
+                "--page-all",                       # ★必须：否则 --page-limit 失效（每次仅 1 页）
                 "--page-limit", str(take), "--page-size", str(ps),
                 "--order", "asc", "--format", "json"]
         if token:
@@ -321,6 +327,22 @@ def chat_messages_chunked(chat_id, since="", until="", timeout=180,
         token = pag.get("next_token") or ""
         if isinstance(pag.get("complete"), bool):
             complete = pag["complete"]
+        else:
+            # 元信息缺席（旧版 lark-cli / 包装层变化）⇒ 回退 has_more，
+            # 两者皆无则保持 None（下面按「未取完」处理，宁可标下界）
+            hm = pag.get("has_more")
+            if not isinstance(hm, bool):
+                _d = data.get("data") if isinstance(data, dict) else None
+                if isinstance(_d, dict):
+                    hm = _d.get("has_more")
+            if not isinstance(hm, bool) and isinstance(data, dict):
+                # 包装层差异：has_more 也可能落在顶层（官方 API 在 data 下，两者都收）
+                hm = data.get("has_more")
+            if isinstance(hm, bool):
+                complete = not hm
+                if log:
+                    log("  · %s 第 %d 块无 pagination.complete ⇒ 按 data.has_more=%s 回退"
+                        % (name or chat_id, chunks, hm))
         if log:
             log("  · %s 第 %d 块 pages=%s items=%s 累计=%d token=%s complete=%s"
                 % (name or chat_id, chunks, pag.get("pages"), len(items),
@@ -338,7 +360,12 @@ def chat_messages_chunked(chat_id, since="", until="", timeout=180,
                                                   "items": len(msgs),
                                                   "next_token": token,
                                                   "total": server_total}}})
-        if token and complete is not True:
+        if complete is None:
+            # 元信息与 has_more 都拿不到 ⇒ 无法证明取全（旧实现会落回启发式并可能判 complete）
+            meta["complete"] = False
+            meta["truncated"] = True
+            meta["source"] = "chunk_unknown"
+        elif token and complete is not True:
             meta["complete"] = False
             meta["truncated"] = True
             meta["source"] = "chunk_resume"
@@ -419,14 +446,44 @@ def summarize(records, since_ts, until_ts, me=DEFAULT_ME, me_ids=()):
     return out
 
 
+def filter_chats(chats, include=(), skip=()):
+    """按会话名子串过滤：先 include（非空则只留命中者），再 skip（丢弃命中者）。
+
+    整库遍历会扫进运维告警群等噪声（实测 20:05 报错群 121 块/6050 条）⇒ 收窄
+    必须是一等参数、且过滤结果要落进产物，否则「到底扫了哪些会话」不可追溯。
+    """
+    inc = [s for s in (include or []) if s]
+    skp = [s for s in (skip or []) if s]
+    kept, dropped_inc, dropped_skp = [], [], []
+    for c in chats or []:
+        nm = c.get("name") or ""
+        if inc and not any(s in nm for s in inc):
+            dropped_inc.append(nm)
+            continue
+        if skp and any(s in nm for s in skp):
+            dropped_skp.append(nm)
+            continue
+        kept.append(c)
+    return kept, {"include": inc, "skip": skp,
+                  "dropped": len(dropped_inc) + len(dropped_skp),
+                  "dropped_by": {"include_miss": len(dropped_inc),
+                                 "skip_hit": len(dropped_skp)}}
+
+
 def collect(chats, since="", until="", limit=None, timeout=180, log=None,
-            page_limit=None, page_size=None, chunked=False, chunk_pages=None):
+            page_limit=None, page_size=None, chunked=False, chunk_pages=None,
+            include_chats=(), skip_chats=()):
     """遍历会话取消息 ⇒ records=[{'chat_id','name','messages','error','pagination'}]。
 
     ★超时自愈：大群（数千条×50 条/页）可能超过单次 CLI 超时（rc=124）⇒ 命中超时
     自动升档重试（TIMEOUT_ESCALATE 倍，上限 TIMEOUT_MAX），避免整批数字因单个大群缺失。
     """
     recs = []
+    chats, _flt = filter_chats(chats, include_chats, skip_chats)
+    if _flt["dropped"] and log:
+        log("会话过滤：%d 个被排除（include 未命中 %d / skip 命中 %d），余 %d 个"
+            % (_flt["dropped"], _flt["dropped_by"]["include_miss"],
+               _flt["dropped_by"]["skip_hit"], len(chats)))
     for i, c in enumerate(chats, 1):
         if limit and i > limit:
             break
@@ -471,7 +528,8 @@ def collect(chats, since="", until="", limit=None, timeout=180, log=None,
 
 
 def run(win, me=DEFAULT_ME, me_ids=(), limit=None, timeout=180, log=None,
-        page_limit=None, page_size=None, chunked=False, chunk_pages=None):
+        page_limit=None, page_size=None, chunked=False, chunk_pages=None,
+        include_chats=(), skip_chats=()):
     """全流程：会话列表 → 逐会话消息 → 汇总。返回 (result, errors)。"""
     errors = []
     chats, err = chat_list(timeout=timeout)
@@ -480,7 +538,8 @@ def run(win, me=DEFAULT_ME, me_ids=(), limit=None, timeout=180, log=None,
     recs = collect(chats, since=win["since"], until=win["until"],
                    limit=limit, timeout=timeout, log=log,
                    page_limit=page_limit, page_size=page_size,
-                   chunked=chunked, chunk_pages=chunk_pages)
+                   chunked=chunked, chunk_pages=chunk_pages,
+                   include_chats=include_chats, skip_chats=skip_chats)
     for r in recs:
         if r.get("error"):
             errors.append("%s: %s" % (r["name"], r["error"]))
@@ -538,6 +597,10 @@ def main(argv=None):
                     help="单会话最多取多少**页**（lark-cli 上限 1000，默认 %d）" % PAGE_LIMIT_DEFAULT)
     ap.add_argument("--page-size", type=int, default=PAGE_SIZE_DEFAULT,
                     help="每页条数（≤50，默认 %d）" % PAGE_SIZE_DEFAULT)
+    ap.add_argument("--include-chats", action="append", default=[], metavar="SUBSTR",
+                    help="只扫会话名含该子串的会话（可多次；整库遍历前建议收窄）")
+    ap.add_argument("--skip-chats", action="append", default=[], metavar="SUBSTR",
+                    help="排除会话名含该子串的会话（可多次，如 告警/运维）")
     ap.add_argument("--chunked", dest="chunked", action="store_true", default=True,
                     help="分块续拉（自管 page-token，大群更稳；**默认开**）")
     ap.add_argument("--no-chunked", dest="chunked", action="store_false",
@@ -565,15 +628,25 @@ def main(argv=None):
                                     ensure_ascii=False))
         print("lark:", LARK, "im +chat-list --types=p2p,group --page-all --page-limit %d --format json"
               % CHAT_LIST_PAGE_LIMIT)
-        print("lark:", LARK, "im +chat-messages-list --chat-id <id> --page-all --page-limit %d"
-              " --page-size %d --order asc --format json --start %s --end %s"
-              % (args.page_limit, args.page_size, win["since"], win["until"]))
+        if args.chunked:
+            cp = max(1, min(int(args.chunk_pages), int(args.page_limit)))
+            print("lark:", LARK, "im +chat-messages-list --chat-id <id> --page-limit %d"
+                  " --page-size %d --order asc --format json --start %s --end %s"
+                  "   # 分块续拉：每块 %d 页，用上块 next_token 续（page-all 由本工具自理）"
+                  % (args.page_limit, args.page_size, win["since"], win["until"], cp))
+        else:
+            print("lark:", LARK, "im +chat-messages-list --chat-id <id> --page-all --page-limit %d"
+                  " --page-size %d --order asc --format json --start %s --end %s"
+                  "   # --no-chunked（旧行为，仅排障）"
+                  % (args.page_limit, args.page_size, win["since"], win["until"]))
         return 0
 
     st, errors = run(win, me=args.me, me_ids=tuple(args.me_id),
                      limit=args.limit, timeout=args.timeout,
                      page_limit=args.page_limit, page_size=args.page_size,
                      chunked=args.chunked, chunk_pages=args.chunk_pages,
+                     include_chats=tuple(args.include_chats),
+                     skip_chats=tuple(args.skip_chats),
                      log=lambda s: print(s, file=sys.stderr))
     if st is None:
         print("ERROR: %s" % "; ".join(errors), file=sys.stderr)
@@ -584,6 +657,8 @@ def main(argv=None):
             json.dump(st, fh, ensure_ascii=False, indent=1)
         print("json:", args.json)
     if errors:
+        print("ERROR: %d 个会话取数失败（结果不含这些会话，数字为下界）：%s"
+              % (len(errors), " | ".join(errors[:5])), file=sys.stderr)
         return 3
     if (st.get("pagination") or {}).get("chats_incomplete"):
         print("WARN: 有会话分页未取完（数字为下界，勿当完整值）", file=sys.stderr)
@@ -755,6 +830,7 @@ def _selftest():
             n = st["n"]
             st["n"] += 1
             st["calls"].append({"n": n, "i": blk, "page_limit": pl_, "token": tok,
+                                "page_all": ("--page-all" in args),
                                 "timeout": timeout})
             if n in timeout_idx:
                 return 124, "", "lark-cli timeout after %ss" % timeout
@@ -816,6 +892,65 @@ def _selftest():
         _chk(checks, mt["pages_done"] == 4 and mt["truncated"] is True and len(ms) == 200,
              "分块续拉：触到 page_limit 上限仍判截断（下界语义）")
 
+        # T8c 分块每块必须带 --page-all（负控：缺它时 lark-cli 忽略 --page-limit、每次仅 1 页
+        #     ⇒ chunk_pages 静默失效、调用次数放大；2026-10-09 真机 A/B 证实的真缺陷）
+        _chk(checks, bool(st["calls"]) and all(c.get("page_all") for c in st["calls"]),
+             "分块每块须带 --page-all（否则 --page-limit/chunk_pages 静默失效）")
+        _chk(checks, all(c.get("page_all") for c in st["calls"]) and len(st["calls"]) == 2,
+             "分块调用次数=celling(page_limit/chunk_pages)（page-all 生效下方可成立）")
+
+        # T7 元信息未知（无 complete 且无 has_more）⇒ 必须判「未知」而非完整（负控：禁 fail-open）
+        def _mk_nometa(pages=6, ps=50):
+            st = {"n": 0, "calls": []}
+            def _f(args, timeout=180, env=None):
+                pl_ = int(args[args.index("--page-limit") + 1])
+                tok = args[args.index("--page-token") + 1] if "--page-token" in args else ""
+                blk = int(tok[3:]) if tok.startswith("tok") else 0
+                st["n"] += 1; st["calls"].append(blk)
+                get = min(pl_, max(0, pages - blk * pl_))
+                items = [{"create_time": "1", "message_id": "n%d-%d" % (blk, k),
+                          "sender": {"name": "崔朋"}} for k in range(get * ps)]
+                return 0, json.dumps({"data": {"items": items},
+                                      "meta": {"pagination": {}}}), ""
+            return _f, st
+        f, st = _mk_nometa(pages=6)
+        globals()["lark_run"] = f
+        ms, er, mt = chat_messages_chunked("c7", page_limit=10, page_size=50, chunk_pages=2)
+        _chk(checks, mt["complete"] is False and mt["truncated"] is True
+             and mt["source"] == "chunk_unknown" and len(ms) == 100,
+             "分块续拉：元信息未知⇒未知即截断（负控：禁 fail-open 当完整）")
+
+        # T8 顶层 data.has_more=False 兜底 ⇒ 判完整（一次即止）
+        def _mk_hasmore():
+            st = {"n": 0}
+            def _f(args, timeout=180, env=None):
+                st["n"] += 1
+                items = [{"create_time": "1", "message_id": "h%d" % k,
+                          "sender": {"name": "崔朋"}} for k in range(3)]
+                return 0, json.dumps({"data": {"items": items, "has_more": False},
+                                      "meta": {"pagination": {}}}), ""
+            return _f, st
+        f, st = _mk_hasmore()
+        globals()["lark_run"] = f
+        ms, er, mt = chat_messages_chunked("c8", page_limit=10, page_size=50, chunk_pages=2)
+        _chk(checks, mt["complete"] is True and mt["truncated"] is False and st["n"] == 1,
+             "分块续拉：无 pagination 时按 data.has_more=False 兜底判完整（一次即止）")
+
+        # T8b 包装层把 has_more 放顶层 ⇒ 同样兜底判完整（兼容旧包装）
+        f, st = _mk_hasmore()
+        _orig_f = f
+
+        def _f_top(args, timeout=180, env=None):
+            rc, out, err = _orig_f(args, timeout=timeout, env=env)
+            d = json.loads(out)
+            d2 = {"data": {"items": d["data"]["items"]}, "has_more": False,
+                  "meta": {"pagination": {}}}
+            return rc, json.dumps(d2), err
+        globals()["lark_run"] = _f_top
+        ms, er, mt = chat_messages_chunked("c8b", page_limit=10, page_size=50, chunk_pages=2)
+        _chk(checks, mt["complete"] is True and mt["truncated"] is False,
+             "分块续拉：has_more 在顶层也能兜底判完整（兼容旧包装）")
+
         # T6 collect 分派：chunked=True 必须走分块实现（负控：默认仍走旧实现）
         _orig_cmc = globals()["chat_messages_chunked"]
         seen = []
@@ -837,6 +972,21 @@ def _selftest():
             globals()["chat_messages_chunked"] = _orig_cmc
     finally:
         globals()["lark_run"] = _orig_lr
+
+    # T9 会话过滤（纯函数；负控：不误放/不误杀）
+    _c0 = [{"chat_id": "1", "name": "工程群"}, {"chat_id": "2", "name": "运维故障告警群"},
+           {"chat_id": "3", "name": "禅道通知"}]
+    _k1, _f1 = filter_chats(_c0, include=("工程", "禅道"))
+    _chk(checks, [c["name"] for c in _k1] == ["工程群", "禅道通知"]
+         and _f1["dropped_by"]["include_miss"] == 1,
+         "会话过滤：include 只留命中（告警群被排除）")
+    _k2, _f2 = filter_chats(_c0, skip=("告警",))
+    _chk(checks, [c["name"] for c in _k2] == ["工程群", "禅道通知"]
+         and _f2["dropped_by"]["skip_hit"] == 1,
+         "会话过滤：skip 精确剔除（负控：不误杀其它会话）")
+    _k3, _f3 = filter_chats(_c0)
+    _chk(checks, len(_k3) == 3 and _f3["dropped"] == 0,
+         "会话过滤：无参时零过滤（保持整库遍历默认行为）")
 
     bad = [n for ok, n in checks if not ok]
     for ok, n in checks:
