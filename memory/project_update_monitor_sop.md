@@ -54,6 +54,7 @@ python3 -m py_compile ../project_update_monitor/monitor.py
 - 自测陷阱：用 `signal.alarm` 包 `report()` 时抛出的 `TimeoutError` 会被 `except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError)` 吞成 `TranslationError: ... TimeoutError: internal timeout`——**这是脚手架假象而非脚本真错**，别据此下结论（2026-09-23 实际踩到）。
 - 未根治项（提案，属改自身源码需请示）：给翻译调用加"首调放宽超时 / 失败重试 1 次"，避免单个翻译超时导致整轮不出卡。
 - ★第二真因：**翻译产物在合法 JSON 之后多出文本**（2026-09-25 首跑实测 `JSONDecodeError: Extra data: line 1 column 898`）——`monitor.py:180` 的严格 `json.loads` 整体失败 → `TranslationError` → 同样 exit=2、不推送、不落盘，与超时无关。判据：堆栈出现 `Extra data` 且不是 `TimeoutError` 型。
+- ★第三形态（2026-10-09 复现）：本轮 exit=2 的三源失败类型互不相同 = **Paseo / Orca 仍是 `timeout=120` 超时**、**Ruflo 是 `Codex 退出码 1: ... 502 Bad Gateway ... http://127.0.0.1:3425/v1/responses`**（本机 codex 自定义 provider 网关 5xx，与超时无关）。⇒ 判读时**逐源看失败类型**，别把三源统一归到超时；跨日观察：`state.json` 自 2026-10-07T08:04:28（sha256 前16 `334173bbf86dbca2`）起经 10-08、10-09 两轮 exit=2 均未推进 ⇒ 两轮变更（CCB v8.7.8 / Trellis v0.7.0-beta.4）尚欠推送，下轮成功时会一并重报，**不是丢数据**。另：同日多实例（0802/0815/0938）只需真跑一次，其余档在 done 报告注明「合并执行、未重复推送」即可。
 - 处置（temp 侧，不改仓源码）：`temp/pum_wrapper2.py` = `import monitor` 后 patch ①`subprocess.run` timeout 120→420 ②`_translate_to_chinese` 容错版（剥 ``` 围栏 → `json.loads` → 退 `raw_decode` 取**首个** JSON 数组 → 3 次尝试；仍失败留样 `temp/pum_translate_dbg/` 并抛错，保持 all-or-nothing 不静默）。自带 `--selftest` 负控 7/7（含"两数组拼接但首数组条数不足**必须拒**"）。
 - 实测节奏：08:06:25 起 → 08:11:47 落盘（≈5.4 分钟，8 源），必须 `Popen(start_new_session=True)` 后台起 + 轮询；成功判据=`state.json` mtime/sha1 推进（推送失败 `return 3` 且不落盘 ⇒ 推进充要于"卡片已送达"）。
 
@@ -70,4 +71,9 @@ python3 -m py_compile ../project_update_monitor/monitor.py
 - 字段前缀：🏷️ 当前版本、🗂️ 变更类型、💡 建议、🔗 Release/Commit 链接按钮。
 - 变更分类标签：🔒 安全、💥 破坏性变更、🐛 修复、✨ 新增能力、⚡ 性能、🔎 待人工解读。
 新增分类或字段时同步在此登记，保持图标语义一致，避免同一含义用不同符号。
+
+## 跨轮归属口径（2026-10-07 实测沉淀）
+- **`git show HEAD:` 的差异可能跨多轮**：`state.json` 的提交是间歇性的（运行态数据、常不提交），且任何一轮 `exit=2` 都**不推进基线**⇒拿 HEAD 与现文件比对，会把「上一轮已消费的变更」与「本轮变更」混在一起（2026-10-07 实测：HEAD 差异 6 源，其中 trellis 的 `changelog_hash` 变化实为 10-05 那轮已推送项）。
+- 正确做法=以**本机日志的项目块数**为准（`【项目更新】` 命中数 = 本轮真检出的源数），再用**前几轮的 done 报告**逐条交叉核验跨轮项：进入 `sche_tasks/done/` 找最近若干份 `*_project_update_monitor.md`，看该源在前轮是「有更新」还是「未检测到」——前轮「无更新」而本轮有=本轮真变更；前轮已「有更新」=属前轮已消费。
+- 归因不确定时在报告里显式区分「本轮检出」与「HEAD 差异含往轮」，不要用 HEAD 差异直接当本轮变更数。
 
