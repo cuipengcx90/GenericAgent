@@ -8,7 +8,7 @@
 ## 关键路径与对象
 - 绩效表目录：`/Users/cuip/develop/文档/绩效/`
 - 文件名规律：`绩效考评表-崔朋-{年}-Q{n}.xlsx`，唯一 sheet 名 = `模板`
-- 数据源（git）：根 `/Users/cuip/develop/WorkSpaces/idea/smyze/bar-smyze/`，动态扫含 `.git` 子目录；author=`崔朋`，`--no-merges`，`--since/--until` **必带 `T00:00:00+08:00`**（裸日期丢当天 commit，致命级）。
+- 数据源（git）：根 `/Users/cuip/develop/WorkSpaces/idea/smyze/`（**父工程树**；含 bar-smyze 子树与其兄弟仓 ruoyi-vue-pro-ee/bar-deploy/tools/ui 等，实测 99 个 `.git`、去重 72 个 common-dir），动态递归扫含 `.git` 子目录（worktree/嵌套仓全在内，须按 `git-common-dir` 去重）；author=`崔朋`，`--no-merges`，`--since/--until` **必带 `T00:00:00+08:00`**（裸日期丢当天 commit，致命级）。★只扫 `bar-smyze/` 顶层 12 仓会漏 worktree 分支的 HEAD 提交（Q3 实测少 109 条）。
 - 数据源（产出物，量化亮点用）：`bar_smyze_opserver/docs`（设计文档库，统计 md 数/字数/业务域/模块数，证明架构设计主导）；`bar_smyze_opserver/.claude/skills`（自建 AI 研发 skill 数 + agents/hooks/commands，证明 AI coding 团队引领）。
 - 季度区间：Q1=01-01~03-31，Q2=04-01~06-30，Q3=07-01~09-30，Q4=10-01~12-31（未结束季度用至今日）。
 
@@ -90,7 +90,7 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
 - 保存前确认 J 列上级评分占位（通常 100），勿覆盖。
 - **写表必须用 `/opt/anaconda3/bin/python3`**：默认 `python3` 无 openpyxl（2026-10-08 Q3 实测 ModuleNotFoundError）；写前先备份 xlsx 到 temp/。
 - **git 取数必须按 `git-common-dir` 去重**：bar-smyze 各仓下存在 `.git` 子目录 / 主仓+worktree 并存 ⇒ 直接遍历 `.git` 会把同一提交（尤其 root 仓）重复计一遍（Q3 实测去重后 1717 ← 未去重虚高）；`--no-merges` + `--author=崔朋` + 带时区 since/until。
-- **★取数口径三维度（2026-10-09 复核实测，报数前必须挑明）**：①**空间**=根目录下递归全扫，所有 worktree（`.worktrees/*`、`bar_*/.ccb/workspaces/*`、`bar_*/.claude/worktrees/*`、`*/.trellis/spec/smyze-spec`）**全在工程内**（实测落在根外 0 个）；深于 3 层的 `.git` 只有第三方插件缓存（`.ccb/shared-cache/codex/plugin-bundles/*`、`*/.claude/plugins/marketplaces/*`），非我方产出须排除。②**分支**=裸 `git log` 为 **HEAD-only 口径**，会漏掉未合入当前分支的 worktree/功能分支提交：Q3 实测 HEAD=1717 vs `--branches`=1920（+203）vs `--all`=1926（+206，远端分支再多 6），差异集中在 bar-deploy-server 57→140、bar_smyze_screen 1→11、bar-deploy-webadmin 40→62、bar_smyze_op 198→215；**保守报数用 HEAD、要体现完整工作量用 `--all`，择一后须在表内与记忆内注明口径**。③**仓外**=`~/develop` 其它仓 Q3 有本人提交者仅 herdr-agents 290、obsidian-note 90（个人基建/知识库，非 smyze 业务，不入主业绩效），另有重复克隆 bar-deploy-server省市区 39、bar-deploy/bar-deploy-client 2 须按 `git-common-dir` 去重；Q3 末未提交改动仅 4 个文件，不构成工作量口径。
+- **★取数口径三维度（2026-10-09 复核实测，报数前必须挑明）**：①**空间**=根目录下递归全扫，所有 worktree（`.worktrees/*`、`bar_*/.ccb/workspaces/*`、`bar_*/.claude/worktrees/*`、`*/.trellis/spec/smyze-spec`）**全在工程内**（实测落在根外 0 个）；深于 3 层的 `.git` 只有第三方插件缓存（`.ccb/shared-cache/codex/plugin-bundles/*`、`*/.claude/plugins/marketplaces/*`），非我方产出须排除。②**分支**=裸 `git log` 为 **HEAD-only 口径**，会漏掉未合入当前分支的 worktree/功能分支提交：Q3 实测（根=父工程树 `smyze/`，99 个 `.git`→按 common-dir 去重 72）HEAD=**1826** vs `--branches`=**1920**（与旧测逐字相符=交叉验证）vs `--all`=**1929**；旧测 1717（HEAD）偏低 109 条=只扫 bar-smyze 顶层 12 仓、漏掉 worktree/兄弟仓分支头，而 `--branches` 两测一致⇒**报数首选 `--branches`（本地全分支）或 `--all`**；月分布（--all）=7月 504 / 8月 1015 / 9月 895；**保守报数用 HEAD、要体现完整工作量用 `--all`，择一后须在表内与记忆内注明口径**。③**仓外**=`~/develop` 其它仓 Q3 有本人提交者仅 herdr-agents 290、obsidian-note 90（个人基建/知识库，非 smyze 业务，不入主业绩效），另有重复克隆 bar-deploy-server省市区 39、bar-deploy/bar-deploy-client 2 须按 `git-common-dir` 去重；Q3 末未提交改动仅 4 个文件，不构成工作量口径。★**HEAD→`--branches` 多出的 109 条集中在哪**（逐仓 common-dir 实测，各仓求和会重复计嵌套/worktree，仅供看分布、不作对外报数）：bar-deploy-server 57→140、bar_smyze_opserver 1097→1136、bar-deploy-webadmin 40→61、bar_smyze_op 198→213、bar-market-server 25→40、bar_smyze_screen 1→11、bar-smyze 115→121、bar_smyze_scm 112→118、bar_smyze_mp 38→43 ⇒ 漏的是各仓**未合入的 worktree/功能分支头**（部署/权限/市场/大屏几条线并行开发），非同一提交重复计数；旧 SOP 记的「bar-deploy-server 57→140」与本测逐字相符=交叉验证。
 - **跨季雷同度机械比对**：写完用 difflib 对 Q2 的 I7–I9/C15/C16 逐句算相似度，取 max；>0.5 的句子必改写（Q3 实测 I9 总评 0.58、I8 总评 0.47、I7 交付段 0.52 三处返工）。业务名词（点单平台/交付准时率/重大事故）造成的相似度属正常锚点，可保留。
 
 - **★openpyxl 重写会静默丢掉 WPS 内嵌图片/签名图（2026-10-08 Q3 实测事故）**：load_workbook → save 后体积 48023B → 13632B，`xl/cellimages.xml` + `xl/_rels/cellimages.xml.rels` + `xl/media/image1.png`（单元格内嵌签名图，走 WPS 专有 `DISPIMG("ID_...",1)` 公式）与 `sharedStrings.xml` 全被丢弃，openpyxl **不报错**，数据/公式/合并格却完好 ⇒ 只读回数值校验查不出来，**必须比对 zip 成员清单**（`set(前) - set(后)`）。
@@ -98,7 +98,8 @@ S 116-120 / A 110-115 / B 96-109 / C+ 80-95 / C <80。
   ⇒ **铁律：写任何带内嵌图片/签名图的办公文件前先备份；写后除值校验外必做「部件清单 diff」**（`zipfile.namelist()`），装配件数量与体积双判据（本例 13 部件/46.5KB vs 丢图版 10 部件/13.6KB）。
 
 ## 已用锚点（写新季度时作起点，须当场复算）
-- Q3（2026-07-01~09-30）：提交 1717（跨 12 仓；**HEAD-only 口径** = 各仓当前检出分支；含全部本地分支 1920、含远端分支 1926 —— 见上「取数口径三维度」）；opserver docs `*.md` 855 份 / 本季新增 196 份（口径=跟随符号链接计数 / `git ls-files docs` 854 md）；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
+- Q3（2026-07-01~09-30）：提交 **1920**（`--branches` 本地全分支口径；同口径旧测 1920 逐字相符；HEAD-only 1826 / `--all` 1929 —— 见上「取数口径三维度」）；opserver docs `*.md` 855 份 / 本季新增 196 份（口径=跟随符号链接计数 / `git ls-files docs` 854 md）；`.claude/skills` 51 个、commands 72 条、hooks 7、agents 3；主线=统一权限一期 + 供应链数据可信度 + 设备告警联动饮品上下架 + 离线内网 Docker 部署 skill。评分档位 120/115/110。
+- **★三源口径（2026-10-09 建立；报数必须先声明抽哪一源、并按主线锚点去重，禁三源相加）**：①**git**=本仓父树（`--branches` 口径 1920 条；见上）；②**禅道**=本人 Q3 解决 Bug 32（8月12/9月20）、完成任务 9（156h）、进行中 4、需求池 336（脚本与产物 `temp/zentao_probe/`）；③**飞书**=`lark-cli` 拉 26 个会话的 Q3 消息 11979 条、其中本人发出 2434 条（7月1150/8月975/9月309；脚本 `temp/feishu_q3/collect.py`，产物 `temp/feishu_q3/messages.jsonl`）。三源是**同一主线任务的不同流转面**（飞书沟通 → 禅道派单 → 代码落地），必然交叉重复 ⇒ 按锚点去重：git `<sha>` / 禅道 `Bug|任务 ID` / 飞书 `<message_id>`，**同一需求只在其最后落地处计一次**；写自评时一条 bullet 只引一种锚点，跨源呼应写在同一条的括号内，不得拆成多条凑量。
 
 ## 工具
 - 取数+归类：见会话内 git 扫描脚本（os.listdir 扫 .git + git log --pretty=%s + prefix 分类 Counter）。
