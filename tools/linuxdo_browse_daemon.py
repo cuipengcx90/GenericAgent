@@ -1441,21 +1441,27 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
     # 2026-10-06 二次实测：新建标签会**顶到前台**（Chrome 新建即激活）⇒ linux.do 标签
     # 的 document.visibilityState 变 visible，用户前台保护随即每 5min 判「用户在看」而永远跳过。
     # 故建完立刻把原先的活动标签换回来（新标签留在后台），既补上供给也不打扰用户。
+    # ★2026-10-09 修复:早退必须由「主站(_main)」触发。旧版只要收集到任何含
+    #   \"linux.do\" 子串的标签(典型 connect.linux.do)就 return URLS: 并整体跳过建标签,
+    #   Python 侧又把这条当成功 ⇒ 本日 6 次自愈额度全烧在空转上(当日 16:19 起停摆)。
     script = ("tell application \"Google Chrome\"\n"
               "  set _u to \"\"\n"
+              "  set _main to \"\"\n"
               "  repeat with w in windows\n"
               "    repeat with tb in tabs of w\n"
-              "      if (URL of tb) contains \"linux.do\" then set _u to _u & (URL of tb) & linefeed\n"
+              "      set _url to (URL of tb)\n"
+              "      if _url contains \"linux.do\" then set _u to _u & _url & linefeed\n"
+              "      if (_url contains \"//linux.do/\") or (_url contains \"//www.linux.do/\") or (_url ends with \"//linux.do\") or (_url ends with \"//www.linux.do\") then set _main to \"1\"\n"
               "    end repeat\n"
               "  end repeat\n"
-              "  if _u is not \"\" then return \"URLS:\" & _u\n"
+              "  if _main is not \"\" then return \"URLS:\" & _u\n"
               "  if (count of windows) = 0 then make new window\n"
               "  set _prev to (active tab index of window 1)\n"
               "  tell window 1 to make new tab with properties {URL:\"https://linux.do/\"}\n"
               "  try\n"
               "    set active tab index of window 1 to _prev\n"
               "  end try\n"
-              "  return (_prev as text)\n"
+              "  return \"CREATED:\" & (_prev as text)\n"
               "end tell")
     prev_idx = None
     try:
@@ -1468,7 +1474,19 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
             _urls = [u.strip() for u in note[5:].splitlines() if u.strip()]
             if any(_is_main_host(_url_host(u)) for u in _urls):
                 return False, "已有 linux.do 主站标签(仅等驱动重连)"
-        if ok:
+            # ★2026-10-09 修复(当日 16:19 停摆事故):走到这里说明只见到「含 linux.do
+            #   子串但非主站」的标签(典型 connect.linux.do)。旧版继续落到下方 if ok 分支、
+            #   把 URLS: 明文当索引解析失败后**仍返回 ok=True**,台账记「自愈成功」而实际
+            #   零产出,6 次额度烧空且告警反复 RESTART。现改为 fail-closed:明确标记未新建。
+            ok = False
+            note = "仅非主站标签,未新建主站标签: %s" % note[:200]
+        elif ok and note.upper().startswith("CREATED:"):
+            try:
+                prev_idx = int(str(note).split(":", 1)[1].strip() or 0) or None
+            except Exception:
+                prev_idx = None
+            note = "已新建后台主站标签(idx=%s)" % (prev_idx if prev_idx is not None else "?")
+        elif ok:
             try:
                 prev_idx = int(str(note).strip() or 0) or None
             except Exception:
@@ -2080,14 +2098,23 @@ def _selftest_impl():
             fails.append("T7p 主站标签应短路不新建: %r/%r" % (_okx, _notex))
         if os.path.exists(os.path.join(_sd, "ensure_tab.jsonl")):
             fails.append("T7p 短路分支不应写 ensure_tab 台账")
-        # T7r 负控（2026-10-06 停摆根因）：只有 connect./sharedchat 这类「含 linux.do 子串但非主站」
-        #     的标签时，必须判「无主站标签」并新建；被子串骗过则自愈恒不触发、浏览空转。
-        _ShimSub.out = "URLS:https://connect.linux.do/\nhttps://sharedchat.example/room/1"
+        # T7r 负控(2026-10-06 停摆根因):只有 connect./sharedchat 这类「含 linux.do 子串但非主站」
+        #     的标签时,必须判「无主站标签」并真的新建;被子串骗过则自愈恒不触发、浏览空转。
+        _ShimSub.out = "CREATED:3"
         _ok_r, _note_r = try_ensure_tab(now=time.time())
-        if not _ok_r:
-            fails.append("T7r 仅 connect/非主站标签应判无主站并新建: %r/%r" % (_ok_r, _note_r))
+        if not _ok_r or "新建" not in str(_note_r):
+            fails.append("T7r 无主站标签应新建并报成功: %r/%r" % (_ok_r, _note_r))
         if os.path.exists(os.path.join(_sd, "ensure_tab.jsonl")) is False:
             fails.append("T7r 新建分支应写 ensure_tab 台账")
+        # T7r2 负控(2026-10-09 当日 16:19 停摆事故):苹果脚本或任何上游仍回 URLS: 且只含
+        #      非主站时,Python 必须 fail-closed ⇒ 不得把空转记成「自愈成功」烧额度。
+        _ShimSub.out = "URLS:https://connect.linux.do/" + "\n" + "https://sharedchat.example/room/1"
+        _ok_r2, _note_r2 = try_ensure_tab(now=time.time() + 700)  # 跨过 min_gap_s(600) 节流
+        if _ok_r2:
+            fails.append("T7r2 仅非主站标签不得记成功(伪造自愈): %r/%r" % (_ok_r2, _note_r2))
+        if "未新建" not in str(_note_r2):
+            fails.append("T7r2 应明示未新建主站标签: %r" % (_note_r2,))
+        cases += 1
         if _is_main_host("connect.linux.do") or _is_main_host("sharedchat.linux.do.evil.example"):
             fails.append("T7r _is_main_host 子串误判(应精确匹配)")
         if not (_is_main_host("linux.do") and _is_main_host("www.linux.do")):
@@ -2114,8 +2141,15 @@ def _selftest_impl():
         fails.append("T7s check_level 缺 finally 还原主站")
     if "non-linuxdo-tab" not in _insp.getsource(browse_batch):
         fails.append("T7s browse_batch 缺会话漂移即中止")
-    if "_is_main_host" not in _insp.getsource(try_ensure_tab):
+    _src_et = _insp.getsource(try_ensure_tab)
+    if "_is_main_host" not in _src_et:
         fails.append("T7s try_ensure_tab 未用精确 host 判据")
+    # ★2026-10-09 空转修复锚点:置位门控(set _main)、新建分支标记(CREATED:)、
+    #   非主站 fail-closed 分支,三者缺一即退回「connect 也算已有 ⇒ 空转烧额度」。
+    if "set _main" not in _src_et or "CREATED:" not in _src_et:
+        fails.append("T7s try_ensure_tab 缺主站门控/新建分支标记")
+    elif "未新建主站标签" not in _src_et:
+        fails.append("T7s try_ensure_tab 缺非主站 fail-closed 分支")
     cases += 1
     # T15 批内风控熔断（R563，2026-10-08 回归）：抓取阶段即判，强风控 ∧ 零成功页 ⇒ ABORT
     if fetch_verdict(4, 0, {"status": 403}) != ("ABORT", "FORBIDDEN"):

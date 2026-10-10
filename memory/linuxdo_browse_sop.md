@@ -113,7 +113,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 1. **独立桥保活** `tools/tmwd_bridge_watch.py`（新）：长驻监督 `18765 WS/18766 HTTP` 两端口，桥不在即拉起（失败退避重试、收手守卫），与 Galley 的 runner.workbench_bridge 彻底解耦；`--selftest` 离线自测 PASS。
 2. **看门狗兜底** `linuxdo_daemon_watchd.py ensure_bridge()`：桥不可达 ⇒ 先自动拉起独立桥（冷却 600s、起后等 15s），仍不可达才判 `BRIDGE_DOWN` 只告警不重启；`status` 增 `bridge_reachable`/`bridge_runner_pids`/`bridge_ensure`（selftest 86 checks / 0 failed）。
-3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab_ledger.jsonl`。
+3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab.jsonl`(★台账名以源码 `BASE/ensure_tab.jsonl` 为准;旧文档写 `ensure_tab_ledger.jsonl` 系笔误)。
 
 真机链（21:12）：watchd 起→`BRIDGE_DOWN`→独立桥拉起→daemon 重生→补标签顺带拉起 Chrome→扩展连上→ROUND OK；21:17 新码短退避生效（`RC_NO_SESSION_RETRY …（1/8，睡 40s）`）。
 
@@ -158,3 +158,27 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 **自测**：daemon `--selftest` **36/36**；watchd `--selftest` **98 checks / 0 failed**（含 T34a–T34h：启动文案须含「此前未在运行/不是崩溃」、真重启文案不得含该串、`_ever_alive` 四态）；沙盒断言，生产 state/台账指纹前后一致。
 
+
+## 事故:主站自愈空转(子串判据第二次踩坑,R568 2026-10-10)
+
+**症状**:用户报「帖子一直没浏览」。浏览器里只有 `connect.linux.do` 标签、主站标签不存在;
+`try_ensure_tab` 当日 6 次自愈额度已耗尽,而 `ensure_tab.jsonl` 行 3–8 全为
+`ok=true note=URLS:...connect.linux.do...` —— 看似「补过标签」,实则一次都没建。
+
+**根因**:AppleScript EXISTS 判据用**子串** `contains "linux.do"` ⇒ 被同族子域骗过,
+命中「已有主站标签」分支直接 `return "URLS:"` 早退、跳过建标签;Python 侧又把 `URLS:` 回执
+一律当成功(`ok=True`)⇒ 额度记满、主站标签从未补上。与 R557 同源:消费侧 `pick_session`
+用精确 host,自愈侧用子串,两边判据不一致。
+
+**修法(三处)**:1 AppleScript 收集标签时置位精确 host 门控 `_main`(`//linux.do/`、
+`//www.linux.do/` 及尾部形式),仅 `_main` 非空才 `URLS:` 早退;2 Python `URLS:` 分支
+**fail-closed**(回执不含主站 ⇒ 返回 `(False, "未新建主站标签(...)")`,不算成功、不记账为成功);
+3 `CREATED:` 分支解析新建结果(保留「建完切回原活动标签」)。自测 **37/37**(T7r「仅 connect/sharedchat
+时必须判无主站并新建」负控、T7r2 以 `now+700s` 跨 10min 节流、T7s 结构闸门读源码断言三处补丁仍在、
+不绑现场内容;自测走 tempfile 沙箱,生产 state/台账不被写)。
+
+**校验法(判「自愈是否真生效」)**:读 `temp/linuxdo_browse_daemon/ensure_tab.jsonl` 末条 ——
+`ok=true ∧ note=URLS:` 只含子域 ⇒ 仍是空转,必须修判据而非补标签;真补上时 note 为 `CREATED:`。
+守护存活另看 `heartbeat.json`(phase/next_wake_ts)与 `browse_log.jsonl` 新增 `DONE`。
+
+**铁律**:同一语义禁两份判据;早退/`except` 分支必须先证明「正常路径能走通」,且**不得把「没做事」记成成功**。
