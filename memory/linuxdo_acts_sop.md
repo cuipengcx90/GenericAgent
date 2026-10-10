@@ -228,6 +228,14 @@ python3 tools/linuxdo_post_forge.py forge --notify           # 落草稿 + 私�
 - **不做无条件周期回访**：不给 daemon 加「每隔 N 小时必回访一次」的循环——那等于给站点制造新的规律流量。**发帖后也不会自动标记回访**（`act_post()` 不写 `revisit.last_ts`，避免「一发帖就必然产生一批回访流量」这种可预测耦合）；想回访时显式 `python3 tools/linuxdo_acts.py revisit --max 1 --now --apply`（`--now` 把 `revisit.last_ts` 置 0 以越过 6h 最小间隔），否则就等下次有需要时再读。
 - 结论：revisit 属「有需要才用」的备用动作，不进入等级缺项路由（等级指标不含回访），不改变 §一 的分流表。
 
+### 11.8 发帖(post)为何常不执行:两道闸门(2026-10-10 实测)
+
+- **闸门一(设计使然)**:post 只在「获赞(earn)缺项 ∧ 有草稿」时排队(§一 分流表)。获赞长期充足(实测 47–50/门槛 20 ⇒ 恒 MET)⇒ post **永不激活**;此时唯一缺项若是「浏览/阅读」,走 browse 桶由 daemon 自补。**不是坏了,是不满足触发条件**。
+- **闸门二(真缺陷,待修)**:daemon 进程 `PATH` 不含 `/opt/homebrew/bin`,而 `codex` 是 `#!/usr/bin/env node` 脚本 ⇒ `gen_text()` spawn codex 时 `rc=127 env: node: No such file or directory` ⇒ forge 连标题都生成不出(`NO_TOPIC`)。
+  - **验证配方**:在与 daemon 同款受限 PATH 下直调 `acts.gen_text(...)`,看 `why` 是否 `rc=127`;补 PATH 后再跑,若仍失败则看上游额度(实测 sharedchat-k1 返 403「没有可用的 Codex 订阅额度或余额」)。
+  - **修复点单一**:`tools/linuxdo_acts.py:gen_text()` 的 `subprocess.run` 未传 `env` ⇒ 注入 PATH(含 `dirname(codex_bin)`、`/opt/homebrew/bin`、`/usr/local/bin`);forge 经 `_codex_gen` 复用同一函数,daemon 侧 Popen 用绝对 `sys.executable` 故无需另修。
+- **判读铁律**:见「发帖没执行」先分清是**触发条件未满足**(看 level_log 的 pending 项归属哪一桶)还是**管道断开**(看 forge ledger 的 `why`),二者修法完全不同。
+
 ## 尾注
 - 站点侧浏览器操作细则（标签页/CF/登录态）见 `memory/linuxdo_browse_sop.md`、`memory/linuxdo_reply_sop.md`、`memory/linuxdo_trust_level_sop.md`。
 - 对外分享镜像（更新 2026-10-05）：OB 知识库已建页 `60 Wiki/topics/linuxdo-anti-detection-system.md`（结构化条目，mature），方案全文备份在 `30 Areas/research/linuxdo/2026-10-05 linux.do 全动作防检测体系（方案全文）.md`；vault 提交 `5efb5e2`（vault=`~/develop/obsidian-note`，无远端只本地 commit）。改本 SOP 涉及的机制/参数后，须同批回填该 OB 页与全文备份，避免两处口径漂移。
