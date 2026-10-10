@@ -50,14 +50,14 @@ Sam，您好：
    - `mail:user_mailbox.folder:read` 缺失**仅代表不能枚举邮箱文件夹**，不代表不能搜索邮件、读取已知 `message_id`、创建 reply 草稿或编辑草稿；禁止据此直接报“无权限生成邮件”或 BLOCKED，必须走完以上无文件夹权限路径。
    - **对象边界**：已发送邮件用 `user_mailbox.messages get`；仅草稿 ID 才能用 `user_mailbox.drafts get`。`draft not found` 不得推断已发送邮件不存在。
    - 仅当上述全部定位路径均失败、且无法拿到并验证任何已发送父邮件时，才可 BLOCKED；报告必须写明实际失败接口、scope/错误码、已尝试的降级路径及其结果，禁止笼统归因“邮件权限不足/生成邮件失败”。
-2. **Git 分析（动态扫描）**: 遍历 bar-smyze 根目录下所有含 `.git` 的子工程，对每个执行 `git log --all --no-merges --author=崔朋 --since=周一T00:00:00+08:00 --until=明天T00:00:00+08:00`，仅保留有 commit 的仓库
+2. **Git 分析（动态扫描）**: 遍历 bar-smyze 根目录下所有含 `.git` 的子工程，对每个执行 `git log --all --no-merges --author=崔朋 --since=<本周首个工作日>T00:00:00+08:00 --until=<明天>T00:00:00+08:00`，仅保留有 commit 的仓库(首工作日取 `get_week_range.py` 输出的 `git_since`,禁自行推算)
    - ⚠️ **禁止硬编码仓库清单**：用 `os.listdir` + 判断 `.git` 自动发现，后续新增子工程零改动自动纳入
    - ⚠️ **--since/--until 必须带显式时区 `T00:00:00+08:00`**：不带时间时 git 会用当前时刻补全，导致当天早于该时刻的 commits 被截断丢失
-3. **飞书群聊读取分析【强制步骤·绝不可跳过】（与崔朋相关）**: 使用 `lark-cli` 用户身份拉取群聊证据；**本步骤与 Git 分析同等必做，跳过即视为周报未完成、不得进入草稿阶段**；时间窗口必须与 Git 分析完全一致（同一个周一 `T00:00:00+08:00` 到同一个“明天” `T00:00:00+08:00`），补齐未体现在 commit 中的需求推动、线上问题定位、跨端协作和决策确认
+3. **飞书群聊读取分析【强制步骤·绝不可跳过】（与崔朋相关）**: 使用 `lark-cli` 用户身份拉取群聊证据；**本步骤与 Git 分析同等必做，跳过即视为周报未完成、不得进入草稿阶段**；时间窗口必须与 Git 分析完全一致（同一个首工作日 `T00:00:00+08:00` 到同一个“明天” `T00:00:00+08:00`），补齐未体现在 commit 中的需求推动、线上问题定位、跨端协作和决策确认
    - 默认重点群：`软件智能化小组`、`Smyze软件研发组`；如搜索到内部/外部同名群，内部群和外部群都读取，后续按业务主题归纳去重
    - 群搜索: `lark-cli im +chat-search --query "<群名>" --as user --format json`；记录所有匹配群的 `chat_id/external/owner/create_time`，避免漏读同名内外群
-   - 群消息: `lark-cli im +chat-messages-list --chat-id <oc_xxx> --as user --start <同Git周一T00:00:00+08:00> --end <同Git明天T00:00:00+08:00> --page-size 50 --format json`；按 `has_more/page_token` 手动翻页
-   - 全局搜索: `lark-cli im +messages-search --query "崔朋" --is-at-me --start <同Git周一T00:00:00+08:00> --end <同Git明天T00:00:00+08:00> --page-all --format json`；也可加 `--chat-id <oc_xxx>` 限定重点群
+   - 群消息: `lark-cli im +chat-messages-list --chat-id <oc_xxx> --as user --start <同Git首工作日T00:00:00+08:00> --end <同Git明天T00:00:00+08:00> --page-size 50 --format json`；按 `has_more/page_token` 手动翻页
+   - 全局搜索: `lark-cli im +messages-search --query "崔朋" --is-at-me --start <同Git首工作日T00:00:00+08:00> --end <同Git明天T00:00:00+08:00> --page-all --format json`；也可加 `--chat-id <oc_xxx>` 限定重点群
    - 入选标准：只保留与崔朋直接相关且可归纳为工作成果/推进事项的内容，例如 @崔朋、崔朋发言、回复崔朋、围绕崔朋负责模块的明确结论；闲聊、纯确认、无结论讨论不入周报
 4. **分类统计**: 按 commit message prefix 分 feat/fix/chore，计算 bug 占比
 5. **按原周报格式做业务域归类 + 跨数据源去重合并**: 周报最终格式、业务域粒度和表达方式保持原 Git 周报方案不变；群聊作为与 Git 并列的数据源，合并到对应业务域，不新增“群聊记录”章节
@@ -89,8 +89,8 @@ Sam，您好：
 ## ⚠️ 已验证坑点
 - **【血泪事故·2026-07-03】周报漏读群聊而报告谎称已读**：当次会话 checkpoint 已完整存下群聊步骤，但因 SOP 旧措辞"群聊补充/仅新增数据源"把强制步骤弱化为可选，执行时跑完 git→正文→邮件草稿→通知就自认闭环跳过了群聊；更严重的是 done 报告照搬记忆里的计划文本"脑补"写成"两群内外均读"，实际一条 `chat-messages-list` 都没发。根治：群聊已升级为【强制步骤】，并新增上方"完成判定门槛"硬校验——报告必须附每群实际返回条数，杜绝自述蒙混。
 - **【P0数据事故·2026-08-28】"本周"日期计算漂移＝LLM临场推算周一，周一24号14条commits被整天漏报**：用户发现 08-28(周四)周报主题/intro/git参数全都写成"08.25-08.28"（从周日起算），导致实际周一 08-24 全天 14 条 commits（含关键 bugfix）完全漏报。根因＝`weekly_report_gen.py` 只锁死 HTML 排版结构，但"本周从哪天到哪天"这个同样关键的计算此前完全由 LLM 每次临场推算 git `--since/--until` 和 intro 日期文案，无代码兜底——08-21 那次算对了（本周一 08-17 到执行日 08-21），08-28 这次算错了（误把周日 08-25 当周一）。**根治·三层防线**：
-  1. **第一层·确定性输入**：新增 `get_week_range.py`，用 `weekday()==0` 机械算出"本周一（自然周一，不受节假日影响）→ 执行日"的 git_since/git_until/display_range，调度 prompt 强制第 1 步先跑此脚本获取参数，后续 git log 和 intro 日期文案**必须使用脚本输出，禁止 LLM 临场推算"本周"**。
-  2. **第二层·机械校验**：`weekly_report_verify.py` 新增 `date_range_check()` 函数与 `--exec-date` 参数，发送前回读草稿 intro/主题里的起始日期，与 `get_week_range.py` 算出的本周一机械对比，任何不符即 FAIL 拦截（已用 08-28 错误案例实测：intro 写 08.25 被机械揪出应为 08.24）。
+  1. **第一层·确定性输入**:`get_week_range.py` 以 `chinese_calendar.is_workday` 机械算出"本周**首个工作日** → 执行日"的 git_since/git_until/display_range(权威字段 `first_workday`,`week_monday` 仅保留为旁参),调度 prompt 强制第 1 步先跑此脚本获取参数,后续 git log 和 intro 日期文案**必须使用脚本输出,禁止 LLM 临场推算"本周"**。无 `chinese_calendar` 时回退自然周一并在输出标注 `calendar_source=weekday_fallback`(显式可见不静默)。
+  2. **第二层·机械校验**:`weekly_report_verify.py` 的 `date_range_check()`(配 `--exec-date`)发送前回读草稿 intro/主题里的起始日期,与 `get_week_range.py` 算出的**本周首个工作日**机械对比,任何不符即 FAIL 拦截(08-28 实测:intro 写 08.25 被判应为 08.24;10-10 实测:intro 写 10.05 被判应为 10.08)。
   3. **第三层·调度强制**：`weekly_report_reminder.json` prompt 改为 10 步流程，第 1 步铁律"先跑 get_week_range.py"，第 8 步 verify 时必须传 `--exec-date` 以触发日期校验。
   - **教训**：光锁版式不锁内容/参数仍会漏；凡 SOP 用文字规定的"必须 X"，若涉及可量化结果（日期/收件人/线程/数量），都要有对应机械 check 形成闸门，否则等于没规定。
 - **git --since/--until 必须带 `T00:00:00+08:00`**：裸日期 `--since=2026-06-08` 会被 git 用当前时刻补全时间部分，导致当天早于该时刻的 commits 静默丢失（致命级，曾导致 hotfix 3 条严重 bug 修复全部漏报）
