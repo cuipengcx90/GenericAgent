@@ -510,21 +510,79 @@ def deai_check(text, min_score=None):
             int(r.get("score") or 0))
 
 
+# ---- codex 生成通道:PATH 注入 + 模型回退(R569,2026-10-10)--------------
+# 1) daemon/launchd/sche_tasks 等启动环境的 PATH 常缺 /opt/homebrew/bin,而
+#    codex 是 `#!/usr/bin/env node` 脚本 ⇒ 子进程必须补 PATH,否则 rc=127
+#    (`env: node: No such file or directory`),表现为「生成器恒失败」。
+# 2) 配置里的默认模型可能额度耗尽(403 无可用订阅额度)⇒ 允许 -m 回退链。
+CODEX_PATH_EXTRA = ("/opt/homebrew/bin", "/usr/local/bin")
+# 3) 配置里的默认模型(sharedchat-k1/gpt-5.6-sol)当前 403「没有可用的 Codex
+#    订阅额度或余额」⇒ 不能当首选;下表为 2026-10-11 直打 magpie
+#    (127.0.0.1:3425/v1/responses)+ 真 CLI 双验证可用的 id(带 provider 前缀),
+#    codex exec -m 接受该形态。配置默认模型仅作**最后兜底**(链尾)。
+DEF_CODEX_MODEL_CHAIN = ("4router-terra/gpt-5.6-terra",
+                         "4router-terra/gpt-6.1-sol",
+                         "hxi/gpt-5.6-sol")
+CODEX_MODEL_CHAIN = [m.strip() for m in
+                     (os.environ.get("LJQ_CODEX_MODEL")
+                      or ",".join(DEF_CODEX_MODEL_CHAIN)).split(",")
+                     if m.strip()]
+
+
+def codex_env(bin_=None):
+    """codex 子进程环境:PATH=[codex 所在目录]+常见落点+原 PATH(去重保序)。"""
+    env = dict(os.environ)
+    parts = []
+    for d in (os.path.dirname(bin_) if bin_ else None,
+              os.path.dirname(CODEX_BIN) if CODEX_BIN else None):
+        if d:
+            parts.append(d)
+    parts += list(CODEX_PATH_EXTRA)
+    parts += [x for x in (env.get("PATH") or "").split(os.pathsep) if x]
+    seen, out = set(), []
+    for d in parts:
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    env["PATH"] = os.pathsep.join(out)
+    return env
+
+
 def gen_text(prompt, timeout=180, codex_bin=None):
-    """codex exec 生成文案；失败/超时返回 None（绝不硬顶重试）。"""
+    """codex exec 生成文案;带模型回退链;失败/超时返回 (None, why)。
+
+    绝不硬顶同一模型重试;总耗时受 timeout 预算约束(预算尽即停、绝不挂住调用方)。
+    codex_bin 显式传入(自测/替身)时只用配置默认模型,不做模型回退。
+    """
     bin_ = codex_bin or CODEX_BIN
     if not bin_ or not os.path.exists(bin_):
         return None, "codex_not_found:%s" % bin_
-    try:
-        r = subprocess.run([bin_, "exec", "--skip-git-repo-check", prompt],
-                           capture_output=True, text=True, timeout=timeout,
-                           cwd=tempfile.gettempdir())
+    deadline = time.time() + float(timeout)
+    # 已验证通道优先;""=配置默认模型(当前 403)仅兜底,避免先烧一轮无用等待。
+    chain = [""] if codex_bin else list(CODEX_MODEL_CHAIN) + [""]
+    diags = []
+    for model in chain:
+        left = deadline - time.time()
+        if left <= 5:
+            diags.append("budget_exhausted")
+            break
+        cmd = [bin_, "exec", "--skip-git-repo-check"] + (["-m", model] if model else [])
+        cmd.append(prompt)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=left,
+                               cwd=tempfile.gettempdir(), env=codex_env(bin_))
+        except subprocess.TimeoutExpired:
+            diags.append("timeout(%ds/%s)" % (int(left), model or "config"))
+            continue
+        except Exception as e:
+            diags.append("err:%s" % str(e)[:120])
+            continue
         out = (r.stdout or "").strip()
-        return (out or None), ("rc=%d %s" % (r.returncode, (r.stderr or "")[:160]))
-    except subprocess.TimeoutExpired:
-        return None, "timeout(%ds)" % timeout
-    except Exception as e:
-        return None, "err:%s" % str(e)[:160]
+        if r.returncode == 0 and out:
+            return out, "rc=0 model=%s" % (model or "config")
+        tail = (r.stderr or "").strip().replace("\n", " ")[-160:]
+        diags.append("rc=%d/%s%s" % (r.returncode, model or "config", (" " + tail) if tail else ""))
+    return None, " | ".join(diags)[:400]
 
 
 # ------------------------------------------------------------------ 站点动作

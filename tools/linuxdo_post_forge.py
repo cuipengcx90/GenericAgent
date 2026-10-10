@@ -214,6 +214,23 @@ def _codex_gen(prompt, timeout=CODEX_TIMEOUT):
         return None, "gen_unavailable:%s" % str(e)[:120]
 
 
+def classify_gen_fail(why):
+    """把生成通道的失败诊断分成「环境/通道坏」与「生成内容不可用」两类(R569)。
+
+    环境类(rc=127 / node 缺失 / 无可用额度 / 认证 / 超时 / 不可执行)属于
+    「这次环境不行、下次可能就行」,调用方应据此决定是否退避重试而非永久冷却;
+    内容类(rc=0 但空输出)属「这次生成没产出」。
+    返回 (reason, detail)。
+    """
+    d = str(why or "")[:300]
+    env_marks = ("codex_not_found", "rc=127", "No such file or directory", "not found",
+                 "ENOENT", "permission denied", "quota", "额度", "403", "401",
+                 "timeout(", "budget_exhausted", "err:", "Connection", "Reconnecting")
+    if any(m in d for m in env_marks):
+        return "GEN_ENV", d
+    return "GEN_FAIL", d
+
+
 def _extract_json_array(s):
     if not s:
         return None
@@ -389,9 +406,18 @@ def forge(material_path=None, dry_run=False, draft_dir=DRAFT_DIR, ledger=LEDGER,
 
     excerpt = material_excerpt(mat["text"])
     ins_txt, ins_n = browse_inspiration(inspire_log) if inspire else ("", 0)
-    topics = parse_topics(gen(TOPIC_PROMPT.format(material=excerpt,
-                                                  tmax=TITLE_MAX,
-                                                  inspire=ins_txt))[0])
+    traw, twhy = gen(TOPIC_PROMPT.format(material=excerpt,
+                                         tmax=TITLE_MAX,
+                                         inspire=ins_txt))
+    if not (traw or "").strip():
+        # 生成通道本身失败(路径/额度/超时)与「模型给了但解析不出」必须分开,
+        # 否则上层无法区分「环境坏了」和「这次选题不行」(R569)。
+        reason, detail = classify_gen_fail(twhy)
+        append_ledger({"ok": False, "why": reason, "detail": detail, "stage": "topic",
+                       "day": day, "material_sha": mat["sha"], "material": mat["path"]},
+                      ledger)
+        return {"ok": False, "why": reason, "detail": detail}
+    topics = parse_topics(traw)
     if not topics:
         append_ledger({"ok": False, "why": "NO_TOPIC", "day": day,
                        "material_sha": mat["sha"], "material": mat["path"]}, ledger)
@@ -419,10 +445,11 @@ def forge(material_path=None, dry_run=False, draft_dir=DRAFT_DIR, ledger=LEDGER,
         raw, why = gen(base if attempt == 1 else base + STRICT_SUFFIX.format(
             issues=", ".join((gate.get("hard") or []) + (gate.get("warn") or []))))
         if not raw:
-            append_ledger({"ok": False, "why": "GEN_FAIL:%s" % why, "day": day,
-                           "material_sha": mat["sha"], "material": mat["path"]},
+            reason, detail = classify_gen_fail(why)
+            append_ledger({"ok": False, "why": reason, "detail": detail, "stage": "body",
+                           "day": day, "material_sha": mat["sha"], "material": mat["path"]},
                           ledger)
-            return {"ok": False, "why": "GEN_FAIL"}
+            return {"ok": False, "why": reason, "detail": detail}
         body = clean_body(raw)
         gate = deai_check(body)
         if gate.get("ok") and BODY_MIN <= len(body) <= BODY_MAX:
@@ -634,7 +661,9 @@ def selftest():
 def main(argv=None):
     ap = argparse.ArgumentParser(description="L站发帖草稿锻造器")
     ap.add_argument("cmd", nargs="?", default="forge",
-                    choices=["forge", "list", "selftest"])
+                    choices=["forge", "list", "selftest", "gen-check"])
+    ap.add_argument("--gen-timeout", type=int, default=120,
+                    help="gen-check 用的生成超时(秒)")
     ap.add_argument("--material", action="append", default=None)
     ap.add_argument("--category", type=int, default=CATEGORY_DEFAULT)
     ap.add_argument("--tags", default=",".join(TAGS_DEFAULT))
@@ -647,6 +676,15 @@ def main(argv=None):
 
     if args.cmd == "selftest":
         return selftest()
+    if args.cmd == "gen-check":
+        raw, why = _codex_gen("只输出三个字符:OK的", timeout=args.gen_timeout)
+        ok = bool(raw)
+        detail = raw[:80] if ok else classify_gen_fail(why)[1]
+        print(json.dumps({"ok": ok, "cmd": "gen-check",
+                          "verdict": "OK" if ok else classify_gen_fail(why)[0],
+                          "out": (raw or "")[:80], "why": detail},
+                         ensure_ascii=False))
+        return 0 if ok else 1
     if args.cmd == "list":
         rows = load_ledger()
         print(json.dumps({"ledger": len(rows), "today": count_today(rows),

@@ -231,10 +231,13 @@ python3 tools/linuxdo_post_forge.py forge --notify           # 落草稿 + 私�
 ### 11.8 发帖(post)为何常不执行:两道闸门(2026-10-10 实测)
 
 - **闸门一(设计使然)**:post 只在「获赞(earn)缺项 ∧ 有草稿」时排队(§一 分流表)。获赞长期充足(实测 47–50/门槛 20 ⇒ 恒 MET)⇒ post **永不激活**;此时唯一缺项若是「浏览/阅读」,走 browse 桶由 daemon 自补。**不是坏了,是不满足触发条件**。
-- **闸门二(真缺陷,待修)**:daemon 进程 `PATH` 不含 `/opt/homebrew/bin`,而 `codex` 是 `#!/usr/bin/env node` 脚本 ⇒ `gen_text()` spawn codex 时 `rc=127 env: node: No such file or directory` ⇒ forge 连标题都生成不出(`NO_TOPIC`)。
-  - **验证配方**:在与 daemon 同款受限 PATH 下直调 `acts.gen_text(...)`,看 `why` 是否 `rc=127`;补 PATH 后再跑,若仍失败则看上游额度(实测 sharedchat-k1 返 403「没有可用的 Codex 订阅额度或余额」)。
-  - **修复点单一**:`tools/linuxdo_acts.py:gen_text()` 的 `subprocess.run` 未传 `env` ⇒ 注入 PATH(含 `dirname(codex_bin)`、`/opt/homebrew/bin`、`/usr/local/bin`);forge 经 `_codex_gen` 复用同一函数,daemon 侧 Popen 用绝对 `sys.executable` 故无需另修。
-- **判读铁律**:见「发帖没执行」先分清是**触发条件未满足**(看 level_log 的 pending 项归属哪一桶)还是**管道断开**(看 forge ledger 的 `why`),二者修法完全不同。
+- **闸门二(真缺陷,★已于 2026-10-11 修复,R571)**:daemon 进程 `PATH` 不含 `/opt/homebrew/bin`,而 `codex` 是 `#!/usr/bin/env node` 脚本 ⇒ `gen_text()` spawn codex 时 `rc=127 env: node: No such file or directory` ⇒ forge 连标题都生成不出(`NO_TOPIC`)。
+  - **验证配方**:在与 daemon 同款受限 PATH 下直调 `acts.gen_text(...)`,看 `why` 是否 `rc=127`;补 PATH 后再跑,若仍失败则看上游额度。
+  - **修复点单一**:`tools/linuxdo_acts.py:gen_text()` 的 `subprocess.run` 未传 `env` ⇒ 注入 PATH(含 `dirname(codex_bin)`、`/opt/homebrew/bin`、`/usr/local/bin`);forge 经 `_codex_gen` 复用同一函数,daemon 侧 Popen 亦传 `_forge_env()`。
+  - **修复内容(R571,三文件)**:①`acts.py` 新增 `codex_env(bin_)`(去重保序补 PATH)+ `CODEX_MODEL_CHAIN`(**模型回退链**,env `LJQ_CODEX_MODEL` 可覆盖)+ `gen_text` 改 **deadline 预算**(预算尽即停,绝不挂住调用方);②`post_forge.py` 新增 `classify_gen_fail()`(`GEN_ENV` 环境/上游 vs `GEN_FAIL` 真失败)+ `gen-check` 子命令;③`browse_daemon.py` 新增 `_forge_env()` 并给 Popen 传 `env`,`_forge_gate` 对 `GEN_ENV` 走短退避而非日级冷却。
+  - **★模型链口径(2026-10-11 实测)**:本机 codex 走 **magpie 代理**(`~/.codex/config.toml` → `http://127.0.0.1:3425/v1`,`wire_api=responses`);配置默认 `sharedchat-k1/gpt-5.6-sol` 当前 **403「没有可用的 Codex 订阅额度或余额」**⇒ 不能当首选。`GET /v1/models` 返 77 个 id(多池);探针 + 真 CLI 双验证可用档=`4router-terra/gpt-5.6-terra`、`4router-terra/gpt-6.1-sol`、`hxi/gpt-5.6-sol`(`codex exec -m` **接受带 provider 前缀的 id**;配置默认模型排链尾兜底)。
+  - **★两层正交**:`PATH`(本地环境层)与**上游额度**(供给层)是两层;修好 PATH 只是让 codex 起得来,仍可能被上游 403 拦(此时 `why=GEN_ENV`)。见「发帖没执行」先看 `why` 前缀再定修法。
+- **判读铁律**:见「发帖没执行」先分清是**触发条件未满足**(看 level_log 的 pending 项归属哪一桶)还是**管道断开**(看 forge ledger 的 `why`),二者修法完全不同;**管道断开再分 `GEN_ENV`(环境/上游,改路径或换通道)与 `GEN_FAIL`(真失败,查代码)**。
 
 ## 尾注
 - 站点侧浏览器操作细则（标签页/CF/登录态）见 `memory/linuxdo_browse_sop.md`、`memory/linuxdo_reply_sop.md`、`memory/linuxdo_trust_level_sop.md`。

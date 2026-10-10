@@ -184,6 +184,11 @@ ACTS_ROUND_GAP = (1200, 2700)
 FORGE_MIN_GAP_S = 3 * 86400       # 无草稿时后台锻造的最小间隔（3 天）
 FORGE_JITTER_S = 4 * 86400        # 再叠 0~4 天随机抖动 ⇒ 实际 3~7 天，禁固定节奏
 FORGE_STATE = os.environ.get("LJQ_FORGE_STATE") or os.path.join(BASE, "post_forge.json")
+FORGE_LEDGER = os.path.join(GA_ROOT, "temp", "linuxdo_post_forge", "ledger.jsonl")
+# 生成通道「环境坏」(codex 不在 PATH / node 缺失 / 上游额度 403 等)不是内容问题,
+# 不该白等 3~7 天;按短退避 6~10h 重试(R569)。
+FORGE_ENV_MIN_GAP_S = 6 * 3600
+FORGE_ENV_JITTER_S = 4 * 3600
 # connect 页两条路径结构不同：connect=({met:bool,name:'当前/门槛'}，无指标名)；首页卡=({mark, name, cur, req})。
 # connect 实测固定 12 项顺序（2026-10-05 level_log.jsonl）⇒ 仅当这些项的**门槛值全部吻合**才启用顺序映射，
 # 否则一律按「未识别」处理（fail-safe：只通知人，绝不误判为可自动补）。
@@ -798,10 +803,45 @@ def _forge_gate(now=None):
     except Exception:
         st = {}
     last = float(st.get("last_ts") or 0)
-    need = FORGE_MIN_GAP_S + random.uniform(0, FORGE_JITTER_S)
+    # 上一轮 forge 若是「环境类」失败(GEN_ENV),走短退避而非 3~7 天
+    env_fail = False
+    try:
+        if os.path.exists(FORGE_LEDGER):
+            tail = None
+            with open(FORGE_LEDGER, encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln:
+                        tail = ln
+            if tail:
+                row = json.loads(tail)
+                env_fail = str(row.get("why") or "").startswith("GEN_ENV")
+                last = max(last, float(row.get("ts") or 0))
+    except Exception:
+        env_fail = False
+    if env_fail:
+        need = FORGE_ENV_MIN_GAP_S + random.uniform(0, FORGE_ENV_JITTER_S)
+    else:
+        need = FORGE_MIN_GAP_S + random.uniform(0, FORGE_JITTER_S)
     if last and (now - last) < need:
         return False, round((need - (now - last)) / 86400.0, 2)
     return True, 0.0
+
+
+def _forge_env():
+    """锻造子进程环境:补 PATH(守护/launchd 起的进程 PATH 常缺 homebrew,而 codex 是
+    `#!/usr/bin/env node` 脚本 ⇒ 缺 node 即 rc=127)。R569 根因修复。
+    """
+    env = dict(os.environ)
+    cb = os.environ.get("LJQ_CODEX_BIN") or shutil.which("codex")
+    extra = [os.path.dirname(cb) if cb else "",
+             "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    parts = [p for p in str(env.get("PATH") or "").split(":") if p]
+    for d in extra:
+        if d and d not in parts:
+            parts.append(d)
+    env["PATH"] = ":".join(parts)
+    return env
 
 
 def _maybe_forge_draft(out, apply_=True):
@@ -827,6 +867,7 @@ def _maybe_forge_draft(out, apply_=True):
         logf = open(os.path.join(BASE, "forge.log"), "a")
         proc = subprocess.Popen([sys.executable, script, "forge", "--notify"],
                                 stdout=logf, stderr=subprocess.STDOUT,
+                                env=_forge_env(),
                                 start_new_session=True, close_fds=True)
         logf.close()
         tmp = FORGE_STATE + ".tmp"
