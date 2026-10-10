@@ -15,11 +15,13 @@
 阈值以 `rules` 子命令输出为准；SOP 里引用的数字须与之一致（RULES#21）。
 """
 import argparse
+import ast
 import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -194,14 +196,26 @@ def check_workbook(wb, path=None):
     return out
 
 
-def load_wb(path):
+def _require_openpyxl():
+    """环境闸门:缺 openpyxl ⇒ SystemExit(2)(fail-closed)。
+
+    真缺陷(2026-10-09 实测):原写 SystemExit("rc=2 ...") 属**字符串负载**,Python 对非 int
+    负载一律以 rc=1 退出 ⇒ 声明的「2=输入或环境错误」契约失效(系统 python3 跑 check/selftest
+    实测 rc=1 + 裸 traceback)。故一律退整数。
+    """
     try:
-        import openpyxl  # noqa: F401
+        import openpyxl
     except ImportError as e:
-        raise SystemExit("rc=2 缺 openpyxl（用 /opt/anaconda3/bin/python3 跑）：%r" % (e,))
-    import openpyxl
+        sys.stderr.write("rc=2 缺 openpyxl(用 /opt/anaconda3/bin/python3 跑):%r\n" % (e,))
+        raise SystemExit(2)
+    return openpyxl
+
+
+def load_wb(path):
+    openpyxl = _require_openpyxl()
     if not os.path.isfile(path):
-        raise SystemExit("rc=2 文件不存在：%s" % path)
+        sys.stderr.write("rc=2 文件不存在:%s\n" % path)
+        raise SystemExit(2)
     return openpyxl.load_workbook(path, data_only=False)
 
 
@@ -290,7 +304,7 @@ def _make_zip(path, parts):
 
 
 def cmd_selftest(args):
-    import openpyxl
+    openpyxl = _require_openpyxl()
     tmp = tempfile.mkdtemp(prefix="perf_gate_")
     checks = []
 
@@ -368,12 +382,37 @@ def cmd_selftest(args):
                  i_text="1、第一条没有结尾分号\n2、交付节奏稳定，任务交付准时率 100%；")
     expect("NC12 条末标点", p, good_zip, ["I_ITEM_RE"], 1)
 
-    # NC13 文件不存在 ⇒ rc=2 fail-closed
-    try:
-        load_wb(os.path.join(tmp, "nope.xlsx"))
-        checks.append(("NC13 缺文件 fail-closed", False, "未抛错"))
-    except SystemExit as e:
-        checks.append(("NC13 缺文件 fail-closed", "rc=2" in str(e), str(e)[:60]))
+    # NC13 文件不存在 ⇒ rc=2 fail-closed(**真退出码**,不只看异常文案)
+    r = subprocess.run([sys.executable, os.path.abspath(__file__), "check",
+                        os.path.join(tmp, "nope.xlsx")], capture_output=True, text=True)
+    checks.append(("NC13 缺文件 fail-closed rc=2", r.returncode == 2,
+                   "rc=%d err=%s" % (r.returncode, r.stderr.strip()[:50])))
+
+    # NC14 环境缺依赖(模拟 openpyxl 不可导入)⇒ 必须 rc=2,绝不能是 1
+    # 负控靶心:字符串负载 SystemExit("rc=2 ...") 在 Python 里退 rc=1(真缺陷形态)
+    blocker = ("import sys, runpy\n"
+               "sys.modules['openpyxl'] = None\n"
+               "sys.argv = ['gate', 'check', %r]\n"
+               "runpy.run_path(%r, run_name='__main__')\n" % (os.path.join(tmp, "ok.xlsx"),
+                                                               os.path.abspath(__file__)))
+    r = subprocess.run([sys.executable, "-c", blocker], capture_output=True, text=True)
+    checks.append(("NC14 缺 openpyxl ⇒ rc=2(禁 rc=1)", r.returncode == 2,
+                   "rc=%d err=%s" % (r.returncode, r.stderr.strip()[:50])))
+
+    # NC15 结构断言(AST,不看 docstring 文本):SystemExit 一律整数负载
+    # 契约:非 int 负载 ⇒ Python 以 rc=1 退出,「2=输入或环境错误」失效
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    str_exits, int_exits = [], []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "SystemExit":
+            if node.args and isinstance(node.args[0], ast.Constant):
+                (str_exits if isinstance(node.args[0].value, str) else int_exits).append(node.lineno)
+            elif not node.args:
+                int_exits.append(node.lineno)
+    checks.append(("NC15 SystemExit 均为整数负载(AST)",
+                   not str_exits and bool(int_exits),
+                   "str_payload_lines=%s int_exit_lines=%s" % (str_exits, len(int_exits))))
 
     bad = [c for c in checks if not c[1]]
     for name, ok, detail in checks:
