@@ -105,3 +105,4 @@ L4: ../memory/L4_raw_sessions/ (历史会话层 - scheduler反射自动收集，
 - **数值/状态类事实必须回源代码常量或当场命令输出**：SOP / 定时任务 prompt / L1 / L2 里写「默认 160」「日上限 140–180」「单段 110min」这类数字，代码一改就静默变成谎言（实测 R550：daemon 顶部注释与 anti_detection_sop 同时残留旧档值）。改口径须**同批**改：代码注释 + SOP + prompt + L1/L2。
 - **自测/演练禁写生产状态**：selftest 必须沙箱化（临时目录/临时 state）；直调内部实现函数会绕过沙箱并覆盖生产状态文件（实测 R546：state.json 被覆盖成 66B、browse_log 截断至 5 行，历史行不可复原）。判活看**业务产物**（台账新增行/计数增长），不看守护日志字节。
 - **各层落点速查**：L0=本文件（写入规则）/ L1=global_mem_insight.txt（极简索引，**已跟踪**，关键事实必须在此留痕）/ L2=global_mem.txt（环境事实，gitignored 无版本历史）/ L3=memory/*.md 与 memory/*_sop/（已跟踪）/ L4=memory/L4_raw_sessions（会话归档，滚动滞后；原始文件数 == 保留窗(10) 时管线按设计空转）。写完必回读断言。
+- **CLI 退出码契约须整数负载**:`raise SystemExit(N)` 必须传**整数**;传字符串(如 `SystemExit("rc=2 ...")`)Python 实退 rc=**1**,声明的 rc=2 契约静默失效(实测 R567:tools/perf_review_format_gate.py 首版栽此)。同批须给 `--selftest` 加**子进程**负控(缺文件/缺依赖应干净 rc=2;见裸 traceback+rc=1 即回归),并让 `rules` 打印阈值使 SOP/文档数字可回源核对(RULES#21)。
