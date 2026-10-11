@@ -207,6 +207,12 @@ SESS_RETRY_SHORT_MAX = 6                # 前 N 次用短退避，之后转长�
 SESS_RETRY_SLEEP = (600, 1200)          # 断链长退避间隔 10–20min
 FRONT_NONE_TOLERANCE = 3                # 前台探测连续失败≥3次按后台继续（fail-open 防永停）
 LATEST_PAGE_MAX = 9
+# ---- 抓取韧性(R572,2026-10-11)---------------------------------------------
+# 现场:09:19 单次页内 fetch 返 TypeError:Failed to fetch(疑为前台标签正在导航)⇒ 单发即弃
+#       ⇒ 整批 0 候选 ⇒ 白睡 10min。瞬态抖动不该按「无新帖」处理,也不该与「候选全重」混为一谈。
+FETCH_RETRY_MAX = 1                     # 采样页全失败且非强风控 ⇒ 换会话重试次数(上限)
+FETCH_RETRY_GAP = (3.0, 8.0)            # 重试前的短随机延迟(秒;不构成固定节奏特征)
+ZERO_FETCH_FAIL_SLEEP = (150, 300)      # 抓取全失败(瞬态)退避 2.5–5min,短于 ALL_SEEN 档的 10min
 
 # ---- 风控保险丝（2026-10-05 用户要求：借 anyrouter 被封教训）-----------------
 # anyrouter 教训三条：①高频自动请求累积 → 封号；②把异常当常态（429/503 当"供给态"
@@ -1294,6 +1300,23 @@ def fetch_candidates(session, page):
     return []
 
 
+def fetch_round(session, pages):
+    """一轮采样:逐页取候选(页间留小间隔)。R572 抽出以便失败后换会话重试。"""
+    out = []
+    for p in pages:
+        out += fetch_candidates(session, p)
+        time.sleep(random.uniform(1.5, 4.0))
+    return out
+
+
+def zero_yield_kind(stats=None):
+    """R572 D2:零产出归因(纯函数,便于自测)。
+    返回 "FETCH_FAIL"(采样页全部抓取失败=瞬态/标签被占)或 "ALL_SEEN"(抓取正常但候选全重)。
+    旧日志把两者都写成「候选全重/接口异常」,掩盖了偶发抖动。"""
+    s = dict(stats if stats is not None else LAST_FETCH_STATS)
+    return "FETCH_FAIL" if int(s.get("pages") or 0) > 0 and int(s.get("ok") or 0) == 0 else "ALL_SEEN"
+
+
 def fetch_verdict(pages_total, pages_ok, diag):
     """批内候选抓取后的风控判定（纯函数，便于离线自测；R563）。
 
@@ -1453,6 +1476,51 @@ def browse_one(session, tid, state, cand=None):
     return ok, res
 
 
+# ★R572 -1743 兜底:osascript 建后台标签依赖「自动化」TCC 授权(驱动进程→Google Chrome)。
+#   授权被撤销/主体变化时 osascript 报 `未获得授权将Apple事件发送给Google Chrome (-1743)`
+#   ⇒ 自愈恒失败(10-10 两条台账)。改走桥(execute_js)在任一会话里 window.open 建后台主站
+#   标签:**实测不抢前台**(新标签 visible=false/focused=false),且不依赖 AppleScript 授权。
+BRIDGE_OPEN_JS = ("(function(){try{var w=window.open('https://linux.do/','_blank');"
+                  "return JSON.stringify({ok:!!w});}catch(e){"
+                  "return JSON.stringify({ok:false,err:String(e)});}})()")
+
+
+def _try_bridge_open_main_tab():
+    """osascript 不可用时(典型 -1743 未授权)用桥建后台主站标签。
+
+    返回 (ok, note)。只读+建标签,从不导航既有标签(绝不顶掉等级检查页)。
+    """
+    try:
+        sess = list_sessions()
+    except Exception as e:
+        return False, "BRIDGE_OPEN 失败:桥不可达 %s" % repr(e)[:80]
+    for s in sess:
+        try:
+            res = run_js(s.get("id"), BRIDGE_OPEN_JS, timeout=15)
+        except Exception:
+            continue
+        raw = res
+        if isinstance(res, dict):
+            if res.get("data") is not None:
+                raw = res["data"]
+            elif res.get("raw") is not None:
+                raw = res["raw"]
+        try:
+            d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            d = {}
+        if isinstance(d, dict) and d.get("ok"):
+            time.sleep(3)
+            try:
+                _now = [x for x in list_sessions() if _is_main_host(_url_host(x.get("url") or ""))]
+            except Exception:
+                _now = []
+            if _now:
+                return True, "BRIDGE_OPEN 已建后台主站标签(绕过 -1743 授权)"
+            return False, "BRIDGE_OPEN 已发起但 3s 内未见主站会话(桥/扩展异常)"
+    return False, "BRIDGE_OPEN 无可用会话(window.open 无处可发)"
+
+
 def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
     """无 linux.do 标签时补一个**后台**标签（有界自愈；2026-10-06 放宽至 6 次/日、间隔 10min）。"""
     """无 linux.do 标签时补一个**后台**标签（有界自愈）。
@@ -1534,6 +1602,15 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
                 prev_idx = None
     except Exception as e:
         ok, note = False, repr(e)[:120]
+    # ★R572 -1743 兜底:自动化授权缺失 ⇒ osascript 恒失败,改走桥 window.open 建后台主站标签
+    #   (实测不抢前台、不依赖 AppleScript;台账 note 以 BRIDGE_OPEN 前缀可辨识)。
+    if (not ok) and ("-1743" in str(note) or "未获得授权" in str(note)
+                     or "not authorized" in str(note).lower()):
+        _bok, _bnote = _try_bridge_open_main_tab()
+        if _bok:
+            ok, note = True, "osascript -1743(无自动化授权)⇒ 回退桥: " + _bnote
+        else:
+            note = "osascript -1743 且回退失败: " + _bnote
     try:
         with io.open(led, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": now_ts, "day": day, "ok": ok, "note": note,
@@ -1550,10 +1627,28 @@ def browse_batch(session, st, batch=25):
     done = skipped = 0
     loiter_n = random.randint(*LOITER_P_LIST)
     pages = random.sample(range(0, LATEST_PAGE_MAX + 1), min(LATEST_PAGE_MAX + 1, 4))
-    cand = []
-    for p in pages:
-        cand += fetch_candidates(session, p)
-        time.sleep(random.uniform(1.5, 4.0))
+    cand = fetch_round(session, pages)
+    _act, _rk = fetch_verdict(LAST_FETCH_STATS["pages"], LAST_FETCH_STATS["ok"], LAST_FETCH_DIAG)
+    # ★R572 D1 抓取韧性:采样页**全失败**且非强风控 ⇒ 短随机延迟后换会话重试
+    #   旧行为:单次页内 fetch 抖动(TypeError:Failed to fetch,前台标签正在导航时常见)
+    #   ⇒ 整批 0 候选 ⇒ 白睡 10min,日志还写成「候选全重/接口异常」(归因错)。
+    _retried = 0
+    while (not cand) and LAST_FETCH_STATS.get("ok", 0) == 0 and _act != "ABORT" and _retried < FETCH_RETRY_MAX:
+        _retried += 1
+        _w = random.uniform(*FETCH_RETRY_GAP)
+        print("[%s] 采样页全失败(非风控)⇒ %.1fs 后换会话重试 %d/%d" % (
+            now_str(), _w, _retried, FETCH_RETRY_MAX), flush=True)
+        log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "FETCH_RETRY",
+                                       "n": _retried, "wait_s": round(_w, 1),
+                                       "detail": str(LAST_FETCH_DIAG.get("diag"))[:200]})
+        time.sleep(_w)
+        _ns, _note = pick_session()
+        if not _ns:
+            break
+        session = _ns
+        LAST_FETCH_STATS.update({"pages": 0, "ok": 0})
+        cand = fetch_round(session, pages)
+        _act, _rk = fetch_verdict(LAST_FETCH_STATS["pages"], LAST_FETCH_STATS["ok"], LAST_FETCH_DIAG)
     # ★R563 批内风控熔断：抓取阶段已确认强风控（403/429/401/封禁文案）⇒ 零帖中止。
     #   旧行为把风控判定放在本函数返回之后，403 时仍照跑整批（2026-10-08 实测多浏览 20 帖）。
     _act, _rk = fetch_verdict(LAST_FETCH_STATS["pages"], LAST_FETCH_STATS["ok"], LAST_FETCH_DIAG)
@@ -1817,8 +1912,20 @@ def watch(args):
                 log_jsonl("risk_log.jsonl", {"ts": now_str(), "st": "INFO", "kind": "FETCH_FAIL",
                                              "detail": str(diag)[:300]})
         if done == 0 and skipped == 0:
-            print("[%s] 无可用候选（候选全重/接口异常），睡 10min 重试" % now_str(), flush=True)
-            _nap(600)
+            # ★R572 D2 归因分列:抓取全失败(瞬态)≠ 候选全重(正常无新帖)
+            zk = zero_yield_kind(LAST_FETCH_STATS)
+            if zk == "FETCH_FAIL":
+                _w = random.uniform(*ZERO_FETCH_FAIL_SLEEP)
+                print("[%s] 抓取全失败(%d 页全空,接口异常/标签被占),退避 %.0fs 重试" % (
+                    now_str(), LAST_FETCH_STATS.get("pages"), _w), flush=True)
+                log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "ZERO_FETCH_FAIL",
+                                               "pages": LAST_FETCH_STATS.get("pages"),
+                                               "wait_s": round(_w, 1),
+                                               "detail": str(diag)[:200]})
+                _nap(_w)
+            else:
+                print("[%s] 候选全重(无新帖),睡 10min 重试" % now_str(), flush=True)
+                _nap(600)
         gap = _batch_gap()
         print("[%s] 批间休 %.0fs" % (now_str(), gap), flush=True)
         _nap(gap)
@@ -2214,7 +2321,7 @@ def _selftest_impl():
     _src_bb = _insp.getsource(browse_batch)
     if "raise RiskAbort" not in _src_bb:
         fails.append("T15s browse_batch 缺批内 raise RiskAbort")
-    elif _src_bb.index("raise RiskAbort") < _src_bb.index("fetch_candidates(session, p)"):
+    elif _src_bb.index("raise RiskAbort") < max(_src_bb.rindex("fetch_round("), _src_bb.find("fetch_candidates(")):
         fails.append("T15s raise 位置早于抓取循环（形同未熔断）")
     if "except RiskAbort" not in _insp.getsource(watch):
         fails.append("T15s watch 未接住 RiskAbort")
@@ -2478,6 +2585,113 @@ def _selftest_impl():
             _g["_day_segments_cached"] = _keep
         if not _na["note"] or _na["theoretical"] is not None or _na["current_index"] is not None:
             fails.append("T18j 内核缺席须 note+null: %s" % _na)
+    cases += 1
+
+    # ---- T19 抓取韧性 + 零产出归因分列(R572)
+    if not callable(globals().get("fetch_round")) or not callable(globals().get("zero_yield_kind")):
+        fails.append("T19 内核缺席(fetch_round/zero_yield_kind)")
+    else:
+        # T19a 归因纯函数:全失败⇒FETCH_FAIL;正常抓取但候选全重⇒ALL_SEEN;无采样⇒ALL_SEEN
+        _yn = {"pages": 4, "ok": 0}
+        if zero_yield_kind(_yn) != "FETCH_FAIL":
+            fails.append("T19a 全失败须判 FETCH_FAIL: %s" % zero_yield_kind(_yn))
+        if zero_yield_kind({"pages": 4, "ok": 1}) != "ALL_SEEN":
+            fails.append("T19b 抓到页但无候选须判 ALL_SEEN")
+        if zero_yield_kind({"pages": 0, "ok": 0}) != "ALL_SEEN":
+            fails.append("T19c 未采样须回落 ALL_SEEN(不得误判接口异常)")
+        if zero_yield_kind({"ok": 0}) != "ALL_SEEN":
+            fails.append("T19d 缺 pages 键须安全回落")
+        # T19e 负控:参数为 None 时须读全局 LAST_FETCH_STATS(不得抛/不得恒 FETCH_FAIL)
+        _keep_stats = dict(LAST_FETCH_STATS)
+        LAST_FETCH_STATS.update({"pages": 2, "ok": 2})
+        try:
+            if zero_yield_kind() != "ALL_SEEN":
+                fails.append("T19e 全局态读取错(应 ALL_SEEN)")
+        finally:
+            LAST_FETCH_STATS.update(_keep_stats)
+        # T19f 行为级:fetch_round 只按页取候选且保序(桩替身,零网络)
+        _calls = []
+        _g = globals()
+        _keep_fc = _g["fetch_candidates"]
+        _keep_sleep = time.sleep
+        try:
+            def _stub(session, page):
+                _calls.append(page)
+                return [{"id": page}]
+            _g["fetch_candidates"] = _stub
+            time.sleep = lambda *a, **k: None
+            _out = fetch_round("sess", [3, 1])
+            if [c["id"] for c in _out] != [3, 1]:
+                fails.append("T19f fetch_round 须按页保序取候选: %s" % _out)
+            if _calls != [3, 1]:
+                fails.append("T19f2 fetch_round 页序错: %s" % _calls)
+        finally:
+            _g["fetch_candidates"] = _keep_fc
+            time.sleep = _keep_sleep
+        # T19g 负控:重试块必须存在且受常量封顶(源码结构判据,不绑现场内容)
+        _src19 = open(os.path.abspath(__file__), encoding="utf-8").read() if os.path.exists(os.path.abspath(__file__)) else ""
+        if _src19:
+            _bb = _src19[_src19.find("def browse_batch"):_src19.find("def now_str")]
+            if "FETCH_RETRY_MAX" not in _bb:
+                fails.append("T19g 重试不得无封顶(FETCH_RETRY_MAX 未出现在 browse_batch)")
+            if "pick_session()" not in _bb:
+                fails.append("T19g2 重试须换会话(pick_session)")
+        # T19h 负控:抓取重试不得吞掉风控熔断(ABORT 分支仍须在重试后判定)
+        if _src19:
+            if _src19.find("_act ==") < 0 or "RiskAbort" not in _src19:
+                fails.append("T19h 风控熔断路径整体消失(过度删除)")
+        # T19i 守恒:零产出分列不得改变「全重仍睡 10min」语义
+        if "ZERO_FETCH_FAIL_SLEEP" not in _src19 or "_nap(600)" not in _src19:
+            fails.append("T19i 零产出双档退避缺失(FETCH_FAIL 短退避 + 全重 10min)")
+    # ---- T20 -1743 自动化授权缺失时的桥兜底(R572)
+    if not callable(globals().get("_try_bridge_open_main_tab")):
+        fails.append("T20 桥兜底内核缺席(_try_bridge_open_main_tab)")
+    else:
+        _src20 = open(os.path.abspath(__file__), encoding="utf-8").read() if os.path.exists(os.path.abspath(__file__)) else ""
+        if "window.open('https://linux.do/'" not in _src20:
+            fails.append("T20a 桥兜底须用 window.open 打开主站 URL")
+        _g20 = globals()
+        _k_ls, _k_rj, _k_sl = _g20["list_sessions"], _g20["run_js"], time.sleep
+        try:
+            _g20["list_sessions"] = lambda *a, **k: [{"id": "s1", "url": "https://linux.do/t/x"}]
+            _g20["run_js"] = lambda sid, code, timeout=15: {"ok": True}
+            time.sleep = lambda *a, **k: None
+            _ok20, _n20 = _try_bridge_open_main_tab()
+            if not _ok20:
+                fails.append("T20b 有会话且 window.open 成功须判成功: %s" % _n20)
+            _g20["run_js"] = lambda sid, code, timeout=15: {"ok": False}
+            if _try_bridge_open_main_tab()[0]:
+                fails.append("T20c window.open 失败不得判成功")
+            _g20["list_sessions"] = lambda *a, **k: []
+            if _try_bridge_open_main_tab()[0]:
+                fails.append("T20d 无会话不得判成功")
+        finally:
+            _g20["list_sessions"], _g20["run_js"], time.sleep = _k_ls, _k_rj, _k_sl
+        # T20e -1743 须真触发兜底(桩 osascript 恒失败 + 桩兜底计数)
+        _k_run20 = _g20["subprocess"].run
+        _k_bo20 = _g20["_try_bridge_open_main_tab"]
+        _called = {"n": 0}
+
+        class _R20:
+            returncode = 1
+            stdout = ""
+            stderr = "未获得授权将Apple事件发送给Google Chrome (-1743)"
+
+        def _stub_bo():
+            _called["n"] += 1
+            return True, "stub 桥兜底"
+
+        try:
+            _g20["subprocess"].run = lambda *a, **k: _R20()
+            _g20["_try_bridge_open_main_tab"] = _stub_bo
+            _ke, _ne = try_ensure_tab(now=time.time() + 10 ** 6, max_per_day=99, min_gap_s=0)
+            if _called["n"] != 1:
+                fails.append("T20e -1743 须触发桥兜底(调用%d次)" % _called["n"])
+            if not _ke:
+                fails.append("T20e2 兜底成功时 try_ensure_tab 须返回 ok=True: %s" % _ne)
+        finally:
+            _g20["subprocess"].run = _k_run20
+            _g20["_try_bridge_open_main_tab"] = _k_bo20
     cases += 1
 
     return fails, cases
