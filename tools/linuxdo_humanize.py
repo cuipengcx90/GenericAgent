@@ -242,14 +242,24 @@ def scrolls_after(kind, rng=None):
     return r.randint(lo, hi) if kind != "browse" else r.randint(1, 3)
 
 
-def action_gap(kind, rng=None, base=None):
-    """两次同类动作之间的人类化间隔：内核 base × 抖动，另有起身长休。"""
+def action_gap(kind, rng=None, base=None, cap=None):
+    """两次同类动作之间的人类化间隔:内核 base × 抖动,另有起身长休。
+
+    cap:单次间隔上限(秒),默认 None=不设限。R574:段内帖间间隔必须传 cap —
+    旧实现无上限,当 base 取内核长休档(300–600s)时 6% 起身分支可单次睡到
+    base×12=2h,与段预算 6–8 段 × 85–160min 的段级节律直接冲突(段内出现 2h
+    静默,守护按 age 判停滞→误重启)。段级长休归 SESSION_REST,不在帖间叠加。
+    """
     r = _rng(rng)
     if base is None:
         base = 300.0
     if r.random() < 0.06:                                  # 起身/走开
-        return round(_lognormal(r, base * 3.5, 0.5, base * 1.5, base * 12.0), 1)
-    return round(base * _lognormal(r, 1.0, 0.22, 0.82, 1.6), 1)
+        v = round(_lognormal(r, base * 3.5, 0.5, base * 1.5, base * 12.0), 1)
+    else:
+        v = round(base * _lognormal(r, 1.0, 0.22, 0.82, 1.6), 1)
+    if cap is not None and v > cap:
+        v = float(cap)
+    return v
 
 
 def pose(kind, n_chars=0, rng=None):

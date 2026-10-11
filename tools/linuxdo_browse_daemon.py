@@ -201,6 +201,7 @@ CONNECT_ITEM_MAP = (
     (5, 20, "获赞"),
 )
 BATCH_GAP_MULT = 1.5                    # 批间休息 = 内核 gap_long 档 ×1.5（同一来源的批级放大）
+POST_GAP_CAP_S = 900.0                   # R574:段内帖间单次睡眠硬上限(15min);段级长休归 SESSION_REST
 SESS_RETRY_MAX = 8                      # pick_session/判级连续失败达上限才退出
 SESS_RETRY_SHORT = (20, 40)             # 首段短退避（秒）：覆盖 Chrome 冷启动/扩展重连成
 SESS_RETRY_SHORT_MAX = 6                # 前 N 次用短退避，之后转长退避
@@ -1713,7 +1714,9 @@ def browse_batch(session, st, batch=25):
             skipped += 1
         # 帖间随机间隔（防检测核心）：统一走 humanize，含 25-35% 长休
         _base_gap = _ad.gap_seconds("browse") if _ad is not None else random.uniform(*GAP_RANGE)
-        time.sleep(hu.action_gap("browse", base=_base_gap))
+        # ★R574 段内帖间间隔硬上限:内核长休档(base 300-600s)×0.06 起身分支曾可单次睡到
+        #   base×12=2h ⇒ 段内出现 2h 静默,既破坏 6-8 段×85-160min 节律也触发守护误重启。
+        time.sleep(hu.action_gap("browse", base=_base_gap, cap=POST_GAP_CAP_S))
     return done, skipped
 
 
