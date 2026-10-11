@@ -253,7 +253,7 @@
    "id": "R483-A18",
    "cls": "COUNT",
    "check": "count_consistency",
-   "status": "ACTIVE",
+   "status": "CLOSED",
    "params": {
     "file": "memory/global_mem_insight.txt",
     "count_line_regex": "targets 44→(\\d+)",
@@ -264,7 +264,20 @@
      "path": "targets"
     }
    },
-   "note": "R483 行「判据表 targets 44→45（新增 kind=retention=rolling_source_retention）」的终值须等于判据表 targets 数组长度。"
+   "note": "★R573 起 targets=46(新增 sche=linuxdo_nightly_report)⇒本断言转 CLOSED(该 L1 行为 R483 时点快照),当前值由 R573-A19 守。原注: R483 行「判据表 targets 44→45（新增 kind=retention=rolling_source_retention）」的终值须等于判据表 targets 数组长度。"
+  },
+  {
+   "id": "R573-A19",
+   "cls": "COUNT",
+   "check": "count_consistency",
+   "status": "ACTIVE",
+   "params": {
+    "file": "memory/global_mem_insight.txt",
+    "count_line_regex": "targets 45→(\\d+)",
+    "claim_take": "first",
+    "count_source": {"kind": "json_len", "file": "tools/freshness_criteria.json", "path": "targets"}
+   },
+   "note": "R573 行「判据表 targets 45→46(新增 sche=linuxdo_nightly_report)」的终值须等于判据表 targets 数组长度。"
   }
  ]
 }
