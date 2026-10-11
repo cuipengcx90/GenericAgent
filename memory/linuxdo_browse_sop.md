@@ -207,3 +207,18 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 **铁律**:外部命令的 rc 不可当能力可用证据(-1743 是「没权限」不是「session 忙」);
 重试必须与风控信号互斥(升级失败不得绕过熔断);「跑而不产出」要能在台账上区分「坏」与「正常空」。
+## 段内帖间长睡上限 900s(R574,2026-10-11)
+
+**机制**:帖间 `time.sleep(hu.action_gap("browse", base=内核gap))`;`action_gap` 在 6% 的
+「起身/走开」分支返回 `_lognormal(..., base*12.0)` ⇒ 内核抽到长休档(300–600s)时**单次可睡 2h**,
+与段预算(段长 85–160min)直接冲突,并逼近 watchd 停滞阈值。
+
+**修**:`tools/linuxdo_humanize.py: action_gap(kind, rng, base, cap=None)`——超 `cap` 即截断
+(默认 None=行为不变);`tools/linuxdo_browse_daemon.py` 新增 `POST_GAP_CAP_S = 900.0` 并在帖间传
+`cap=POST_GAP_CAP_S`。**段级长休归内核 `day_segments`/`SESSION_REST`,不在帖间叠加**。
+
+**证据**:humanize selftest 25/25、daemon selftest 38/38;蒙特卡洛 20000 次(同 RNG 序列):
+修复前 max 6236s / 2.35% >900s / 136 次 >1800s ⇒ 修复后 max 900s / 0% / 0。
+
+**判据**:`tools/linuxdo_browse_daemon.py status` 看 `segments.rests[].minutes`,以及
+`browse_log.jsonl` 相邻 `DONE` 行时间差(段内单次 ≥15min 即为回归)。
