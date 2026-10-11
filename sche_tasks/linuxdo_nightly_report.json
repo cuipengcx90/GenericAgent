@@ -1,0 +1,7 @@
+{
+  "schedule": "08:30",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 4,
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\nL站浏览栈「早间稳定性汇报」。本任务**纯本地只读**——不访问任何站点、不改任何状态、不重启任何进程;判定全由脚本确定性完成,零站点请求。\n\n1) 【跑脚本】shell 执行:\n   python3 tools/linuxdo_nightly_report.py run --window-hours 16\n   脚本只读本地文件(temp/linuxdo_browse_daemon/ 下的 browse_log.jsonl、watchd.jsonl、risk_log.jsonl、level_log.jsonl、ensure_tab.jsonl、state.json、heartbeat.json),把过去 16 小时的浏览产出/自愈重启/桥可达/风控/补标签/等级 汇总成一段话,末尾给结论行(OK/WARN/ALERT)。脚本自带幂等:当日已汇报则只打印「跳过推送」不改状态;首次执行会发一条飞书私信并把结果追加到 temp/linuxdo_nightly/ledger.jsonl(仅真推送成功才追加 sent=true 行)。\n\n2) 【报告内容】把脚本 stdout **原样**贴进报告(含标题行/各项统计/结论行)。禁止改写数值、禁止自己下别的结论、禁止用 web_scan/web_execute_js 去站点复核。\n\n3) 【按结论处理】\n   - OK:健康,报告里说明「无异常」即可,无需其他动作。\n   - WARN/ALERT:在报告里单列一行「需关注:<脚本结论行原文>」。**不要**自行重启守护、不要改随机节奏参数、不要补做浏览——守护自愈由 watchd 负责,重启/恢复它已另行告警。\n\n4) 【禁止】禁止访问 linux.do / connect.linux.do 或新开任何站点 tab;禁止手工重启看门狗;禁止修改随机节奏参数;禁止额外推送无关通知。\n\n5) 结论写入报告路径即可。\n"
+}
