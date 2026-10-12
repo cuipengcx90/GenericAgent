@@ -82,6 +82,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 - **深浅分层**：真人不是每帖都读到底。daemon `browse_one` 内置浅读分支（`LIGHT_P=0.25`，等效文本量×0.35、屏幅×1.3–1.8、停顿×0.5、驻留封顶 25s、不回滚；★2026-10-05 17:02 起由 humanize 生成，原「快滚 4–6 屏、驻留 15–30s」为旧口径，现行见文末「口径订正」节），其余 75% 沿用深读；`browse_log.jsonl` 每行带 `mode=LIGHT/DEEP` 字段。
 - **判读口径**：浅读帖照样计入浏览话题数（主指标不受损），但 posts_read（楼数）偏少——这是预期行为不是漏报，勿当故障修。
+- **三个计数器的对应关系（R576c 澄清，2026-10-12 用户提问）**：L站 connect 页/等级页的「浏览话题」= 进入过的**话题数**（一个 URL 话题算 1）；「浏览帖子」= Discourse `posts_read_count`，即**楼层数**（话题内每个回复楼层算 1）——页面用词「帖子」易被误读成帖数，实为楼数。判据：10-12 实测 topics +102 而 posts +818，差 8 倍，posts 不可能与话题同量级。daemon 台账字段名固定 `topics`(话题) / `posts`(楼层)，`temp/linuxdo_floor_ledger.py` 表头用「浏览话题 / 浏览帖子」与页面逐字对齐。
 - **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
 - 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
 
@@ -258,11 +259,14 @@ return JSON.stringify({fail:true,now:location.pathname});
 | `gap_long` / `gap_long_p` 长休区间/概率 | 300–600 / 0.30 | lo≥60 / 0–1 |
 | `batch_gap` 批间休息(秒) | gap_long×1.5 | lo≥30 |
 | `daily_cap` 每日上限 | 约 200 | 1–800(不写 state 的正常日 cap) |
+| `daily_cap_jitter` turbo 日 cap 抖动(±帖) | 0(缺省=不摇) | 0–200 |
 | `deep_cap_s` 深读停留封顶 | 150 | 30–150 |
 | `light_p` 浅读比例 | 0.25 | 0–0.7 |
 | `stay_s` 底部驻留(秒) | 2–10 | 0–300 |
 | `rollback` 深读回滚步数(false=关) | 10 | 0–10 |
 | `pause_scale` 滚动停顿缩放 | 1.0 | 0.4–1.0 |
+
+**turbo 日 cap 的随机化(R576c,2026-10-12)**:只配 `daily_cap` 时该值**每天恒定**(如 600 就天天 600,是可被识别的机械特征);补配 `daily_cap_jitter:60` 后按 `sha1("turbo-cap|<当日>")` 派生当日 cap(600±60),**同一天内恒定、跨重启不重置**(与内核 `day_segments` 同款日期种子法),且**不写 `state["cap"]`**(正常档 cap 不受污染)。实盘校验:`python3 -c "...; print(m._cap_today({}, 200, m.turbo_cfg()))"` 当日得 551;自测 T21b6 系列断言区间/同日稳定/jitter=0 回 600/14 天 ≥3 种取值。
 
 **turbo 不介入**:风控熔断、休息日、静默窗、段预算、前台保护、会话自愈、分类偏好,以及深浅读的**分层逻辑本身**(`light_p` 只调浅读比例,属用户授权的「临时提速可调开关」)。守法方式:自测 T21j 用 AST 断言 `turbo_cfg()` 只出现在 `_batch_gap/browse_one/browse_batch/watch` 四处白名单且父节点形态固定(赋值或 `_turbo_base_gap`/`_cap_today` 参数),T21j2 另检 12 个闸门函数源码不含 turbo;评审曾复现「在 watch 段闸门加 `and not turbo_cfg()`」旧断言抓不到,现已变红。
 
