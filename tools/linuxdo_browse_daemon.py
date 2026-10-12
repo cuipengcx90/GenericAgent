@@ -291,6 +291,7 @@ TURBO_RANGE_BOUNDS = {"gap": (15.0, 3600.0), "gap_long": (60.0, 7200.0),
                       "batch_gap": (30.0, 7200.0), "stay_s": (0.0, 300.0)}
 # 标量旋钮的硬边界
 TURBO_SCALAR_BOUNDS = {"gap_long_p": (0.0, 1.0), "daily_cap": (1, 800),
+                       "daily_cap_jitter": (0, 200),
                        "deep_cap_s": (30.0, 150.0), "light_p": (0.0, 0.7),
                        "pause_scale": (0.4, 1.0), "rollback": (0, 10)}
 _TURBO_STATE = {"sig": None, "cfg": None, "exp": None, "last": None}
@@ -476,10 +477,18 @@ def _turbo_base_gap(tc):
 
 
 def _cap_today(st, base, tc):
-    """今日 cap：turbo 配置了 daily_cap 就用它（不写 state，正常日 cap 不被污染）；否则走原逻辑。"""
-    if tc and tc.get("daily_cap"):
-        return int(tc["daily_cap"])
-    return daily_cap_today(st, base)
+    """今日 cap：turbo 配了 daily_cap 就用它；另配 daily_cap_jitter 时按「日期种子」当日摇一次
+    （同内核 day_segments 的确定性派生 ⇒ 重启不重置、当天稳定），并**不写 state["cap"]**，
+    正常日 cap 不被污染；未配 turbo 走原逻辑。"""
+    if not (tc and tc.get("daily_cap")):
+        return daily_cap_today(st, base)
+    cap = int(tc["daily_cap"])
+    jit = int(tc.get("daily_cap_jitter") or 0)
+    if jit <= 0:
+        return cap
+    _sd = hashlib.sha1(("turbo-cap|%s" % today()).encode("utf-8")).hexdigest()
+    rnd = random.Random(int(_sd[:16], 16))
+    return max(1, cap + rnd.randint(-jit, jit))
 
 
 def _bridge(payload, timeout=90):
@@ -3039,8 +3048,8 @@ def _selftest_impl():
         return time.strftime(_fmt, time.localtime(time.time() + days * 86400))
     _T3 = {"enabled": True, "expires_at": _in(3), "note": "selftest",
            "gap": [20, 45], "gap_long": [90, 180], "gap_long_p": 0.05,
-           "batch_gap": [120, 180], "daily_cap": 600, "deep_cap_s": 60,
-           "light_p": 0.5, "stay_s": [2, 2], "rollback": False, "pause_scale": 0.6}
+           "batch_gap": [120, 180], "daily_cap": 600, "daily_cap_jitter": 60,
+           "deep_cap_s": 60, "light_p": 0.5, "stay_s": [2, 2], "rollback": False, "pause_scale": 0.6}
     if os.path.exists(_tp):
         os.remove(_tp)
     if turbo_cfg() is not None:
@@ -3064,10 +3073,27 @@ def _selftest_impl():
         if sum(float(p["pause"]) for p in _pl) > 60 + 0.5 * len(_pl):
             fails.append("T21b5 深读封顶/停顿缩放未生效: %.1f" % sum(float(p["pause"]) for p in _pl))
         _stc = {"cap": {today(): 111}}
-        if _cap_today(_stc, 200, _tc) != 600 or _stc["cap"][today()] != 111:
-            fails.append("T21b6 turbo cap 须生效且不写正常日 cap: %s" % _stc)
+        _ct = _cap_today(_stc, 200, _tc)
+        if not (540 <= _ct <= 660) or _stc["cap"][today()] != 111:
+            fails.append("T21b6 turbo cap 须在 base±jitter 内且不写正常日 cap: %s -> %s" % (_stc, _ct))
+        if _cap_today(_stc, 200, _tc) != _ct:
+            fails.append("T21b6b turbo cap 须当天稳定（同日多次调用同值）")
+        if _cap_today({"cap": {today(): 111}}, 200, dict(_tc, daily_cap_jitter=0)) != 600:
+            fails.append("T21b6c jitter=0 须回固定 base 值")
+        _orig_today = globals()["today"]
+        try:
+            _vals = set()
+            for _d in range(1, 15):
+                globals()["today"] = (lambda dd: (lambda: "2026-11-%02d" % dd))(_d)
+                _vals.add(_cap_today(_stc, 200, _tc))
+        finally:
+            globals()["today"] = _orig_today
+        if len(_vals) < 3:
+            fails.append("T21b6d turbo cap 须按日摇动（14 天仅 %d 种取值）" % len(_vals))
         if _cap_today(_stc, 200, None) != 111:
             fails.append("T21b7 无 turbo 须走原 cap 逻辑")
+        if _cap_today({"cap": {today(): 999}}, 200, None) != 999:
+            fails.append("T21b7b 正常日已有 cap 须沿用（跨重启稳定）")
     _w(dict(_T3, expires_at=_in(-0.001)))
     if turbo_cfg() is not None:
         fails.append("T21c 已到期须=正常模式（负控）")
