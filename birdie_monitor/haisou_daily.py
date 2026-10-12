@@ -73,6 +73,18 @@ STATIC_KEYWORDS = [
     "AI自媒体", "AI副业", "AI变现", "AI短视频变现",
     "AI绘画变现", "AI数字人", "AI漫剧", "AI口播",
 ]
+# ---- 静态词优先级分层(2026-10-12 R575:修「搜出来全是 AI 副业/AI 自媒体」)----
+# 用户口径:AI Agent / AI Coding / AI 应用开发 是主诉求;变现/自媒体面(下方 8 词)
+# 虽有关注但优先级低。旧行为=静态词按游标**等权**轮转 ⇒ 变现/自媒体面词更泛、命中更多,
+# 在同额预算里刷屏(实测 2026-10-12 当日 47 条新增 100% 来自 AI自媒体/AI副业)。
+# 现改为「核心词重复 CORE_WEIGHT 次 + 低优先面 1 次」的任务序列 ⇒ 同样预算窗口里
+# 核心面被搜到的频次是低优先面的 CORE_WEIGHT 倍;低优先面仍会被轮转到,只是降频。
+PRIORITY_LOW = {
+    "AI自媒体", "AI副业", "AI变现", "AI短视频变现",
+    "AI绘画变现", "AI数字人", "AI漫剧", "AI口播",
+}
+PRIORITY_ENABLED = True   # 分层总开关(自测期间关闭,分层行为由 T14 单独覆盖)
+CORE_WEIGHT = int(os.environ.get("HAISOU_CORE_WEIGHT", "3"))   # 核心:低优先 频次比 3:1
 PLATFORMS = ("quark", "baidu", "ali")
 LINK_TEMPLATES = {
     "quark": "https://pan.quark.cn/s/{code}",
@@ -116,6 +128,39 @@ def next_dyn_index(dyn_total, head, dyn_start):
     if dyn_total <= 0 or dyn_total <= head:
         return 0
     return (int(dyn_start or 0) + head) % dyn_total
+
+
+def build_static_tasks(static_kws, platforms, enabled=True, core_weight=CORE_WEIGHT,
+                       low_words=None):
+    """静态任务表的优先级分层(纯函数,2026-10-12 R575)。
+
+    返回 [(keyword, platform, False, None)]:核心词重复 core_weight 次,低优先面
+    (变现/自媒体,PRIORITY_LOW)恒 1 次并**等距插入**核心序列 ⇒ 长期频次比 = core_weight:1,
+    且任意长度 ≥ 间隔 的游标窗口内低优先占比稳定(不会整窗落进变现面)。
+    其余情况与旧实现逐字一致:enabled=False、分层无意义(全核心/全低优先)时返回原表。
+    """
+    tasks = [(kw, pf, False, None) for kw in static_kws for pf in platforms]
+    if not enabled:
+        return tasks
+    low_set = PRIORITY_LOW if low_words is None else set(low_words)
+    core = [kw for kw in static_kws if kw not in low_set]
+    low = [kw for kw in static_kws if kw in low_set]
+    if not core or not low:
+        return tasks
+    rep = max(1, int(core_weight))
+    core_tasks = [(kw, pf, False, None) for _ in range(rep) for kw in core for pf in platforms]
+    low_tasks = [(kw, pf, False, None) for kw in low for pf in platforms]
+    # 等距插入(2026-10-12):若把 low 整块放尾部,短游标窗口(static_daily=15)会整窗落进低优先块
+    # ⇒ 那些天仍「全是变现」。等距后任意长度 ≥ step 的窗口占比稳定,长期占比 = len(low)/total。
+    total = len(core_tasks) + len(low_tasks)
+    step = total / float(len(low_tasks))
+    out, li = [], 0
+    for t in core_tasks:
+        out.append(t)
+        while li < len(low_tasks) and len(out) >= round((li + 1) * step):
+            out.append(low_tasks[li]); li += 1
+    out.extend(low_tasks[li:])
+    return out
 
 
 def load_cursor():
@@ -410,7 +455,7 @@ def run(max_tasks=None, static_daily=None):
     if len(static_kws) != t0:
         print(f"[方向查询门] 静态词过滤: {t0} -> {len(static_kws)}（{t0 - len(static_kws)} 个非应用向词跳过）")
     dyn_quark = [(d["query"], "quark", True, d["title"]) for d in dynamic]
-    static_tasks = [(kw, pf, False, None) for kw in static_kws for pf in PLATFORMS]
+    static_tasks = build_static_tasks(static_kws, PLATFORMS, enabled=PRIORITY_ENABLED)
     dyn_other = [(d["query"], pf, True, d["title"])
                  for pf in DYNAMIC_PLATFORM_ORDER[1:] for d in dynamic]
     total = len(dyn_quark) + len(static_tasks) + len(dyn_other)
@@ -634,7 +679,7 @@ def _selftest():
         td = Path(td)
         saved = {k: globals().get(k) for k in
                  ("STATE_PATH", "CURSOR_PATH", "PROGRESS_LOG_PATH", "DYNAMIC_KEYWORDS_PATH", "keys",
-                  "AI_GATE_ENABLED", "DIRECTION_GATE_ENABLED")}
+                  "AI_GATE_ENABLED", "DIRECTION_GATE_ENABLED", "PRIORITY_ENABLED")}
         globals()["STATE_PATH"] = td / "state.json"
         globals()["CURSOR_PATH"] = td / "cursor.json"
         globals()["PROGRESS_LOG_PATH"] = td / "progress.jsonl"
@@ -643,6 +688,9 @@ def _selftest():
         # 全部打成"空结果"⇒ 自测期间关闸，门控行为由 T11 用单元判据单独覆盖。
         globals()["AI_GATE_ENABLED"] = False
         globals()["DIRECTION_GATE_ENABLED"] = False   # 方向门行为由 T12 用合成语料单独覆盖
+        # 静态词优先级分层(2026-10-12 R575)改变静态任务表长度 ⇒ 自测期关掉,
+        # 保 T1–T13 预算/轮转断言逐字不变;分层行为由 T14 用纯函数单独覆盖
+        globals()["PRIORITY_ENABLED"] = False
         # 自测零网络：run() 会查站点额度接口，此处一律桩替（sandbox 结束由 saved 还原）
         saved["fetch_quota"] = globals().get("fetch_quota")
         globals()["fetch_quota"] = lambda session: {"daily_quota": 200, "remaining_today": 100,
@@ -960,6 +1008,36 @@ def _selftest():
        and _argv_error(["x.py", "--max-tasks", "9"]) is None
        and _argv_error(["x.py", "--selftest"]) is None
        and _argv_error(["x.py", "--max-tasks"]) is not None)
+    # T14 静态词优先级分层(2026-10-12 R575:用户「搜出来全是 AI 副业/AI 自媒体」)
+    _core = [k for k in STATIC_KEYWORDS if k not in PRIORITY_LOW]
+    _low = [k for k in STATIC_KEYWORDS if k in PRIORITY_LOW]
+    ck("T14 生产默认开分层", globals().get("PRIORITY_ENABLED") is True)
+    ck("T14 低优先面=变现/自媒体 8 词", len(_low) == 8 and len(_core) == len(STATIC_KEYWORDS) - 8)
+    _off = build_static_tasks(STATIC_KEYWORDS, PLATFORMS, enabled=False)
+    _on = build_static_tasks(STATIC_KEYWORDS, PLATFORMS, enabled=True, core_weight=3)
+    ck("T14 关闸=旧行为逐字一致",
+       _off == [(k, p, False, None) for k in STATIC_KEYWORDS for p in PLATFORMS])
+    ck("T14 开闸词集不增不减", {t[0] for t in _on} == set(STATIC_KEYWORDS))
+    _rep = 3
+    ck("T14 总长=核心x{0}x平台+低优先x平台".format(_rep),
+       len(_on) == len(_core) * 3 * _rep + len(_low) * 3)
+    _idx = [i for i, t in enumerate(_on) if t[0] in PRIORITY_LOW]
+    _step = round(len(_on) / float(len(_idx)))
+    ck("T14 低优先面等距插入(相邻间隔近似恒定,round 累积允许差 1)",
+       len(_idx) == len(_low) * 3
+       and all(b - a in (_step - 1, _step, _step + 1) for a, b in zip(_idx, _idx[1:])))
+    _w = 15
+    _sh = [sum(1 for i in range(o, o + _w) if _on[i % len(_on)][0] in PRIORITY_LOW) / float(_w)
+           for o in range(len(_on))]
+    ck("T14 任意 15 长游标窗口低优先占比稳定(0<占比<=25%)",
+       min(_sh) > 0 and max(_sh) <= 0.25)
+    ck("T14 频次比=3:1(长期)",
+       sum(1 for t in _on if t[0] not in PRIORITY_LOW) == 3 * len(_core) * 3
+       and sum(1 for t in _on if t[0] in PRIORITY_LOW) == len(_low) * 3)
+    ck("T14 全核心/全低优先=>原表",
+       build_static_tasks(_core, PLATFORMS, core_weight=3) == [(k, p, False, None) for k in _core for p in PLATFORMS]
+       and build_static_tasks(_low, PLATFORMS, core_weight=3) == [(k, p, False, None) for k in _low for p in PLATFORMS])
+
     ok = sum(1 for _, c in checks if c)
     print(f"\nselftest: {ok}/{len(checks)} checks passed")
     return 0 if ok == len(checks) else 1

@@ -132,3 +132,31 @@ selftest 曾**在进程内**经 `cmd_match→db_build()` 默认参数真写生�
 2. spawn 的子进程（render/db）显式带 `COURSE_DB=<tmp>/...`，不依赖继承；
 3. 负控 T84＝自测前后对生产库做指纹（size+mtime+sha256）比对，不一致即 FAIL——防复发靠断言不靠自觉。
 4. 现场 A/B（2026-10-06）：pre-fix 版对生产库副本 sha 变 + courses 215→2；fixed 版 sha 不变 + 84/84。
+
+## 十一、主题优先级分层(2026-10-12 R575)
+
+**起因(用户)**:「网盘搜索(海搜+盘搜)每日任务优先级有问题,最近搜出来的全是 AI 副业 / AI 自媒体;
+这块我有关注但优先级低。我刚开始关注的是 AI Agent、AI Coding、AI 应用开发。」
+盘搜侧**症状**:当日 6 条 = 2 编程 + 2 副业 + 2 漫剧,低优先面占比过高。
+
+**根因**:`TOPICS` 四组**等权顺序** + 每词同一 `--max-per-kw`,而变现/自媒体组
+(`ai_solo`)天然高产(10-11 raw 逐词:AI 一人公司 46 / AI 工具变现 36 / AI 副业 15 条合格),
+把核心面挤到后面。
+
+**实现(排序 + 条数预算,不另发请求)**=`tools/pan_search.py` 模块级常量:
+- `PRIORITY_CORE = ["ai_coding"]`(排最前)、`PRIORITY_LOW = ["ai_solo"]`(排最后);
+- `LOW_PER_KW = 3`:低优先主题**每词**保留上限(默认 cap 的缩小档),经纯函数 `per_kw_cap()` 取;
+- 纯函数 `topic_order(keys)` / `per_kw_cap(topic, cap)` 供自测;开关 `PAN_PRIORITY=0` 关闭(逐字回旧等权行为);
+- `ai_coding` 词表补 `AI Agent` / `AI 智能体` / `AI 应用开发`(用户点名的核心面,原先 `ai_coding` 缺这三词)。
+
+**A/B(离线重算 10-11 raw,含真 judge 过滤;可复跑)**:
+低优先占**总推送**比 24/86 = 27.9% → 9/71 = 12.7%;核心面 `ai_coding` 21 条不变;
+`ai_solo` 每词由 8 压到 3(AI 一人公司 46→3 / AI 副业 15→3 / AI 工具变现 36→3)。
+展示序由「coding → solo → overseas → course」改为「coding → overseas → course → solo」。
+
+**判据(可复跑)**:`python3 tools/pan_search.py selftest` ⇒ 43/43(位置子命令,**写 `--selftest` 只打 usage rc=2**)。
+**自测沙箱**:selftest 会把 `TEMP` 重定向到临时目录并在 finally 还原,
+负控 E0/E/E1 断言生产 `temp/pan_search/` 指纹前后一致(防夹具 raw 写进生产)。
+
+**归属边界**:本批只声明「排序与每词预算已改 + 离线 A/B 已算 + 自测通过」,
+**不**主张「当日推送构成已改变」——真实构成见下一轮 11:45 定时的 done 报告。

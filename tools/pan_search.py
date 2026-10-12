@@ -67,12 +67,48 @@ CHANNELS = (
 
 # 默认主题（用户定义的关注面：AI coding / AI 一人公司 / AI 出海）
 TOPICS = {
-    "ai_coding": ["AI coding", "Claude Code", "Cursor", "AI 编程"],
+    # 核心面(用户 2026-10-12 明确最高优先):AI Agent / AI Coding / AI 应用开发
+    "ai_coding": ["AI coding", "Claude Code", "Cursor", "AI 编程",
+                  "AI Agent", "AI 智能体", "AI 应用开发"],
     "ai_solo": ["AI 一人公司", "AI 副业", "AI 独立开发", "AI 工具变现"],
     "ai_overseas": ["AI 出海", "AI 产品出海", "出海营销", "跨境电商 AI"],
     "ai_course": ["AI 教程", "大模型 课程", "AI 实战"],
 }
 DEFAULT_TOPICS = ",".join(TOPICS.keys())
+
+# ------------------------------------------------ 主题优先级分层(2026-10-12 R575)
+# 起因:每日盘点里 ai_solo(变现/自媒体)条目刷屏、把核心面挤到后面;用户定义
+# 优先级 = AI Agent / AI Coding / AI 应用开发(高) > AI 出海/课程(中) >
+# AI 副业·一人公司·自媒体变现(低,「有关注但优先级低」)。
+# 实现 = **排序 + 条数预算**,不做「重复搜索」——PanSou 是搜索接口且带 seen 去重,
+# 同一关键词搜两遍第二遍必然 0 新增,重复只会白烧请求(与 haisou 的 3:1 权重
+# 机制形态不同,勿照抄回去)。
+PRIORITY_CORE = ["ai_coding"]   # 排最前
+PRIORITY_LOW = ["ai_solo"]      # 排最后 + 每词条数收紧
+LOW_PER_KW = 3                  # 低优先主题每词保留上限(默认 cap 的缩小档)
+PAN_PRIORITY_ENABLED = os.environ.get("PAN_PRIORITY", "1") != "0"
+
+
+def topic_order(keys, enabled=None):
+    """按优先级重排主题:[core] + [其余按原序] + [low](纯函数,便于自测)。"""
+    keys = [k.strip() for k in keys if k and k.strip()]
+    if enabled is None:
+        enabled = PAN_PRIORITY_ENABLED
+    if not enabled:
+        return keys
+    core = [k for k in PRIORITY_CORE if k in keys]
+    low = [k for k in PRIORITY_LOW if k in keys]
+    mid = [k for k in keys if k not in core and k not in low]
+    return core + mid + low
+
+
+def per_kw_cap(topic, cap, enabled=None):
+    """低优先主题收紧每词保留条数(纯函数)。"""
+    if enabled is None:
+        enabled = PAN_PRIORITY_ENABLED
+    if enabled and topic in PRIORITY_LOW:
+        return max(1, min(cap, LOW_PER_KW))
+    return cap
 
 # --------------------------------------------------------------- 相关性判据（单一源）
 # 复用 R441 的 haisou 判据内核（剔通用 token 取最长候选 + ASCII 词边界），
@@ -284,6 +320,7 @@ def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
     keys = (topics or DEFAULT_TOPICS).split(",")
     if any(x.strip() in ("all", "*") for x in keys):
         keys = list(TOPICS)  # --topics all 等价于全部主题
+    keys = topic_order(keys)   # ★优先级重排:核心面在前、低优先面在后
     seen = load_seen()
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime(
         "%Y-%m-%dT00:00:00")
@@ -293,6 +330,7 @@ def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
         if k not in TOPICS:
             print("[digest] 未知主题 %s（可选: %s）" % (k, ",".join(TOPICS)))
             continue
+        cap = per_kw_cap(k, max_per_kw)   # ★低优先主题收紧条数
         for kw in TOPICS[k]:
             rows = api_search(kw)
             raw[kw] = rows
@@ -314,7 +352,7 @@ def digest(topics=None, max_per_kw=8, days=14, notify=False, mark=True,
                 n_keep += 1
                 # ★只有真正进入本轮推送的才写 seen（超预算的合格条目留待下轮，
                 # 否则会被标成"已见"却从未推送 ⇒ 永久丢单）
-                if n_keep <= max_per_kw:
+                if n_keep <= cap:
                     seen[key] = now_str()
                     r["topic"] = k
                     fresh.append(r)
@@ -473,6 +511,17 @@ def _selftest():
     fp0 = _prod_seen_fingerprint()
     import tempfile
     checks = []
+    # 自测关掉优先级分层:保证 T1-T13 的 digest 行为与旧版逐字一致(分层由 T15 专测)
+    _g_prio = globals().get("PAN_PRIORITY_ENABLED", True)
+    globals()["PAN_PRIORITY_ENABLED"] = False
+    try:
+        return _selftest_impl(checks, fp0)
+    finally:
+        globals()["PAN_PRIORITY_ENABLED"] = _g_prio
+
+
+def _selftest_impl(checks, fp0):
+    import tempfile
 
     def ck(name, cond):
         checks.append((name, bool(cond)))
@@ -510,6 +559,11 @@ def _selftest():
     # 4) seen 幂等：沙箱内跑两遍同一响应，第二遍新增 0
     tmp = tempfile.mkdtemp(prefix="pansel_")
     g_seen_path = SEEN
+    # ★R575:digest 默认 cache_raw=True 会把 raw_<ts>.json 写进模块级 TEMP
+    #   (=生产 temp/pan_search/)。旧版自测未沙箱 TEMP ⇒ 实测污染 6 份 1629B 夹具 raw。
+    g_temp_prod = TEMP
+    _prod_before = _prod_temp_files()
+    globals()["TEMP"] = tmp
     try:
         globals()["SEEN"] = os.path.join(tmp, "seen.json")
         globals()["api_search"] = lambda kw, **k: [
@@ -567,7 +621,11 @@ def _selftest():
     finally:
         globals()["api_search"] = api_search
         globals()["SEEN"] = g_seen_path
+        globals()["TEMP"] = g_temp_prod
     # 负控 C：自测不得改动生产 seen（指纹前后一致）
+    ck("负控E0 沙箱生效(TEMP 已重定向)",
+       os.path.abspath(tmp) != os.path.abspath(g_temp_prod))
+    ck("负控E 自测不写生产 temp", _prod_temp_files() == _prod_before)
     ck("负控C 生产 seen 指纹未变", _prod_seen_fingerprint() == fp0)
 
     # 4b) 相关性判据（正控 + 四类负控）
@@ -598,14 +656,17 @@ def _selftest():
         import tempfile as _tf
         tmp2 = _tf.mkdtemp(prefix="panab_")
         g2 = SEEN
+        g2t = TEMP
         globals()["SEEN"] = os.path.join(tmp2, "seen.json")
+        globals()["TEMP"] = tmp2          # ★同上:raw 落盘也须进沙箱
         f5, txt5 = digest(topics="ai_overseas", days=3)
-        st5 = [s for s in [("x",)] ]  # placeholder to keep linters calm
         ck("A/B 保留 1 条(噪声被剔)", len(f5) == 1)
         ck("A/B 报告含 原始/保留 双计数", "原始" in txt5 and "保留 1 条" in txt5)
     finally:
         globals()["SEEN"] = g2
+        globals()["TEMP"] = g2t
         globals()["api_search"] = api_search
+    ck("负控E1 4c 段亦不写生产 temp", _prod_temp_files() == _prod_before)
 
     # 5) 渲染
     txt = render([], [("ai_solo", "AI 一人公司", 0, 0)])
@@ -615,11 +676,41 @@ def _selftest():
     ck("渲染含主题块", "[ai_coding]" in txt2 and "1. 【quark】T" in txt2)
     ck("渲染含统计行", "新增 1 条" in txt2)
 
+    # 15) 主题优先级分层(2026-10-12 R575):纯函数语义 + 关闸门时逐字不变
+    ck("T15a 核心面排最前",
+       topic_order(["ai_solo", "ai_course", "ai_coding"], enabled=True)[0] == "ai_coding")
+    ck("T15b 低优先面排最后",
+       topic_order(["ai_solo", "ai_course", "ai_coding"], enabled=True)[-1] == "ai_solo")
+    ck("T15c 中档保持原序",
+       topic_order(["ai_overseas", "ai_course"], enabled=True) == ["ai_overseas", "ai_course"])
+    ck("T15d 关闸门时顺序逐字不变",
+       topic_order(["ai_solo", "ai_course", "ai_coding"], enabled=False)
+       == ["ai_solo", "ai_course", "ai_coding"])
+    ck("T15e 低优先词条数收紧",
+       per_kw_cap("ai_solo", 8, enabled=True) == LOW_PER_KW
+       and per_kw_cap("ai_solo", 8, enabled=False) == 8)
+    ck("T15f 核心/中档不受条数收紧",
+       per_kw_cap("ai_coding", 8, enabled=True) == 8
+       and per_kw_cap("ai_overseas", 8, enabled=True) == 8)
+    ck("T15g 核心词面含 AI Agent/应用开发",
+       any("Agent" in w for w in TOPICS["ai_coding"])
+       and any("应用开发" in w for w in TOPICS["ai_coding"]))
+    ck("T15h 主题数仍为 4(不动既有面)",
+       len(TOPICS) == 4)
+
     bad = [n for n, ok in checks if not ok]
     for n, ok in checks:
         print("  %s %s" % ("PASS" if ok else "FAIL", n))
     print("selftest: %d/%d" % (len(checks) - len(bad), len(checks)))
     return 0 if not bad else 1
+
+def _prod_temp_files():
+    """生产 temp/pan_search 下的文件名集合(自测只读探针:断言零写入)。"""
+    try:
+        return sorted(os.listdir(TEMP))
+    except OSError:
+        return []
+
 
 def _prod_seen_fingerprint():
     if not os.path.exists(SEEN):
@@ -639,6 +730,8 @@ USAGE = """用法:
   python3 tools/pan_search.py selftest              # 自测(不联网)
 可选: --topics ai_coding,ai_solo --days 14 --max-per-kw 8 --res all
       --backlog-days 30 --backlog-max 6 | --no-backlog   # 当日零新增时的积压兜底
+  主题优先级(2026-10-12):ai_coding(核心面,含 AI Agent/应用开发)排最前、
+  ai_solo(变现/一人公司)排最后且每词条数收紧为 LOW_PER_KW;PAN_PRIORITY=0 关闭。
 """
 
 
