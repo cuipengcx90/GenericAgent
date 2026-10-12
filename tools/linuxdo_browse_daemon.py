@@ -161,10 +161,13 @@ DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固�
 #   ⇒ 帖子越小越"亏"（本机候选池中位仅 6 楼），**按楼层加权选帖**是唯一不增加访问次数的杠杆。
 FLOOR_BIAS = 0.7            # 楼层加权强度（0=旧行为纯随机；越大越偏高楼帖，仍保留随机性）
 FLOOR_CAP = 40              # 权重封顶楼层数（渲染深度有限，超出部分拿不到分）
-FLOOR_CREDIT_CAP = 40       # 记账时单帖最多按多少楼层计入（保守估计）
+FLOOR_CREDIT_CAP = 40       # 记账回退档：读帖返回值缺失时，单帖最多按多少楼层计入（保守估计）
 BIG_DEEP_MIN_POSTS = 12     # 楼层数 ≥ 此值的帖：浅读概率降到 BIG_DEEP_LIGHT_P（须读到尾部才拿满）
 BIG_DEEP_LIGHT_P = 0.12
-DAILY_FLOOR_CAP_DEFAULT = 1200   # 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）
+# ★R579 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）。
+#   2026-10-13 口径更新：候选池改混池（top×2 + latest×2）后每帖实际读到约 20 楼（旧池中位仅 4）
+#   ⇒ 原 1200 会在约 60 帖时提前熔断（此时帖配额 daily_cap=600 才用掉 10%）⇒ 默认 1200→2400（≈120 帖）。
+DAILY_FLOOR_CAP_DEFAULT = 2400
 FLOOR_STEADY_GOAL = 200          # 稳态目标楼层/日（=20000/100 天滚动窗），供账本/日报显示
 SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入迷的真人，提高占空比）
 SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
@@ -2106,12 +2109,29 @@ def floor_rank(cand):
 
 
 def floors_credit(cand):
-    """单帖计入楼层（保守估计）：min(该帖楼层数, FLOOR_CREDIT_CAP)。"""
+    """单帖计入楼层（**回退档**，保守估计）：min(该帖楼层数, FLOOR_CREDIT_CAP)。"""
     try:
         p = int((cand or {}).get("posts") or 0)
     except Exception:
         p = 0
     return max(0, min(p, FLOOR_CREDIT_CAP))
+
+
+def floors_credit_of(res, cand):
+    """★R579 楼层记账（新口径＝**实际读到的楼层**）。
+
+    优先取读帖返回值 res["posts"]（ROUTE_JS 里 = 页面上 `.topic-post` 的实测数量，
+    即本次真正渲染/读到的那部分楼层）；桥接丢返回值/超时时该键为 None，
+    回退到 floors_credit(cand)（候选列表楼层数，上限 FLOOR_CREDIT_CAP）作保守估计。
+    """
+    if isinstance(res, dict):
+        got = res.get("posts")
+        try:
+            if got and int(got) > 0:
+                return floors_credit({"posts": got})
+        except Exception:
+            pass
+    return floors_credit(cand)
 
 
 def floors_count(st):
@@ -2229,8 +2249,9 @@ def browse_batch(session, st, batch=25):
             st["seen_ids"] = (st.get("seen_ids", []) + [int(tid)])[-4000:]
             st["browsed_total"] = st.get("browsed_total", 0) + 1
             st.setdefault("daily", {})[today()] = daily_count(st) + 1
-            # ★R578 楼层记账：单帖计入 ≈ min(该帖楼层数, FLOOR_CREDIT_CAP)（保守；真值以 connect 页为准）
-            _fc = floors_credit(c)
+            # ★R579 楼层记账（新口径＝实际读到的楼层）：优先 res["posts"](.topic-post 实测数)，
+            #   取不到才回退候选列表楼层数（上限 FLOOR_CREDIT_CAP）；真值仍以 connect 页为准
+            _fc = floors_credit_of(res, c)
             st.setdefault("daily_floors", {})[today()] = floors_count(st) + _fc
             save_state(st)
         else:
@@ -3443,6 +3464,19 @@ def _selftest_impl():
             fails.append("T22k watch 须有楼层上限闸门")
         if "floor_rank(" not in _insp.getsource(browse_batch) or "BIG_DEEP_LIGHT_P" not in _insp.getsource(browse_one):
             fails.append("T22l 选帖加权/高楼帖深读须接线到 browse_batch/browse_one")
+        # T23 ★R579 楼层记账新口径（实际读到的楼层）+ 默认闸门口径
+        if floors_credit_of({"posts": 18}, {"posts": 500}) != 18:
+            fails.append("T23a 记账须优先用读帖实测楼层(18)，不得用候选列表值")
+        if floors_credit_of({"posts": 0}, {"posts": 7}) != 7:
+            fails.append("T23b 实测为 0 须回退候选楼层数")
+        if floors_credit_of({"timeout": True}, {"posts": 100}) != FLOOR_CREDIT_CAP:
+            fails.append("T23c 实测缺失须回退且受 FLOOR_CREDIT_CAP 封顶")
+        if floors_credit_of(None, {"posts": 3}) != 3 or floors_credit_of("x", {}) != 0:
+            fails.append("T23d res 非法须回退候选楼层数")
+        if DAILY_FLOOR_CAP_DEFAULT != 2400 or not (1 <= DAILY_FLOOR_CAP_DEFAULT <= 5000):
+            fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,5000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
+        if "floors_credit_of(res, c)" not in _insp.getsource(browse_batch):
+            fails.append("T23f 记账点须接线 floors_credit_of(res, c)")
     finally:
         random.setstate(_rs)
     cases += 1
