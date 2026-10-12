@@ -267,6 +267,37 @@ def diagnose(now=None, window_hours=16.0, override_procs=True):
     }
 
 
+def floor_line():
+    """楼层口径进度一（R578）：复用 temp/linuxdo_floor_ledger.py 的只读口径，失败则返回 None。
+
+    复用而非重写——「楼层/话题」口径与门槛(20000/500)只有一处定义，避免两处漂移。
+    """
+    try:
+        import importlib.util
+        p = os.path.join(ROOT, "temp", "linuxdo_floor_ledger.py")
+        spec = importlib.util.spec_from_file_location("_ldo_floor_ledger", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        _br = base_root()
+        if _br != ROOT:                     # 沙箱：只读源改指沙箱内同名相对路径
+            m.DAEMON_DIR = os.path.join(_br, "temp", "linuxdo_browse_daemon")
+            m.LEVEL_LOG = os.path.join(m.DAEMON_DIR, "level_log.jsonl")
+            m.LEDGER = os.path.join(_br, "temp", "linuxdo_floor_ledger.jsonl")
+        rows = m.all_rows()
+        if not rows:
+            return None
+        last = rows[-1]
+        if last.get("posts") is None:
+            return None
+        tab = m.daily_table(rows)
+        d_p = (tab[-1] if tab else {}).get("d_posts")
+        return "· 楼层:%d/%d(%.0f%%) 缺口 %d,今日 +%s" % (
+            last["posts"], m.GOAL_POSTS, 100.0 * last["posts"] / m.GOAL_POSTS,
+            max(0, m.GOAL_POSTS - last["posts"]), "-" if d_p is None else d_p)
+    except Exception:
+        return None
+
+
 def render(d):
     L = []
     L.append("%s L站浏览栈夜间稳定性 %s" % (ICON.get(d["verdict"], ""), d["generated"]))
@@ -292,6 +323,9 @@ def render(d):
         L.append("· 标签自愈:%d 次,末次 ok=%s(%s)" % (e["n"], e["last_ok"], (e["last_note"] or "")[:40]))
     lv = d["level"]
     L.append("· 等级:末查 %s met=%s pending=%s" % (lv.get("ts"), lv.get("met"), lv.get("pending")))
+    _fl = floor_line()          # ★R578 楼层口径（TL3 门槛真正卡的是它）
+    if _fl:
+        L.append(_fl)
     L.append("· 结论:%s" % (";".join(d["findings"]) or "窗口内一切正常"))
     return "\n".join(L)
 
@@ -448,6 +482,19 @@ def selftest():
 
     # T9 沙箱下不真发通知
     chk("T9 notify blocked in sandbox", notify("x") is False)
+
+    # T11 楼层口径行(R578):沙箱内追加 connect 读数 ⇒ floor_line 出 20000 口径、render 含该行
+    _lv = pth(LEVEL_REL)
+    os.makedirs(os.path.dirname(_lv), exist_ok=True)
+    with open(_lv, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"ts": "2026-10-11 19:30:00", "st": "OK", "source": "connect",
+                            "met": 11, "pending": 1,
+                            "items": [{"met": True, "name": "16202/ 20000"},
+                                      {"met": True, "name": "1182/ 500"}]},
+                           ensure_ascii=False) + "\n")
+    _fl = floor_line()
+    chk("T11 floor_line 20000 口径", bool(_fl) and "20000" in _fl and "16202" in _fl)
+    chk("T11b render 含楼层行", "楼层:" in render(d))
 
     # T10 空目录(源全缺)不崩且不判 OK
     td2 = tempfile.mkdtemp(prefix="ljq_nightly_st2_")

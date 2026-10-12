@@ -155,6 +155,17 @@ LIGHT_DWELL = (15, 30)      # 浅读驻留秒
 BATCH_DEFAULT = 20
 DAILY_CAP_DEFAULT = 200
 DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固定同一数字=机械特征
+# ★R578 楼层口径（2026-10-12 用户口径对齐）：TL3 门槛「浏览帖子 20000」= **楼层数**（connect 页脚注
+#   逐字「以上"话题"指主帖，"帖子"即传统意义的回复」），100 天滚动窗 ⇒ 稳态需 ≈200 楼层/日(=20000/100)。
+#   实测每帖计入楼层 ≈ min(渲染到的末楼, 该帖楼层数)：当日 45 帖 mean min(posts,20)=7.6 ≈ 当日 楼层/话题 7.9
+#   ⇒ 帖子越小越"亏"（本机候选池中位仅 6 楼），**按楼层加权选帖**是唯一不增加访问次数的杠杆。
+FLOOR_BIAS = 0.7            # 楼层加权强度（0=旧行为纯随机；越大越偏高楼帖，仍保留随机性）
+FLOOR_CAP = 40              # 权重封顶楼层数（渲染深度有限，超出部分拿不到分）
+FLOOR_CREDIT_CAP = 40       # 记账时单帖最多按多少楼层计入（保守估计）
+BIG_DEEP_MIN_POSTS = 12     # 楼层数 ≥ 此值的帖：浅读概率降到 BIG_DEEP_LIGHT_P（须读到尾部才拿满）
+BIG_DEEP_LIGHT_P = 0.12
+DAILY_FLOOR_CAP_DEFAULT = 1200   # 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）
+FLOOR_STEADY_GOAL = 200          # 稳态目标楼层/日（=20000/100 天滚动窗），供账本/日报显示
 SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入迷的真人，提高占空比）
 SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
 MORNING_JITTER = (0, 3600)  # 静默窗结束后随机延迟 0–60min 再开工——真人不会每天准点开始
@@ -292,6 +303,7 @@ TURBO_RANGE_BOUNDS = {"gap": (15.0, 3600.0), "gap_long": (60.0, 7200.0),
 # 标量旋钮的硬边界
 TURBO_SCALAR_BOUNDS = {"gap_long_p": (0.0, 1.0), "daily_cap": (1, 800),
                        "daily_cap_jitter": (0, 200),
+                       "daily_floor_cap": (1, 5000),      # ★R578 楼层口径上限（TL3 门槛按楼层计）
                        "deep_cap_s": (30.0, 150.0), "light_p": (0.0, 0.7),
                        "pause_scale": (0.4, 1.0), "rollback": (0, 10)}
 _TURBO_STATE = {"sig": None, "cfg": None, "exp": None, "last": None}
@@ -344,7 +356,7 @@ def _turbo_parse(raw):
         except Exception as e:
             return None, "旋钮 %s 非法(%s)，整份配置拒绝" % (k, str(e)[:40])
         v = min(max(v, lo_b), hi_b)
-        cfg[k] = int(v) if k in ("daily_cap", "rollback") else v
+        cfg[k] = int(v) if k in ("daily_cap", "rollback", "daily_floor_cap") else v
     return cfg, "ok"
 
 
@@ -1813,7 +1825,14 @@ def _tm_probe(session):
 def browse_one(session, tid, state, cand=None):
     # 深浅分层：真人不是每帖都读到底——约三成是「刷到划走」型浅读（快滚大屏幅、不回滚、短驻留）
     tc = turbo_cfg()                                  # 临时提速配置；None=正常模式
-    light = random.random() < ((tc or {}).get("light_p") if (tc or {}).get("light_p") is not None else LIGHT_P)
+    _lp = (tc or {}).get("light_p") if (tc or {}).get("light_p") is not None else LIGHT_P
+    # ★R578：高楼帖浅读概率更低——浅读滚不到尾部，计入楼层 ≈ 渲染到的末楼（小帖无所谓，大帖亏）
+    try:
+        if int((cand or {}).get("posts") or 0) >= BIG_DEEP_MIN_POSTS:
+            _lp = min(_lp, BIG_DEEP_LIGHT_P)
+    except Exception:
+        pass
+    light = random.random() < _lp
     plan, stay, rb, pose = _browse_plan(_estimate_chars(cand), light, tc)
     plan_js = "[" + ",".join("[%s,%s]" % (p["dy"], p["pause"]) for p in plan) + "]"
     code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
@@ -2006,6 +2025,50 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
     return ok, note
 
 
+# ---------------------------------------------------------------- R578 楼层口径
+def floor_weight(c):
+    """选帖权重：楼层越多权重越大（0 楼=1.0），封顶 FLOOR_CAP。FLOOR_BIAS=0 ⇒ 恒 1.0（旧行为）。"""
+    if FLOOR_BIAS <= 0:
+        return 1.0
+    try:
+        p = int(c.get("posts") or 0)
+    except Exception:
+        p = 0
+    return (1.0 + min(max(p, 0), FLOOR_CAP)) ** FLOOR_BIAS
+
+
+def floor_rank(cand):
+    """按楼层加权做**无放回随机抽样**（Efraimidis–Spirakis: key=u**(1/w) 降序取）。
+
+    FLOOR_BIAS=0 时退化为 random.shuffle（逐字保持旧行为，可一键回退）。
+    """
+    out = list(cand)
+    if FLOOR_BIAS <= 0:
+        random.shuffle(out)
+        return out
+    return sorted(out, key=lambda c: random.random() ** (1.0 / floor_weight(c)), reverse=True)
+
+
+def floors_credit(cand):
+    """单帖计入楼层（保守估计）：min(该帖楼层数, FLOOR_CREDIT_CAP)。"""
+    try:
+        p = int((cand or {}).get("posts") or 0)
+    except Exception:
+        p = 0
+    return max(0, min(p, FLOOR_CREDIT_CAP))
+
+
+def floors_count(st):
+    return int((st.get("daily_floors") or {}).get(today(), 0))
+
+
+def floor_cap_today(st, base, tc):
+    """今日楼层上限：turbo 的 daily_floor_cap 优先，否则 base（默认 DAILY_FLOOR_CAP_DEFAULT）。"""
+    if tc and tc.get("daily_floor_cap"):
+        return int(tc["daily_floor_cap"])
+    return int(base)
+
+
 def browse_batch(session, st, batch=25):
     """浏览一批。返回 (done, skipped)"""
     LAST_FETCH_DIAG.clear()
@@ -2065,7 +2128,10 @@ def browse_batch(session, st, batch=25):
         pref_pool = [c for c in cand if c.get("cat") in pref_cats]
         other_pool = [c for c in cand if c.get("cat") not in pref_cats]
         n_pref = min(len(pref_pool), max(2, int(batch * 0.6)))
-        cand = pref_pool[:n_pref] + other_pool
+        # ★R578：板块偏好之后再做**楼层加权**（两个池各自加权，不破坏「进一个板块连看」的顺序语义）
+        cand = floor_rank(pref_pool[:n_pref]) + floor_rank(other_pool)
+    else:
+        cand = floor_rank(cand)          # ★R578 楼层加权（FLOOR_BIAS=0 时=原 random.shuffle）
     for i, c in enumerate(cand):
         if i >= batch:
             break
@@ -2106,6 +2172,9 @@ def browse_batch(session, st, batch=25):
             st["seen_ids"] = (st.get("seen_ids", []) + [int(tid)])[-4000:]
             st["browsed_total"] = st.get("browsed_total", 0) + 1
             st.setdefault("daily", {})[today()] = daily_count(st) + 1
+            # ★R578 楼层记账：单帖计入 ≈ min(该帖楼层数, FLOOR_CREDIT_CAP)（保守；真值以 connect 页为准）
+            _fc = floors_credit(c)
+            st.setdefault("daily_floors", {})[today()] = floors_count(st) + _fc
             save_state(st)
         else:
             skipped += 1
@@ -2255,7 +2324,14 @@ def watch(args):
                                     for k in ("reply", "like", "post")}), flush=True)
             _nap(3600)
             continue
-        # ---- 段级节奏（2026-10-06 R546，修 R545 缺陷①）--------------------------------
+        # ★R578 楼层上限闸门：TL3 门槛「浏览帖子」按**楼层**计，故 cap 之外再兜一层楼层口径
+        #   （turbo 可用 daily_floor_cap 覆盖；到顶即睡到明天，不额外产生访问）
+        _fcap = floor_cap_today(st, DAILY_FLOOR_CAP_DEFAULT, turbo_cfg())
+        if floors_count(st) >= _fcap:
+            print("[%s] 今日已达楼层上限=%d（今日已计 %d 楼层），睡到明天" % (
+                now_str(), _fcap, floors_count(st)), flush=True)
+            _nap(3600)
+            continue
         # 当日活动段由内核按「日期种子」确定性派生（day_segments）：守护重启/被杀不重置段位，
         # 段外一律等（不再有「段满才休息」的进程内计时器——旧实现在 9h20m 内被守护重启 35 次，
         # 段满事件几乎永不发生，长休档形同虚设）。内核缺席时回落旧行为。
@@ -3208,9 +3284,12 @@ def _selftest_impl():
     for _n in _ast.walk(_tree):
         for _c in _ast.iter_child_nodes(_n):
             _c._par = _n
-    _ALLOW = {  # 外层函数 → 父节点要求
-        "_batch_gap": ("Assign", None), "browse_one": ("Assign", None),
-        "browse_batch": ("Call", "_turbo_base_gap"), "watch": ("Call", "_cap_today"),
+    _ALLOW = {  # 外层函数 → 允许的父节点形态集合
+        # ★R578：白名单语义=「**只管浏览量的旋钮**才能吃 turbo」。daily_cap / daily_floor_cap
+        #   同属体量档（只影响今天读多少，不会削弱风控/静默窗/段闸门/前台保护），故一并列入。
+        "_batch_gap": {("Assign", None)}, "browse_one": {("Assign", None)},
+        "browse_batch": {("Call", "_turbo_base_gap")},
+        "watch": {("Call", "_cap_today"), ("Call", "floor_cap_today")},
     }
     _bad = []
     for _n in _ast.walk(_tree):
@@ -3226,7 +3305,7 @@ def _selftest_impl():
         _p = getattr(_n, "_par", None)
         _pk = type(_p).__name__
         _pn = _p.func.id if isinstance(_p, _ast.Call) and isinstance(_p.func, _ast.Name) else None
-        if not _need or _pk != _need[0] or (_need[1] and _pn != _need[1]):
+        if not _need or (_pk, _pn) not in _need:
             _bad.append("%s 内 turbo_cfg() 父节点=%s%s（line %d）" % (_fn, _pk, ("/" + _pn) if _pn else "", _n.lineno))
     if _bad:
         fails.append("T21j turbo_cfg() 出现在非白名单位置（风控/静默窗/段闸门/前台保护不得受 turbo 影响）: %s" % _bad)
@@ -3235,6 +3314,52 @@ def _selftest_impl():
                 pick_session, try_ensure_tab, note_risk):
         if "turbo" in _insp.getsource(_fn).lower():
             fails.append("T21j2 %s 不得引用 turbo" % _fn.__name__)
+    # T22 楼层口径（R578）：加权选帖 / 记账 / 上限闸门（负控=旧行为必须仍可复现）
+    _rs = random.getstate()
+    try:
+        if floor_weight({"posts": 0}) != 1.0 or not (floor_weight({"posts": 30}) > floor_weight({"posts": 3}) > 1.0):
+            fails.append("T22a floor_weight 须随楼层单调且 0 楼=1.0")
+        if abs(floor_weight({"posts": FLOOR_CAP * 3}) - floor_weight({"posts": FLOOR_CAP})) > 1e-9:
+            fails.append("T22b floor_weight 须在 FLOOR_CAP 封顶")
+        _kb = globals()["FLOOR_BIAS"]
+        globals()["FLOOR_BIAS"] = 0
+        if floor_weight({"posts": 50}) != 1.0:
+            fails.append("T22c FLOOR_BIAS=0 须回到旧行为（恒 1.0）")
+        globals()["FLOOR_BIAS"] = _kb
+        _cands = [{"id": i, "posts": (i * 7) % 40} for i in range(40)]
+        random.seed(7)
+        _fr = floor_rank(_cands)
+        if sorted(x["id"] for x in _fr) != sorted(x["id"] for x in _cands):
+            fails.append("T22d floor_rank 须是无放回重排（集合不变）")
+        _m5 = lambda xs: sum(x["posts"] for x in xs[:5]) / 5.0
+        _fsum = _rsum = 0.0
+        for _i in range(60):
+            random.seed(1000 + _i)
+            _fsum += _m5(floor_rank(_cands))
+            random.seed(1000 + _i)
+            _rsum += _m5(random.sample(_cands, len(_cands)))
+        if not (_fsum / 60.0 > _rsum / 60.0 + 1.0):
+            fails.append("T22e 楼层加权须显著偏向高楼帖: 加权 %.2f vs 随机 %.2f" % (_fsum / 60.0, _rsum / 60.0))
+        if (floors_credit({"posts": None}), floors_credit({"posts": "7"}),
+                floors_credit({"posts": 100}), floors_credit({})) != (0, 7, FLOOR_CREDIT_CAP, 0):
+            fails.append("T22f floors_credit 须 min(posts,cap) 且坏值=0")
+        if floors_count({"daily_floors": {today(): 5}}) != 5 or floors_count({}) != 0:
+            fails.append("T22g floors_count 读取/缺省")
+        if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, None) != DAILY_FLOOR_CAP_DEFAULT:
+            fails.append("T22h 无 turbo 须用默认楼层上限")
+        if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, {"daily_floor_cap": 900}) != 900:
+            fails.append("T22i turbo 须可覆盖楼层上限")
+        _wx, _ = _turbo_parse(dict(_T3, daily_floor_cap=99999))
+        if _wx is None or _wx.get("daily_floor_cap") != 5000:
+            fails.append("T22j daily_floor_cap 越界须截断到 5000: %s" % _wx)
+        _wsrc = _insp.getsource(globals()["watch"])
+        if "floor_cap_today" not in _wsrc or "floors_count(st) >= _fcap" not in _wsrc:
+            fails.append("T22k watch 须有楼层上限闸门")
+        if "floor_rank(" not in _insp.getsource(browse_batch) or "BIG_DEEP_LIGHT_P" not in _insp.getsource(browse_one):
+            fails.append("T22l 选帖加权/高楼帖深读须接线到 browse_batch/browse_one")
+    finally:
+        random.setstate(_rs)
+    cases += 1
     # T21k 观测补丁未误伤原有「楼层上报三件套」，且新增 timings 观测
     for _k in ("screen-track", "_onscreen", "__tmInterval", "dispatchEvent(new Event('scroll'))",
                "PerformanceObserver", "/topics/timings", "session:main", "set('hasFocus', true)",

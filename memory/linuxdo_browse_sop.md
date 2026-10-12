@@ -61,7 +61,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 ## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
 
 触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
-后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测（计数以最近一次运行输出为准，R576 后 39/39）；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测（计数以最近一次运行输出为准，R578 后 40/40）；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
 - 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 读帖滚动与底部驻留（★2026-10-05 17:02 起由 humanize 拟人层生成，旧口径「慢滚 22–30 步×1.4–2.0s、底驻 90–125s」已被取代，现行值见文末「口径订正」节）+ 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（内核 `daily_cap=200` ± `cap_jitter=20` ⇒ 实际 180–220，每天摇一次、跨重启稳定）+ 全天切成 `seg_n=6–8` 段 × 每段 `seg_len=85–160min`（内核 `day_segments` 日期种子派生 ⇒ 重启不重置段位；段总长 ≤ 活动窗 80%，段间随机长休 ~130–150min） + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
@@ -76,7 +76,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 - 强信号集 `RISK_STRONG` 只含 `BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED`；`CF_CHALLENGE` 刻意**不**入强信号（常见且多半自愈，否则误伤成小时级停机）。
 - **批内熔断（R563 补，2026-10-08）**：风控判定原先在 `browse_batch` **返回之后**才做 ⇒ 抓取阶段的失败诊断容易被静默吞掉，只有凑齐一个完整批后才轮到风控检查，命中窗口偏晚。10-08 实测时间线（browse_log/risk_log 原始台账）：19:55:37 开机后 daemon 起跑（watchd `DAEMON_NEVER_RUNNING` 补拉）→ 20:00–22:02 正常浏览 **20 帖**（`DONE`×20）→ **22:06:47** 抓到当日唯一一次 `FORBIDDEN page=5 status=403`（risk_log 仅此一条）⇒ `handle_risk` 暂停 → 23:20 恢复（间隔 ~74min，符合 RISK_PAUSE 60–120min）。现改为**抓取阶段**判定：`fetch_verdict()`（纯函数）在「**所有**采样页失败 ∧ 诊断为强风控信号 / 封禁文案」时返回 `ABORT` ⇒ `browse_batch` 抛 `RiskAbort`（`browse_log` 落 `ABORT why=risk_abort:<kind>`，**零帖**）⇒ 主循环走 `handle_risk` 长暂停。部分页失败但仍有候选 ⇒ 只 `NOTE` 留痕（单页抖动不该整批空转）。抓取失败时诊断里额外留**响应正文前 200 字**（`LAST_FETCH_DIAG["detail"]`），用于区分 CF 挑战 / 封禁文案 / 限流。
 - **随机休息日**：平均每 7 天 1 天完全不浏览（`REST_DAY_P=1/7`），两次休息至少隔 3 天不连休；判定一次即落盘（幂等），当日零浏览。
-- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ 计数随版本增长，**当前口径以源码/最近一次运行输出为准**（R572 实测 **38/38 PASS**；本行原记 14/14 系 2026-10-05 时点）。含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」。
+- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ 计数随版本增长，**当前口径以源码/最近一次运行输出为准**（R578 实测 **40/40 PASS**；R572 时点 38/38、R576 时点 39/39）。含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」。
 
 ## 反检测审查强化（2026-10-05）
 
@@ -86,7 +86,13 @@ return JSON.stringify({fail:true,now:location.pathname});
   ★**CF 盾 vs 真风控判据（2026-10-12 实测）**：daemon 报 `批内风控熔断 RATE_LIMIT … status=429 body=<title>Just a moment...</title>` ⇒ 这是 **Cloudflare 边缘挑战/限流**，不是账号级风控——① 响应体是 CF 挑战页且 `server: cloudflare`（真 Discourse 风控返 JSON `{"errors":[...]}`）；② 同一 URL/同一 tab/cookie 稍后复测即 **200 + 82KB JSON**（瞬时性）；③ 同时段话题读取、`/u/<name>/summary.json`、connect 页全 200，合规记录 0。触发点是**候选列表接口** `/latest.json?page=N&order=created`（CF 对 API 路径常见挑战目标），turbo 提速后批密度升高更易命中。命中后 `RISK_PAUSE` 随机暂停 60–120min（本次 82min，零浏览损失=熔断发生在取列表阶段），当日同类 ≥3 次才升级「当日停浏览+强制告警」。
   ★**为什么会频繁遇到 CF 盾（根因，2026-10-12 实测）**：本机出口 IP `104.28.166.42 / 104.28.152.173`，`ipinfo`/`ipwho.is` 判 **AS13335 Cloudflare, Inc.（org=Cloudflare WARP）**，`/cdn-cgi/trace` 亦为 `colo=SJC loc=US`（Clash TUN 下的落地出口）⇒ 我们走的是 **Cloudflare WARP 的共享数据中心出口**，CF 对自家 WARP 段的 bot 分天然偏低：**这是「出口信誉」问题，不是我们的请求频率问题**——实测同一标签**连续 9 次**请求（6 次×2s 间隔 + 3 次）**全 200**，故「太频繁」不成立。
   ★**怎么过这个盾（实测可行）**：CF 挑战页要在**文档层**跑完 JS 挑战才下发域级 `cf_clearance`（实测当前 cookie 里**没有** cf_clearance ⇒ 只靠 `fetch` 永远过不去）⇒ 可靠做法=**整页导航**到 `https://linux.do/latest`（经桥 `execute_js` 执行 `location.href=...` **不激活标签页**，不打扰用户），等 20–40s 再重试 fetch 即 200。
-  ★**已落地（R577，提交 f7907b4，`--selftest` 39/39 PASS）**：①`risk_kind_of(status,body)` = **正文里的 CF 挑战优先于状态码**（旧序 `risk_kind_from_http(429)` 先判 ⇒ 误当 RATE_LIMIT 强信号 ⇒ 熔断+82min 停机）；②`fetch_candidates()` 命中挑战时：随机 20–60s **原地重试** → 整页**导航过盾** + 60–180s 再试 → 仍失败才落诊断交熔断；③daemon 重启加载新码（PID 91892，2026-10-12 21:24）。
+  ★**已落地（R577，提交 f7907b4，`--selftest` 39/39 PASS）**：①`risk_kind_of(status,body)` = **正文里的 CF 挑战优先于状态码**（旧序 `risk_kind_from_http(429)` 先判 ⇒ 误当 RATE_LIMIT 强信号 ⇒ 熔断+82min 停机）；②`fetch_candidates()` 命中挑战时：随机 20–60s **原地重试** → 整页**导航过盾** + 60–180s 再试 → 仍失败才落诊断交熔断；③daemon 重启加载新码（R577 时点）。
+
+- **★R578 楼层口径规则对齐（2026-10-12，用户令「全做」）**：口径 = connect 页「浏览帖子 20000」按**楼层**计、100 天滚动窗 ⇒ 稳态需 ≈**200 楼层/日**；「浏览话题 500」=主帖数，早已达标 ⇒ **楼层是唯一瓶颈**。「按楼层加权选帖」是不增加访问次数的唯一杠杆，已落地三处旋钮：
+  - `FLOOR_BIAS=0.7` 与 `FLOOR_CAP=40`（`floor_weight`/`floor_rank`，Efraimidis–Spirakis 无放回加权抽样，**保留随机性**；板块偏好之后各自加权，不破坏「进一个板块连看」语义）；`FLOOR_BIAS=0` ⇒ 逐字回到旧 `random.shuffle`（一键回退）。
+  - `BIG_DEEP_MIN_POSTS=12` / `BIG_DEEP_LIGHT_P=0.12`：≥12 楼的帖浅读概率压到 0.12（浅读滚不到尾 ⇒ 大帖亏楼层）。
+  - `DAILY_FLOOR_CAP_DEFAULT=1200` 楼层上限闸门（主循环 `floors_count>=cap` ⇒ 睡到明天，**不额外产生访问**；turbo 可配 `daily_floor_cap` 覆盖，硬边界 (1, 5000)）；记账 `state["daily_floors"][今日] += min(posts, FLOOR_CREDIT_CAP=40)`（保守，真值以 connect 页为准）。
+  - 观测单一源：`python3 temp/linuxdo_floor_ledger.py status`（一句话进度 缺口/今日增量/ETA），夜间汇报 `tools/linuxdo_nightly_report.py` 的 `floor_line()` **复用**该账本口径内嵌同一行（禁两处各写一份）；自测 40/40（负控：`FLOOR_BIAS=0` ⇒ T22a/T22e 必红）；**改这些常量后必须重启 daemon 才生效**（进程内常量）。
 - **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
 - 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
 
