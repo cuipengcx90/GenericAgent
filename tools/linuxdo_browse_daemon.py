@@ -671,6 +671,41 @@ def risk_kind_from_text(txt):
     return None
 
 
+# ---- ★R577 CF 边缘挑战 vs 真风控（2026-10-12 实测）--------------------------------
+# 现场：19:37 候选接口 `/latest.json?page=3&order=created` 返 **429**，正文是 CF 挑战页
+# `<title>Just a moment...</title>` ⇒ 旧逻辑「状态码优先」判 RATE_LIMIT(强信号) ⇒ 熔断 +
+# 82min 长暂停 + 告警。反证=**不是**账号级风控：同一 URL/同 tab/cookie 20:35 复测即
+# 200(82469B JSON)，同时段话题读取/connect 页/`/u/<name>/summary.json` 全 200，合规记录 0。
+# 触发面=候选列表 API 路径 + 出口 IP 属 **Cloudflare WARP**(AS13335，104.28.x.x 共享出口)。
+# 对策：①正文里的 CF 挑战**优先于**状态码（软信号，只留痕）；②抓取命中挑战时先短抖动
+# 重试、再整页导航「过盾」（复用 R563 的 `location.href` 原语，CF 挑战在文档层跑完即过）。
+CF_CHALLENGE_RE = r"Just a moment|cf-chl|cf-mitigated|Attention Required|__cf_chl|安全验证|人机验证"
+CF_RETRY_N = 2                     # 候选抓取命中 CF 挑战的重试次数（1=原地重试，2=过盾后重试）
+CF_RETRY_GAP = (2.5, 6.0)          # 原地重试前的短随机延迟（秒）
+CF_SOLVE_SLEEP = (5.0, 11.0)       # 过盾导航后的等待（秒）
+CF_SOLVE_URL = "https://linux.do/latest"
+
+
+def is_cf_challenge(txt):
+    """正文是否 CF 挑战/拦截页。紧口径：不认裸 'Cloudflare' 字样（技术帖里到处是）。"""
+    return bool(re.search(CF_CHALLENGE_RE, (txt or "")[:4000], re.I))
+
+
+def risk_kind_of(status, body):
+    """HTTP 状态 + 正文 → 风控类别（★R577：正文里的 CF 挑战优先于状态码）。
+
+    挑战页常带 403/429 ⇒ 只看状态码会误判成 FORBIDDEN/RATE_LIMIT（强信号）⇒ 小时级
+    停机；先认 CF 挑战（软信号，只 NOTE 留痕）再退回状态码。
+    """
+    if is_cf_challenge(body):
+        return "CF_CHALLENGE"
+    # 正文里的具体信号（封禁/挑战/限流）比裸状态码信息量大 ⇒ 文案优先，状态码兜底
+    _k = risk_kind_from_text(body or "")
+    if _k:
+        return _k
+    return risk_kind_from_http(status)
+
+
 class RiskAbort(Exception):
     """批内风控熔断（R563）：候选抓取阶段确认强风控信号 ⇒ 立即中止本批。
 
@@ -1494,8 +1529,31 @@ LAST_FETCH_STATS = {"pages": 0, "ok": 0}   # R563：本批候选抓取的页数/
 
 
 def fetch_candidates(session, page):
+    """抓候选页。★R577：命中 CF 挑战先原地抖动重试，再整页导航「过盾」，仍失败才留诊断。"""
     code = LATEST_JS.replace("__PAGE__", str(int(page)))
-    res = run_js(session["id"], code, timeout=30)
+    res = None
+    for _att in range(CF_RETRY_N + 1):
+        res = run_js(session["id"], code, timeout=30)
+        if isinstance(res, dict) and res.get("ok"):
+            break
+        if not (isinstance(res, dict) and is_cf_challenge(str(res.get("body") or ""))):
+            break                      # 非 CF 挑战（真限流/封禁/抖动）⇒ 不重试，走原诊断路径
+        if _att >= CF_RETRY_N:
+            break
+        if _att == 0:
+            _w = random.uniform(*CF_RETRY_GAP)
+            print("[%s] CF 挑战(候选接口 page=%s)⇒ %.1fs 后原地重试 %d/%d" % (
+                now_str(), page, _w, _att + 1, CF_RETRY_N), flush=True)
+        else:
+            _w = random.uniform(*CF_SOLVE_SLEEP)
+            print("[%s] CF 挑战仍在 ⇒ 整页导航过盾(%s)等 %.1fs 后重试" % (
+                now_str(), CF_SOLVE_URL, _w), flush=True)
+            # 过盾：整页导航让 CF 的 JS 挑战在文档层跑完（cf_clearance 是域级，一次即够）
+            run_js(session["id"], "location.href='%s'" % CF_SOLVE_URL, timeout=20)
+        log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "CF_CHALLENGE", "page": page,
+                                       "attempt": _att + 1, "wait_s": round(_w, 1),
+                                       "body": str(res.get("body") or "")[:120]})
+        time.sleep(_w)
     LAST_FETCH_STATS["pages"] = int(LAST_FETCH_STATS.get("pages", 0)) + 1
     if isinstance(res, dict) and res.get("ok"):
         LAST_FETCH_STATS["ok"] = int(LAST_FETCH_STATS.get("ok", 0)) + 1
@@ -1546,7 +1604,9 @@ def fetch_verdict(pages_total, pages_ok, diag):
       None ：无风控信号（含「全成功」与「非风控码失败」）
     """
     d = diag or {}
-    rk = risk_kind_from_http(d.get("status")) or risk_kind_from_text(d.get("body") or d.get("detail") or "")
+    # ★R577：正文里的 CF 挑战优先于状态码（挑战页常带 403/429，旧序会误判成强信号）
+    _body = d.get("body") or d.get("detail") or ""
+    rk = risk_kind_of(d.get("status"), _body)
     if rk in RISK_STRONG and pages_ok == 0:
         return ("ABORT", rk)
     if rk:
@@ -2242,7 +2302,8 @@ def watch(args):
         # 候选抓取失败时留了诊断 ⇒ 先判是不是风控（HTTP 429/403 / 封禁文案）
         diag = LAST_FETCH_DIAG.get("diag")
         if diag:
-            rk = risk_kind_from_http(LAST_FETCH_DIAG.get("status")) or risk_kind_from_text(diag)
+            rk = risk_kind_of(LAST_FETCH_DIAG.get("status"),
+                              LAST_FETCH_DIAG.get("body") or diag)
             if rk in RISK_STRONG:
                 handle_risk(st, rk, diag)
                 continue
@@ -2654,6 +2715,29 @@ def _selftest_impl():
         fails.append("T15n 全成功不得判风控")
     if fetch_verdict(4, 0, {"body": "Just a moment..."}) != ("NOTE", "CF_CHALLENGE"):
         fails.append("T15n CF 挑战非强信号（只 NOTE 不熔断）")
+    # ★T15c（R577，2026-10-12 现场回归）：CF 挑战页**带 429/403** 时旧序按状态码先判 ⇒
+    #   误判 RATE_LIMIT/FORBIDDEN(强) ⇒ 熔断 + 82min 长暂停；正文是 CF 挑战就必须走软信号。
+    _cf_body = "<html><head><title>Just a moment...</title></head><body>cf-chl</body></html>"
+    if fetch_verdict(4, 0, {"status": 429, "body": _cf_body}) != ("NOTE", "CF_CHALLENGE"):
+        fails.append("T15c CF 挑战带 429 须判 NOTE/CF_CHALLENGE（R577 误熔断回归）")
+    if fetch_verdict(4, 0, {"status": 403, "body": _cf_body}) != ("NOTE", "CF_CHALLENGE"):
+        fails.append("T15c CF 挑战带 403 须判 NOTE/CF_CHALLENGE")
+    if fetch_verdict(4, 0, {"status": 429, "body": '{"errors":["Too Many Requests"]}'}) != ("ABORT", "RATE_LIMIT"):
+        fails.append("T15c 真限流（JSON 正文，非 CF 挑战）仍须 ABORT/RATE_LIMIT")
+    if risk_kind_of(403, "您的账号已被封禁") != "BANNED":
+        fails.append("T15c 封禁文案须优先于 403 状态码")
+    if is_cf_challenge("我们聊聊 Cloudflare 这家公司") or is_cf_challenge("rate limit exceeded") \
+            or is_cf_challenge('{"errors":["Too Many Requests"]}'):
+        fails.append("T15c 紧口径负控：裸 Cloudflare/限流文案不得判 CF 挑战")
+    import inspect as _ins_cf
+    if "risk_kind_of" not in _ins_cf.getsource(fetch_verdict):
+        fails.append("T15c fetch_verdict 未走 risk_kind_of（状态码优先回归）")
+    _src_fc = _ins_cf.getsource(fetch_candidates)
+    for _k in ("CF_RETRY_N", "CF_SOLVE_URL", "is_cf_challenge"):
+        if _k not in _src_fc:
+            fails.append("T15c fetch_candidates 缺 CF 挑战重试/过盾接线：%s" % _k)
+    if "risk_kind_of" not in _ins_cf.getsource(watch):
+        fails.append("T15c watch 主循环未走 risk_kind_of")
     _ra = RiskAbort("FORBIDDEN", "page=5 status=403")
     if _ra.kind != "FORBIDDEN" or "403" not in _ra.detail:
         fails.append("T15 RiskAbort 未携带 kind/detail")
