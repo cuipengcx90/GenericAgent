@@ -1520,10 +1520,39 @@ def check_level(session, timeout=40):
 
 
 # ---------------------------------------------------------------- 候选帖
+# ---- R579 候选混池（2026-10-13）-------------------------------------------
+# 现场：原候选源只有 /latest.json?order=created（**按创建时间**取最新帖）⇒ 实测该池中位
+#   仅 4 层楼、51% <5 楼、≥100 楼 0 个 ⇒ 无论怎么读都出不了楼层（「每帖 5 楼」的真因）。
+# 修法：**同一批请求数不变**，把 4 个采样页拆成「热帖 top ×2 + 最新 latest ×2」
+#   ⇒ 池子构成约 60% 热帖 / 40% 最新帖（保留"随机刷帖"的观感，不变成只泡热榜）。
+# 可回退：CAND_TOP_PAGES=0 ⇒ 逐字回到旧行为（全 latest）。
+CAND_PAGES_PER_ROUND = 4        # 每批采样页数（与旧实现一致，请求数不变）
+CAND_TOP_PAGES = 2              # 其中热帖(/top.json)页数；其余取最新帖
+TOP_PAGE_MAX = 4                # /top.json 页号上限
+TOP_PERIODS = ("daily", "weekly")   # 每页随机取一个周期，避免固定模式
 LATEST_JS = r"""
 (async (page) => {
   try {
     const r = await fetch('/latest.json?no_definitions=true&page=' + page + '&order=created',
+                          {credentials: 'include', cache: 'no-store'});
+    if (!r.ok) { let _b=''; try { _b=(await r.text()).slice(0,200); } catch(e){}
+                 return JSON.stringify({ok: false, status: r.status, body: _b}); }
+    const j = await r.json();
+    const topics = (j && j.topic_list && j.topic_list.topics) || [];
+    return JSON.stringify({ok: true, topics: topics.map(t => ({
+      id: t.id, title: t.title, cat: t.category_id, posts: t.posts_count}))});
+  } catch (e) { return JSON.stringify({ok: false, err: String(e).slice(0, 120)}); }
+})(__PAGE__)
+"""
+
+# ★R579（2026-10-13）热帖池：与 LATEST_JS 同构，只把接口换成 /top.json（按热度而非创建时间）。
+# 现场：R579 实测原候选池「/latest.json?order=created（最新创建帖）」中位仅 **4 层楼**、
+#   51% 的帖 <5 楼、≥100 楼 **0 个** ⇒ 「每帖只出 5 楼」的主因是**挑的帖本来就短**，
+#   不是读得浅。对照 /top.json?period=weekly 同刻有 30 个 ≥200 楼（头部 7646）。
+TOP_JS = r"""
+(async (page) => {
+  try {
+    const r = await fetch('/top.json?period=__PERIOD__&page=' + page,
                           {credentials: 'include', cache: 'no-store'});
     if (!r.ok) { let _b=''; try { _b=(await r.text()).slice(0,200); } catch(e){}
                  return JSON.stringify({ok: false, status: r.status, body: _b}); }
@@ -1540,9 +1569,14 @@ LAST_FETCH_DIAG = {}
 LAST_FETCH_STATS = {"pages": 0, "ok": 0}   # R563：本批候选抓取的页数/成功页数（供 fetch_verdict 判定）
 
 
-def fetch_candidates(session, page):
-    """抓候选页。★R577：命中 CF 挑战先原地抖动重试，再整页导航「过盾」，仍失败才留诊断。"""
-    code = LATEST_JS.replace("__PAGE__", str(int(page)))
+def fetch_candidates(session, page, src="latest"):
+    """抓候选页。★R577：命中 CF 挑战先原地抖动重试，再整页导航「过盾」，仍失败才留诊断。
+    ★R579：src ∈ {"latest","top"}——top=热帖池(/top.json，按热度)；latest=最新帖池(旧行为)。"""
+    if src == "top":
+        _per = random.choice(TOP_PERIODS)
+        code = TOP_JS.replace("__PERIOD__", _per).replace("__PAGE__", str(int(page)))
+    else:
+        code = LATEST_JS.replace("__PAGE__", str(int(page)))
     res = None
     for _att in range(CF_RETRY_N + 1):
         res = run_js(session["id"], code, timeout=30)
@@ -1569,7 +1603,11 @@ def fetch_candidates(session, page):
     LAST_FETCH_STATS["pages"] = int(LAST_FETCH_STATS.get("pages", 0)) + 1
     if isinstance(res, dict) and res.get("ok"):
         LAST_FETCH_STATS["ok"] = int(LAST_FETCH_STATS.get("ok", 0)) + 1
-        return res.get("topics") or []
+        _topics = res.get("topics") or []
+        for _t in _topics:          # ★R579 打来源标（纯观测；不改选帖/加权逻辑）
+            if isinstance(_t, dict):
+                _t.setdefault("src", src)
+        return _topics
     # 失败：留下诊断（供风控保险丝判 HTTP 429/403 等）
     # R563：非 2xx 时连响应正文前 200 字一起留（区分 CF 挑战 / 封禁文案 / 限流），
     #       旧实现只有 status 码 ⇒ 「是站点抖动还是账号级拦截」不可分。
@@ -1590,12 +1628,30 @@ def fetch_candidates(session, page):
 
 
 def fetch_round(session, pages):
-    """一轮采样:逐页取候选(页间留小间隔)。R572 抽出以便失败后换会话重试。"""
+    """一轮采样:逐页取候选(页间留小间隔)。R572 抽出以便失败后换会话重试。
+    ★R579：pages 元素可为 int（旧口径=latest）或 (src, page) 元组。"""
     out = []
     for p in pages:
-        out += fetch_candidates(session, p)
+        _src, _pg = (p[0], p[1]) if isinstance(p, (tuple, list)) else ("latest", p)
+        out += fetch_candidates(session, _pg, _src)
         time.sleep(random.uniform(1.5, 4.0))
     return out
+
+
+def sample_pages(rng=None):
+    """★R579 混池采样（纯函数，便于自测）：本批 CAND_PAGES_PER_ROUND 页
+    = CAND_TOP_PAGES 页热帖(/top.json) + 其余最新帖(/latest.json)，顺序打乱。
+    CAND_TOP_PAGES=0 ⇒ 逐字回到旧行为（全 latest，页数不变）。
+    返回 [(src, page), ...]。"""
+    r = rng or random
+    n_top = max(0, min(int(CAND_TOP_PAGES), int(CAND_PAGES_PER_ROUND)))
+    jobs = [("top", p) for p in r.sample(range(0, TOP_PAGE_MAX + 1),
+                                         min(TOP_PAGE_MAX + 1, n_top))]
+    _n_lat = max(0, int(CAND_PAGES_PER_ROUND) - len(jobs))
+    jobs += [("latest", p) for p in r.sample(range(0, LATEST_PAGE_MAX + 1),
+                                             min(LATEST_PAGE_MAX + 1, _n_lat))]
+    r.shuffle(jobs)
+    return jobs
 
 
 def zero_yield_kind(stats=None):
@@ -2075,7 +2131,7 @@ def browse_batch(session, st, batch=25):
     LAST_FETCH_STATS.update({"pages": 0, "ok": 0})
     done = skipped = 0
     loiter_n = random.randint(*LOITER_P_LIST)
-    pages = random.sample(range(0, LATEST_PAGE_MAX + 1), min(LATEST_PAGE_MAX + 1, 4))
+    pages = sample_pages()   # ★R579 混池（热帖 top ×N + 最新 latest ×M），页数与旧实现一致
     cand = fetch_round(session, pages)
     _act, _rk = fetch_verdict(LAST_FETCH_STATS["pages"], LAST_FETCH_STATS["ok"], LAST_FETCH_DIAG)
     # ★R572 D1 抓取韧性:采样页**全失败**且非强风控 ⇒ 短随机延迟后换会话重试
@@ -2151,6 +2207,7 @@ def browse_batch(session, st, batch=25):
                                        "why": _why,
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
+                                       "src": c.get("src"),   # ★R579 候选来源（top/latest），纯观测
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
                                        "pose": res.get("pose") if isinstance(res, dict) else None,
                                        "exec": res.get("exec") if isinstance(res, dict) else None,
@@ -3115,16 +3172,16 @@ def _selftest_impl():
         _keep_fc = _g["fetch_candidates"]
         _keep_sleep = time.sleep
         try:
-            def _stub(session, page):
-                _calls.append(page)
+            def _stub(session, page, src="latest"):
+                _calls.append((src, page))
                 return [{"id": page}]
             _g["fetch_candidates"] = _stub
             time.sleep = lambda *a, **k: None
             _out = fetch_round("sess", [3, 1])
             if [c["id"] for c in _out] != [3, 1]:
                 fails.append("T19f fetch_round 须按页保序取候选: %s" % _out)
-            if _calls != [3, 1]:
-                fails.append("T19f2 fetch_round 页序错: %s" % _calls)
+            if _calls != [("latest", 3), ("latest", 1)]:
+                fails.append("T19f2 fetch_round 页序错(旧口径 int 页须判 latest): %s" % _calls)
         finally:
             _g["fetch_candidates"] = _keep_fc
             time.sleep = _keep_sleep
@@ -3254,6 +3311,35 @@ def _selftest_impl():
             fails.append("T21b7 无 turbo 须走原 cap 逻辑")
         if _cap_today({"cap": {today(): 999}}, 200, None) != 999:
             fails.append("T21b7b 正常日已有 cap 须沿用（跨重启稳定）")
+    # ---- T22（R579）候选混池：页数与来源构成 + 0 回退逐字旧行为 ----------------
+    _sp = sample_pages()
+    if len(_sp) != CAND_PAGES_PER_ROUND:
+        fails.append("T22a sample_pages 页数须=%d，实=%d" % (CAND_PAGES_PER_ROUND, len(_sp)))
+    elif sum(1 for _s, _p in _sp if _s == "top") != min(CAND_TOP_PAGES, CAND_PAGES_PER_ROUND):
+        fails.append("T22b sample_pages 热帖页数须=%d：%s" % (CAND_TOP_PAGES, _sp))
+    if any((_s not in ("top", "latest"))
+           or not (0 <= int(_p) <= (TOP_PAGE_MAX if _s == "top" else LATEST_PAGE_MAX))
+           for _s, _p in _sp):
+        fails.append("T22c sample_pages 来源/页号越界：%s" % _sp)
+    _sset = {tuple(sample_pages()) for _ in range(30)}
+    if len(_sset) < 5:
+        fails.append("T22d sample_pages 须随机（30 次采样仅 %d 种取值）" % len(_sset))
+    if "top.json" not in TOP_JS or "__PERIOD__" not in TOP_JS or "__PAGE__" not in TOP_JS:
+        fails.append("T22e TOP_JS 须含 top.json / __PERIOD__ / __PAGE__ 占位")
+    _fc_src = _ins_cf.getsource(fetch_candidates)
+    if '"top"' not in _fc_src or '"latest"' not in _fc_src:
+        fails.append("T22f fetch_candidates 未接 src 分支（top/latest）")
+    if "(tuple, list)" not in _ins_cf.getsource(fetch_round):
+        fails.append("T22g fetch_round 未兼容 (src,page) 元组")
+    _orig_topn = globals()["CAND_TOP_PAGES"]
+    try:
+        globals()["CAND_TOP_PAGES"] = 0
+        _sp0 = sample_pages()
+        if len(_sp0) != CAND_PAGES_PER_ROUND or any(_s != "latest" for _s, _ in _sp0):
+            fails.append("T22h CAND_TOP_PAGES=0 须逐字回旧行为（全 latest）：%s" % _sp0)
+    finally:
+        globals()["CAND_TOP_PAGES"] = _orig_topn
+    cases += 1
     _w(dict(_T3, expires_at=_in(-0.001)))
     if turbo_cfg() is not None:
         fails.append("T21c 已到期须=正常模式（负控）")
