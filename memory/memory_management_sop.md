@@ -77,6 +77,7 @@ L4: ../memory/L4_raw_sessions/ (历史会话层 - scheduler反射自动收集，
 
 > **同步红线**：L1 只写关键词/名称，禁搬细节。括号内只写反直觉的场景触发词(2-4字)，禁写机制/方法/步骤。需要评估L1中的token数和索引效用。
 > 反例：❌ sop_name(场景A:方法1+方法2+方法3) → ✅ sop_name(场景A)
+> **任务记录不进 L1（2026-10-12 增）**：带 `R###` 轮次编号的任务/批次/复盘记录不是「场景」，只写 `memory/autonomous_reports/` 与其三索引（history.txt/history.md/INDEX.md），不进 L1。仅当产生了**新的反直觉场景触发词**时，L1 才加一行：名称+路径，≤120 字，必须 file_patch 词级修改。违规时 `plugins/ga_guard.py` 会在工具结果里提示纠正；L1 现有「→A###/→N####」锚点指向 `memory/l1_detail_archive.md` 的同名块。
 > 反例：名字已自解释时 ❌ discord_slate_sop(Slate输入框) → ✅ discord_slate_sop
 
 ---
