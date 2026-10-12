@@ -167,7 +167,12 @@ BIG_DEEP_LIGHT_P = 0.12
 # ★R579 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）。
 #   2026-10-13 口径更新：候选池改混池（top×2 + latest×2）后每帖实际读到约 20 楼（旧池中位仅 4）
 #   ⇒ 原 1200 会在约 60 帖时提前熔断（此时帖配额 daily_cap=600 才用掉 10%）⇒ 默认 1200→2400（≈120 帖）。
+#   ★R580(2026-10-13 用户口径)日常档同样加「当日种子抖动」:上限 = 2400 + U[0,3600] ∈ [2400,6000]
+#   (与帖配额 daily_cap 同一手法:按日期种子摇一次、同日稳定、跨重启不变;避免每天死板同一数字)。
+#   注意:这是**纯本机熔断天花板**,不产生任何网络访问、对外不可见;低端 2400 仍有在高楼日
+#   (200 帖 × 约 20 楼 ≈ 4000)提前熔断的可能——按用户选择保留宽区间。turbo 显式值仍逐字优先。
 DAILY_FLOOR_CAP_DEFAULT = 2400
+DAILY_FLOOR_CAP_JITTER = 3600    # 日常档当日上限单向上抖 0..+JITTER ⇒ 上限落在 [2400, 6000]
 FLOOR_STEADY_GOAL = 200          # 稳态目标楼层/日（=20000/100 天滚动窗），供账本/日报显示
 SESSION_MIN_DEFAULT = 110   # 单段连续浏览分钟数（拉长=更像刷入迷的真人，提高占空比）
 SESSION_REST = (1500, 3200) # 段间休息秒（25–53min）
@@ -306,7 +311,7 @@ TURBO_RANGE_BOUNDS = {"gap": (15.0, 3600.0), "gap_long": (60.0, 7200.0),
 # 标量旋钮的硬边界
 TURBO_SCALAR_BOUNDS = {"gap_long_p": (0.0, 1.0), "daily_cap": (1, 800),
                        "daily_cap_jitter": (0, 200),
-                       "daily_floor_cap": (1, 5000),      # ★R578 楼层口径上限（TL3 门槛按楼层计）
+                       "daily_floor_cap": (1, 6000),      # ★R578 楼层口径上限(TL3 门槛按楼层计);★R580 抬到 6000 与日常抖动上界一致
                        "deep_cap_s": (30.0, 150.0), "light_p": (0.0, 0.7),
                        "pause_scale": (0.4, 1.0), "rollback": (0, 10)}
 _TURBO_STATE = {"sig": None, "cfg": None, "exp": None, "last": None}
@@ -2225,10 +2230,18 @@ def floors_count(st):
 
 
 def floor_cap_today(st, base, tc):
-    """今日楼层上限：turbo 的 daily_floor_cap 优先，否则 base（默认 DAILY_FLOOR_CAP_DEFAULT）。"""
+    """今日楼层上限:turbo 的 daily_floor_cap 优先(逐字用),否则 base 按「日期种子」当日摇一次
+    单向上抖 U[0, DAILY_FLOOR_CAP_JITTER] ⇒ 落在 [base, base+JITTER](默认 [2400, 6000])。
+    与帖配额 daily_cap 同手法:同日稳定、跨重启不变,避免每天死板同一数字(机械特征)。"""
     if tc and tc.get("daily_floor_cap"):
         return int(tc["daily_floor_cap"])
-    return int(base)
+    base = int(base)
+    jit = int(DAILY_FLOOR_CAP_JITTER)
+    if jit <= 0:
+        return base
+    _sd = hashlib.sha1(("floor-cap|%s" % today()).encode("utf-8")).hexdigest()
+    rnd = random.Random(int(_sd[:16], 16))
+    return max(1, base + rnd.randint(0, jit))
 
 
 def browse_batch(session, st, batch=25):
@@ -3546,13 +3559,16 @@ def _selftest_impl():
             fails.append("T22f floors_credit 须 min(posts,cap) 且坏值=0")
         if floors_count({"daily_floors": {today(): 5}}) != 5 or floors_count({}) != 0:
             fails.append("T22g floors_count 读取/缺省")
-        if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, None) != DAILY_FLOOR_CAP_DEFAULT:
-            fails.append("T22h 无 turbo 须用默认楼层上限")
+        _fcd = floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, None)
+        if not (DAILY_FLOOR_CAP_DEFAULT <= _fcd <= DAILY_FLOOR_CAP_DEFAULT + DAILY_FLOOR_CAP_JITTER):
+            fails.append("T22h 无 turbo 须用默认楼层上限(带当日抖动): %s" % _fcd)
+        if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, None) != _fcd:
+            fails.append("T22h2 楼层上限须同日稳定(二次调用同值)")
         if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, {"daily_floor_cap": 900}) != 900:
             fails.append("T22i turbo 须可覆盖楼层上限")
         _wx, _ = _turbo_parse(dict(_T3, daily_floor_cap=99999))
-        if _wx is None or _wx.get("daily_floor_cap") != 5000:
-            fails.append("T22j daily_floor_cap 越界须截断到 5000: %s" % _wx)
+        if _wx is None or _wx.get("daily_floor_cap") != 6000:
+            fails.append("T22j daily_floor_cap 越界须截断到 6000: %s" % _wx)
         _wsrc = _insp.getsource(globals()["watch"])
         if "floor_cap_today" not in _wsrc or "floors_count(st) >= _fcap" not in _wsrc:
             fails.append("T22k watch 须有楼层上限闸门")
@@ -3567,8 +3583,25 @@ def _selftest_impl():
             fails.append("T23c 实测缺失须回退且受 FLOOR_CREDIT_CAP 封顶")
         if floors_credit_of(None, {"posts": 3}) != 3 or floors_credit_of("x", {}) != 0:
             fails.append("T23d res 非法须回退候选楼层数")
-        if DAILY_FLOOR_CAP_DEFAULT != 2400 or not (1 <= DAILY_FLOOR_CAP_DEFAULT <= 5000):
-            fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,5000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
+        if DAILY_FLOOR_CAP_DEFAULT != 2400 or not (1 <= DAILY_FLOOR_CAP_DEFAULT <= 6000):
+            fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,6000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
+        if not (0 <= DAILY_FLOOR_CAP_JITTER <= 6000) or DAILY_FLOOR_CAP_DEFAULT + DAILY_FLOOR_CAP_JITTER > 6000:
+            fails.append("T23e2 日常楼层抖动须使上限不超硬边界 6000: base=%s jit=%s" % (DAILY_FLOOR_CAP_DEFAULT, DAILY_FLOOR_CAP_JITTER))
+        _orig_today_fc = globals()["today"]
+        try:
+            _fcv = set()
+            for _d in range(1, 15):
+                globals()["today"] = (lambda dd: (lambda: "2026-12-%02d" % dd))(_d)
+                _v = floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, None)
+                if not (DAILY_FLOOR_CAP_DEFAULT <= _v <= DAILY_FLOOR_CAP_DEFAULT + DAILY_FLOOR_CAP_JITTER):
+                    fails.append("T23e3 日常楼层上限越界(应 [2400,6000]): %s" % _v)
+                _fcv.add(_v)
+        finally:
+            globals()["today"] = _orig_today_fc
+        if len(_fcv) < 3:
+            fails.append("T23e4 日常楼层上限须按日摇动(14 天仅 %d 种取值)" % len(_fcv))
+        if floor_cap_today({}, DAILY_FLOOR_CAP_DEFAULT, {"daily_floor_cap": 900}) != 900:
+            fails.append("T23e5 turbo 显式楼层上限须逐字优先,不走抖动")
         if "floors_credit_of(res, c)" not in _insp.getsource(browse_batch):
             fails.append("T23f 记账点须接线 floors_credit_of(res, c)")
         # ---- T24：R579b 口径一致四项（楼层探针/dwell 随内容缩放/LOITER 真实来源/轮内去重）----
