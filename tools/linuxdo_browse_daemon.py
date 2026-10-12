@@ -1657,6 +1657,18 @@ def sample_pages(rng=None):
     return jobs
 
 
+def page_path(src, page):
+    """★R579b：采样页 → 逛列表页用的真实 URL（与 fetch_candidates 同一构造口径）。"""
+    if src == "top":
+        u = "/top?period=%s" % random.choice(TOP_PERIODS)
+    else:
+        u = "/latest"
+    p = int(page or 0)
+    if p > 0:
+        u += ("&page=%d" % p) if "?" in u else ("?page=%d" % p)
+    return u
+
+
 def zero_yield_kind(stats=None):
     """R572 D2:零产出归因(纯函数,便于自测)。
     返回 "FETCH_FAIL"(采样页全部抓取失败=瞬态/标签被占)或 "ALL_SEEN"(抓取正常但候选全重)。
@@ -1765,10 +1777,11 @@ ROUTE_JS = r"""
 
 LOITER_JS = r"""
 (async () => {
+  const P = "__PATH__";
   try { const m=window.require('discourse/lib/url');
-    if (m && m.default && m.default.routeTo){ m.default.routeTo('/latest'); }
-    else { location.href='/latest'; }
-  } catch(e) { location.href='/latest'; }
+    if (m && m.default && m.default.routeTo){ m.default.routeTo(P); }
+    else { location.href=P; }
+  } catch(e) { location.href=P; }
   await new Promise(r=>setTimeout(r,1800));
   const steps = __STEPS__;
   for (let s=0;s<steps;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*600));
@@ -1782,8 +1795,25 @@ LOITER_JS = r"""
 POST_CHARS_PER_FLOOR = 420
 POST_CHARS_FALLBACK = (2200, 9000)
 # 单帖时长的上界（沿用接线前的预算，避免接上拟人层后慢到日 cap 跑不完）。
+# ★R579b 口径一致：深读上限**随内容缩放**——基准内容量(20 屏≈8400 字)保持旧上限 150s，
+#   更长的帖子按比例放宽，绝对封顶 DEEP_DWELL_ABS_CAP_S(保当日段表能跑完)；
+#   短帖不削（上限永不低于旧值 150）⇒ 中位帖(≈21 楼≈8800 字)行为与改前逐字一致。
 DEEP_DWELL_CAP_S = 150.0
+DEEP_DWELL_ABS_CAP_S = 300.0
+DEEP_DWELL_REF_CHARS = 8400     # = 20 屏 × humanize 420 字/屏（口径单一源）
 LIGHT_DWELL_CAP_S = 25.0
+
+
+def deep_dwell_cap(n_chars, tc=None):
+    """深读驻留上限（★R579b 随内容缩放；tc["deep_cap_s"] 显式优先=旧行为保留）。"""
+    if tc and tc.get("deep_cap_s"):
+        return float(tc["deep_cap_s"])
+    try:
+        n = max(0, int(n_chars or 0))
+    except Exception:
+        n = 0
+    r = float(n) / float(DEEP_DWELL_REF_CHARS)
+    return min(DEEP_DWELL_ABS_CAP_S, max(DEEP_DWELL_CAP_S, DEEP_DWELL_CAP_S * r))
 
 
 def _estimate_chars(c):
@@ -1813,7 +1843,8 @@ def _browse_plan(n_chars, light=False, tc=None):
     n_eff = max(600, int(n_chars * (0.35 if light else 1.0)))
     dwell = hu.read_dwell_seconds(n_eff, kind="browse")
     tc = tc or {}
-    dwell = min(dwell, LIGHT_DWELL_CAP_S if light else (tc.get("deep_cap_s") or DEEP_DWELL_CAP_S))
+    # ★R579b：深读上限随内容缩放（deep_dwell_cap 内保留 tc["deep_cap_s"] 显式优先）
+    dwell = min(dwell, LIGHT_DWELL_CAP_S if light else deep_dwell_cap(n_eff, tc))
     plan = hu.scroll_plan(n_eff, dwell, kind="browse")
     if light:                                     # 浅读：屏幅更大、停顿更短
         for p in plan:
@@ -1881,6 +1912,29 @@ def _tm_probe(session):
         return None
 
 
+FLOOR_PROBE_JS = ("(()=>{try{return JSON.stringify({posts:document.querySelectorAll('.topic-post').length})}"
+                  "}catch(e){return JSON.stringify({posts:null})}})()")
+
+
+def _floor_probe(session, timeout=12):
+    """★R579b 楼层探针：**短**只读 JS 读页上已渲染的 .topic-post 数。
+
+    长读帖脚本的返回值经桥接常丢（实测 browse_log 约 68% 行 posts 缺失），而记账/观测都要
+    「实际读到的楼层」⇒ 长脚本没带回 posts 时用本探针补真值。只读、不滚动、不导航，不改变
+    任何浏览动作（防检测零增量）；失败返回 None（回退保守估计，口径不变）。
+    """
+    try:
+        r = run_js(session["id"], FLOOR_PROBE_JS, timeout=timeout)
+        raw = r
+        if isinstance(r, dict):
+            raw = r.get("data") if r.get("data") is not None else r.get("raw")
+        d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        n = int(d.get("posts")) if isinstance(d, dict) and d.get("posts") is not None else -1
+        return n if n >= 0 else None
+    except Exception:
+        return None
+
+
 def browse_one(session, tid, state, cand=None):
     # 深浅分层：真人不是每帖都读到底——约三成是「刷到划走」型浅读（快滚大屏幅、不回滚、短驻留）
     tc = turbo_cfg()                                  # 临时提速配置；None=正常模式
@@ -1917,6 +1971,14 @@ def browse_one(session, tid, state, cand=None):
         res2 = run_js(session["id"], code, timeout=_js_to)
         ok = isinstance(res2, dict) and not res2.get("fail")
         res = res2
+    # ★R579b 楼层探针：长脚本返回值常丢（68% 行 posts 缺失）⇒ 补「实际读到的楼层」真值
+    if isinstance(res, dict) and res.get("posts") is None:
+        _fp = _floor_probe(session)
+        if _fp is not None:
+            res["posts"] = _fp
+            res["posts_src"] = "probe"
+    if isinstance(res, dict) and res.get("posts") is not None and not res.get("posts_src"):
+        res["posts_src"] = "res"
     _tm_pre = None
     if tc and ok and _is_bridge_timeout(res):
         # R576c：仅 turbo。超时≠没读（实测正常模式 4/4 超时但每帖仍有 5–10 次上报）。先等脚本跑完，
@@ -2108,6 +2170,30 @@ def floor_rank(cand):
     return sorted(out, key=lambda c: random.random() ** (1.0 / floor_weight(c)), reverse=True)
 
 
+def dedupe_candidates(cand):
+    """★R579b 轮内去重（纯函数）：同一帖可能同时出现在 top 与 latest 两页。
+
+    保序取首现（srcs 记录全部来源）；加权/板块偏好在此之后进行，语义不变，
+    只消除「同一帖被抽两次白烧一次浏览机会」的浪费。"""
+    seen, out = set(), []
+    for c in cand or []:
+        try:
+            _id = int(c.get("id"))
+        except Exception:
+            out.append(c)
+            continue
+        if _id in seen:
+            for o in out:
+                if int(o.get("id")) == _id:
+                    _ss = set((o.get("srcs") or [o.get("src")]) or [])
+                    _ss.add(c.get("src"))
+                    o["srcs"] = sorted(x for x in _ss if x)
+            continue
+        seen.add(_id)
+        out.append(c)
+    return out
+
+
 def floors_credit(cand):
     """单帖计入楼层（**回退档**，保守估计）：min(该帖楼层数, FLOOR_CREDIT_CAP)。"""
     try:
@@ -2194,6 +2280,7 @@ def browse_batch(session, st, batch=25):
                                      "pages": LAST_FETCH_STATS["pages"], "pages_ok": LAST_FETCH_STATS["ok"]})
     seen = set(st.get("seen_ids", []))
     cand = [c for c in cand if c.get("id") and int(c["id"]) not in seen]
+    cand = dedupe_candidates(cand)   # ★R579b 轮内去重（top/latest 混池后同一帖可能两页都出现）
     random.shuffle(cand)
     # 分类偏好加权：真人会「进一个板块连看」，均匀跳遍全站分类=机器味
     by_cat = {}
@@ -2214,8 +2301,12 @@ def browse_batch(session, st, batch=25):
         tid = str(c["id"])
         if i == loiter_n:
             # 拟人：逛一次列表页不进帖
-            run_js(session["id"], LOITER_JS.replace("__STEPS__", str(random.randint(4, 8))), timeout=45)
-            log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "LOITER", "note": "latest"})
+            # ★R579b 逛的就是本批真实采样页之一（URL 与 fetch 同口径）；note/path 记真实来源
+            _lsrc, _lpage = random.choice(pages) if pages else ("latest", 0)
+            _lpath = page_path(_lsrc, _lpage)
+            run_js(session["id"], LOITER_JS.replace("__PATH__", _lpath).replace("__STEPS__", str(random.randint(4, 8))), timeout=45)
+            log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "LOITER",
+                                           "note": _lsrc, "path": _lpath})
         ok, res = browse_one(session, tid, st)
         title = (res.get("title", "") if isinstance(res, dict) else "")[:36]
         _why = ""
@@ -2223,10 +2314,14 @@ def browse_batch(session, st, batch=25):
             _why = str(res.get("fail") or res.get("err") or res.get("need_loc") or "unknown")[:100]
         elif not ok:
             _why = "no-result"
+        # ★R579b 记账值随行落日志：fc=计入楼层数、posts_src=该值来源（res=读帖脚本/probe=楼层探针）
+        _fc = floors_credit_of(res, c) if ok else None
         log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "DONE" if ok else "FAIL",
                                        "why": _why,
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
+                                       "posts_src": res.get("posts_src") if isinstance(res, dict) else None,
+                                       "fc": _fc,
                                        "src": c.get("src"),   # ★R579 候选来源（top/latest），纯观测
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
                                        "pose": res.get("pose") if isinstance(res, dict) else None,
@@ -2250,8 +2345,7 @@ def browse_batch(session, st, batch=25):
             st["browsed_total"] = st.get("browsed_total", 0) + 1
             st.setdefault("daily", {})[today()] = daily_count(st) + 1
             # ★R579 楼层记账（新口径＝实际读到的楼层）：优先 res["posts"](.topic-post 实测数)，
-            #   取不到才回退候选列表楼层数（上限 FLOOR_CREDIT_CAP）；真值仍以 connect 页为准
-            _fc = floors_credit_of(res, c)
+            #   探针补值次之，仍取不到才回退候选列表楼层数（上限 FLOOR_CREDIT_CAP）；真值以 connect 页为准
             st.setdefault("daily_floors", {})[today()] = floors_count(st) + _fc
             save_state(st)
         else:
@@ -3477,6 +3571,23 @@ def _selftest_impl():
             fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,5000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
         if "floors_credit_of(res, c)" not in _insp.getsource(browse_batch):
             fails.append("T23f 记账点须接线 floors_credit_of(res, c)")
+        # ---- T24：R579b 口径一致四项（楼层探针/dwell 随内容缩放/LOITER 真实来源/轮内去重）----
+        if "topic-post" not in FLOOR_PROBE_JS or "_floor_probe(session)" not in _insp.getsource(browse_one):
+            fails.append("T24a browse_one 须在 posts 缺失时调楼层探针")
+        if "posts_src" not in _insp.getsource(browse_one) or '"fc": _fc' not in _insp.getsource(browse_batch):
+            fails.append("T24b 日志须带 posts_src/fc 字段")
+        if (deep_dwell_cap(8400) != DEEP_DWELL_CAP_S
+                or not (deep_dwell_cap(8400 * 5) > DEEP_DWELL_CAP_S
+                        and deep_dwell_cap(8400 * 50) == DEEP_DWELL_ABS_CAP_S
+                        and deep_dwell_cap(600) >= DEEP_DWELL_CAP_S)):
+            fails.append("T24c 深读上限须随内容缩放(基准不变/长帖放宽/绝对封顶/短帖不削)")
+        if "deep_dwell_cap(n_eff, tc)" not in _insp.getsource(_browse_plan):
+            fails.append("T24d _browse_plan 须走 deep_dwell_cap")
+        if "__PATH__" not in LOITER_JS or 'LOITER_JS.replace("__PATH__"' not in _insp.getsource(browse_batch):
+            fails.append("T24e LOITER 须按真实采样页导航并记来源")
+        _dd = dedupe_candidates([{"id": 1, "src": "top"}, {"id": 2, "src": "latest"}, {"id": 1, "src": "latest"}])
+        if [c["id"] for c in _dd] != [1, 2] or _dd[0].get("srcs") != ["latest", "top"]:
+            fails.append("T24f 轮内去重须保序首现并记 srcs")
     finally:
         random.setstate(_rs)
     cases += 1
