@@ -295,3 +295,8 @@ return JSON.stringify({fail:true,now:location.pathname});
 - 观测字段(R576,正常模式同样记录):`exec`(实际执行的 steps/plan_s/stay_s/rb)、`tm`(每帖结束后另发一次只读探测,取页内 `PerformanceObserver` 累计的 `/topics/timings` 请求数:`n`=累计、`st`=最近 3 次状态码、`d`=较上一帖增量;**上报在离开话题时触发,增量归属下一帖**,按日统计即可;`d` 长期为 0 ⇒ 楼层上报没发)。★JS 返回值经桥接常丢失(历史 DONE 里约 75% 的 `title` 为空),所以 `tm` 不靠 `ROUTE_JS` 返回值带出。
 - `risk_log.jsonl` 新增 `INFO/FETCH_PARTIAL`(部分页风控信号,含页码与响应正文前 200 字),用于判断 403 是否真风控。
 - **一旦出现 403/风控信号先删 turbo.json**,再复盘。
+
+## pick_session 恒失败的现场处置（2026-10-12 实测）
+- 现象：`RC_NO_SESSION_RETRY: 候选标签页 ['<id>'] 均不在 linux.do`，连续 8 次后进程 `RC_NO_SESSION` 退出（由 watchd 拉起→再失败，循环）。根因是**桥侧 tab id 会整体刷新**（浏览器/扩展重连后 chat 窗口与内容脚本重新注册，旧 id 全废；实测 2109126426/666 → 2109126867/870），而守护沿用旧 id（`CDP fallback failed: No tab with given id` / `Detached while handling command` / `Another debugger is already attached`）。
+- 处置顺序：①用桥 `{"cmd":"get_all_sessions"}` 重新列 id（**不要**用 AppleScript 看 Chrome 标签——多实例/多 Space 下「Google Chrome」可能只报出另一个实例的窗口，实测只看到 1 个无关标签）；②挑一个现存标签，用桥 `{"cmd":"execute_js","sessionId":<id>,"code":"location.href='https://linux.do/'"}` 把它导航到主站（**经桥的 execute_js 不会激活标签页**，故不会把 linux.do 顶到前台）；③确认该标签 `document.visibilityState=='hidden'`，否则前台保护会一直「用户在前台看 linux.do，跳过本轮浏览」。
+- `visibilityState=='visible'` 只取决于该标签是否是**当前激活标签**（分屏/焦点在终端不算）；要恢复自动化浏览，只需让 Chrome 的前台标签不是 linux.do（用 `window.open('about:blank')` 或用户自己切走），守护下一轮就会继续。

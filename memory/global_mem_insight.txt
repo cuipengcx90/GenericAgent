@@ -82,7 +82,7 @@ L4: L4_raw_sessions/(原文检索) →A065
 12. 拼接URL/ID禁凭直觉套模板，须用真实返回值实测打开；出错要批量回刷历史数据非只改模板
 13. 禁空报完成: GUI/发布类任务须OCR或等价证据核验后才可报成功；未打通步骤须明示，禁把中间态当完成；口头「已沉淀SOP」须grep memory确认文件真实存在
 14. 网络诊断: Clash TUN 开启时本机"直连"同样被接管，--noproxy/裸socket 结果不可作真实直连证据 →A083
-15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环 ★2026-09-25: 本机 `which setsid`=NOT FOUND ⇒ 上述 setsid 配方在本机恒不生效；改用 `tools/bg_task.py`(start/status/tail/stop/list/selftest；补 tmux_utils 缺的退出码/PID复用/文件日志；R398) →A084
+15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环 ★2026-09-25: 本机 `which setsid`=NOT FOUND ⇒ 上述 setsid 配方在本机恒不生效；改用 `tools/bg_task.py`(start/status/tail/stop/list/selftest；补 tmux_utils 缺的退出码/PID复用/文件日志；R398) →A084。★PID 身份比对:`ps lstart` 是**本地化**串(中文 LC_TIME 下 `一 10/12 …`≠`Mon Oct 12 …`)⇒ps 探针必锁 `LC_ALL=C`,且 lstart 不符时要用命令行(含 wrapper 名)二次确认再判 PID 复用(2026-10-12 实测 `stop` 误判 STALE_PID_REUSED 而拒停,`start` 又拉起第二个=双 daemon;已修 tools/bg_task.py 并加 selftest 正控⑤)
 16. 审「测试全绿」先验测试本身是否真执行: 内联/mock 执行器(如桩PA)会无条件写 PASS、把从未运行过的工具记成 exit_code=0 成功记录→只证明管道通不证明能力通,须用真执行替身复跑；桩替身还须校验**接口形状**(flag名/取值域/必填项)——只校验调用次数与顺序会放走 `--timeout-ms` 这类笔误(假herdr照单全收,17例全绿却真机必败)；★判「某能力已进 CI/已接线」禁按目录名或工具名字面 grep——herdr-agents 的 run_tests.sh 用 `for d in control-plane/*/` **glob 自动发现**整套件,字面搜恒零命中(实测把「已进 CI 且 26 用例通过」的 l3_skills_v0 误判成「未接线」并写进报告)⇒一律以实际套件清单+运行日志为证
 17. 拷本机数据库做只读快照必须连 -wal/-shm 一起拷(缺 -wal 会"假空":实测 Notes 2→8 对象),查询走 `file:...?mode=ro`;macOS 容器目录(~/Library/Containers)递归 `find -type f` 会被 TCC **挂起**(>25s 不返回≠返回 0)→只能 `ls` 限深+显式超时,判"空库"要用第二来源交叉证
 18. 引文即契约: 情报/对照/研读类产出里引号内文字会被读作原话, 压缩改写混入=误读源文; 写完须脚本抽取全部引号文本(含「」)回源逐字 grep 校验, 并在文首声明哪些小节才是逐字引用(金句须连标点/引号字形一致) →A087
