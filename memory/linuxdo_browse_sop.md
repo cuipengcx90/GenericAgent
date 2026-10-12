@@ -91,8 +91,9 @@ return JSON.stringify({fail:true,now:location.pathname});
 - **★R578 楼层口径规则对齐（2026-10-12，用户令「全做」）**：口径 = connect 页「浏览帖子 20000」按**楼层**计、100 天滚动窗 ⇒ 稳态需 ≈**200 楼层/日**；「浏览话题 500」=主帖数，早已达标 ⇒ **楼层是唯一瓶颈**。「按楼层加权选帖」是不增加访问次数的唯一杠杆，已落地三处旋钮：
   - `FLOOR_BIAS=0.7` 与 `FLOOR_CAP=40`（`floor_weight`/`floor_rank`，Efraimidis–Spirakis 无放回加权抽样，**保留随机性**；板块偏好之后各自加权，不破坏「进一个板块连看」语义）；`FLOOR_BIAS=0` ⇒ 逐字回到旧 `random.shuffle`（一键回退）。
   - `BIG_DEEP_MIN_POSTS=12` / `BIG_DEEP_LIGHT_P=0.12`：≥12 楼的帖浅读概率压到 0.12（浅读滚不到尾 ⇒ 大帖亏楼层）。
-  - `DAILY_FLOOR_CAP_DEFAULT=1200` 楼层上限闸门（主循环 `floors_count>=cap` ⇒ 睡到明天，**不额外产生访问**；turbo 可配 `daily_floor_cap` 覆盖，硬边界 (1, 5000)）；记账 `state["daily_floors"][今日] += min(posts, FLOOR_CREDIT_CAP=40)`（保守，真值以 connect 页为准）。
-  - 观测单一源：`python3 temp/linuxdo_floor_ledger.py status`（一句话进度 缺口/今日增量/ETA），夜间汇报 `tools/linuxdo_nightly_report.py` 的 `floor_line()` **复用**该账本口径内嵌同一行（禁两处各写一份）；自测 40/40（负控：`FLOOR_BIAS=0` ⇒ T22a/T22e 必红）；**改这些常量后必须重启 daemon 才生效**（进程内常量）。
+  - `DAILY_FLOOR_CAP_DEFAULT=2400` 楼层上限闸门（主循环 `floors_count>=cap` ⇒ 睡到明天，**不额外产生访问**；turbo 可配 `daily_floor_cap` 覆盖，硬边界 (1, 5000)；★R579：混池后每帖实际读到约 20 楼，原 1200 会在约 60 帖即熔断（帖配额才用掉 10%）⇒ 下限值提到 2400，运行期 turbo 已显式写 `daily_floor_cap=5000`）；**记账口径（R579 起＝实际读到的楼层）**：`floors_credit_of(res, cand)` 优先取读帖返回值 `res["posts"]`（= 页面上 `.topic-post` 实测数，即本次真正读到的楼层），桥接丢返回值/超时时回退 `min(候选列表楼层数, FLOOR_CREDIT_CAP=40)` 保守估计；真值仍以 connect 页为准。
+  - 观测单一源：`python3 temp/linuxdo_floor_ledger.py status`（一句话进度 缺口/今日增量/ETA），夜间汇报 `tools/linuxdo_nightly_report.py` 的 `floor_line()` **复用**该账本口径内嵌同一行（禁两处各写一份）；自测 41/41（负控：`FLOOR_BIAS=0` ⇒ T22a/T22e 必红；R579 正控：把 `DAILY_FLOOR_CAP_DEFAULT` 改错 ⇒ T23e 真红）；**改这些常量后必须重启 daemon 才生效**（进程内常量）。
+- **★R579 候选混池 + 记账口径（2026-10-13，提交 609e2d9 / 3130833）**：用户现象「每帖只出 5 楼」根因＝**候选源专挑最新短帖**（`/latest.json` 中位 4 楼、51% <5 楼），非读得浅 ⇒ 候选改**混池** `CAND_TOP_PAGES=2` + `CAND_LATEST_PAGES=2`（4 页：top.json×2 + latest.json×2，同刻 top 中位 52 楼），`CAND_TOP_PAGES=0` 一键回退旧行为（T22h 逐字断言）。真路径实测：160 帖、楼层中位 21、`GE20=85/GE100=11`、页 ok 4/4。混池后**每帖实际读到约 20 楼 ⇒ 楼层闸门从「非瓶颈」变成「约 60 帖即触顶」**，故同批：①`DAILY_FLOOR_CAP_DEFAULT` 1200→**2400**；②记账改**实际读到的楼层**（`floors_credit_of`，见上条）；③运行期 turbo 显式 `daily_floor_cap=5000`。
 - **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
 - 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
 
