@@ -66,6 +66,7 @@ import datetime as dt
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import re
@@ -270,7 +271,215 @@ def _batch_gap():
         except Exception:
             rng_lo_hi = None
     lo, hi = rng_lo_hi or tuple(GAP_LONG_RANGE)
+    _tc = turbo_cfg()
+    if _tc and _tc.get("batch_gap"):        # 临时提速：批间休息区间直接取配置（见 turbo_cfg）
+        return round(random.uniform(*_tc["batch_gap"]), 1)
     return round(random.uniform(lo, hi) * BATCH_GAP_MULT, 1)
+
+
+# ---------------------------------------------------------------- 临时提速（turbo，2026-10-12）
+# 用户裁决：正常模式的节奏与拟人策略一律不动；「临时提速」只通过一份**带到期时间**的配置文件
+# `<BASE>/turbo.json` 覆盖下列时间/开关旋钮。文件缺失/过期/损坏/enabled=false ⇒ 一律按正常模式
+# （fail-closed 回正常）；守护每次取用时 stat 一次，删文件即刻恢复，无需重启。
+# 不进配置、turbo 任何情况下都不改：风控熔断、休息日、静默窗、段预算、前台保护、会话自愈、
+# 深浅读分层逻辑、分类偏好。到期时间必填且距今 ≤ TURBO_MAX_DAYS 天。
+# 示例（T3 档，3 天）见 memory/linuxdo_browse_sop.md「临时提速开关」节。
+TURBO_FILE_NAME = "turbo.json"
+TURBO_MAX_DAYS = 7
+# 区间旋钮 [lo, hi]（秒）的硬边界：越界按边界截断，防止配成荒谬值
+TURBO_RANGE_BOUNDS = {"gap": (15.0, 3600.0), "gap_long": (60.0, 7200.0),
+                      "batch_gap": (30.0, 7200.0), "stay_s": (0.0, 300.0)}
+# 标量旋钮的硬边界
+TURBO_SCALAR_BOUNDS = {"gap_long_p": (0.0, 1.0), "daily_cap": (1, 800),
+                       "deep_cap_s": (30.0, 150.0), "light_p": (0.0, 0.7),
+                       "pause_scale": (0.4, 1.0), "rollback": (0, 10)}
+_TURBO_STATE = {"sig": None, "cfg": None, "exp": None, "last": None}
+
+
+def _turbo_parse(raw):
+    """校验并规整配置 ⇒ (cfg|None, 原因)。cfg 含 _exp（到期 epoch）。越界旋钮截断到边界。"""
+    if not isinstance(raw, dict):
+        return None, "配置不是对象"
+    if raw.get("enabled") is not True:
+        return None, "enabled 不为 true"
+    exp_s = raw.get("expires_at")
+    try:
+        exp = time.mktime(time.strptime(str(exp_s), "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None, "expires_at 缺失或格式不是 YYYY-MM-DD HH:MM:SS"
+    if exp - time.time() > TURBO_MAX_DAYS * 86400:
+        return None, "expires_at 距今超过 %d 天，拒绝生效" % TURBO_MAX_DAYS
+    cfg = {"_exp": exp, "_note": str(raw.get("note") or "")[:120]}
+
+    def _num(x):
+        """严格数字：拒绝 bool/字符串/NaN/±Inf（NaN 会绕过 min/max 截断并让 sleep 抛异常）。"""
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+            raise ValueError("非有限数字: %r" % (x,))
+        return float(x)
+
+    for k, (lo_b, hi_b) in TURBO_RANGE_BOUNDS.items():
+        v = raw.get(k)
+        if v is None:
+            continue
+        try:
+            if not isinstance(v, (list, tuple)) or len(v) != 2:
+                raise ValueError("须为长度 2 的数组")
+            lo, hi = _num(v[0]), _num(v[1])
+            if lo > hi:
+                raise ValueError("lo>hi")
+        except Exception as e:
+            return None, "旋钮 %s 非法(%s)，整份配置拒绝" % (k, str(e)[:40])
+        lo = min(max(lo, lo_b), hi_b)
+        hi = min(max(hi, lo), hi_b)
+        cfg[k] = (lo, hi)
+    for k, (lo_b, hi_b) in TURBO_SCALAR_BOUNDS.items():
+        v = raw.get(k)
+        if v is None:
+            continue
+        try:
+            if k == "rollback" and isinstance(v, bool):
+                v = 10 if v else 0
+            v = _num(v)
+        except Exception as e:
+            return None, "旋钮 %s 非法(%s)，整份配置拒绝" % (k, str(e)[:40])
+        v = min(max(v, lo_b), hi_b)
+        cfg[k] = int(v) if k in ("daily_cap", "rollback") else v
+    return cfg, "ok"
+
+
+def _turbo_note(active, why):
+    """状态变化才留痕（浏览台账 TURBO 行 + stdout），避免每次取用刷屏。"""
+    key = (bool(active), why)
+    if _TURBO_STATE["last"] == key:
+        return
+    _TURBO_STATE["last"] = key
+    try:
+        log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "TURBO",
+                                       "on": bool(active), "note": str(why)[:160]})
+        print("[%s] 临时提速 %s：%s" % (now_str(), "生效" if active else "未生效", why), flush=True)
+    except Exception:
+        pass
+
+
+def turbo_cfg():
+    """生效中的临时提速配置（dict）；否则 None（=正常模式）。"""
+    path = os.path.join(BASE, TURBO_FILE_NAME)
+    try:
+        _stt = os.stat(path)
+        sig = (path, _stt.st_mtime_ns, _stt.st_size, _stt.st_ino)   # inode：cp -p/rsync -t 替换同尺寸文件也能感知
+    except OSError:
+        _TURBO_STATE.update(sig=None, cfg=None)
+        if _TURBO_STATE["last"] is not None and _TURBO_STATE["last"][0]:
+            _turbo_note(False, "配置文件已移除，恢复正常模式")
+        else:
+            _TURBO_STATE["last"] = (False, "无配置")
+        return None
+    if _TURBO_STATE["sig"] != sig:
+        try:
+            with open(path, encoding="utf-8") as f:
+                cfg, why = _turbo_parse(json.load(f))
+        except Exception as e:
+            cfg, why = None, "配置读取/解析失败: %s" % str(e)[:80]
+        _TURBO_STATE.update(sig=sig, cfg=cfg, why=why)
+        if cfg is None:
+            _turbo_note(False, why)
+    cfg = _TURBO_STATE["cfg"]
+    if cfg is None:
+        return None
+    if time.time() >= cfg["_exp"]:
+        _turbo_note(False, "已到期（%s），恢复正常模式" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cfg["_exp"])))
+        return None
+    _fz = _turbo_fused_today()
+    if _fz:
+        _turbo_note(False, "熔断：%s（当日不再提速，次日自动恢复；配置文件未动）" % _fz)
+        return None
+    _turbo_note(True, "到期 %s %s" % (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(cfg["_exp"])), cfg["_note"]))
+    return cfg
+
+
+TURBO_FUSE_N = 3                 # 连续 N 帖「桥接超时/楼层上报增量为 0」⇒ 当日熔断
+TURBO_FUSE_FILE = "turbo_fuse.json"
+
+
+def _is_bridge_timeout(res):
+    """桥接超时返回（TMWebDriver：{"result": "No response data in Ns (...)"}，可能嵌在 data 下）。
+
+    超时≠页面确实读完：脚本在后台标签里可能仍在跑或根本没投递。正常模式沿用旧语义（算 DONE，
+    不动）；仅 turbo 下按失败记账，避免无效读帖污染 cap/seen_ids。
+    """
+    if not isinstance(res, dict):
+        return False
+    for v in (res.get("result"), (res.get("data") or {}).get("result") if isinstance(res.get("data"), dict) else None):
+        if isinstance(v, str) and v.startswith("No response data"):
+            return True
+    return False
+
+
+def _turbo_fused_today():
+    """当日是否已熔断（持久化在 BASE/turbo_fuse.json，跨重启；日期不同即视为未熔断）。返回原因或 None。"""
+    try:
+        with open(os.path.join(BASE, TURBO_FUSE_FILE), encoding="utf-8") as f:
+            j = json.load(f)
+        if isinstance(j, dict) and j.get("day") == today():
+            return str(j.get("why") or "已熔断")[:120]
+    except Exception:
+        pass
+    return None
+
+
+def _turbo_fuse_feed(ok, why, tm_d, turbo_on):
+    """turbo 下逐帖喂熔断计数。坏=桥接超时 或 (成功但 tm.d==0)；好=成功且 tm.d>=1；其余中性。
+
+    连续坏 TURBO_FUSE_N 帖 ⇒ 写 turbo_fuse.json + 留痕 + 私信告警（失败不致命）。
+    只在 turbo 生效的帖子上计数；正常模式不受影响。返回是否刚熔断。
+    """
+    if not turbo_on:
+        _TURBO_STATE["bad_run"] = 0
+        return False
+    if (not ok) and why == "bridge_timeout":
+        bad = True
+    elif ok and isinstance(tm_d, int):
+        bad = (tm_d == 0)
+        if not bad:
+            _TURBO_STATE["bad_run"] = 0
+            return False
+    else:
+        return False
+    _TURBO_STATE["bad_run"] = int(_TURBO_STATE.get("bad_run") or 0) + (1 if bad else 0)
+    if _TURBO_STATE["bad_run"] < TURBO_FUSE_N:
+        return False
+    reason = "连续 %d 帖桥接超时/楼层上报增量为 0（疑似后台标签节流，读帖未入账）" % _TURBO_STATE["bad_run"]
+    try:
+        os.makedirs(BASE, exist_ok=True)
+        with open(os.path.join(BASE, TURBO_FUSE_FILE), "w", encoding="utf-8") as f:
+            json.dump({"day": today(), "ts": now_str(), "why": reason}, f, ensure_ascii=False)
+    except Exception as e:
+        print("[warn] turbo 熔断落盘失败: %s" % str(e)[:100], flush=True)
+    _TURBO_STATE["bad_run"] = 0
+    _turbo_note(False, "熔断：" + reason)
+    try:
+        if not _SANDBOX_ACTIVE:
+            notify("⚠️ L站临时提速已自动熔断（当日不再提速，次日按配置恢复）：%s。配置文件未改动。" % reason)
+    except Exception:
+        pass
+    return True
+
+
+def _turbo_base_gap(tc):
+    """帖间 base 间隔（秒）。tc 无 gap 类旋钮 ⇒ 沿用内核常规档；否则按配置取（常规档/长休档二选一）。"""
+    if tc is None or not (tc.get("gap") or tc.get("gap_long") or "gap_long_p" in tc):
+        return _ad.gap_seconds("browse") if _ad is not None else random.uniform(*GAP_RANGE)
+    lo, hi = tc.get("gap") or tuple(GAP_RANGE)
+    llo, lhi = tc.get("gap_long") or tuple(GAP_LONG_RANGE)
+    p = tc.get("gap_long_p", 0.30)
+    return round(random.uniform(llo, lhi) if random.random() < p else random.uniform(lo, hi), 1)
+
+
+def _cap_today(st, base, tc):
+    """今日 cap：turbo 配置了 daily_cap 就用它（不写 state，正常日 cap 不被污染）；否则走原逻辑。"""
+    if tc and tc.get("daily_cap"):
+        return int(tc["daily_cap"])
+    return daily_cap_today(st, base)
 
 
 def _bridge(payload, timeout=90):
@@ -1339,6 +1548,11 @@ def fetch_verdict(pages_total, pages_ok, diag):
 # ---------------------------------------------------------------- 浏览动作
 ROUTE_JS = r"""
 (async () => {
+  // R576c：页内忙标记。桥接超时后脚本仍在后台标签里跑（正常模式 4/4 超时、上报照常到账，实测），
+  //   turbo 下紧超时会让下一帖的脚本叠在上一帖未完成的读帖上。daemon 在 turbo 下发下一帖前
+  //   轮询 __tmBusy（TAB_BUSY_JS）等其清零；纯页内变量，不发请求、不改页面行为。
+  window.__tmBusy = Date.now();
+  try { return await (async () => {
   const tid='__TID__'; let how=null;
   // ── 记账解锁三件套（2026-10-05 R558 实锤：后台 tab IntersectionObserver/rAF 停→
   //    screen-track 零 timings POST→服务端 last_read 不动→浏览帖子计数不涨）。
@@ -1352,6 +1566,11 @@ ROUTE_JS = r"""
       window.__tmUnlockOn = true;
       window.__tmUnlock = () => {
         try {
+          // R576b：session.hasFocus=false（Chrome 非前台应用/标签 hidden）时 Discourse 不累计阅读时长
+          //   （_timings/_topicTime 恒空 ⇒ 零 /topics/timings POST ⇒ 已读帖子不涨而浏览话题照涨，
+          //   2026-10-12 实测）。与本块三件套同族：保持「窗口有焦点」口径，使入账与前台真人阅读一致。
+          const se = c.lookup('session:main');
+          if (se && se.hasFocus === false) { se.set('hasFocus', true); }
           if (!t._topicId) return;
           const nums = [];
           document.querySelectorAll('.topic-post[data-post-number]').forEach(e => {
@@ -1369,6 +1588,19 @@ ROUTE_JS = r"""
       }, 1500);
     }
   } catch(e){}
+  // ── 观测（R576，只读不改页面行为）：被动统计 /topics/timings 的请求次数与状态码，
+  //    用来区分「楼层上报没发」与「100 天窗口回落」。PerformanceObserver 不受资源时序缓冲区
+  //    （默认 250 条）已满影响；累计值由 daemon 每帖结束后另发一次 TM_PROBE_JS 读取
+  //    （本 JS 的返回值经桥接常丢失，实测 75% 的 title 为空，不能靠返回值带出）。
+  try {
+    if (!window.__tmObs) { window.__tmObs = true; window.__tmN = 0; window.__tmLast = [];
+      new PerformanceObserver((l) => { for (const e of l.getEntries()) {
+        if (e.name.indexOf('/topics/timings') >= 0) { window.__tmN++;
+          window.__tmLast.push(e.responseStatus || 0); if (window.__tmLast.length > 5) window.__tmLast.shift(); } } })
+        .observe({type: 'resource'}); }
+  } catch(e){}
+  try { const se0 = window.Discourse && window.Discourse.__container__.lookup('session:main');
+        if (se0 && se0.hasFocus === false) { se0.set('hasFocus', true); } } catch(e){}   // R576b 见上
   try { const m=window.require('discourse/lib/url');
     if (m && m.default && m.default.routeTo){ m.default.routeTo('/t/topic/'+tid); how='REQ'; } } catch(e){}
   if (!how) return JSON.stringify({need_loc:true});
@@ -1387,6 +1619,7 @@ ROUTE_JS = r"""
         window.scrollBy(0, -380); }
       return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length}); } }
   return JSON.stringify({fail:true,now:location.pathname});
+  })(); } finally { window.__tmBusy = 0; }
 })()
 """
 
@@ -1423,11 +1656,12 @@ def _estimate_chars(c):
     return random.randint(*POST_CHARS_FALLBACK)
 
 
-def _browse_plan(n_chars, light=False):
+def _browse_plan(n_chars, light=False, tc=None):
     """一次浏览的姿势（humanize 单一源）：分屏滚动计划 + 底部停留 + 回滚。
 
     light=浅读：约三成帖子是「刷到划走」——等效文本量砍到 35%、屏内停顿减半、不回滚。
     humanize 缺席时回退常量均匀计划（保证守护仍能跑）。返回 (plan, stay_ms, rb, pose)。
+    tc=临时提速配置（turbo_cfg()）；None=正常模式，行为与此前逐项一致。仅 humanize 路径生效。
     """
     if hu is None:
         steps = random.randint(*(LIGHT_STEPS if light else SCROLL_STEPS))
@@ -1438,26 +1672,91 @@ def _browse_plan(n_chars, light=False):
         return plan, stay_ms, (0 if light else ROLLBACK_STEPS), None
     n_eff = max(600, int(n_chars * (0.35 if light else 1.0)))
     dwell = hu.read_dwell_seconds(n_eff, kind="browse")
-    dwell = min(dwell, LIGHT_DWELL_CAP_S if light else DEEP_DWELL_CAP_S)
+    tc = tc or {}
+    dwell = min(dwell, LIGHT_DWELL_CAP_S if light else (tc.get("deep_cap_s") or DEEP_DWELL_CAP_S))
     plan = hu.scroll_plan(n_eff, dwell, kind="browse")
     if light:                                     # 浅读：屏幅更大、停顿更短
         for p in plan:
             p["dy"] = round(p["dy"] * random.uniform(1.3, 1.8), 1)
             p["pause"] = round(max(0.25, p["pause"] * 0.5), 2)
-    stay_ms = int(hu.wrap_up_seconds("browse") * 1000)
+    if tc.get("pause_scale") is not None:         # 临时提速：整体缩放滚动停顿
+        for p in plan:
+            p["pause"] = round(max(0.05, p["pause"] * tc["pause_scale"]), 2)
+    if tc.get("stay_s"):                          # 临时提速：底部驻留区间取配置
+        stay_ms = int(random.uniform(*tc["stay_s"]) * 1000)
+    else:
+        stay_ms = int(hu.wrap_up_seconds("browse") * 1000)
+    rb = 0 if light else (tc["rollback"] if tc.get("rollback") is not None else ROLLBACK_STEPS)
     pose = hu.pose("browse", n_eff)
     pose.update({"light": light, "n_chars": n_eff})
-    return plan, stay_ms, (0 if light else ROLLBACK_STEPS), pose
+    return plan, stay_ms, rb, pose
+
+
+TAB_BUSY_JS = "(()=>JSON.stringify({b:window.__tmBusy||0,now:Date.now()}))()"
+TAB_IDLE_MAX_S = 240.0     # turbo：等上一段读帖脚本跑完的上限；超时放行（不无限阻塞）
+TAB_BUSY_STALE_MS = 900000  # 忙标记超过 15 分钟视为陈旧（页面重载会清空；此处兜底）
+
+
+def _wait_tab_idle(session, max_s=None, poll=3.0):
+    """等页内 __tmBusy 清零（上一帖读帖脚本跑完）。返回等待秒数。
+
+    fail-open：探测失败/返回异常一律放行，绝不因探测问题卡住守护。仅 turbo 调用。
+    """
+    max_s = TAB_IDLE_MAX_S if max_s is None else max_s
+    t0 = time.time()
+    while time.time() - t0 < max_s:
+        try:
+            r = run_js(session["id"], TAB_BUSY_JS, timeout=15)
+        except Exception:
+            break
+        if not (isinstance(r, dict) and isinstance(r.get("b"), (int, float))):
+            break
+        b = r["b"]
+        if not b or (float(r.get("now") or 0) - float(b)) > TAB_BUSY_STALE_MS:
+            break
+        time.sleep(poll)
+    return round(time.time() - t0, 1)
+
+
+TM_PROBE_JS = "(()=>JSON.stringify({n:window.__tmN||0,st:(window.__tmLast||[]).slice(-3)}))()"
+_TM_PREV = {"n": None}
+
+
+def _tm_probe(session):
+    """读页内观察器累计的 /topics/timings 请求数（只读页内变量，不发网络请求）。
+
+    返回 {n:累计, st:最近3次状态码, d:较上一帖增量(页面重载致计数归零时取 n)}；失败 None。
+    上报在离开话题时触发，故 d 归属下一帖，按日统计即可；d 长期为 0 ⇒ 楼层上报没发。
+    """
+    try:
+        r = run_js(session["id"], TM_PROBE_JS, timeout=15)
+        if not (isinstance(r, dict) and isinstance(r.get("n"), int)):
+            return None
+        n, prev = r["n"], _TM_PREV["n"]
+        _TM_PREV["n"] = n
+        # 首次探测（守护重启后）增量未知 ⇒ None；n<prev 说明页面重载过，计数从 0 重新累计 ⇒ d=n
+        return {"n": n, "st": r.get("st"),
+                "d": None if prev is None else ((n - prev) if n >= prev else n)}
+    except Exception:
+        return None
 
 
 def browse_one(session, tid, state, cand=None):
     # 深浅分层：真人不是每帖都读到底——约三成是「刷到划走」型浅读（快滚大屏幅、不回滚、短驻留）
-    light = random.random() < LIGHT_P
-    plan, stay, rb, pose = _browse_plan(_estimate_chars(cand), light)
+    tc = turbo_cfg()                                  # 临时提速配置；None=正常模式
+    light = random.random() < ((tc or {}).get("light_p") if (tc or {}).get("light_p") is not None else LIGHT_P)
+    plan, stay, rb, pose = _browse_plan(_estimate_chars(cand), light, tc)
     plan_js = "[" + ",".join("[%s,%s]" % (p["dy"], p["pause"]) for p in plan) + "]"
     code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
     js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2)
-    res = run_js(session["id"], code, timeout=max(150, js_budget + 45))
+    # ★R576：深读 JS 的返回值经桥接常丢失（历史 DONE 里深读约 95% 的 title 为空），丢失时守护要白等到
+    #   桥接超时。正常模式沿用 max(150, 预算+45) 不动；turbo 下单帖只有几十秒，150 秒下限会把提速吃掉
+    #   （实测 T3 每帖 175–180s 而非 ~80s），故收紧为 预算+30（JS 最坏额外耗时约 23s：路由等待≤12.5s、
+    #   每步抖动≤0.4s、底驻抖动≤2.5s）。超时返回的非 need_loc/fail 结果本就按成功处理，语义不变。
+    _js_to = max(40, js_budget + 30) if tc else max(150, js_budget + 45)
+    if tc:
+        _wait_tab_idle(session)        # R576c：上一帖脚本未跑完就不叠加下一帖（仅 turbo）
+    res = run_js(session["id"], code, timeout=_js_to)
     ok = isinstance(res, dict) and not res.get("need_loc") and not res.get("fail")
     if isinstance(res, dict) and res.get("need_loc"):
         # 兜底整页导航仅允许在主站 tab 上做：connect.linux.do 等子域无 Discourse，
@@ -1468,12 +1767,29 @@ def browse_one(session, tid, state, cand=None):
             return False, {"fail": "non-linuxdo-tab:%s" % host}
         run_js(session["id"], "location.href='/t/topic/%s'" % tid, timeout=20)  # 整页直达兜底
         time.sleep(6)
-        res2 = run_js(session["id"], code, timeout=max(150, js_budget + 45))
+        res2 = run_js(session["id"], code, timeout=_js_to)
         ok = isinstance(res2, dict) and not res2.get("fail")
         res = res2
+    _tm_pre = None
+    if tc and ok and _is_bridge_timeout(res):
+        # R576c：仅 turbo。超时≠没读（实测正常模式 4/4 超时但每帖仍有 5–10 次上报）。先等脚本跑完，
+        #   再用「上报增量」判定：d==0 才按失败记账（bridge_timeout，不进 cap/seen_ids）；
+        #   d>=1 或未知（重启后首探 None）沿用旧语义算成功。正常模式保持旧语义，不动。
+        _wait_tab_idle(session)
+        _tm_pre = _tm_probe(session)
+        if _tm_pre is not None and _tm_pre.get("d") == 0:
+            ok = False
+            res = {"fail": "bridge_timeout", "detail": str(res)[:120]}
+        else:
+            res = {"title": "", "posts": None, "timeout": True}
     if isinstance(res, dict):
         res["mode"] = "LIGHT" if light else "DEEP"
         res["pose"] = pose
+        # R576：落**实际执行值**（pose 是 humanize 另抽的随机摘要，不等于执行值，勿当审计依据）
+        res["exec"] = {"steps": len(plan), "plan_s": round(sum(float(p["pause"]) for p in plan), 1),
+                       "stay_s": round(stay / 1000.0, 1), "rb": rb,
+                       "turbo": bool(tc) and hu is not None}
+        res["tm"] = _tm_pre if _tm_pre is not None else (_tm_probe(session) if ok else None)
     return ok, res
 
 
@@ -1662,6 +1978,12 @@ def browse_batch(session, st, batch=25):
         raise RiskAbort(_rk, LAST_FETCH_DIAG.get("detail") or "")
     if _act == "NOTE":
         print("[%s] 部分页风控信号 %s（仍有候选）⇒ 本批继续，仅留痕" % (now_str(), _rk), flush=True)
+        # R576：此前只写 stdout，risk_log 低估次数且没有页码/响应正文 ⇒ 无法判是否真风控。
+        #   用 INFO 行留痕（不走 note_risk，不计入当日风控累计，行为不变）。
+        log_jsonl("risk_log.jsonl", {"ts": now_str(), "st": "INFO", "kind": "FETCH_PARTIAL",
+                                     "risk_kind": _rk,
+                                     "detail": str(LAST_FETCH_DIAG.get("detail"))[:300],
+                                     "pages": LAST_FETCH_STATS["pages"], "pages_ok": LAST_FETCH_STATS["ok"]})
     seen = set(st.get("seen_ids", []))
     cand = [c for c in cand if c.get("id") and int(c["id"]) not in seen]
     random.shuffle(cand)
@@ -1695,7 +2017,13 @@ def browse_batch(session, st, batch=25):
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
-                                       "pose": res.get("pose") if isinstance(res, dict) else None})
+                                       "pose": res.get("pose") if isinstance(res, dict) else None,
+                                       "exec": res.get("exec") if isinstance(res, dict) else None,
+                                       "tm": res.get("tm") if isinstance(res, dict) else None})
+        # R576：turbo 熔断计数（连续桥接超时/tm.d==0 ⇒ 当日停用 turbo；正常模式不计）
+        _ex = (res.get("exec") if isinstance(res, dict) else None) or {}
+        _turbo_fuse_feed(ok, _why, ((res.get("tm") or {}).get("d") if isinstance(res, dict) else None),
+                         bool(_ex.get("turbo")))
         # ★会话级故障即中止本批（2026-10-06）：标签被导航走/驱动回落错标签时，逐帖重试
         #   会把本批 19 次机会全烧在同一个故障上（当次 21:52–22:56 零产出）。交回主循环自愈。
         if (not ok) and str(_why).startswith("non-linuxdo-tab"):
@@ -1713,7 +2041,7 @@ def browse_batch(session, st, batch=25):
         else:
             skipped += 1
         # 帖间随机间隔（防检测核心）：统一走 humanize，含 25-35% 长休
-        _base_gap = _ad.gap_seconds("browse") if _ad is not None else random.uniform(*GAP_RANGE)
+        _base_gap = _turbo_base_gap(turbo_cfg())
         # ★R574 段内帖间间隔硬上限:内核长休档(base 300-600s)×0.06 起身分支曾可单次睡到
         #   base×12=2h ⇒ 段内出现 2h 静默,既破坏 6-8 段×85-160min 节律也触发守护误重启。
         time.sleep(hu.action_gap("browse", base=_base_gap, cap=POST_GAP_CAP_S))
@@ -1848,7 +2176,7 @@ def watch(args):
         if route["manual"] or route["unknown"]:
             if maybe_notify_manual(st, route):
                 print("[%s] 已私信提醒须人工项（今日首次）" % now_str(), flush=True)
-        cap_today = daily_cap_today(st, args.daily_cap)
+        cap_today = _cap_today(st, args.daily_cap, turbo_cfg())
         if daily_count(st) >= cap_today:
             print("[%s] 今日已达 daily-cap=%d（base=%d，每日随机定一次），睡到明天" % (now_str(), cap_today, args.daily_cap), flush=True)
             _r = maybe_run_pending_acts(st, session)
@@ -1913,7 +2241,7 @@ def watch(args):
                 note_risk(st, rk, diag)
             else:
                 log_jsonl("risk_log.jsonl", {"ts": now_str(), "st": "INFO", "kind": "FETCH_FAIL",
-                                             "detail": str(diag)[:300]})
+                                             "detail": str(LAST_FETCH_DIAG.get("detail") or diag)[:300]})
         if done == 0 and skipped == 0:
             # ★R572 D2 归因分列:抓取全失败(瞬态)≠ 候选全重(正常无新帖)
             zk = zero_yield_kind(LAST_FETCH_STATS)
@@ -2695,6 +3023,274 @@ def _selftest_impl():
         finally:
             _g20["subprocess"].run = _k_run20
             _g20["_try_bridge_open_main_tab"] = _k_bo20
+    cases += 1
+
+    # T21 临时提速（turbo，R576）：配置缺失=正常；到期/损坏/越界/过长有效期=fail-closed；
+    #     生效时旋钮真被应用；风控/静默窗/段闸门不受影响（结构负控）。全部落沙箱 BASE。
+    import inspect as _insp
+    _tp = os.path.join(BASE, TURBO_FILE_NAME)
+    _fmt = "%Y-%m-%d %H:%M:%S"
+
+    def _w(obj):
+        with open(_tp, "w", encoding="utf-8") as f:
+            f.write(obj if isinstance(obj, str) else json.dumps(obj))
+
+    def _in(days):
+        return time.strftime(_fmt, time.localtime(time.time() + days * 86400))
+    _T3 = {"enabled": True, "expires_at": _in(3), "note": "selftest",
+           "gap": [20, 45], "gap_long": [90, 180], "gap_long_p": 0.05,
+           "batch_gap": [120, 180], "daily_cap": 600, "deep_cap_s": 60,
+           "light_p": 0.5, "stay_s": [2, 2], "rollback": False, "pause_scale": 0.6}
+    if os.path.exists(_tp):
+        os.remove(_tp)
+    if turbo_cfg() is not None:
+        fails.append("T21a 无配置文件须=正常模式")
+    _gs0 = [_batch_gap() for _ in range(30)]
+    if min(_gs0) < 300 * BATCH_GAP_MULT - 0.05:
+        fails.append("T21a2 无配置时批间休须仍是正常口径: %s" % min(_gs0))
+    _w(_T3)
+    _tc = turbo_cfg()
+    if not _tc or _tc.get("daily_cap") != 600 or _tc.get("rollback") != 0:
+        fails.append("T21b 合法配置须生效并规整(rollback=false→0): %s" % _tc)
+    else:
+        if any(not (120 - .05 <= _batch_gap() <= 180 + .05) for _ in range(30)):
+            fails.append("T21b2 批间休须取配置区间")
+        _bg = [_turbo_base_gap(_tc) for _ in range(200)]
+        if not (min(_bg) >= 20 - .05 and max(_bg) <= 180 + .05):
+            fails.append("T21b3 帖间 base 越出配置区间: %s~%s" % (min(_bg), max(_bg)))
+        _pl, _sm, _rb, _po = _browse_plan(6000, False, _tc)
+        if _rb != 0 or not (1900 <= _sm <= 2100):
+            fails.append("T21b4 turbo 须关回滚且底驻=2s: rb=%s stay=%s" % (_rb, _sm))
+        if sum(float(p["pause"]) for p in _pl) > 60 + 0.5 * len(_pl):
+            fails.append("T21b5 深读封顶/停顿缩放未生效: %.1f" % sum(float(p["pause"]) for p in _pl))
+        _stc = {"cap": {today(): 111}}
+        if _cap_today(_stc, 200, _tc) != 600 or _stc["cap"][today()] != 111:
+            fails.append("T21b6 turbo cap 须生效且不写正常日 cap: %s" % _stc)
+        if _cap_today(_stc, 200, None) != 111:
+            fails.append("T21b7 无 turbo 须走原 cap 逻辑")
+    _w(dict(_T3, expires_at=_in(-0.001)))
+    if turbo_cfg() is not None:
+        fails.append("T21c 已到期须=正常模式（负控）")
+    _w("{坏json")
+    if turbo_cfg() is not None:
+        fails.append("T21d 损坏文件须=正常模式（负控）")
+    _w(dict(_T3, expires_at=_in(30)))
+    if turbo_cfg() is not None:
+        fails.append("T21e 有效期超过 %d 天须拒绝（负控）" % TURBO_MAX_DAYS)
+    _w(dict(_T3, enabled=False))
+    if turbo_cfg() is not None:
+        fails.append("T21f enabled=false 须=正常模式（负控）")
+    _w(dict(_T3, gap=[1, 2], deep_cap_s=1, pause_scale=0.01, daily_cap=99999, light_p=1.0))
+    _tc2 = turbo_cfg()
+    if not _tc2 or _tc2["gap"][0] != 15 or _tc2["deep_cap_s"] != 30 or _tc2["pause_scale"] != 0.4 \
+            or _tc2["daily_cap"] != 800 or _tc2["light_p"] != 0.7:
+        fails.append("T21g 越界旋钮须截断到硬边界: %s" % _tc2)
+    _w(_T3)
+    if turbo_cfg() is None:
+        fails.append("T21h 恢复合法配置须重新生效（mtime 变化重读）")
+    os.remove(_tp)
+    if turbo_cfg() is not None:
+        fails.append("T21i 删文件须即刻恢复正常")
+    # T21j 结构负控（AST 调用点白名单，R576 评审后加强）：turbo_cfg() 只允许出现在白名单位置，
+    #   且父节点形态固定——任何「if ... and not turbo_cfg()」之类的闸门介入都会被抓到。
+    import ast as _ast
+    _tree = _ast.parse(open(os.path.abspath(__file__), encoding="utf-8").read())
+    for _n in _ast.walk(_tree):
+        for _c in _ast.iter_child_nodes(_n):
+            _c._par = _n
+    _ALLOW = {  # 外层函数 → 父节点要求
+        "_batch_gap": ("Assign", None), "browse_one": ("Assign", None),
+        "browse_batch": ("Call", "_turbo_base_gap"), "watch": ("Call", "_cap_today"),
+    }
+    _bad = []
+    for _n in _ast.walk(_tree):
+        if not (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name) and _n.func.id == "turbo_cfg"):
+            continue
+        _f = _n
+        while _f is not None and not isinstance(_f, _ast.FunctionDef):
+            _f = getattr(_f, "_par", None)
+        _fn = _f.name if _f else "<module>"
+        if _fn in ("turbo_cfg", "_selftest_impl"):
+            continue
+        _need = _ALLOW.get(_fn)
+        _p = getattr(_n, "_par", None)
+        _pk = type(_p).__name__
+        _pn = _p.func.id if isinstance(_p, _ast.Call) and isinstance(_p.func, _ast.Name) else None
+        if not _need or _pk != _need[0] or (_need[1] and _pn != _need[1]):
+            _bad.append("%s 内 turbo_cfg() 父节点=%s%s（line %d）" % (_fn, _pk, ("/" + _pn) if _pn else "", _n.lineno))
+    if _bad:
+        fails.append("T21j turbo_cfg() 出现在非白名单位置（风控/静默窗/段闸门/前台保护不得受 turbo 影响）: %s" % _bad)
+    for _fn in (risk_kind_from_http, risk_kind_from_text, fetch_verdict, handle_risk,
+                segment_gate, quiet_window_check, rest_day_today, tab_is_front, front_decision,
+                pick_session, try_ensure_tab, note_risk):
+        if "turbo" in _insp.getsource(_fn).lower():
+            fails.append("T21j2 %s 不得引用 turbo" % _fn.__name__)
+    # T21k 观测补丁未误伤原有「楼层上报三件套」，且新增 timings 观测
+    for _k in ("screen-track", "_onscreen", "__tmInterval", "dispatchEvent(new Event('scroll'))",
+               "PerformanceObserver", "/topics/timings", "session:main", "set('hasFocus', true)",
+               "window.__tmBusy = Date.now()", "finally { window.__tmBusy = 0; }"):
+        if _k not in ROUTE_JS:
+            fails.append("T21k ROUTE_JS 缺 %s" % _k)
+    if "__tmN" not in TM_PROBE_JS:
+        fails.append("T21k2 TM_PROBE_JS 须读观察器累计值 __tmN")
+    _bo_src = _insp.getsource(browse_one)
+    if "max(150, js_budget + 45)" not in _bo_src or "max(40, js_budget + 30) if tc else" not in _bo_src:
+        fails.append("T21l browse_one 超时须：正常模式保持 max(150,预算+45)、仅 turbo 收紧")
+    # T21m 非法输入整份拒绝（NaN/Inf/字符串/长度/lo>hi/bool），不得放行也不得抛异常
+    for _bad_cfg in ({"gap": [20, float("nan")]}, {"gap": [float("nan"), 45]}, {"batch_gap": [float("nan")] * 2},
+                     {"stay_s": [float("nan")] * 2}, {"pause_scale": float("nan")}, {"deep_cap_s": float("inf")},
+                     {"light_p": float("nan")}, {"daily_cap": float("nan")}, {"rollback": float("nan")},
+                     {"gap": [45, 20]}, {"gap": "20"}, {"gap": [20, 45, 999]}, {"gap": [True, 45]},
+                     {"pause_scale": "0.6"}, {"gap_long_p": [0.1]}):
+        _cfgx, _wx = _turbo_parse(dict(_T3, **_bad_cfg))
+        if _cfgx is not None:
+            fails.append("T21m 非法旋钮须整份拒绝: %s ⇒ %s" % (_bad_cfg, _cfgx))
+    # T21n 熔断：连续 N 帖坏 ⇒ 当日熔断、turbo_cfg()=None、不动配置文件；好帖清零；正常模式不计；次日恢复
+    _w(_T3)
+    _TURBO_STATE["bad_run"] = 0
+    _notified = []
+    _kn = globals()["notify"]
+    globals()["notify"] = lambda t: _notified.append(t) or True
+    _ksb = globals()["_SANDBOX_ACTIVE"]
+    globals()["_SANDBOX_ACTIVE"] = False      # 让熔断走一次通知分支（notify 已打桩，不真发）
+    try:
+        _fz = os.path.join(BASE, TURBO_FUSE_FILE)
+        if os.path.exists(_fz):
+            os.remove(_fz)
+        if turbo_cfg() is None:
+            fails.append("T21n0 前置：turbo 须生效")
+        _r = [_turbo_fuse_feed(True, "", 0, True), _turbo_fuse_feed(True, "", 2, True),   # 好帖清零
+              _turbo_fuse_feed(False, "bridge_timeout", None, True), _turbo_fuse_feed(True, "", 0, True)]
+        if any(_r) or _TURBO_STATE["bad_run"] != 2:
+            fails.append("T21n1 好帖须清零、未满 N 不得熔断: %s run=%s" % (_r, _TURBO_STATE["bad_run"]))
+        if _turbo_fuse_feed(True, "", 0, False) or _TURBO_STATE["bad_run"] != 0:
+            fails.append("T21n2 正常模式的帖不得计数并须清零")
+        _turbo_fuse_feed(False, "bridge_timeout", None, True)
+        _turbo_fuse_feed(True, "", 0, True)
+        _tripped = _turbo_fuse_feed(False, "bridge_timeout", None, True)
+        if not _tripped or not _notified or not os.path.exists(_fz):
+            fails.append("T21n3 连续 %d 帖坏须熔断+落盘+告警: tripped=%s notified=%d" % (TURBO_FUSE_N, _tripped, len(_notified)))
+        if turbo_cfg() is not None:
+            fails.append("T21n4 熔断当日 turbo_cfg() 须=None")
+        if not os.path.exists(_tp):
+            fails.append("T21n5 熔断不得删改配置文件")
+        with open(_fz, "w", encoding="utf-8") as _f:
+            json.dump({"day": "2000-01-01", "why": "旧日"}, _f)
+        _TURBO_STATE.update(last=None)
+        if turbo_cfg() is None:
+            fails.append("T21n6 熔断记录非当日须视为未熔断（次日自动恢复）")
+    finally:
+        globals()["notify"] = _kn
+        globals()["_SANDBOX_ACTIVE"] = _ksb
+        for _p in (os.path.join(BASE, TURBO_FUSE_FILE),):
+            if os.path.exists(_p):
+                os.remove(_p)
+        _TURBO_STATE["bad_run"] = 0
+    # T21o 桥接超时识别：两种嵌套形态命中；普通结果/空结果不误判
+    if not (_is_bridge_timeout({"result": "No response data in 40.0s (ACK received, script may still be running)"})
+            and _is_bridge_timeout({"data": {"result": "No response data in 69.0s (no ACK)"}})):
+        fails.append("T21o 桥接超时两种形态须识别")
+    if any(_is_bridge_timeout(x) for x in ({"title": "No response data"}, {"data": None}, {"ok": True}, None, "x")):
+        fails.append("T21o 非超时结果不得误判")
+    # T21q 行为（R576c）：turbo 下桥接超时先等脚本跑完再看上报增量——d==0 记失败(bridge_timeout)，
+    #   d>=1 或未知算成功；正常模式保持旧语义（超时算成功，且不等待/不探测）。打桩 run_js/sleep。
+    _to_res = {"result": "No response data in 40.0s (ACK received, script may still be running)"}
+    _krj, _kts = globals()["run_js"], time.sleep
+    _calls = {"busy": 0, "probe": 0}
+    _nseq = {"n": 7}
+    _order = []
+
+    def _stub(sid, code, timeout=60):
+        _order.append("route" if "routeTo" in code else ("busy" if "__tmBusy||0" in code else "probe"))
+        if "routeTo" in code:
+            return _to_res
+        if "__tmBusy||0" in code:
+            _calls["busy"] += 1
+            return {"b": 1 if _calls["busy"] == 1 else 0, "now": 2}   # 首次忙、之后空闲
+        _calls["probe"] += 1
+        return {"n": _nseq["n"], "st": [200]}
+    try:
+        globals()["run_js"] = _stub
+        time.sleep = lambda x: None
+        _w(_T3)
+        _TM_PREV["n"] = 7                      # 上一帖累计 7，现在仍 7 ⇒ d=0
+        _ok_t, _res_t = browse_one({"id": "s"}, "123", {})
+        if _ok_t or not (isinstance(_res_t, dict) and _res_t.get("fail") == "bridge_timeout"):
+            fails.append("T21q turbo 超时且 d==0 须记失败 bridge_timeout: ok=%s res=%s" % (_ok_t, _res_t))
+        if _calls["busy"] < 2:
+            fails.append("T21q0 turbo 须先等标签空闲再发/判（busy 探测 %d 次）" % _calls["busy"])
+        if not _order or _order[0] != "busy" or "route" not in _order or _order.index("busy") > _order.index("route"):
+            fails.append("T21q0b turbo 须在发读帖脚本之前先探测标签空闲: 顺序=%s" % _order[:4])
+        _TM_PREV["n"] = 5; _nseq["n"] = 7      # d=2 ⇒ 上报在到账，算成功
+        _ok_g, _res_g = browse_one({"id": "s"}, "123", {})
+        if not _ok_g or (_res_g.get("tm") or {}).get("d") != 2:
+            fails.append("T21q1 turbo 超时但 d>=1 须算成功并带 tm: ok=%s res=%s" % (_ok_g, _res_g))
+        _TM_PREV["n"] = None                   # 重启后首探 d=None ⇒ 未知，算成功
+        _ok_u, _res_u = browse_one({"id": "s"}, "123", {})
+        if not _ok_u:
+            fails.append("T21q1b 首探 d=None 须算成功(未知不误杀): %s" % (_res_u,))
+        if os.path.exists(_tp):
+            os.remove(_tp)
+        _calls.update(busy=0, probe=0)
+        _ok_n, _res_n = browse_one({"id": "s"}, "123", {})
+        if not _ok_n or _calls["busy"] != 0:
+            fails.append("T21q2 正常模式超时须算成功且不等待标签空闲: ok=%s busy=%d" % (_ok_n, _calls["busy"]))
+    finally:
+        globals()["run_js"] = _krj
+        time.sleep = _kts
+        _TM_PREV["n"] = None
+        if os.path.exists(_tp):
+            os.remove(_tp)
+    # T21r _wait_tab_idle：忙→空闲即返回；一直忙到上限放行；探测异常/格式不对 fail-open 立刻放行
+    try:
+        globals()["run_js"] = lambda *a, **k: {"b": 1, "now": 2}
+        time.sleep = lambda x: _tick_clock.__setitem__("t", _tick_clock["t"] + x)
+        _tick_clock = {"t": 0.0}
+        _real_time = time.time
+        time.time = lambda: _tick_clock["t"]
+        _wt = _wait_tab_idle({"id": "s"}, max_s=30, poll=3.0)
+        if not (29 <= _wt <= 40):
+            fails.append("T21r 一直忙须在上限附近放行: %s" % _wt)
+        globals()["run_js"] = lambda *a, **k: {"raw": "garbage"}
+        _tick_clock["t"] = 0.0
+        if _wait_tab_idle({"id": "s"}, max_s=30, poll=3.0) > 0.5:
+            fails.append("T21r2 探测格式异常须 fail-open 立即放行")
+        def _boom(*a, **k):
+            raise RuntimeError("bridge down")
+        globals()["run_js"] = _boom
+        _tick_clock["t"] = 0.0
+        if _wait_tab_idle({"id": "s"}, max_s=30, poll=3.0) > 0.5:
+            fails.append("T21r3 探测抛异常须 fail-open 立即放行")
+    finally:
+        time.time = _real_time
+        time.sleep = _kts
+        globals()["run_js"] = _krj
+    # T21p 配置签名含 inode：同尺寸、同 mtime 的替换也要重读
+    _w(_T3)
+    turbo_cfg()
+    _sig0 = _TURBO_STATE["sig"]
+    _tmp2 = _tp + ".new"
+    with open(_tmp2, "w", encoding="utf-8") as _f:
+        _f.write(open(_tp, encoding="utf-8").read())
+    _stt0 = os.stat(_tp)
+    os.utime(_tmp2, ns=(_stt0.st_atime_ns, _stt0.st_mtime_ns))
+    os.replace(_tmp2, _tp)
+    turbo_cfg()
+    if _TURBO_STATE["sig"] == _sig0:
+        fails.append("T21p 配置签名须含 inode（同尺寸同 mtime 替换也要感知）")
+    if os.path.exists(_tp):
+        os.remove(_tp)
+    _TM_PREV["n"] = None
+    _kr = run_js
+    try:
+        _seq = iter([{"n": 3, "st": [200]}, {"n": 5, "st": [200, 200]}, {"n": 1, "st": [200]}, "bad"])
+        globals()["run_js"] = lambda *a, **k: next(_seq)
+        _r1, _r2, _r3, _r4 = (_tm_probe({"id": "x"}) for _ in range(4))
+        if (_r1 or {}).get("d", "x") is not None or (_r2 or {}).get("d") != 2 or (_r3 or {}).get("d") != 1 or _r4 is not None:
+            fails.append("T21k3 tm 增量：首探=None、累计差、重载归零取 n、坏返回=None: %s %s %s %s" % (_r1, _r2, _r3, _r4))
+    finally:
+        globals()["run_js"] = _kr
+        _TM_PREV["n"] = None
     cases += 1
 
     return fails, cases

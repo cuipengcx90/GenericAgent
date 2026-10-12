@@ -61,9 +61,9 @@ return JSON.stringify({fail:true,now:location.pathname});
 ## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
 
 触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
-后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测 35/35；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测（计数以最近一次运行输出为准，R576 后 39/39）；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
-- 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 慢滚 22–30 步×1.4–2.0s + 底部驻留 90–125s + 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（内核 `daily_cap=200` ± `cap_jitter=20` ⇒ 实际 180–220，每天摇一次、跨重启稳定）+ 全天切成 `seg_n=6–8` 段 × 每段 `seg_len=85–160min`（内核 `day_segments` 日期种子派生 ⇒ 重启不重置段位；段总长 ≤ 活动窗 80%，段间随机长休 ~130–150min） + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
+- 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 读帖滚动与底部驻留（★2026-10-05 17:02 起由 humanize 拟人层生成，旧口径「慢滚 22–30 步×1.4–2.0s、底驻 90–125s」已被取代，现行值见文末「口径订正」节）+ 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（内核 `daily_cap=200` ± `cap_jitter=20` ⇒ 实际 180–220，每天摇一次、跨重启稳定）+ 全天切成 `seg_n=6–8` 段 × 每段 `seg_len=85–160min`（内核 `day_segments` 日期种子派生 ⇒ 重启不重置段位；段总长 ≤ 活动窗 80%，段间随机长休 ~130–150min） + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
 - 风控信号与休息日另有独立台账：`risk_log.jsonl`（每次风控信号一行，含 kind/原文片段/动作）、`rest_log.jsonl`（休息日判定）
 
@@ -80,7 +80,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 ## 反检测审查强化（2026-10-05）
 
-- **深浅分层**：真人不是每帖都读到底。daemon `browse_one` 已内置 `LIGHT_P=0.30` 浅读分支（快滚 4–6 屏、步速 0.25–0.5s、驻留 15–30s、不回滚），其余 70% 沿用深读慢滚+底驻；`browse_log.jsonl` 每行带 `mode=LIGHT/DEEP` 字段。
+- **深浅分层**：真人不是每帖都读到底。daemon `browse_one` 内置浅读分支（`LIGHT_P=0.25`，等效文本量×0.35、屏幅×1.3–1.8、停顿×0.5、驻留封顶 25s、不回滚；★2026-10-05 17:02 起由 humanize 生成，原「快滚 4–6 屏、驻留 15–30s」为旧口径，现行见文末「口径订正」节），其余 75% 沿用深读；`browse_log.jsonl` 每行带 `mode=LIGHT/DEEP` 字段。
 - **判读口径**：浅读帖照样计入浏览话题数（主指标不受损），但 posts_read（楼数）偏少——这是预期行为不是漏报，勿当故障修。
 - **分类偏好加权**：每批（≥8 帖）随机定 2–3 个偏好板块占约 60%，其余散选——真人会「进一个板块连看」，均匀跳遍全站分类是机器味（已在 `browse_batch` 实现，偏好分类每批重抽）。
 - 回复版的去 AI 味与指纹铁律见 `memory/linuxdo_reply_sop.md` 的「去AI味与反检测强化」节。
@@ -222,3 +222,72 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 **判据**:`tools/linuxdo_browse_daemon.py status` 看 `segments.rests[].minutes`,以及
 `browse_log.jsonl` 相邻 `DONE` 行时间差(段内单次 ≥15min 即为回归)。
+
+## 口径订正:读帖滚动/底部驻留/深读封顶(2026-10-12,只订正文字,不改行为)
+
+**裁决(用户 2026-10-12)**:保持**现行代码口径**,SOP 文字向代码对齐;不恢复旧底驻。
+
+**口径演变**:
+| 时间 | 口径 | 出处 |
+|---|---|---|
+| 10-05 01:57 | 手动版底部驻留 70–84s | `2b06fdc`(「修法三件套」节) |
+| 10-05 09:33–11:39 | 后台版慢滚 22–30 步×1.4–2.0s + 底驻 90–125s | `1d942c3` / `2a8242d` |
+| 10-05 17:02 起(**现行**) | 接入 humanize 拟人层:底驻 2–14s(wrap 区间 2–10s,lognormal 上界 ×1.4)、深读封顶 150s | `5d06b91`(提交说明写明「深读上限 150s」;代码注释:沿用接线前的预算,避免慢到日 cap 跑不完) |
+
+**现行值(以 `tools/linuxdo_browse_daemon.py` / `tools/linuxdo_humanize.py` 源码为准)**:
+- 读帖停留 = `humanize.read_dwell_seconds`:字数÷阅读速度(精读 3.6 / 常速 7 字/秒,45% 概率精读)×对数正态波动 + 开屏定位 0.8–2.5s,范围 2.5–300s;daemon 再封顶——深读 150s(`DEEP_DWELL_CAP_S`)、浅读 25s(`LIGHT_DWELL_CAP_S`)。
+- 滚动 = `humanize.scroll_plan`:约 420 字/屏,步长与停顿逐步不同,含回滚项。
+- 底部驻留 = `humanize.wrap_up_seconds("browse")`:区间 2–10s,lognormal 上界 hi×1.4 ⇒ 实际 2–14s(台账 `wrap_up` 实测最大 14.0)。深读回滚 10 步(`ROLLBACK_STEPS`),浅读不回滚。
+- 浅读 25%(`LIGHT_P`):等效文本量×0.35、屏幅×1.3–1.8、停顿×0.5。
+- 帖间 = 内核 gap(110–260s,30% 长休 300–600s)经 `action_gap`(6% 起身分支,R574 上限 900s);批间休息 = gap_long×1.5。
+
+**为什么不恢复底驻 90–125s**:旧底驻时期每个新计入话题带来约 7.2 楼(10-05 11:43→16:10:+315 楼/+44 话题),现口径正常日 7.1–8.9 楼/话题(10-06 至 10-11),**未见下降**;恢复预计日产 73–86 帖(现 87–102),无入账收益证据。
+
+**产量基线(现口径)**:模拟 + 近 6 天实测,每日 87–102 帖(好日);每新计入话题约 7–8 楼,100 天窗口每日回落约 200 楼(由实测反推,粗估)。
+
+**审计注意**:台账 `pose.read_dwell/wrap_up/scroll_screens` 是 humanize 另抽的随机摘要,**不是执行值**(`pose` 里 89% 的 `read_dwell=300` 即此);审计看 R576 起新增的 `exec` 字段。
+
+## 临时提速开关(turbo,R576,2026-10-12)
+
+**定位**:正常模式的节奏与拟人策略**一律不动**;「临时提速」只通过 `temp/linuxdo_browse_daemon/turbo.json` 覆盖时间/开关旋钮。**文件缺失 / 过期 / 损坏 / `enabled≠true` ⇒ 一律按正常模式**(fail-closed);守护每次取用 stat 一次,**删文件即刻恢复,无需重启**。到期时间必填且距今 ≤7 天。
+
+**旋钮**(缺省的旋钮沿用正常值;越界按硬边界截断):
+| 旋钮 | 正常值 | 硬边界 |
+|---|---|---|
+| `gap` 帖间间隔(秒) | 110–260 | lo≥15 |
+| `gap_long` / `gap_long_p` 长休区间/概率 | 300–600 / 0.30 | lo≥60 / 0–1 |
+| `batch_gap` 批间休息(秒) | gap_long×1.5 | lo≥30 |
+| `daily_cap` 每日上限 | 约 200 | 1–800(不写 state 的正常日 cap) |
+| `deep_cap_s` 深读停留封顶 | 150 | 30–150 |
+| `light_p` 浅读比例 | 0.25 | 0–0.7 |
+| `stay_s` 底部驻留(秒) | 2–10 | 0–300 |
+| `rollback` 深读回滚步数(false=关) | 10 | 0–10 |
+| `pause_scale` 滚动停顿缩放 | 1.0 | 0.4–1.0 |
+
+**turbo 不介入**:风控熔断、休息日、静默窗、段预算、前台保护、会话自愈、分类偏好,以及深浅读的**分层逻辑本身**(`light_p` 只调浅读比例,属用户授权的「临时提速可调开关」)。守法方式:自测 T21j 用 AST 断言 `turbo_cfg()` 只出现在 `_batch_gap/browse_one/browse_batch/watch` 四处白名单且父节点形态固定(赋值或 `_turbo_base_gap`/`_cap_today` 参数),T21j2 另检 12 个闸门函数源码不含 turbo;评审曾复现「在 watch 段闸门加 `and not turbo_cfg()`」旧断言抓不到,现已变红。
+
+**T3 档示例(3 天)**:
+```json
+{"enabled": true, "expires_at": "YYYY-MM-DD HH:MM:SS", "note": "T3 3d",
+ "gap": [20, 45], "gap_long": [90, 180], "gap_long_p": 0.05, "batch_gap": [120, 180],
+ "daily_cap": 600, "deep_cap_s": 60, "light_p": 0.5, "stay_s": [2, 2],
+ "rollback": false, "pause_scale": 0.6}
+```
+预估 490–576 帖/天(同一套真实函数模拟,理想值×0.85–1.0);每帖约 80s,**机器味重、403 风险最高**,且每帖入账楼层会降(降多少无数据)。
+
+**JS 超时(turbo 专属)**:深读 JS 的返回值经桥接常丢失(历史 DONE 里深读约 95% 的 `title` 为空),丢失时守护白等到桥接超时。正常模式沿用 `max(150, 预算+45)` **不动**(代价约 45s/帖,已知未改);turbo 下收紧为 `max(40, 预算+30)`(JS 在前台标签下最坏额外耗时约 23s;**后台标签被浏览器节流时远不止此,实测出现连续桥接超时**),否则 150s 下限会把提速吃掉(实测 T3 首版每帖 175–180s,而非预期 ~80s)。
+
+**turbo 下的超时记账与自动熔断(R576 评审后加,R576c 修订)**:
+- 桥接返回 `No response data in Ns(...)`(`TMWebDriver.execute_js` 超时,脚本仍在后台标签里跑)时,**正常模式**保持旧语义(算 DONE,不等待、不探测,不动)。**实测正常模式 4/4 超时但每帖仍有 5–10 次上报**,所以超时≠没读。
+- **turbo 下**:发下一帖前先轮询页内 `__tmBusy`(`ROUTE_JS` 起止写/清的忙标记)等上一帖脚本跑完(上限 240s,探测失败 fail-open 放行),避免两段读帖脚本叠在同一标签里;超时后同样先等空闲,再用 `tm.d` 判定——`d==0` 记 `FAIL why=bridge_timeout`(不进 `daily`/`seen_ids`),`d≥1` 或未知(重启后首探 None)按成功。
+- **页内焦点解锁(R576b)**:Discourse 只在 `session.hasFocus=true` 时累计阅读时长;后台标签/Chrome 非前台时为 false ⇒ `_timings`/`_topicTime` 恒空 ⇒ 零 `/topics/timings` 上报(**已读帖子不涨,浏览话题照涨**)。`ROUTE_JS` 在路由前及每 1.5s 的 `__tmUnlock` 里把它置 true(与三件套同族,正常模式同样生效)。上报由网站自己的脚本发出,GA 从不直接调用该接口。
+- 熔断:turbo 生效的帖子上**连续 3 帖**(桥接超时 或 成功但 `tm.d==0`)⇒ 写 `temp/linuxdo_browse_daemon/turbo_fuse.json`(当日有效、跨重启)+ `TURBO` 台账行 + 飞书私信;当日 `turbo_cfg()` 返回 None(=正常模式),**次日自动恢复**,`turbo.json` 本身不被改动。好帖(`tm.d≥1`)清零计数。
+- 触发证据(2026-10-12):T3 运行 10:55–11:05 连续 8 帖 `tm.n` 冻结在 49,其中 7 帖对应桥接超时,标签页(`visibilityState=hidden`)停在别的话题;原因未定论(后台标签定时器节流为推断)。
+
+**配置校验(fail-closed)**:数组须长度 2 且为有限数字(拒 NaN/±Inf/字符串/bool),`lo>hi` 整份拒绝;文件签名含 mtime/size/inode;`expires_at` 按**守护进程所在机器的本地时区**解释,距今 ≤7 天。
+
+**开启期间判据**:
+- 生效/到期/移除都在 `browse_log.jsonl` 落一行 `st=TURBO`;每条 `DONE` 带 `exec.turbo`。
+- 观测字段(R576,正常模式同样记录):`exec`(实际执行的 steps/plan_s/stay_s/rb)、`tm`(每帖结束后另发一次只读探测,取页内 `PerformanceObserver` 累计的 `/topics/timings` 请求数:`n`=累计、`st`=最近 3 次状态码、`d`=较上一帖增量;**上报在离开话题时触发,增量归属下一帖**,按日统计即可;`d` 长期为 0 ⇒ 楼层上报没发)。★JS 返回值经桥接常丢失(历史 DONE 里约 75% 的 `title` 为空),所以 `tm` 不靠 `ROUTE_JS` 返回值带出。
+- `risk_log.jsonl` 新增 `INFO/FETCH_PARTIAL`(部分页风控信号,含页码与响应正文前 200 字),用于判断 403 是否真风控。
+- **一旦出现 403/风控信号先删 turbo.json**,再复盘。
