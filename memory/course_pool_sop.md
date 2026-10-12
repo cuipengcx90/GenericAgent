@@ -53,6 +53,7 @@ P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；�
 2. `archive/courses/index.html` 与池 JSON 不进 git：耐久性=靠重抓重渲染，属可再生数据；若要留档须用户批准另立路径。
 3. docstring 与 argparse 会漂移（R551 实测：docstring 写了不存在的 proof 子命令）⇒ 修文档必须逐子命令取 `--help` 对账，禁凭印象补。
 4. 本机无 `lsof`/`netstat`：端口归属用 Python（socket 枚举/psutil）+ 进程命令行交叉定位。
+5. ★**`tools/pan_search.py` 子命令不认 `--help`，加了就是「真跑一趟」**（2026-10-12 实测）：`main()` 只在 `cmd in ("-h","--help","help")` 时打印用法，`digest --help` 会被当作默认参数执行（`days=14`、`days` 之外的 `mark=True`、**无 `--notify`**）⇒ 探测参数**只能读源码或跑顶级 `-h`**，禁对子命令加 `--help`（此条修正上文坑 3 的「逐子命令取 --help 对账」，对带状态副作用的子命令不适用）。副作用=把当日命中 URL 写进 `temp/pan_search/seen.json` 却**未推送**＝静默丢单；补救=备份 seen.json → 删除该次时间戳（如 `2026-10-12 12:01*`）的条目 → 重跑正式任务（实测 45→43→重跑后 45，无丢单无重复推送）。
 
 ## 七、词表产物与入库口径
 
