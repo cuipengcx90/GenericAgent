@@ -58,6 +58,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -151,10 +152,16 @@ def ps_probe(pid: int) -> Optional[Dict[str, str]]:
     """`ps -p PID -o pid=,stat=,lstart=,etime=,pgid=` → dict；进程不存在返回 None。
 
     用 ps 而不用 os.kill(pid,0)：后者对僵尸进程/权限不足会给出误导性的「活着」。
+
+    ★强制 `LC_ALL=C`：`lstart` 是**本地化**字符串（实测中文 LC_TIME 下同一进程在 A 环境登记成
+    `一 10/12 12:34:49 2026`、在 B 环境读成 `Mon Oct 12 12:34:49 2026`）⇒ 不锁 locale 时
+    「登记值与当前值字面不同」会被误判成 PID 复用（2026-10-12 实测：`stop` 因此拒绝停一个
+    确实在跑的 daemon，随后 `start` 又拉起第二个 ⇒ 双 daemon）。
     """
+    env = dict(os.environ, LC_ALL="C", LANG="C")
     r = subprocess.run(
         ["ps", "-p", str(pid), "-o", "pid=,stat=,lstart=,etime=,pgid="],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     out = r.stdout.strip()
     if r.returncode != 0 or not out:
@@ -173,6 +180,14 @@ def ps_probe(pid: int) -> Optional[Dict[str, str]]:
     etime = tail[0] if tail else ""
     pgid = tail[1] if len(tail) > 1 else ""
     return {"pid": str(pid), "stat": stat, "lstart": lstart, "etime": etime, "pgid": pgid}
+
+
+def ps_command(pid: int) -> str:
+    """`ps -p PID -o command=` → 命令行原文（做 lstart 字面不一致时的第二身份证据）。"""
+    r = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, LC_ALL="C", LANG="C"))
+    return (r.stdout or "").strip()
 
 
 def task_state(reg: Registry, name: str) -> Dict[str, Any]:
@@ -200,8 +215,19 @@ def task_state(reg: Registry, name: str) -> Dict[str, Any]:
         res.update(state="ZOMBIE", detail="进程已是僵尸态（已退出待回收）")
     elif info is not None:
         if meta.get("lstart") and info["lstart"] and info["lstart"] != meta["lstart"]:
-            res.update(state="STALE_PID_REUSED",
-                       detail=f"PID {pid} 已被复用（登记 lstart={meta['lstart']!r} ≠ 当前 {info['lstart']!r}）")
+            # lstart 是本地化字符串：历史登记可能是在别的 LC_TIME 下写的（中文环境下
+            # `Mon Oct 12 …` 会变成 `一 10/12 …`）⇒ 先做第二身份证据（命令行是否仍指向
+            # 本任务的 wrapper），一致则判 RUNNING，避免「活着却判复用」导致 stop 空转、
+            # start 又拉起第二个（2026-10-12 实测双 daemon 事故）。
+            w = meta.get("wrapper") or ""
+            cur = ps_command(pid)
+            if w and cur and os.path.basename(w) and os.path.basename(w) in cur:
+                res.update(state="RUNNING",
+                           detail=f"运行中（etime={info['etime']}；lstart 串随 locale 变化，"
+                                  f"已用 wrapper 命令行确认同一进程）")
+            else:
+                res.update(state="STALE_PID_REUSED",
+                           detail=f"PID {pid} 已被复用（登记 lstart={meta['lstart']!r} ≠ 当前 {info['lstart']!r}）")
         else:
             res.update(state="RUNNING", detail=f"运行中（etime={info['etime']}）")
     elif code is not None:
@@ -440,6 +466,16 @@ def cmd_selftest(reg: Registry, args) -> int:
                               "exit_file": str(reg.paths("st_reuse")[1])})
     st = task_state(reg, "st_reuse")
     check("负控④：PID 复用 → STALE_PID_REUSED（不误报 RUNNING）", st["state"] == "STALE_PID_REUSED", f"state={st['state']}")
+
+    # 6b) 正控：lstart 字面不一致但命令行仍指向本任务 wrapper → RUNNING（2026-10-12 locale 事故回归）
+    #     登记串故意用中文 locale 口径（星期/月日被本地化），当前进程命令行里含 "bg_task.py"
+    _fake_wrap = os.path.join(tempfile.gettempdir(), "bg_task.py")
+    reg.register("st_l10n", {"name": "st_l10n", "pid": os.getpid(), "pgid": str(os.getpid()),
+                             "lstart": "一 10/12 12:34:49 2026", "wrapper": _fake_wrap,
+                             "log": str(reg.paths("st_l10n")[0]), "exit_file": str(reg.paths("st_l10n")[1])})
+    st = task_state(reg, "st_l10n")
+    check("正控⑤：lstart 因 locale 不同 + wrapper 命令行吻合 → RUNNING（不误判 PID 复用）",
+          st["state"] == "RUNNING", f"state={st['state']} detail={st.get('detail')}")
 
     # 7) 真 stop：SIGTERM 即退出
     main(["--state-dir", str(reg.dir), "start", "--name", "st_stop", "--", py, "-c", "import time;time.sleep(60)"])
