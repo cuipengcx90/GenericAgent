@@ -13,6 +13,8 @@
 - 正确姿势＝**scheduler 只在窗口起点唤起一次**，任务 prompt 里用 `tools/bg_task.py start --name <唯一名> -- <解释器绝对路径> tools/xxx.py --watch ...` 把自轮询进程挂到窗口结束（`--max-minutes` 硬超时兜底，进程脱离会话）。
 - prompt 里**禁止 sleep / 轮询等待**：命令立即返回，后台进程自己覆盖窗口；会话只负责贴 `bg_task status` 的 pid + 日志路径。
 - 解释器写**绝对路径**（如 `/opt/anaconda3/bin/python3`）：GA scheduler/bg_task 子进程的 PATH 不保证；详见 `memory/agentrouter_quota_sop.md` 的「典型坑」。
+- **`bg_task.py status --json` 确实可用**（2026-10-13 19:00 实测，输出含 `name/pid/pgid/cmd/cwd/started_at/log/log_size/exit_code/ps/state/detail`）⇒ 报告里贴 pid+日志路径时优先用它取值；文本形态 `RUNNING pid=… exit=- log=…B 运行中（etime=…）` 亦可，但**勿再记成「无 --json」**。
+- **同名槽位跨日复用是正常的**：同日/隔日重跑同一 `--name` 时，`start` 会打印 `同名任务已存在但状态=EXITED_OK，覆盖登记并重新启动`（旧登记已正常退出，非冲突）⇒ 属预期，报告照写即可。
 
 ## 任务JSON格式（*.json）
 ```json
