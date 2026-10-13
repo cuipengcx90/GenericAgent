@@ -128,7 +128,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 
 1. **独立桥保活** `tools/tmwd_bridge_watch.py`（新）：长驻监督 `18765 WS/18766 HTTP` 两端口，桥不在即拉起（失败退避重试、收手守卫），与 Galley 的 runner.workbench_bridge 彻底解耦；`--selftest` 离线自测 PASS。
 2. **看门狗兜底** `linuxdo_daemon_watchd.py ensure_bridge()`：桥不可达 ⇒ 先自动拉起独立桥（冷却 600s、起后等 15s），仍不可达才判 `BRIDGE_DOWN` 只告警不重启；`status` 增 `bridge_reachable`/`bridge_runner_pids`/`bridge_ensure`（selftest 86 checks / 0 failed）。
-3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab.jsonl`(★台账名以源码 `BASE/ensure_tab.jsonl` 为准;旧文档写 `ensure_tab_ledger.jsonl` 系笔误)。
+3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab.jsonl`(★台账名以源码 `BASE/ensure_tab.jsonl` 为准;旧文档写 `ensure_tab_ledger.jsonl` 系笔误)。★R582(2026-10-13)边界订正:上面"Chrome 未运行时会顺带拉起"**仅在 Automation 授权有效时成立**——`try_ensure_tab` 两条路都要求"已有一个在跑的 Chrome(有窗口或已有桥会话)":AppleScript 无窗口才 `make new window` 但需授权(缺则 `-1743` 整体失败);桥兜底 `_try_bridge_open_main_tab` 走目前有标签里的 `window.open`,无会话即返回"无可用会话"。全仓无 `open -a` 冷启动兜底 ⇒ **Chrome 进程被整体退掉时无稳定自动拉起**(仅覆盖"运行中 Chrome 内标签被导航走")。诊断见 `temp/R582_L站浏览器关闭未恢复_排查记录.md`。
 
 真机链（21:12）：watchd 起→`BRIDGE_DOWN`→独立桥拉起→daemon 重生→补标签顺带拉起 Chrome→扩展连上→ROUND OK；21:17 新码短退避生效（`RC_NO_SESSION_RETRY …（1/8，睡 40s）`）。
 
