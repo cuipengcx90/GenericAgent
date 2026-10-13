@@ -1785,7 +1785,7 @@ ROUTE_JS = r"""
       //   appendMore 拉取——后台标签页里 rAF 被节流,scrollBy 拉不出下一批(实测 DOM 恒 20、
       //   canAppendMore=true、滚到底 26s 不变)。这里在滚到底后显式调用 postStream.appendMore()
       //   逐批加载,直到 canAppendMore=false 或达 __MAXMORE__ 上限(真人也不会一口气读完高楼)。
-      let _more = 0, _canMore = null, _psN = null;
+      let _more = 0, _canMore = null, _psN = null, _mbErr = null;
       try {
         const _ctrl = window.Discourse.__container__.lookup('controller:topic');
         const _ps = _ctrl.model.postStream;
@@ -1797,11 +1797,11 @@ ROUTE_JS = r"""
         }
         _canMore = _ps.canAppendMore;
         try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
-      } catch(e){}
+      } catch(e){ _mbErr = String(e).slice(0,120); }   // ★R583c:静默改为可观测(丢桥接/无 appendMore 时留证)
       for(let s=0;s<__RB__;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*500));
         window.scrollBy(0, -380); }
       return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length,
-        psposts:_psN, moreBatches:_more, canMore:_canMore}); } }
+        psposts:_psN, moreBatches:_more, canMore:_canMore, mbErr:_mbErr}); } }
   return JSON.stringify({fail:true,now:location.pathname});
   })(); } finally { window.__tmBusy = 0; }
 })()
@@ -2418,6 +2418,8 @@ def browse_batch(session, st, batch=25):
                                        "mb": res.get("moreBatches") if isinstance(res, dict) else None,
                                        "psn": res.get("psposts") if isinstance(res, dict) else None,
                                        "canmore": res.get("canMore") if isinstance(res, dict) else None,
+                                       # ★R583c:续载异常可观测(原为静默 catch(e){},桥接/无 appendMore 时丢证)
+                                       "mberr": res.get("mbErr") if isinstance(res, dict) else None,
                                        "src": c.get("src"),   # ★R579 候选来源（top/latest），纯观测
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
                                        "pose": res.get("pose") if isinstance(res, dict) else None,
@@ -3811,10 +3813,36 @@ def _selftest_impl():
             if subprocess.run([shutil.which("node"), "--check", "-"],
                               input="(()=>{)()", capture_output=True, text=True, timeout=10).returncode == 0:
                 fails.append("T25b2 node 未判坏 JS")
-            # T25c(★R583b):续载占位符须存在且被 browse_one 现场替换——漏替换时 __MAXMORE__
-            #   是合法标识符,node --check 照样过,运行时静默零续载
-            if "__MAXMORE__" not in ROUTE_JS or '"__MAXMORE__"' not in _insp.getsource(browse_one):
-                fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 且 browse_one 现场替换")
+            # T25c(★R583b/R583c):续载占位符须存在且被 browse_one **真正 .replace()**——漏替换时
+            #   __MAXMORE__ 是合法标识符,node --check 照样过,运行时静默零续载。仅 grep 子串太弱
+            #   (留个死字符串也能过)⇒ 用 AST 断言存在 `.replace("__MAXMORE__", …)` 实参调用,
+            #   并以「死字符串」反例做正控(检测器须判否)。
+            import ast as _ast
+
+            def _has_ph_replace(_src, _ph):
+                for _n in _ast.walk(_ast.parse(_src)):
+                    if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
+                            and _n.func.attr == "replace" and _n.args
+                            and isinstance(_n.args[0], _ast.Constant) and _n.args[0].value == _ph):
+                        return True
+                return False
+
+            if "__MAXMORE__" not in ROUTE_JS:
+                fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 占位符")
+            elif not _has_ph_replace(_insp.getsource(browse_one), "__MAXMORE__"):
+                fails.append('T25c browse_one 须真调 .replace("__MAXMORE__", …)(仅出现字符串不算)')
+            if _has_ph_replace('x = "__MAXMORE__"', "__MAXMORE__"):
+                fails.append("T25c 正控失败:死字符串被误判为 .replace 调用")
+            # T25d(★R583c):续载 try 块**禁静默吞异常**——漏价/无 appendMore 时须留证。断言 ROUTE_JS
+            #   真捕获(_mbErr=String(e))且 browse_batch 日志落 mberr 字段;正控=裸 catch(e){} 须判否。
+            def _has_obs_catch(_js):
+                return "_mbErr" in _js and "_mbErr = String(e)" in _js
+            if not _has_obs_catch(ROUTE_JS):
+                fails.append("T25d ROUTE_JS 续载 catch 须捕获错误(_mbErr = String(e)),禁静默空 catch")
+            if '"mberr"' not in _insp.getsource(browse_batch):
+                fails.append("T25d browse_batch 日志须落 mberr 字段")
+            if _has_obs_catch("} catch(e){}"):
+                fails.append("T25d 正控失败:裸空 catch 被误判为可观测")
     finally:
         random.setstate(_rs)
     cases += 1
