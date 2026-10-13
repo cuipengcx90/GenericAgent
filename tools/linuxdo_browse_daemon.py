@@ -159,11 +159,11 @@ DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固�
 #   逐字「以上"话题"指主帖，"帖子"即传统意义的回复」），100 天滚动窗 ⇒ 稳态需 ≈200 楼层/日(=20000/100)。
 #   实测每帖计入楼层 ≈ min(渲染到的末楼, 该帖楼层数)：当日 45 帖 mean min(posts,20)=7.6 ≈ 当日 楼层/话题 7.9
 #   ⇒ 帖子越小越"亏"（本机候选池中位仅 6 楼），**按楼层加权选帖**是唯一不增加访问次数的杠杆。
-FLOOR_BIAS = 0.7            # 楼层加权强度（0=旧行为纯随机；越大越偏高楼帖，仍保留随机性）
-FLOOR_CAP = 40              # 权重封顶楼层数（渲染深度有限，超出部分拿不到分）
-FLOOR_CREDIT_CAP = 40       # 记账回退档：读帖返回值缺失时，单帖最多按多少楼层计入（保守估计）
+FLOOR_BIAS = 0.8            # 楼层加权强度(★R581 0.7→0.8:更偏高楼帖,不增访问次数仍保留随机性)
+FLOOR_CAP = 64              # 权重封顶楼层数(★R581 40→64:更偏大帖,仍保留随机性)
+FLOOR_CREDIT_CAP = 64       # 记账回退档:读帖返回值缺失时,单帖最多按多少楼层计入(★R581 40→64)
 BIG_DEEP_MIN_POSTS = 12     # 楼层数 ≥ 此值的帖：浅读概率降到 BIG_DEEP_LIGHT_P（须读到尾部才拿满）
-BIG_DEEP_LIGHT_P = 0.12
+BIG_DEEP_LIGHT_P = 0.08    # (★R581 0.12→0.08:高楼帖更少被划走,须读到尾部才拿满)
 # ★R579 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）。
 #   2026-10-13 口径更新：候选池改混池（top×2 + latest×2）后每帖实际读到约 20 楼（旧池中位仅 4）
 #   ⇒ 原 1200 会在约 60 帖时提前熔断（此时帖配额 daily_cap=600 才用掉 10%）⇒ 默认 1200→2400（≈120 帖）。
@@ -2320,7 +2320,10 @@ def browse_batch(session, st, batch=25):
             run_js(session["id"], LOITER_JS.replace("__PATH__", _lpath).replace("__STEPS__", str(random.randint(4, 8))), timeout=45)
             log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "LOITER",
                                            "note": _lsrc, "path": _lpath})
-        ok, res = browse_one(session, tid, st)
+        # ★R581 缺陷修复:必须把候选 c 传进去,否则 browse_one 内 _estimate_chars(None) 恒走
+        #   随机回退 ⇒ (a) 深读深度与帖子大小脱钩 (b) BIG_DEEP_MIN_POSTS 高楼帖降浅读概率形同死代码
+        #   (该参数自 R578 引入,但生产调用点从未接线;selftest 传了 cand 故一直假绿)
+        ok, res = browse_one(session, tid, st, cand=c)
         title = (res.get("title", "") if isinstance(res, dict) else "")[:36]
         _why = ""
         if not ok and isinstance(res, dict):

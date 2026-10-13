@@ -89,9 +89,9 @@ return JSON.stringify({fail:true,now:location.pathname});
   ★**已落地（R577，提交 f7907b4，`--selftest` 39/39 PASS）**：①`risk_kind_of(status,body)` = **正文里的 CF 挑战优先于状态码**（旧序 `risk_kind_from_http(429)` 先判 ⇒ 误当 RATE_LIMIT 强信号 ⇒ 熔断+82min 停机）；②`fetch_candidates()` 命中挑战时：随机 20–60s **原地重试** → 整页**导航过盾** + 60–180s 再试 → 仍失败才落诊断交熔断；③daemon 重启加载新码（R577 时点）。
 
 - **★R578 楼层口径规则对齐（2026-10-12，用户令「全做」）**：口径 = connect 页「浏览帖子 20000」按**楼层**计、100 天滚动窗 ⇒ 稳态需 ≈**200 楼层/日**；「浏览话题 500」=主帖数，早已达标 ⇒ **楼层是唯一瓶颈**。「按楼层加权选帖」是不增加访问次数的唯一杠杆，已落地三处旋钮：
-  - `FLOOR_BIAS=0.7` 与 `FLOOR_CAP=40`（`floor_weight`/`floor_rank`，Efraimidis–Spirakis 无放回加权抽样，**保留随机性**；板块偏好之后各自加权，不破坏「进一个板块连看」语义）；`FLOOR_BIAS=0` ⇒ 逐字回到旧 `random.shuffle`（一键回退）。
-  - `BIG_DEEP_MIN_POSTS=12` / `BIG_DEEP_LIGHT_P=0.12`：≥12 楼的帖浅读概率压到 0.12（浅读滚不到尾 ⇒ 大帖亏楼层）。
-  - `DAILY_FLOOR_CAP_DEFAULT=2400` 楼层上限闸门（主循环 `floors_count>=cap` ⇒ 睡到明天，**不额外产生访问**；turbo 可配 `daily_floor_cap` 覆盖，硬边界 (1, 6000)(★R580 抬到 6000 与日常抖动上界一致)；★R579：混池后每帖实际读到约 20 楼，原 1200 会在约 60 帖即熔断（帖配额才用掉 10%）⇒ 下限值提到 2400，运行期 turbo 已显式写 `daily_floor_cap=5000`）；**记账口径（R579 起＝实际读到的楼层）**：`floors_credit_of(res, cand)` 优先取读帖返回值 `res["posts"]`（= 页面上 `.topic-post` 实测数，即本次真正读到的楼层），桥接丢返回值/超时时回退 `min(候选列表楼层数, FLOOR_CREDIT_CAP=40)` 保守估计；真值仍以 connect 页为准。
+  - `FLOOR_BIAS=0.8`(★R581 0.7→0.8) 与 `FLOOR_CAP=64`(★R581 40→64)（`floor_weight`/`floor_rank`，Efraimidis–Spirakis 无放回加权抽样，**保留随机性**；板块偏好之后各自加权，不破坏「进一个板块连看」语义）；`FLOOR_BIAS=0` ⇒ 逐字回到旧 `random.shuffle`（一键回退）。
+  - `BIG_DEEP_MIN_POSTS=12` / `BIG_DEEP_LIGHT_P=0.08`(★R581 0.12→0.08)：≥12 楼的帖浅读概率压到 0.08（浅读滚不到尾 ⇒ 大帖亏楼层）。
+  - `DAILY_FLOOR_CAP_DEFAULT=2400` 楼层上限闸门（主循环 `floors_count>=cap` ⇒ 睡到明天，**不额外产生访问**；turbo 可配 `daily_floor_cap` 覆盖，硬边界 (1, 6000)(★R580 抬到 6000 与日常抖动上界一致)；★R579：混池后每帖实际读到约 20 楼，原 1200 会在约 60 帖即熔断（帖配额才用掉 10%）⇒ 下限值提到 2400，运行期 turbo 已显式写 `daily_floor_cap=5000`）；**记账口径（R579 起＝实际读到的楼层）**：`floors_credit_of(res, cand)` 优先取读帖返回值 `res["posts"]`（= 页面上 `.topic-post` 实测数，即本次真正读到的楼层），桥接丢返回值/超时时回退 `min(候选列表楼层数, FLOOR_CREDIT_CAP=64)(★R581 40→64)` 保守估计；真值仍以 connect 页为准。
   - 观测单一源：`python3 temp/linuxdo_floor_ledger.py status`（一句话进度 缺口/今日增量/ETA），夜间汇报 `tools/linuxdo_nightly_report.py` 的 `floor_line()` **复用**该账本口径内嵌同一行（禁两处各写一份）；自测 41/41（负控：`FLOOR_BIAS=0` ⇒ T22a/T22e 必红；R579 正控：把 `DAILY_FLOOR_CAP_DEFAULT` 改错 ⇒ T23e 真红；R579b 正控：`DEEP_DWELL_ABS_CAP_S` 改错 ⇒ T24c 真红）；**改这些常量后必须重启 daemon 才生效**（进程内常量）。
 - **★R579 候选混池 + 记账口径（2026-10-13，提交 609e2d9 / 3130833）**：用户现象「每帖只出 5 楼」根因＝**候选源专挑最新短帖**（`/latest.json` 中位 4 楼、51% <5 楼），非读得浅 ⇒ 候选改**混池** `CAND_TOP_PAGES=2` + `CAND_LATEST_PAGES=2`（4 页：top.json×2 + latest.json×2，同刻 top 中位 52 楼），`CAND_TOP_PAGES=0` 一键回退旧行为（T22h 逐字断言）。真路径实测：160 帖、楼层中位 21、`GE20=85/GE100=11`、页 ok 4/4。混池后**每帖实际读到约 20 楼 ⇒ 楼层闸门从「非瓶颈」变成「约 60 帖即触顶」**，故同批：①`DAILY_FLOOR_CAP_DEFAULT` 1200→**2400**；②记账改**实际读到的楼层**（`floors_credit_of`，见上条）；③运行期 turbo 显式 `daily_floor_cap=5000`。
 - **★R580 日常楼层上限加当日种子抖动(2026-10-13,提交 db7f774)**:用户令「日常上限也别是死数字」⇒ 新增常量 `DAILY_FLOOR_CAP_JITTER=3600`,`floor_cap_today()` 非 turbo 路径按**日期种子**(`sha1("floor-cap|<day>")`)单向上抖 U[0,3600] ⇒ 日常上限落在 **[2400, 6000]**,同日稳定、跨重启不变(cap 抖动双向、楼层档单向:保 2400 下限免过早熔断)。turbo 显式 `daily_floor_cap` 仍**逐字优先**、不走抖动(运行期仍显式 5000);turbo 硬边界随之上抬 (1,5000)→**(1,6000)**。selftest 仍 41/41(新增 T23e 14 天取值非死数断言 / T22h 区间+同日稳定 / T22j 截断 6000)。
@@ -250,7 +250,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 | 10-05 17:02 起(**现行**) | 接入 humanize 拟人层:底驻 2–14s(wrap 区间 2–10s,lognormal 上界 ×1.4)、深读封顶 150s | `5d06b91`(提交说明写明「深读上限 150s」;代码注释:沿用接线前的预算,避免慢到日 cap 跑不完) |
 
 **现行值(以 `tools/linuxdo_browse_daemon.py` / `tools/linuxdo_humanize.py` 源码为准)**:
-- 读帖停留 = `humanize.read_dwell_seconds`:字数÷阅读速度(精读 3.6 / 常速 7 字/秒,45% 概率精读)×对数正态波动 + 开屏定位 0.8–2.5s,范围 2.5–300s;daemon 再封顶——深读 150s(`DEEP_DWELL_CAP_S`)、浅读 25s(`LIGHT_DWELL_CAP_S`)。
+- 读帖停留 = `humanize.read_dwell_seconds`:字数÷阅读速度(精读 3.6 / 常速 7 字/秒,50% 概率精读(★R581 45%→50%))×对数正态波动 + 开屏定位 0.8–2.5s,范围 2.5–300s;daemon 再封顶——深读 150s(`DEEP_DWELL_CAP_S`)、浅读 25s(`LIGHT_DWELL_CAP_S`)。
 - 滚动 = `humanize.scroll_plan`:约 420 字/屏,步长与停顿逐步不同,含回滚项。
 - 底部驻留 = `humanize.wrap_up_seconds("browse")`:区间 2–10s,lognormal 上界 hi×1.4 ⇒ 实际 2–14s(台账 `wrap_up` 实测最大 14.0)。深读回滚 10 步(`ROLLBACK_STEPS`),浅读不回滚。
 - 浅读 25%(`LIGHT_P`):等效文本量×0.35、屏幅×1.3–1.8、停顿×0.5。

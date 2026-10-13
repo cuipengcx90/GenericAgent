@@ -45,7 +45,7 @@ KIND_BEHAVIOR = {
 
 # 阅读速度（字/秒 中位数）。真人先扫读、部分段落精读 ⇒ 用混合档
 READ_SPEED = dict(fast=11.0, normal=7.0, careful=3.6)
-PRECISE_P = 0.45          # 进入精读档的概率
+PRECISE_P = 0.50          # 进入精读档的概率(★R581 0.45→0.50:更常精读,只增不减)
 DWELL_MIN, DWELL_MAX = 2.5, 300.0
 FIXATION = (0.8, 2.5)     # 开屏定位（找到要读的位置）耗时
 
@@ -123,7 +123,7 @@ def scroll_plan(n_chars, dwell_s, rng=None, kind="browse"):
     step_lo, step_hi = {"browse": (180, 520), "like": (150, 420),
                         "reply": (200, 620), "post": (200, 620)}[kind]
     screens = max(1, int(round(n_chars / 420.0)))          # 约 420 字/屏
-    screens = min(screens, 24)
+    screens = min(screens, 32)                          # ★R581 24→32:大帖读得更深(真人继续往下翻)
     total = max(float(dwell_s), 1.5)
     plan, used = [], 0.0
     for i in range(screens):
@@ -137,7 +137,7 @@ def scroll_plan(n_chars, dwell_s, rng=None, kind="browse"):
         k = total / used
         for p in plan:
             p["pause"] = round(p["pause"] * k, 2)
-    if plan and r.random() < 0.7:                          # 底部多停一会
+    if plan and r.random() < 0.75:                         # 底部多停一会(★R581 0.7→0.75)
         plan[-1]["pause"] = round(plan[-1]["pause"] * r.uniform(1.2, 2.4), 2)
     return plan
 
