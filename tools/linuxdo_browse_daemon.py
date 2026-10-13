@@ -161,12 +161,21 @@ DAILY_CAP_JITTER = 20       # 每日 cap 在 ±JITTER 内随机——每天固�
 #   ⇒ 帖子越小越"亏"（本机候选池中位仅 6 楼），**按楼层加权选帖**是唯一不增加访问次数的杠杆。
 FLOOR_BIAS = 0.8            # 楼层加权强度(★R581 0.7→0.8:更偏高楼帖,不增访问次数仍保留随机性)
 FLOOR_CAP = 64              # 权重封顶楼层数(★R581 40→64:更偏大帖,仍保留随机性)
-FLOOR_CREDIT_CAP = 64       # 记账回退档:读帖返回值缺失时,单帖最多按多少楼层计入(★R581 40→64)
+FLOOR_CREDIT_CAP = 20       # 记账**回退档**上限(★R583 64→20):首屏批就是 20 楼,返回值全丢时最多只能
+                            #   按 20 计(旧 64 会高估——探针语法错致回退,实测把权益记成 64 楼/帖)
+FLOOR_READ_CAP = 10000      # ★R583 记账**实测档**上限(防御性大封顶;实测=真正渲染到的楼层,不该被 20 截)
 BIG_DEEP_MIN_POSTS = 12     # 楼层数 ≥ 此值的帖：浅读概率降到 BIG_DEEP_LIGHT_P（须读到尾部才拿满）
 BIG_DEEP_LIGHT_P = 0.08    # (★R581 0.12→0.08:高楼帖更少被划走,须读到尾部才拿满)
+# ★R583 续载上限:深读帖在滚到底后主动 appendMore 拉下一批楼层,批次上限(每批约 20 楼)。
+#   后台标签页 rAF 被节流 ⇒ scrollBy 触底不会自动拉下一批(实测 DOM 恒 20、canAppendMore=true),
+#   故显式调用 postStream.appendMore();真人也不会一口气读完高楼 ⇒ 深读随机 2..FLOOR_MAX_MORE 批,
+#   浅读 0 批(刷到划走)。仅影响阅读深度,不增访问次数。
+FLOOR_MAX_MORE = 4
 # ★R579 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）。
 #   2026-10-13 口径更新：候选池改混池（top×2 + latest×2）后每帖实际读到约 20 楼（旧池中位仅 4）
 #   ⇒ 原 1200 会在约 60 帖时提前熔断（此时帖配额 daily_cap=600 才用掉 10%）⇒ 默认 1200→2400（≈120 帖）。
+#   ★R583b:加续载(深读帖 appendMore 2..FLOOR_MAX_MORE 批)后单帖实测可达 20×(1+FLOOR_MAX_MORE)=100 楼,
+#   高速率日 2400 会在更少帖数熔断——但稳态目标仅 FLOOR_STEADY_GOAL=200/日,不影响达标,仅纯本机天花板。
 #   ★R580(2026-10-13 用户口径)日常档同样加「当日种子抖动」:上限 = 2400 + U[0,3600] ∈ [2400,6000]
 #   (与帖配额 daily_cap 同一手法:按日期种子摇一次、同日稳定、跨重启不变;避免每天死板同一数字)。
 #   注意:这是**纯本机熔断天花板**,不产生任何网络访问、对外不可见;低端 2400 仍有在高楼日
@@ -1772,9 +1781,27 @@ ROUTE_JS = r"""
         window.scrollBy(0, plan[k][0] + Math.random()*120);
       }
       await new Promise(r=>setTimeout(r, __STAYMS__ + Math.random()*2500));
+      // ★R583:主动续载下一批楼层。Discourse 首屏只渲染 20 楼,后续靠触底滚动由 rAF/IO 触发的
+      //   appendMore 拉取——后台标签页里 rAF 被节流,scrollBy 拉不出下一批(实测 DOM 恒 20、
+      //   canAppendMore=true、滚到底 26s 不变)。这里在滚到底后显式调用 postStream.appendMore()
+      //   逐批加载,直到 canAppendMore=false 或达 __MAXMORE__ 上限(真人也不会一口气读完高楼)。
+      let _more = 0, _canMore = null, _psN = null;
+      try {
+        const _ctrl = window.Discourse.__container__.lookup('controller:topic');
+        const _ps = _ctrl.model.postStream;
+        while (_more < __MAXMORE__ && _ps.canAppendMore) {
+          window.scrollBy(0, 400);                                  // 停在底部附近
+          await Promise.resolve(_ps.appendMore());                  // 拉下一批(20 楼)
+          _more++;
+          await new Promise(r=>setTimeout(r, 700 + Math.random()*500));
+        }
+        _canMore = _ps.canAppendMore;
+        try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
+      } catch(e){}
       for(let s=0;s<__RB__;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*500));
         window.scrollBy(0, -380); }
-      return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length}); } }
+      return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length,
+        psposts:_psN, moreBatches:_more, canMore:_canMore}); } }
   return JSON.stringify({fail:true,now:location.pathname});
   })(); } finally { window.__tmBusy = 0; }
 })()
@@ -1918,7 +1945,7 @@ def _tm_probe(session):
 
 
 FLOOR_PROBE_JS = ("(()=>{try{return JSON.stringify({posts:document.querySelectorAll('.topic-post').length})}"
-                  "}catch(e){return JSON.stringify({posts:null})}})()")
+                  "catch(e){return JSON.stringify({posts:null})}})()")
 
 
 def _floor_probe(session, timeout=12):
@@ -1953,8 +1980,10 @@ def browse_one(session, tid, state, cand=None):
     light = random.random() < _lp
     plan, stay, rb, pose = _browse_plan(_estimate_chars(cand), light, tc)
     plan_js = "[" + ",".join("[%s,%s]" % (p["dy"], p["pause"]) for p in plan) + "]"
-    code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb))
-    js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2)
+    # ★R583:续载批数——浅读 0 批(刷到划走),深读随机 2..FLOOR_MAX_MORE 批(真人不会一口气读完高楼)
+    maxmore = 0 if light else random.randint(2, FLOOR_MAX_MORE)
+    code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb)).replace("__MAXMORE__", str(maxmore))
+    js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2 + maxmore * 2.5)
     # ★R576：深读 JS 的返回值经桥接常丢失（历史 DONE 里深读约 95% 的 title 为空），丢失时守护要白等到
     #   桥接超时。正常模式沿用 max(150, 预算+45) 不动；turbo 下单帖只有几十秒，150 秒下限会把提速吃掉
     #   （实测 T3 每帖 175–180s 而非 ~80s），故收紧为 预算+30（JS 最坏额外耗时约 23s：路由等待≤12.5s、
@@ -2253,20 +2282,23 @@ def floors_credit(cand):
 
 
 def floors_credit_of(res, cand):
-    """★R579 楼层记账（新口径＝**实际读到的楼层**）。
+    """★R579 楼层记账(新口径=**实际读到的楼层**)。
 
-    优先取读帖返回值 res["posts"]（ROUTE_JS 里 = 页面上 `.topic-post` 的实测数量，
-    即本次真正渲染/读到的那部分楼层）；桥接丢返回值/超时时该键为 None，
-    回退到 floors_credit(cand)（候选列表楼层数，上限 FLOOR_CREDIT_CAP）作保守估计。
+    优先取读帖返回值 res["posts"](ROUTE_JS 里 = 页面上 `.topic-post` 的实测数量,
+    即本次真正渲染/读到的那部分楼层)。
+    ★R583:实测档走 FLOOR_READ_CAP(大),**不再**经 floors_credit(其上限 20 会把真正读到的
+    多批楼层又截回首屏批);桥接丢返回值/超时时该键为 None,才回退 floors_credit(cand)
+    (候选列表楼层数,上限 FLOOR_CREDIT_CAP=20)作保守估计——回退值恒 <=20,不会高估。
+    返回 (值, 来源):'measured'=读帖脚本/探针实测,'estimate'=回退估计。
     """
     if isinstance(res, dict):
         got = res.get("posts")
         try:
             if got and int(got) > 0:
-                return floors_credit({"posts": got})
+                return max(0, min(int(got), FLOOR_READ_CAP)), "measured"
         except Exception:
             pass
-    return floors_credit(cand)
+    return floors_credit(cand), "estimate"
 
 
 def floors_count(st):
@@ -2375,13 +2407,17 @@ def browse_batch(session, st, batch=25):
         elif not ok:
             _why = "no-result"
         # ★R579b 记账值随行落日志：fc=计入楼层数、posts_src=该值来源（res=读帖脚本/probe=楼层探针）
-        _fc = floors_credit_of(res, c) if ok else None
+        _fc, _fc_src = floors_credit_of(res, c) if ok else (None, None)
         log_jsonl("browse_log.jsonl", {"ts": now_str(), "st": "DONE" if ok else "FAIL",
                                        "why": _why,
                                        "id": tid, "cat": c.get("cat"), "title": title,
                                        "posts": res.get("posts") if isinstance(res, dict) else None,
                                        "posts_src": res.get("posts_src") if isinstance(res, dict) else None,
-                                       "fc": _fc,
+                                       "fc": _fc, "fc_src": _fc_src,
+                                       # ★R583b:续载观测(桥接可能丢;有则可见 appendMore 是否真拉到多批)
+                                       "mb": res.get("moreBatches") if isinstance(res, dict) else None,
+                                       "psn": res.get("psposts") if isinstance(res, dict) else None,
+                                       "canmore": res.get("canMore") if isinstance(res, dict) else None,
                                        "src": c.get("src"),   # ★R579 候选来源（top/latest），纯观测
                                        "mode": res.get("mode") if isinstance(res, dict) else None,
                                        "pose": res.get("pose") if isinstance(res, dict) else None,
@@ -2690,6 +2726,32 @@ def main(argv=None):
 
 # ---------------------------------------------------------------- selftest
 _SANDBOX_ACTIVE = False
+
+
+def _js_syntax_errors():
+    """★R583:用 `node --check` 静态校验本模块所有 *_JS 常量(占位符 __X__ 先替换成 0)。
+
+    背景:41/41 全绿却漏掉了 FLOOR_PROBE_JS 里一个多余 `}`——因为自测只 grep 子串、
+    从不真解析 JS。JS 语法错会在生产里静默变成「探针恒失败/回退估计」,故加此闸门。
+    返回 [(常量名, 报错首行), ...];node 不可用则返回 None(调用方跳过,不判失败)。
+    """
+    node = shutil.which("node")
+    if not node:
+        return None
+    errs = []
+    for name, val in list(globals().items()):
+        if not (name.endswith("_JS") and isinstance(val, str)):
+            continue
+        js = re.sub(r"__[A-Z0-9_]+__", "0", val)
+        try:
+            p = subprocess.run([node, "--check", "-"], input=js, capture_output=True, text=True, timeout=10)
+        except Exception as e:
+            errs.append((name, "node --check 运行异常:%s" % repr(e)[:60]))
+            continue
+        if p.returncode != 0:
+            first = (p.stderr or "").strip().splitlines()
+            errs.append((name, first[0] if first else "node --check 非零退出"))
+    return errs
 
 
 def _selftest_impl():
@@ -3681,14 +3743,19 @@ def _selftest_impl():
         if "floor_rank(" not in _insp.getsource(browse_batch) or "BIG_DEEP_LIGHT_P" not in _insp.getsource(browse_one):
             fails.append("T22l 选帖加权/高楼帖深读须接线到 browse_batch/browse_one")
         # T23 ★R579 楼层记账新口径（实际读到的楼层）+ 默认闸门口径
-        if floors_credit_of({"posts": 18}, {"posts": 500}) != 18:
+        if floors_credit_of({"posts": 18}, {"posts": 500}) != (18, "measured"):
             fails.append("T23a 记账须优先用读帖实测楼层(18)，不得用候选列表值")
-        if floors_credit_of({"posts": 0}, {"posts": 7}) != 7:
+        if floors_credit_of({"posts": 0}, {"posts": 7}) != (7, "estimate"):
             fails.append("T23b 实测为 0 须回退候选楼层数")
-        if floors_credit_of({"timeout": True}, {"posts": 100}) != FLOOR_CREDIT_CAP:
+        if floors_credit_of({"timeout": True}, {"posts": 100}) != (FLOOR_CREDIT_CAP, "estimate"):
             fails.append("T23c 实测缺失须回退且受 FLOOR_CREDIT_CAP 封顶")
-        if floors_credit_of(None, {"posts": 3}) != 3 or floors_credit_of("x", {}) != 0:
+        if floors_credit_of(None, {"posts": 3}) != (3, "estimate") or floors_credit_of("x", {}) != (0, "estimate"):
             fails.append("T23d res 非法须回退候选楼层数")
+        # ★R583:实测档不受首屏 20 截(多批 appendMore 后可达 >20),但受 FLOOR_READ_CAP 大封顶
+        if floors_credit_of({"posts": 60}, {"posts": 60}) != (60, "measured"):
+            fails.append("T23h 实测楼层 >20 须按实测计(不得被 FLOOR_CREDIT_CAP 截)")
+        if floors_credit_of({"posts": FLOOR_READ_CAP + 500}, {}) != (FLOOR_READ_CAP, "measured"):
+            fails.append("T23i 实测楼层须受 FLOOR_READ_CAP 大封顶")
         if DAILY_FLOOR_CAP_DEFAULT != 2400 or not (1 <= DAILY_FLOOR_CAP_DEFAULT <= 6000):
             fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,6000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
         if not (0 <= DAILY_FLOOR_CAP_JITTER <= 6000) or DAILY_FLOOR_CAP_DEFAULT + DAILY_FLOOR_CAP_JITTER > 6000:
@@ -3713,8 +3780,8 @@ def _selftest_impl():
         # ---- T24：R579b 口径一致四项（楼层探针/dwell 随内容缩放/LOITER 真实来源/轮内去重）----
         if "topic-post" not in FLOOR_PROBE_JS or "_floor_probe(session)" not in _insp.getsource(browse_one):
             fails.append("T24a browse_one 须在 posts 缺失时调楼层探针")
-        if "posts_src" not in _insp.getsource(browse_one) or '"fc": _fc' not in _insp.getsource(browse_batch):
-            fails.append("T24b 日志须带 posts_src/fc 字段")
+        if "posts_src" not in _insp.getsource(browse_one) or '"fc": _fc, "fc_src": _fc_src' not in _insp.getsource(browse_batch):
+            fails.append("T24b 日志须带 posts_src/fc/fc_src 字段")
         if (deep_dwell_cap(8400) != DEEP_DWELL_CAP_S
                 or not (deep_dwell_cap(8400 * 5) > DEEP_DWELL_CAP_S
                         and deep_dwell_cap(8400 * 50) == DEEP_DWELL_ABS_CAP_S
@@ -3727,6 +3794,27 @@ def _selftest_impl():
         _dd = dedupe_candidates([{"id": 1, "src": "top"}, {"id": 2, "src": "latest"}, {"id": 1, "src": "latest"}])
         if [c["id"] for c in _dd] != [1, 2] or _dd[0].get("srcs") != ["latest", "top"]:
             fails.append("T24f 轮内去重须保序首现并记 srcs")
+        # ---- T25:R583 JS 常量语法闸门(node --check),治「41/41 全绿却漏 JS 语法错」----
+        _jserr = _js_syntax_errors()
+        if _jserr is not None:
+            if _jserr:
+                fails.append("T25 JS 常量语法错: " + "; ".join("%s→%s" % (n, e) for n, e in _jserr[:4]))
+            # 正控(★R583b):坏 JS 必须被 node 判错,**且必须经由 helper 本体**被判出
+            #   (只验 node 能力 ⇒ helper 若恒返回 [] 仍全绿,治不了假绿)
+            globals()["_BAD_T25_JS"] = "(()=>{)()"
+            try:
+                _perr = _js_syntax_errors()
+            finally:
+                del globals()["_BAD_T25_JS"]
+            if not any(_n == "_BAD_T25_JS" for _n, _e in (_perr or [])):
+                fails.append("T25b JS 语法闸门正控失败:helper 未抓出注入的坏 *_JS 常量")
+            if subprocess.run([shutil.which("node"), "--check", "-"],
+                              input="(()=>{)()", capture_output=True, text=True, timeout=10).returncode == 0:
+                fails.append("T25b2 node 未判坏 JS")
+            # T25c(★R583b):续载占位符须存在且被 browse_one 现场替换——漏替换时 __MAXMORE__
+            #   是合法标识符,node --check 照样过,运行时静默零续载
+            if "__MAXMORE__" not in ROUTE_JS or '"__MAXMORE__"' not in _insp.getsource(browse_one):
+                fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 且 browse_one 现场替换")
     finally:
         random.setstate(_rs)
     cases += 1
