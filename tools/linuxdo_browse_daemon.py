@@ -1785,19 +1785,22 @@ ROUTE_JS = r"""
       //   appendMore 拉取——后台标签页里 rAF 被节流,scrollBy 拉不出下一批(实测 DOM 恒 20、
       //   canAppendMore=true、滚到底 26s 不变)。这里在滚到底后显式调用 postStream.appendMore()
       //   逐批加载,直到 canAppendMore=false 或达 __MAXMORE__ 上限(真人也不会一口气读完高楼)。
-      let _more = 0, _canMore = null, _psN = null, _mbErr = null;
+      let _more = 0, _canMore = null, _psN = null, _mbErr = "";
       try {
         const _ctrl = window.Discourse.__container__.lookup('controller:topic');
         const _ps = _ctrl.model.postStream;
+        // ★R583d D4:先取「续载前」快照,并在每批成功后刷新——中途抛错不再把 psn/canmore 清成 null
+        _canMore = _ps.canAppendMore;
+        try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
         while (_more < __MAXMORE__ && _ps.canAppendMore) {
           window.scrollBy(0, 400);                                  // 停在底部附近
           await Promise.resolve(_ps.appendMore());                  // 拉下一批(20 楼)
           _more++;
           await new Promise(r=>setTimeout(r, 700 + Math.random()*500));
+          _canMore = _ps.canAppendMore;
+          try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
         }
-        _canMore = _ps.canAppendMore;
-        try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
-      } catch(e){ _mbErr = String(e).slice(0,120); }   // ★R583c:静默改为可观测(丢桥接/无 appendMore 时留证)
+      } catch(e){ _mbErr = String(e).slice(0,120); }   // ★R583c:静默改为可观测(丢桥接/无 appendMore 时留证);★R583d D6:正常=""
       for(let s=0;s<__RB__;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*500));
         window.scrollBy(0, -380); }
       return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length,
@@ -2022,9 +2025,22 @@ def browse_one(session, tid, state, cand=None):
         _tm_pre = _tm_probe(session)
         if _tm_pre is not None and _tm_pre.get("d") == 0:
             ok = False
-            res = {"fail": "bridge_timeout", "detail": str(res)[:120]}
+            # ★R583d D3:桥接超时时**保留续载观测**(最需诊断的场景别整块丢证)
+            _mbErr_keep = res.get("mbErr") if isinstance(res, dict) else None
+            _psN_keep = res.get("psposts") if isinstance(res, dict) else None
+            _mb_keep = res.get("moreBatches") if isinstance(res, dict) else None
+            _cm_keep = res.get("canMore") if isinstance(res, dict) else None
+            res = {"fail": "bridge_timeout", "detail": str(res)[:120],
+                   "mbErr": _mbErr_keep, "psposts": _psN_keep,
+                   "moreBatches": _mb_keep, "canMore": _cm_keep}
         else:
-            res = {"title": "", "posts": None, "timeout": True}
+            _mbErr_keep = res.get("mbErr") if isinstance(res, dict) else None
+            _psN_keep = res.get("psposts") if isinstance(res, dict) else None
+            _mb_keep = res.get("moreBatches") if isinstance(res, dict) else None
+            _cm_keep = res.get("canMore") if isinstance(res, dict) else None
+            res = {"title": "", "posts": None, "timeout": True,
+                   "mbErr": _mbErr_keep, "psposts": _psN_keep,
+                   "moreBatches": _mb_keep, "canMore": _cm_keep}
     if isinstance(res, dict):
         res["mode"] = "LIGHT" if light else "DEEP"
         res["pose"] = pose
@@ -3813,36 +3829,77 @@ def _selftest_impl():
             if subprocess.run([shutil.which("node"), "--check", "-"],
                               input="(()=>{)()", capture_output=True, text=True, timeout=10).returncode == 0:
                 fails.append("T25b2 node 未判坏 JS")
-            # T25c(★R583b/R583c):续载占位符须存在且被 browse_one **真正 .replace()**——漏替换时
-            #   __MAXMORE__ 是合法标识符,node --check 照样过,运行时静默零续载。仅 grep 子串太弱
-            #   (留个死字符串也能过)⇒ 用 AST 断言存在 `.replace("__MAXMORE__", …)` 实参调用,
-            #   并以「死字符串」反例做正控(检测器须判否)。
+            # T25c(★R583b/R583c/R583d):续载占位符须存在且被**真正 .replace()**——漏替换时 __MAXMORE__ 是
+            #   合法标识符,node --check 照样过,运行时静默零续载。仅 grep 子串太弱(留个死字符串也能过)⇒
+            #   AST 断言存在 `.replace("__MAXMORE__", <活性实参>)`;R583d 强化:第二实参**不得是硬编码常量**
+            #   (0/"0"/""⇒等于关掉续载仍全绿),检索面=整模块源码(允许抽到 helper,不再误伤重构)。
             import ast as _ast
 
-            def _has_ph_replace(_src, _ph):
+            def _ph_replace_ok(_src, _ph):
                 for _n in _ast.walk(_ast.parse(_src)):
                     if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
-                            and _n.func.attr == "replace" and _n.args
+                            and _n.func.attr == "replace" and len(_n.args) >= 2
                             and isinstance(_n.args[0], _ast.Constant) and _n.args[0].value == _ph):
+                        _rhs = _n.args[1]
+                        if isinstance(_rhs, _ast.Constant) and _rhs.value in (0, "0", ""):
+                            return False        # 硬编码常量 ⇒ 等于关掉续载,不算活性替换
                         return True
                 return False
 
+            try:
+                _src_all = open(__file__, encoding="utf-8").read()
+            except Exception:
+                _src_all = _insp.getsource(browse_one)
             if "__MAXMORE__" not in ROUTE_JS:
                 fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 占位符")
-            elif not _has_ph_replace(_insp.getsource(browse_one), "__MAXMORE__"):
-                fails.append('T25c browse_one 须真调 .replace("__MAXMORE__", …)(仅出现字符串不算)')
-            if _has_ph_replace('x = "__MAXMORE__"', "__MAXMORE__"):
+            elif not _ph_replace_ok(_src_all, "__MAXMORE__"):
+                fails.append('T25c 须真调 .replace("__MAXMORE__", <活性实参>)(整模块内;硬编码常量/仅出现字符串不算)')
+            if _ph_replace_ok('x.replace("__MAXMORE__", "0")', "__MAXMORE__"):
+                fails.append("T25c 正控失败:硬编码常量 0 被误判为活性替换")
+            if _ph_replace_ok('x = "__MAXMORE__"', "__MAXMORE__"):
                 fails.append("T25c 正控失败:死字符串被误判为 .replace 调用")
-            # T25d(★R583c):续载 try 块**禁静默吞异常**——漏价/无 appendMore 时须留证。断言 ROUTE_JS
-            #   真捕获(_mbErr=String(e))且 browse_batch 日志落 mberr 字段;正控=裸 catch(e){} 须判否。
-            def _has_obs_catch(_js):
-                return "_mbErr" in _js and "_mbErr = String(e)" in _js
-            if not _has_obs_catch(ROUTE_JS):
-                fails.append("T25d ROUTE_JS 续载 catch 须捕获错误(_mbErr = String(e)),禁静默空 catch")
-            if '"mberr"' not in _insp.getsource(browse_batch):
-                fails.append("T25d browse_batch 日志须落 mberr 字段")
-            if _has_obs_catch("} catch(e){}"):
+            # T25d(★R583c/R583d):续载 try 块**禁静默吞异常**。R583d 结构级判据:注释剥离后须真存在
+            #   `catch(...){ ... _mbErr = <非空> }` 赋值(注释里写一句不算);browse_batch 的 log_jsonl 须含
+            #   AST 级 "mberr" 字典键(注释天然不入 AST,无法绕过)。
+            def _strip_js_comments(_js):
+                _js = re.sub(r"/\*.*?\*/", "", _js, flags=re.S)
+                return re.sub(r"//[^\n]*", "", _js)
+
+            def _js_catch_assigns(_js, _var):
+                _s = _strip_js_comments(_js)
+                for _m in re.finditer(r"catch\s*\(\s*\w+\s*\)\s*\{([^}]*)\}", _s):
+                    if re.search(r"\b%s\s*=\s*[^;\s]" % re.escape(_var), _m.group(1)):
+                        return True
+                return False
+
+            def _py_log_has_key(_src, _key):
+                for _n in _ast.walk(_ast.parse(_src)):
+                    if not (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name) and _n.func.id == "log_jsonl"):
+                        continue
+                    for _a in _n.args:
+                        if isinstance(_a, _ast.Dict):
+                            for _k in _a.keys:
+                                if isinstance(_k, _ast.Constant) and _k.value == _key:
+                                    return True
+                return False
+
+            if not _js_catch_assigns(ROUTE_JS, "_mbErr"):
+                fails.append("T25d ROUTE_JS 续载 catch 须真赋值 _mbErr(注释里写不算),禁静默空 catch")
+            if not _py_log_has_key(_insp.getsource(browse_batch), "mberr"):
+                fails.append("T25d browse_batch log_jsonl 须落 mberr 字典键(AST 级,注释不算)")
+            if _js_catch_assigns("try{} catch(e){}", "_mbErr"):
                 fails.append("T25d 正控失败:裸空 catch 被误判为可观测")
+            if _js_catch_assigns("try{} catch(e){ /* _mbErr = String(e) */ }", "_mbErr"):
+                fails.append("T25d 正控失败:注释里的 _mbErr 赋值被误判为可观测")
+            if _py_log_has_key("# log_jsonl(x, {'mberr': 1})", "mberr"):
+                fails.append("T25d 正控失败:死注释里的 mberr 被误判为真键")
+            # T25e(★R583d D4):续载每批成功后须刷新 _canMore/_psN,否则中途抛错把它们清成 null,
+            #   日志出现「mb>0 但 psn/canmore=null」自相矛盾读数(不影响记账,但误导归因)。
+            _s_route = _strip_js_comments(ROUTE_JS)
+            if not re.search(r"_more\s*\+\+[^}]*?_canMore\s*=\s*_ps\.canAppendMore", _s_route, flags=re.S):
+                fails.append("T25e ROUTE_JS 每批续载后须刷新 _canMore(防中途抛错清空快照)")
+        else:
+            globals()["_JS_GATE_SKIPPED"] = True   # ★R583d D2:node 缺席须显式可见,禁静默假绿
     finally:
         random.setstate(_rs)
     cases += 1
@@ -4070,7 +4127,12 @@ def selftest():
         for f in fails:
             print("FAIL " + f)
         return RC_SELFTEST
-    print("selftest %d/%d PASS" % (cases, cases))
+    # ★R583d D2:node 缺席时 JS 语法闸门+T25c/d/e 整块跳过 ⇒ 摘要须显式标注,禁静默假绿
+    _skip = globals().pop("_JS_GATE_SKIPPED", False)
+    if _skip:
+        print("selftest %d/%d PASS (JS闸门 SKIP: 无 node,T25b/c/d/e 未执行)" % (cases, cases))
+    else:
+        print("selftest %d/%d PASS" % (cases, cases))
     return RC_OK
 
 
