@@ -39,6 +39,12 @@ python3 tools/course_pool.py render --out archive/courses/index.html
 
 抓取入口统一：`fetch --source <id>`（`--dry-run` 只解析不入池）。**禁在主流程为某个站写 if-else**——新站一律走注册表。
 
+### channel 实测（2026-10-13 取证，`temp/course_pool/fetch_log.json`）
+同站不同源的差别全在 `channel` 列表：`imooc`=`['browser','jina']` **成功**（records=120），而
+`imooc_class`/`imooc_free`/`imooc_home`=`['jina','http']`（**无 browser**）⇒ 5 个 URL 全败，报错签名
+`jina → HTTP Error 403: Forbidden` + `http → parsed_0_bytes(29180)`（首页 468327）。
+⇒ 判「某源抓不到」先看它的 `channel` 是否含 `browser`，别先怀疑站点下线；修法=改注册表 channel 即可（不动 prompt/代码）。
+
 ## 四、与搜索面（海搜/盘搜/全能）的关系
 
 P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；池按 course_id/标题归一去重，`dup_groups` 暴露跨源重复。海搜/盘搜仍走各自脚本（`birdie_monitor/`，配额与轮转口径见 haisou_monitor_sop）；后续新搜索源同样以注册表条目接入，**不另写散脚本**。
@@ -54,6 +60,8 @@ P1 把「全能 quangneng 课程列表」接进池作为 search 侧一个源；�
 3. docstring 与 argparse 会漂移（R551 实测：docstring 写了不存在的 proof 子命令）⇒ 修文档必须逐子命令取 `--help` 对账，禁凭印象补。
 4. 本机无 `lsof`/`netstat`：端口归属用 Python（socket 枚举/psutil）+ 进程命令行交叉定位。
 5. ★**`tools/pan_search.py` 子命令不认 `--help`，加了就是「真跑一趟」**（2026-10-12 实测）：`main()` 只在 `cmd in ("-h","--help","help")` 时打印用法，`digest --help` 会被当作默认参数执行（`days=14`、`days` 之外的 `mark=True`、**无 `--notify`**）⇒ 探测参数**只能读源码或跑顶级 `-h`**，禁对子命令加 `--help`（此条修正上文坑 3 的「逐子命令取 --help 对账」，对带状态副作用的子命令不适用）。副作用=把当日命中 URL 写进 `temp/pan_search/seen.json` 却**未推送**＝静默丢单；补救=备份 seen.json → 删除该次时间戳（如 `2026-10-12 12:01*`）的条目 → 重跑正式任务（实测 45→43→重跑后 45，无丢单无重复推送）。
+
+6. ★**上游 t.me 不可达时 PanSou 静默降级为空结果(HTTP 仍 200)**(2026-10-13 实测):PanSou 启动即探测 TG 可达性,`[TG可达性] 探测失败 1/2 … 3s 后复检` → `转为不可达,TG 阶段将跳过(不写缓存、不计频道失败)`,`/api/search` 会以 **200 + 毫秒级耗时**返回**空结果集** ⇒ `pan_search.py digest` 打印「命中 0/原始新增 0/保留 0」且 **无任何 `失败` 行**(请求未抛异常,是服务端返回空)。判据=同日 `temp/pan_search/pansou.log` 出现 `[TG可达性]`/`[searchTG] … 跳过 TG 阶段`;复现/补救=等 t.me 恢复后**重跑 `digest --notify`**(脚本内 URL 去重,重复跑不丢单不重复推)。本机脚本无法区分「真无新资源」与「上游不可达」(残余风险,若要根治须在 digest「18 词命中合计==0」时告警 rc≠0,需用户批准改码)。
 
 ## 七、词表产物与入库口径
 
