@@ -61,7 +61,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 ## 接入 TL3 维护链路（2026-10-05 后台版，用户授权）
 
 触发 = linuxdo_trust_level_sop 检测**不满足**时，后台执行本浏览链路**直到满足**（满足即自然停）。
-后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测（计数以最近一次运行输出为准，R578 后 40/40）；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
+后台运行器 = `tools/linuxdo_browse_daemon.py`（零 LLM token；HTTP 打 TMWebDriver 桥 `127.0.0.1:18766/link` 复用已登录 tab；`--selftest` 离线自测（计数以最近一次运行输出为准，R582 后 41/41）；桥由独立保活进程 `tools/tmwd_bridge_watch.py` 托管（18765 WS/18766 HTTP），**不再依赖 Galley 座舱**，见文末 R556 节）：
 - `watch` 长驻判停循环：每批后重读 TL3 等级，**按页面 ✓/○ 标记**判 pending==0 即退出（禁数值机械比较——上限类指标会误报）；`browse --batch N` 手动一批；`check`/`status` 只读
 - 防检测（后台版在单任务版之上再拉稀）：帖间 110–260s（30% 概率 300–600s）+ 读帖滚动与底部驻留（★2026-10-05 17:02 起由 humanize 拟人层生成，旧口径「慢滚 22–30 步×1.4–2.0s、底驻 90–125s」已被取代，现行值见文末「口径订正」节）+ 25% 浅读（刷到不感兴趣划走型）+ 每批随机 2–5 次只逛列表页不进帖 + `--daily-cap` 每日话题上限（内核 `daily_cap=200` ± `cap_jitter=20` ⇒ 实际 180–220，每天摇一次、跨重启稳定）+ 全天切成 `seg_n=6–8` 段 × 每段 `seg_len=85–160min`（内核 `day_segments` 日期种子派生 ⇒ 重启不重置段位；段总长 ≤ 活动窗 80%，段间随机长休 ~130–150min） + 静默窗结束后晨抖 0–60min 再开工 + 静默窗 01:00–07:30；只读铁律不变（零发帖/回复/点赞/关注）
 - 收尾统计同款以 `temp/linuxdo_browse_daemon/browse_log.jsonl` 为准；等级检查记录落 `level_log.jsonl`
@@ -76,7 +76,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 - 强信号集 `RISK_STRONG` 只含 `BANNED/RATE_LIMIT/FORBIDDEN/LOGIN_REQUIRED`；`CF_CHALLENGE` 刻意**不**入强信号（常见且多半自愈，否则误伤成小时级停机）。
 - **批内熔断（R563 补，2026-10-08）**：风控判定原先在 `browse_batch` **返回之后**才做 ⇒ 抓取阶段的失败诊断容易被静默吞掉，只有凑齐一个完整批后才轮到风控检查，命中窗口偏晚。10-08 实测时间线（browse_log/risk_log 原始台账）：19:55:37 开机后 daemon 起跑（watchd `DAEMON_NEVER_RUNNING` 补拉）→ 20:00–22:02 正常浏览 **20 帖**（`DONE`×20）→ **22:06:47** 抓到当日唯一一次 `FORBIDDEN page=5 status=403`（risk_log 仅此一条）⇒ `handle_risk` 暂停 → 23:20 恢复（间隔 ~74min，符合 RISK_PAUSE 60–120min）。现改为**抓取阶段**判定：`fetch_verdict()`（纯函数）在「**所有**采样页失败 ∧ 诊断为强风控信号 / 封禁文案」时返回 `ABORT` ⇒ `browse_batch` 抛 `RiskAbort`（`browse_log` 落 `ABORT why=risk_abort:<kind>`，**零帖**）⇒ 主循环走 `handle_risk` 长暂停。部分页失败但仍有候选 ⇒ 只 `NOTE` 留痕（单页抖动不该整批空转）。抓取失败时诊断里额外留**响应正文前 200 字**（`LAST_FETCH_DIAG["detail"]`），用于区分 CF 挑战 / 封禁文案 / 限流。
 - **随机休息日**：平均每 7 天 1 天完全不浏览（`REST_DAY_P=1/7`），两次休息至少隔 3 天不连休；判定一次即落盘（幂等），当日零浏览。
-- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ 计数随版本增长，**当前口径以源码/最近一次运行输出为准**（R578 实测 **40/40 PASS**；R572 时点 38/38、R576 时点 39/39）。含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」。
+- 自测：`python3 tools/linuxdo_browse_daemon.py --selftest` ⇒ 计数随版本增长，**当前口径以源码/最近一次运行输出为准**（R582 实测 **41/41 PASS**;R578 时点 40/40；R572 时点 38/38、R576 时点 39/39）。含风控判据正负控、风控链路 stub 通知不真发、休息日幂等与常量边界、T14「自测零污染生产 state」。
 
 ## 反检测审查强化（2026-10-05）
 
@@ -129,6 +129,7 @@ return JSON.stringify({fail:true,now:location.pathname});
 1. **独立桥保活** `tools/tmwd_bridge_watch.py`（新）：长驻监督 `18765 WS/18766 HTTP` 两端口，桥不在即拉起（失败退避重试、收手守卫），与 Galley 的 runner.workbench_bridge 彻底解耦；`--selftest` 离线自测 PASS。
 2. **看门狗兜底** `linuxdo_daemon_watchd.py ensure_bridge()`：桥不可达 ⇒ 先自动拉起独立桥（冷却 600s、起后等 15s），仍不可达才判 `BRIDGE_DOWN` 只告警不重启；`status` 增 `bridge_reachable`/`bridge_runner_pids`/`bridge_ensure`（selftest 86 checks / 0 failed）。
 3. **标签自愈** daemon `try_ensure_tab`：无 linux.do 标签 ⇒ AppleScript 补开并导航——**Chrome 未运行时该调用会顺带拉起 Chrome**；补开前先查 EXISTS 防标签堆积，日上限 6 次/间隔 10min，台账 `temp/linuxdo_browse_daemon/ensure_tab.jsonl`(★台账名以源码 `BASE/ensure_tab.jsonl` 为准;旧文档写 `ensure_tab_ledger.jsonl` 系笔误)。★R582(2026-10-13)边界订正:上面"Chrome 未运行时会顺带拉起"**在 Automation 授权有效时成立**(AppleScript 对未运行的可脚本化 app 有冷启动语义——以无害 app TextEdit 替身实测 `tell application "TextEdit" … activate/make new document` 均从"未运行"把进程拉起)。真正的断点是**授权缺失**:缺授权时 AppleScript 路径(含冷启动)整条被拒(`-1743`),此时只剩桥兜底 `_try_bridge_open_main_tab`(走现有标签里的 `window.open`),而它**必须有已连上的会话** ⇒ **授权缺失 + Chrome 已整体退出(无会话)** 时两路俱灭=无任何拉起路径;授权有效时则能拉起。⇒ 缺口不是"缺冷启动路径",而是**授权缺失时缺一个不依赖 TCC 的兜底**(如 `open -a "Google Chrome" <url>`,`open` 走 LaunchServices、不经 Apple Events)。诊断见 `temp/R582_L站浏览器关闭未恢复_排查记录.md`。
+  - ★R582(2026-10-13)**已落地(用户批方案 A)**:`try_ensure_tab` 增**第三档** `_try_open_app_main_tab()`——`subprocess.run(["open","-a",CHROME_APP_NAME,MAIN_URL])`(`MAIN_URL=https://linux.do/`),LaunchServices 不经 Apple Events,**不受 -1743 影响**;rc=0 后 sleep 4s 再以 `_is_main_host` 复核主站会话,无主站会话即判失败(fail-closed);台账 note 以 `OPEN_APP` 前缀可辨识。**触发守卫**=仅当 `osascript 真失败`(rc!=0/异常,`_ran_ok=False`)且桥也失败时才下探;`「URLS: 但仅非主站标签」`属 fail-closed(ok 置 False 但 `_ran_ok=True`)⇒**不下探**桥/open-a,避免伪造自愈(此即 T7r2 早前被误触发的根因)。仍受"日上限 6 次/间隔 10min"闸门约束。daemon `--selftest` 41/41(新增 T20f=桥失败须回退 open -a、T20g=open -a 也失败不得判成功、T20h=内核结构 `open -a`+MAIN_URL 与 rc/主站判定;正控 A/B 已验证 T20f2/T20g 真红)。**改后须重启 daemon 生效**(进程内常量)。待批:B watchd Chrome 进程探针 / C 固化 Automation 授权。
 
 真机链（21:12）：watchd 起→`BRIDGE_DOWN`→独立桥拉起→daemon 重生→补标签顺带拉起 Chrome→扩展连上→ROUND OK；21:17 新码短退避生效（`RC_NO_SESSION_RETRY …（1/8，睡 40s）`）。
 

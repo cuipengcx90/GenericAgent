@@ -2015,6 +2015,13 @@ BRIDGE_OPEN_JS = ("(function(){try{var w=window.open('https://linux.do/','_blank
                   "return JSON.stringify({ok:!!w});}catch(e){"
                   "return JSON.stringify({ok:false,err:String(e)});}})()")
 
+# ★R582 「非 TCC」冷启动兜底(用户批准 = 报告 §6 方案 A):AppleScript 冷启动依赖「自动化」
+#   授权(-1743 即整条被拒),桥又需已连会话 ⇒ 授权缺失 + Chrome 已退出时两路俱灭。
+#   `open -a` 经 LaunchServices、**不发送 Apple 事件**,故不受 -1743 影响;Chrome 未运行时
+#   会顺带冷启动它。作为第三档、在 AppleScript 与桥都未能建标签时才用。
+MAIN_URL = "https://linux.do/"
+CHROME_APP_NAME = "Google Chrome"
+
 
 def _try_bridge_open_main_tab():
     """osascript 不可用时(典型 -1743 未授权)用桥建后台主站标签。
@@ -2050,6 +2057,30 @@ def _try_bridge_open_main_tab():
                 return True, "BRIDGE_OPEN 已建后台主站标签(绕过 -1743 授权)"
             return False, "BRIDGE_OPEN 已发起但 3s 内未见主站会话(桥/扩展异常)"
     return False, "BRIDGE_OPEN 无可用会话(window.open 无处可发)"
+
+
+def _try_open_app_main_tab(timeout=20):
+    """★R582 非 TCC 兜底:AppleScript(-1743)与桥(需已连会话)都失效时,用 `open -a` 冷启动。
+
+    `open` 经 LaunchServices 打开 app/URL,**不发送 Apple 事件**,故不受「自动化」TCC 授权
+    影响;Chrome 未运行时会被顺带启动,并作为参数 URL 打开主站标签(可能顶前台一次,但仅在
+    两路俱灭的极端情形,次数受 max_per_day/min_gap_s 闸门约束)。返回 (ok, note)。
+    """
+    try:
+        r = subprocess.run(["open", "-a", CHROME_APP_NAME, MAIN_URL],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return False, "OPEN_APP 失败: %s" % repr(e)[:100]
+    if r.returncode != 0:
+        return False, "OPEN_APP rc=%s %s" % (r.returncode, ((r.stderr or r.stdout or "").strip()[:120]))
+    time.sleep(4)
+    try:
+        _now = [x for x in list_sessions() if _is_main_host(_url_host(x.get("url") or ""))]
+    except Exception:
+        _now = []
+    if _now:
+        return True, "OPEN_APP 已拉起 Chrome/主站标签(绕过 -1743/无需已连会话)"
+    return False, "OPEN_APP rc=0 但 4s 内未见主站会话(桥/扩展未连?)"
 
 
 def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
@@ -2104,9 +2135,12 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
               "  return \"CREATED:\" & (_prev as text)\n"
               "end tell")
     prev_idx = None
+    _ran_ok = False   # ★R582 区分「osascript 真失败(rc!=0/异常)」与「成功但仅非主站标签」:
+                      #   后者 fail-closed 不当成功,但也**不该**下探桥/open-a(那会伪造自愈)。
     try:
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=25)
         ok = (r.returncode == 0)
+        _ran_ok = ok
         note = (r.stdout or r.stderr or "").strip()
         if ok and note.upper().startswith("URLS:"):
             # ★精确 host 判据（2026-10-06）：只认主站；connect.linux.do 不算「已有」；
@@ -2135,13 +2169,23 @@ def try_ensure_tab(now=None, max_per_day=6, min_gap_s=600):
         ok, note = False, repr(e)[:120]
     # ★R572 -1743 兜底:自动化授权缺失 ⇒ osascript 恒失败,改走桥 window.open 建后台主站标签
     #   (实测不抢前台、不依赖 AppleScript;台账 note 以 BRIDGE_OPEN 前缀可辨识)。
-    if (not ok) and ("-1743" in str(note) or "未获得授权" in str(note)
-                     or "not authorized" in str(note).lower()):
+    if (not ok) and (not _ran_ok) and ("-1743" in str(note) or "未获得授权" in str(note)
+                                       or "not authorized" in str(note).lower()):
         _bok, _bnote = _try_bridge_open_main_tab()
         if _bok:
             ok, note = True, "osascript -1743(无自动化授权)⇒ 回退桥: " + _bnote
         else:
             note = "osascript -1743 且回退失败: " + _bnote
+    # ★R582 第三档(非 TCC)兜底:AppleScript 冷启动依赖「自动化」授权(-1743 即整条被拒),
+    #   桥又需已连会话 ⇒ 授权缺失 + Chrome 已退出时两路俱灭。`open -a` 经 LaunchServices、
+    #   不发 Apple 事件,故不受 -1743 影响,并能在 Chrome 未运行时顺带冷启动它。
+    #   仅当 osascript 真失败(rc!=0/异常)时触发;「仅非主站标签」属 fail-closed,不下探避免伪造自愈。
+    if not ok and not _ran_ok:
+        _aok, _anote = _try_open_app_main_tab()
+        if _aok:
+            ok, note = True, "osascript/桥均未建成 ⇒ 回退 open -a: " + _anote
+        else:
+            note = note + " | open -a 亦失败: " + _anote
     try:
         with io.open(led, "a", encoding="utf-8") as f:
             f.write(json.dumps({"ts": now_ts, "day": day, "ok": ok, "note": note,
@@ -3380,6 +3424,65 @@ def _selftest_impl():
         finally:
             _g20["subprocess"].run = _k_run20
             _g20["_try_bridge_open_main_tab"] = _k_bo20
+        # T20f ★R582:桥兜底也失败时,须回退第三档 `open -a`(非 TCC),成功则 ok=True
+        _k_run20f = _g20["subprocess"].run
+        _k_bo20f = _g20["_try_bridge_open_main_tab"]
+        _k_oa20f = _g20.get("_try_open_app_main_tab")
+        _called_oa = {"n": 0}
+
+        def _stub_oa():
+            _called_oa["n"] += 1
+            return True, "stub open -a"
+
+        try:
+            _g20["subprocess"].run = lambda *a, **k: _R20()
+            _g20["_try_bridge_open_main_tab"] = lambda: (False, "stub 桥失败")
+            _g20["_try_open_app_main_tab"] = _stub_oa
+            _kf, _nf = try_ensure_tab(now=time.time() + 2 * 10 ** 6, max_per_day=99, min_gap_s=0)
+            if _called_oa["n"] != 1:
+                fails.append("T20f 桥失败须回退 open -a(调用%d次)" % _called_oa["n"])
+            if not _kf:
+                fails.append("T20f2 open -a 成功时 try_ensure_tab 须 ok=True: %s" % _nf)
+            # T20g 负控:open -a 也失败 ⇒ 不得判成功
+            _g20["_try_open_app_main_tab"] = lambda: (False, "stub open -a 失败")
+            if try_ensure_tab(now=time.time() + 3 * 10 ** 6, max_per_day=99, min_gap_s=0)[0]:
+                fails.append("T20g open -a 失败不得判成功")
+        finally:
+            _g20["subprocess"].run = _k_run20f
+            _g20["_try_bridge_open_main_tab"] = _k_bo20f
+            _g20["_try_open_app_main_tab"] = _k_oa20f
+        # T20h open -a 内核:结构断言 + 行为(rc=0 且主站会话⇒成功;rc!=0/非主站⇒失败)
+        if not callable(globals().get("_try_open_app_main_tab")):
+            fails.append("T20h open -a 兜底内核缺席(_try_open_app_main_tab)")
+        elif not ('"-a"' in _src20 and '"open"' in _src20 and "MAIN_URL" in _src20):
+            fails.append("T20h2 open -a 内核须用 open -a + MAIN_URL 打开主站(非 TCC 路径)")
+        else:
+            _k_run20b = _g20["subprocess"].run
+            _k_ls20b = _g20["list_sessions"]
+            _k_sl20b = time.sleep
+
+            class _Rok:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            try:
+                time.sleep = lambda *a, **k: None
+                _g20["subprocess"].run = lambda *a, **k: _Rok()
+                _g20["list_sessions"] = lambda *a, **k: [{"id": "s1", "url": "https://linux.do/t/x"}]
+                if not _try_open_app_main_tab()[0]:
+                    fails.append("T20h3 rc=0 且见主站会话须判成功")
+                _g20["list_sessions"] = lambda *a, **k: [{"id": "s2", "url": "https://connect.linux.do/"}]
+                if _try_open_app_main_tab()[0]:
+                    fails.append("T20h4 仅非主站会话不得判成功")
+                _g20["subprocess"].run = lambda *a, **k: _R20()
+                _g20["list_sessions"] = lambda *a, **k: [{"id": "s1", "url": "https://linux.do/t/x"}]
+                if _try_open_app_main_tab()[0]:
+                    fails.append("T20h5 rc!=0 不得判成功")
+            finally:
+                _g20["subprocess"].run = _k_run20b
+                _g20["list_sessions"] = _k_ls20b
+                time.sleep = _k_sl20b
     cases += 1
 
     # T21 临时提速（turbo，R576）：配置缺失=正常；到期/损坏/越界/过长有效期=fail-closed；
