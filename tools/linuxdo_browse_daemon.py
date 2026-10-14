@@ -3873,7 +3873,8 @@ def _selftest_impl():
                     if isinstance(_node, _ast.BinOp):
                         return _is_const_expr(_node.left) and _is_const_expr(_node.right)
                     if isinstance(_node, _ast.BoolOp):
-                        # 任一操作数恒定即可产出恒定值(and/or 短路语义)
+                        # 保守判定:仅当**所有**操作数恒定才判否(如 `True or 4`)。
+                        # 少了任一操作数(如 `x or 4`)⇒ 结果随变量变 ⇒ 须判活。
                         return all(_is_const_expr(_v) for _v in _node.values)
                     if isinstance(_node, _ast.UnaryOp):
                         return _is_const_expr(_node.operand)
