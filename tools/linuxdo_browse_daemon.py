@@ -3840,8 +3840,19 @@ def _selftest_impl():
                 # ★R583f R1:字面量经 AST 常量折叠后仍恒定的表达式(str(4)/"1"*1/f"{1}"/0+1/True)同样判否。
                 # ★R583e N1:第二实参**禁任何字面常量**(0/"0"/""/"1"/4/None…)——常量=续载批数被写死,
                 #   半途关掉/钉死续载仍会全绿;活性替换必须是运行时表达式(如 str(maxmore))。
+                # R583f R1 / R583g:值不随运行时数据变的表达式(常量折叠)一律判否。
+                #   判据=「结构白名单 + 递归全常量」:任一叶子是变量/调用即判活。
+                _CONST_FUNCS = ("str", "int", "float", "bool", "repr", "bytes",
+                                "list", "tuple", "set", "dict", "len", "sum",
+                                "min", "max", "abs", "round", "sorted", "format",
+                                "ord", "chr", "hex", "oct", "bin")
+                _CONST_METHODS = ("join", "format", "upper", "lower", "strip",
+                                  "replace", "zfill", "ljust", "rjust", "center",
+                                  "title", "capitalize", "casefold", "swapcase",
+                                  "split", "splitlines", "partition", "rpartition",
+                                  "encode")
+
                 def _is_const_expr(_node):
-                    # R583f R1:值不随运行时数据变的表达式(常量折叠)一律判否。
                     try:
                         _ast.literal_eval(_node)
                         return True                        # 纯字面量/容器/常量表达式
@@ -3856,14 +3867,37 @@ def _selftest_impl():
                         return _is_const_expr(_node.value)
                     if isinstance(_node, (_ast.Tuple, _ast.List, _ast.Set)):
                         return all(_is_const_expr(_e) for _e in _node.elts)
+                    if isinstance(_node, _ast.Dict):
+                        return (all(_is_const_expr(_k) for _k in _node.keys if _k is not None)
+                                and all(_is_const_expr(_v) for _v in _node.values))
                     if isinstance(_node, _ast.BinOp):
                         return _is_const_expr(_node.left) and _is_const_expr(_node.right)
+                    if isinstance(_node, _ast.BoolOp):
+                        # 任一操作数恒定即可产出恒定值(and/or 短路语义)
+                        return all(_is_const_expr(_v) for _v in _node.values)
                     if isinstance(_node, _ast.UnaryOp):
                         return _is_const_expr(_node.operand)
+                    if isinstance(_node, _ast.Compare):
+                        return (_is_const_expr(_node.left)
+                                and all(_is_const_expr(_c) for _c in _node.comparators))
+                    if isinstance(_node, _ast.Subscript):
+                        return (_is_const_expr(_node.value) and _is_const_expr(_node.slice))
+                    if isinstance(_node, _ast.Slice):
+                        return all(_p is None or _is_const_expr(_p)
+                                   for _p in (_node.lower, _node.upper, _node.step))
+                    if isinstance(_node, _ast.Starred):
+                        return _is_const_expr(_node.value)
                     if isinstance(_node, _ast.Call):
                         _f = _node.func
-                        return (isinstance(_f, _ast.Name) and _f.id in ("str", "int", "float", "bool", "repr")
-                                and all(_is_const_expr(_a) for _a in _node.args))
+                        if not all(_is_const_expr(_a) for _a in _node.args):
+                            return False                   # 实参含变量 ⇒ 活性
+                        if isinstance(_f, _ast.Name):
+                            return _f.id in _CONST_FUNCS
+                        if isinstance(_f, _ast.Attribute):
+                            # 常量上的同值方法,如 "".join([]) / "ab".upper()
+                            return (_f.attr in _CONST_METHODS
+                                    and _is_const_expr(_f.value))
+                        return False
                     return False
                 _tree = _ast.parse(_src)
                 if _func is not None:
@@ -3904,6 +3938,18 @@ def _selftest_impl():
             for _expr in ('str(4)', '"1"*1', '0+1', 'f"{1}"', '"1" if y else "2"', 'str(1+1)'):
                 if _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
                     fails.append("T25c 正控失败:常量折叠表达式 %s 被误判为活性替换" % _expr)
+            # ★R583g:结构级恒值式(非字面量但值恒定)也须判否
+            for _expr in ('True or 4', 'False and 4', '[1][0]', '{"k": 1}["k"]',
+                          '"".join([])', 'len("ab")', '(1 < 2)', '1 < 2',
+                          'str(*[4])', '"a" "b"', '{"a": 1, "b": 2}["a"]',
+                          '"ab".upper()', '"a,b".split(",")[0]'):
+                if _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
+                    fails.append("T25c 正控失败:R583g 结构恒值式 %s 被误判为活性替换" % _expr)
+            # ★R583g 反向:变量基上的同名方法仍须判活(禁过度拦截)
+            for _expr in ('str(_cfg.get("maxmore"))', 'str(maxmore)',
+                          '_v.upper()', 'str(maxmore + 1)'):
+                if not _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
+                    fails.append("T25c 正控失败:R583g 反向活性式 %s 未被判活" % _expr)
             # ★R583f R2:_func 限定 ⇒ 死 helper(未被调用)不算
             _dead = ('def browse_one():\n    pass\n'
                      'def dead_helper():\n    x.replace("__MAXMORE__", str(maxmore))\n')
