@@ -3836,13 +3836,14 @@ def _selftest_impl():
             import ast as _ast
 
             def _ph_replace_ok(_src, _ph):
+                # ★R583e N1:第二实参**禁任何字面常量**(0/"0"/""/"1"/4/None…)——常量=续载批数被写死,
+                #   半途关掉/钉死续载仍会全绿;活性替换必须是运行时表达式(如 str(maxmore))。
                 for _n in _ast.walk(_ast.parse(_src)):
                     if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
                             and _n.func.attr == "replace" and len(_n.args) >= 2
                             and isinstance(_n.args[0], _ast.Constant) and _n.args[0].value == _ph):
-                        _rhs = _n.args[1]
-                        if isinstance(_rhs, _ast.Constant) and _rhs.value in (0, "0", ""):
-                            return False        # 硬编码常量 ⇒ 等于关掉续载,不算活性替换
+                        if isinstance(_n.args[1], _ast.Constant):
+                            return False        # 硬编码字面量 ⇒ 等于关掉/钉死续载,不算活性替换
                         return True
                 return False
 
@@ -3856,6 +3857,15 @@ def _selftest_impl():
                 fails.append('T25c 须真调 .replace("__MAXMORE__", <活性实参>)(整模块内;硬编码常量/仅出现字符串不算)')
             if _ph_replace_ok('x.replace("__MAXMORE__", "0")', "__MAXMORE__"):
                 fails.append("T25c 正控失败:硬编码常量 0 被误判为活性替换")
+            # ★R583e N1:任何字面常量实参("1"/4/None…)都等于钉死续载,须判否(活性=运行时表达式)
+            if _ph_replace_ok('x.replace("__MAXMORE__", "1")', "__MAXMORE__"):
+                fails.append('T25c 正控失败:硬编码常量 "1" 被误判为活性替换')
+            if _ph_replace_ok('x.replace("__MAXMORE__", 4)', "__MAXMORE__"):
+                fails.append("T25c 正控失败:硬编码常量 4 被误判为活性替换")
+            if _ph_replace_ok('x.replace("__MAXMORE__", None)', "__MAXMORE__"):
+                fails.append("T25c 正控失败:硬编码常量 None 被误判为活性替换")
+            if not _ph_replace_ok('x.replace("__MAXMORE__", str(maxmore))', "__MAXMORE__"):
+                fails.append("T25c 正控失败:运行时表达式 str(maxmore) 未被判为活性替换")
             if _ph_replace_ok('x = "__MAXMORE__"', "__MAXMORE__"):
                 fails.append("T25c 正控失败:死字符串被误判为 .replace 调用")
             # T25d(★R583c/R583d):续载 try 块**禁静默吞异常**。R583d 结构级判据:注释剥离后须真存在
@@ -4114,6 +4124,7 @@ def selftest():
     try:
         BASE = sb
         _SANDBOX_ACTIVE = True
+        globals().pop("_JS_GATE_SKIPPED", None)   # ★R583e N5:每跑先清,防同进程重复调用残留上次的 SKIP
         fails, cases = _selftest_impl()
     finally:
         BASE = orig
