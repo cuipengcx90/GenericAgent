@@ -162,6 +162,9 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
 ## A055
 | linuxdo_trust_level_sop(linux.do TL3等级维护:官方要求访问≥50天/获赞20/送赞30/回复10话题/浏览25%等,只能人工自动结算无接口强刷;检查读connect.linux.do的"信任级别3要求"区块;★09-28实测 connect 非恒被卡(新tab首读即得完整正文/未遇CF)⇒先试connect,失败再回落首页等级卡;⚠️connect.linux.do被CF卡死(分区cookie topLevelSite=linux.do,顶层导航不带clearance;curl带cookie也403)时改读linux.do首页「要求」等级卡同一套明细(首页本身也可能被IP级CF挑战→bringToFront+重载+分轮短等待~2-3min自愈,判据看innerText>200非title);解析先剔driver注入的"ljq_driver: 已连接"行;访问天数无法脚本代刷/禁模拟登录;发帖需POST /posts.json带tags字段[类版块组标签如AI]否则422;编辑帖子用PUT /posts/{id}.json;语气去AI味=去"1.2.3.分点+客套结尾"模板腔改口语化;已建每天09:30定时检查linuxdo_trust_level_check.json,已符合完全静默不通知,不符合才私信列差距不代操作;★判定须按页面✓/○标记,禁用当前值<门槛机械比较[上限类指标];★2026-10-01实测:connect 首读可能直接成功(未遇CF),ring 名取 txt 末段,指标名禁自造映射(connect 与首页卡同名同义,自造致推送标签整体错位须补更正),连续期断言须逐份回源 done 报告头部[09-19 符合⇒09-20 起连续]；★2026-10-05 现场缺陷修复(守护自身 bug)=check_level() 把唯一 linux.do 标签导航到 connect 后不还原⇒每轮自毁供应⇒watch 空转(done=0)、曾被误判为 CF 封 /latest.json；修法=读完 connect 先 run_js 还原 location.href='https://linux.do/'+sleep 6；★核验配方「浏览是否真入账」=同源 fetch('/t/<id>.json') 读 last_read_post_number ⇔ 楼层数(实测 7/7·16/16·9/9·1/1 全读满)，卡片数值有结算滞后、短时不动≠无效；守护长驻须有一个后台(非 active) linux.do 标签(AppleScript make new tab ... of w，勿用 open location)；判活=browse_log.jsonl 新增 DONE/state.json daily 增长(bg_task 日志常 0 字节≠没跑)) | launchpad_folder_sop
 
+
+【2026-10-13 自 L1 第 56 行迁出（R577–R583 追加内容，原文无损）】
+linuxdo_trust_level_sop(linux.do TL3等级维护:官方要求访…)|★R577(2026-10-12):「浏览话题 500」=主帖数、「浏览帖子 20000」=楼层数(connect 页脚注逐字,100天滚动窗;两项独立;★R578 楼层=唯一瓶颈⇒加权选帖/浅读降概率/每日 daily_floor_cap 闸门已落地,观测=temp/linuxdo_floor_ledger.py status|board(楼层行已进日报08:30;配置项仅两处 cap:daily_cap=帖/daily_floor_cap=楼层)) | ★R579(2026-10-13):候选混池=2×top+2×latest(候选中位 4楼→21楼,「每帖只出5楼」根因=专挑最新短帖)+楼层记账改**实际读到楼层**(`floors_credit_of` 优先 res["posts"])+闸门默认 1200→2400/turbo 现 5000;提交 609e2d9/3130833;★R579b 口径一致四修(楼层短探针补 posts+日志 posts_src/fc·深读上限随内容缩放 基准150s/封顶300s·turbo deep_cap_s 优先·LOITER 按真实采样页·轮内 top∩latest 去重;未动任何浏览动作),提交 028dbba,自测 41/41+正控 T24c 真红 | ★R580(2026-10-13):日常楼层上限加**当日种子抖动** DAILY_FLOOR_CAP_JITTER=3600 ⇒ 上限 [2400,6000] 同日稳定/跨重启不变,turbo 显式值仍逐字优先;turbo 硬边界 (1,5000)→(1,6000);提交 db7f774 | ★R581(2026-10-13 全配置审计):humanize 屏上限24→32·PRECISE_P0.45→0.50·底部多停0.7→0.75;daemon FLOOR_BIAS0.7→0.8·FLOOR_CAP40→64·FLOOR_CREDIT_CAP40→64·BIG_DEEP_LIGHT_P0.12→0.08+修R578接线(browse_one 补 cand=c,否则死代码);提交 0d4a50b | ★R582(2026-10-13):「浏览器关了没自动拉起」多为伪前提(Chrome自10-09常驻);缺口=**授权缺失时无兜底**(AppleScript冷启动本在但依赖Automation授权;-1743即整条被拒,桥又需已连会话),订正旧"无路径"说,`open -a`兜底**已落地**(2026-10-13 批A:第三档 `_try_open_app_main_tab`+`_ran_ok` 守卫;selftest 41/41);待批 B/C | ★R583(2026-10-13):楼层探针JS语法错+后台tab恒≤20楼⇒探针修复+续载+回退档FLOOR_CREDIT_CAP 64→20;提交4012bbe | ★CF 盾根因=本机出口是 Cloudflare WARP(AS13335,104.28.166.42/SJC)非请求频率(实测9连发全200);纯 fetch 过不了(无 cf_clearance)⇒过盾=整页导航 /latest;daemon 已按「正文挑战优先于429/403状态码」判软信号+抖动重试+导航过盾(f7907b4,selftest 39/39) | launchpad_folder_sop
 ## A056
 | linuxdo_reply_sop(L站随机回帖:骨架复用browse_sop,差异面=回复步POST /posts.json{topic_id,raw}+csrf(meta取法)/首帖先试跑校准/文案1-2句须点名帖内细节禁水贴/★2026-10-05 收紧(anyrouter 封号复盘)=条间240-600s随机·日≤10·单任务≤5(旧 180-420s/日≤20 作废)/daemon在跑勿并发;坑=锁帖422/403判读与429频控,成功只认响应j.id;风控红线=遇 429/403/BANNED 立即停当日回帖并记录原因,禁「感觉还好」硬顶)
 
@@ -243,9 +246,15 @@ kc 未消费流首份消费(R434)=tools/kc_app_usage.py(601行/28686B,纯stdlib�
 ## A084
 15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环；期间通道零输出，飞书卡片停"思考中"看似卡死，用户被迫喊"继续"而 put_task 只是排队并不中断)。正确两步法: ①只启动立即返回 `setsid nohup xxx > log 2>&1 < /dev/null & disown; echo pid=$!`(⚠️2026-09-22实测裸`nohup ... & echo pid=$!`仍会挂满 code_run 超时被强杀=后台子进程占住通道;setsid+`</dev/null`+disown 立即返回,且超时强杀不杀已 setsid 的后台进程,用它起长任务更稳)；②后续每轮用一次 code_run 查状态 `tail -3 log; ps -p <pid> >/dev/null 2>&1 || echo DONE`。每次调用秒级返回，通道持续有心跳，多花轮数由 max_turns=180 兜底。★判"是否卡住"前先用 `date` 对照进程 `lstart/etime`：日志久无新增≠卡死(测试套件会在子套件跑完才整块刷出)，曾把实为 2 分钟的等待误判成 17 分钟白烧一轮诊断。★2026-09-25: 本机 `which setsid`=NOT FOUND ⇒ 上述 setsid 配方在本机恒不生效；改用 `tools/bg_task.py`(start/status/tail/stop/list/selftest；补 tmux_utils 缺的退出码/PID复用/文件日志；R398)
 
+
+【2026-10-13 自 L1 第 85 行迁出（R577–R583 追加内容，原文无损）】
+15. 后台任务禁阻塞等待: GA 无后台任务工具，但不能用 `sleep N` 阻塞等(实测尾部30万行里 code_run 执行170次、超时强杀172次，几乎每次都跑满 timeout 被杀再重试，形成"卡-杀-重试"循环 ★2026-09-25: 本机 `which setsid`=NOT FOUND ⇒ 上述 setsid 配方在本机恒不生效；改用 `tools/bg_task.py`(start/status/tail/stop/list/selftest；补 tmux_utils 缺的退出码/PID复用/文件日志；R398) →A084。★PID 身份比对:`ps lstart` 是**本地化**串(中文 LC_TIME 下 `一 10/12 …`≠`Mon Oct 12 …`)⇒ps 探针必锁 `LC_ALL=C`,且 lstart 不符时要用命令行(含 wrapper 名)二次确认再判 PID 复用(2026-10-12 实测 `stop` 误判 STALE_PID_REUSED 而拒停,`start` 又拉起第二个=双 daemon;已修 tools/bg_task.py 并加 selftest 正控⑤)
 ## A085
 16. 审「测试全绿」先验测试本身是否真执行: 内联/mock 执行器(如桩PA)会无条件写 PASS、把从未运行过的工具记成 exit_code=0 成功记录→只证明管道通不证明能力通,须用真执行替身复跑；桩替身还须校验**接口形状**(flag名/取值域/必填项)——只校验调用次数与顺序会放走 `--timeout-ms` 这类笔误(假herdr照单全收,17例全绿却真机必败)；★判「某能力已进 CI/已接线」禁按目录名或工具名字面 grep——herdr-agents 的 run_tests.sh 用 `for d in control-plane/*/` **glob 自动发现**整套件,字面搜恒零命中(实测把「已进 CI 且 26 用例通过」的 l3_skills_v0 误判成「未接线」并写进报告)⇒一律以实际套件清单+运行日志为证
 
+
+【2026-10-13 自 L1 第 86 行迁出（R577–R583 追加内容，原文无损）】
+16. 审「测试全绿」先验测试本身是否真执行: 内联/mock 执行器(如桩PA)会无条件写 PASS、把从未运行过的工具记成 exit_code=0 成功记录→只证明管道通不证明能力通,须用真执行替身复跑；桩替身还须校验**接口形状**(flag名/取值域/必填项)——只校验调用次数与顺序会放走 `--timeout-ms` 这类笔误(假herdr照单全收,17例全绿却真机必败)；★判「某能力已进 CI/已接线」禁按目录名或工具名字面 grep——herdr-agents 的 run_tests.sh 用 `for d in control-plane/*/` **glob 自动发现**整套件,字面搜恒零命中(实测把「已进 CI 且 26 用例通过」的 l3_skills_v0 误判成「未接线」并写进报告)⇒一律以实际套件清单+运行日志为证。★判 CLI 契约 rc 禁用 `cmd | tail`(或任一管道)后再取 `$?`——拿到的是管道末端命令的 rc;实测两次误读(宣称 RC=5 实为 tail 的 0、selftest 已真红仍打印 RC=0)⇒一律用 subprocess 直取 returncode,并保留输出里的 FAIL 行作第二证据。
 ## A086
 17. 拷本机数据库做只读快照必须连 -wal/-shm 一起拷(缺 -wal 会"假空":实测 Notes 2→8 对象),查询走 `file:...?mode=ro`;macOS 容器目录(~/Library/Containers)递归 `find -type f` 会被 TCC **挂起**(>25s 不返回≠返回 0)→只能 `ls` 限深+显式超时,判"空库"要用第二来源交叉证
 
@@ -599,3 +608,116 @@ L站发帖post未执行根因(R569,2026-10-10,用户问「L站流量帖子怎么
 
 ## A206
 报告编号门禁重复交付裁决(R503,TODO L204↔L195)=tools/report_number_gate.py 已由他会话 R486(ec533d0,flag 式 CLI,421行/20091B/sha 9f13b2ca)交付⇒本会话**不重复交付**(替代实现 585行/25885B 留档 temp/report_number_gate/alt_impl/ 未入仓,工作区已还原 HEAD);独立复跑=裸跑 rc=0/建议编号 R504/--selftest 17 passed·--proof files=4 changed=[](只读自证);★唯一偏差=落后夹具(temp max R8<memory max R12)仅 INFO TEMP_MEMORY_DIVERGED rc=0,危险路径在「拟用撞号」时 --propose N⇒rc=1 NUMBER_ALREADY_USED⇒两条待批提案(A 改述验收②+流程强制先 --propose/B 加 --strict-lag opt-in,默认行为不变);★耐久教训=规划批 dedup rc=1 命中「已交付成果名」即真信号(高评分项也可能是重复),动工前先 `git ls-tree -r HEAD -- <落点>`;建议(待批) todo_quality_gate 加提示级 DUP_DELIVERED;报告 R503
+
+## L1_REMOVED_20261014
+以下为 2026-10-14 自 L1 整行移出的任务记录条目（原文无损，原行号为移出前行号；细节见同名 →A### 块）：
+L9: - 规划质量闸门两 ghost 复活(R417) →A008
+L10: - 规划落地率回测(R422) →A009
+L11: - Chrome 历史快照首份消费(R423) →A010
+L12: - Spotlight 检索选路(R424,只读实测) →A011
+L13: - 克隆可得性真演练(R418)(R410) →A012
+L14: - 待批台账注意力压缩(R428) →A013
+L67: - 待批台账批准前证据器(R433) →A066
+L68: - kc 未消费流首份消费(R434) →A067
+L90:  ★R447 实测三坑(memory 侧三索引 blob 法补行):…) →A089
+L95: - herdr-agents 架构剩余工作量总账(R435) →A094 [R435_架构剩余工作量总账.md]
+L96: - 数据源消费者对账(R436)(R421) →A095
+L97: - Chrome 多profile 身份分流证据表(R437)(R430) →A096
+L98: - 高频访问零提及域名清单(R438) →A097
+L99: - macOS shortcuts CLI 单项实测(R439) →A098
+L100: - 第17批规划三路评审(R440,只规划不执行) →A099
+L101: - haisou 判据修复+A/B 复算(R441) →A100 [R441_haisou判据修复与A_B复算.md]
+L102: - 失效网盘链路裁决(R442) →A101 [R442_birdie链路裁决.md]
+L103: - 双 workspace 并发真跑(R443) →A102 [R443_双workspace并发真跑.md]
+L104: - T0 备份→恢复首次真演练(R444) →A103 [R444_T0关键资产备份恢复首次真演练.md]
+L105: - 异议链最小实现(R446) →A104 [R446_异议链最小实现.md]
+L106: - 第18批规划三路评审(R447,只规划不执行) →A105
+L107: - P6 产物查无逐条归因(R448) →A106 [R448_P6产物查无38条逐条归因.md]
+L108: - 零消费者流收口(R449) →A107
+L109: - herdr-agents 规格必填段门禁(R451) →A108
+L110: - herdr-agents revision 一致性快照契约(R452) →A109 [R452_revision快照契约层.md]
+L111: - 待批项代价一页对比(R453) →A110
+L112: - TODO L163 关项(R454) →A111
+L113: - herdr-agents 阶段三验收 4(R455) →A112
+L114: - 规划模式第19批(R456,只规划不执行) →A113
+L115: - 定时任务内容级产出变化检测器(R457,第19批C2)(R411) →A114 [R457_定时任务内容级产出变化检测器.md]
+L116: - herdr-agents monitor 生产端(R458,第19批C1) →A115 [R458_herdr阶段三前置monitor生产端.md]
+L117: - 推送送达凭据单一源(R459,第19批C3) →A116
+L118: - 双会话产出真合并(R460)(R456)(R455) →A117 [R460_R456xR455真合并.md]
+L119: - 台账 C19–C47 前提复测(R463,第19批C6) →A118
+L120: - 规划模式第20批三路评审与下一批 TODO(R465,只规划不执行) →A119
+L121: - efficiency_monitor 错误信号结构化替换(R466,第20批C6) →A120 [R466_efficiency_monitor错误信号结构化替换.md]
+L122: - 三层产物判据回测(R467,第20批C1) →A121 [R467_三层产物判据回测.md]
+L123: - SOP 断言复核器与记忆事实订正(R468,第20批C4) →A122
+L124: - sche_tasks prompt 静态体检器(R469,第20批C3) →A123
+L125: - 家族标定扩面与 done 族键修复(R470,第20批C2) →A124
+L128: - 规划模式第21批三路评审(R472,只规划不执行) →A127
+L129: - 夜批无人值守记录器(R473,第21批C2,三路评审 8/9/7=8.00) →A128
+L130: - R474(第21批 C6「把人叫回来」/TODO 行184,三路评审 9/8.5/6=7.83) →A129
+L131: - 真机面 4 项演练+28 套件复跑(R476,2026-09-28) →A130
+L132: - 记忆计数类断言扩面(R477,第21批 C5 / TODO L186) →A131
+L133: - 状态陈述生成源(R478,第21批 C3/TODO L187) →A132
+L134: - 巡检告警生命周期台账(R479,第21批 C4/TODO L188) →A133 [R479_巡检告警生命周期台账.md]
+L135: - 巡检告警面收口(R480,第21批替换项/TODO L189) →A134 [R480_巡检告警面收口.md]
+L136: - 规划模式第22批(R481,只规划不执行/TODO L190–L196) →A135
+L137: - 时间衰减源留存断档探测(R483,第22批C4/TODO L190) →A136
+L139: - x.com 情报链路裁决(R484,第22批C7/TODO L191) →A138
+L140: - herdr-agents 三支并行成果合并入 main + 仓级验收(R485,2026-09-28) →A139 [R485_三支并行成果合并入main与验收.md]
+L141: - 阶段三收口+阶段四契约层(R489,2026-09-28) →A140
+L142: - tools/sche_tasks_cwd_fix.py(计划器/写入器)与 sche_tasks prompt 锚定修复(R490,2026-09-28) →A141
+L143: - N3 长任务无人值守演练(R491,2026-09-28) →A142
+L144: - herdr-agents 阶段四工作项3目标驱动循环生产端接线(R492,2026-09-28) →A143 [R492_阶段四工作项3目标驱动循环生产端接线.md]
+L145: - 规划模式第23批(R493,2026-09-29,只规划不执行) →A144
+L146: - 阶段四两支并入 main 双层验收(R496,第23批C1/TODO L198)(R492) →A145 [R496_阶段四两支并入main双层验收.md]
+L147: - herdr-agents 阶段四两支+阶段五立项(R494) →A146
+L148: - 入口面收口(R499,第23批 C4) →A147
+L149: - LaunchAgents plist 体检(R500,第23批 C3/TODO L202) →A148
+L150: - LaunchAgents 三真缺陷收口(R506,第24批C1/TODO L206) →A149
+L151: - 真实消费者回放验收(R501,第23批替换项/TODO L203) →A150
+L152: - 规划模式第24批(R502,只规划不执行) →A151
+L153: - goal_v0 approve 放行通道真机端到端(R508) →A152
+L159: - 阶段四判据1夜批连续达标计数(R509,第24批C4/TODO L207) →A158
+L160: 阶段五章程最小能力落地： 对外背书包度量背书+准入探针(R510) →A159
+L161: - 污染信号端到端回放(R511,第24批替换项/TODO L210) →A160
+L162: - 规划模式第25批(R512,只规划不执行) →A161
+L163: - 四源单日活动时间线(R514,TODO L213) →A162
+L164: - 阶段门前置台账与判据探针(R513/R515) →A163
+L165: - L4 会话归档覆盖度审计(R516,第25批C2/TODO L216) →A164
+L166: - attestation 消费者面收口(R517,第25批 L215) →A165
+L167: - 仓外证据根可复算裁决器(R518,第25批 L212/TODO L212) →A166
+L168: - 调度注册面四源对账器(R520,第25批 L214) →A167 [R520_调度注册面四源对账器.md]
+L169: - herdr-agents 延后项台账与门禁自测接线(R519,2026-09-29) →A168
+L170: - R521 阶段门判据真实决策回放器(R519 同批第25批L217) →A169
+L171: - herdr-agents 可视化(R522) →A170
+L172: - 规划模式第26批(R523,只规划不执行) →A171
+L173: - herdr-agents 可视化两批+写侧最小实现(R524) →A172
+L174: - 阶段四 W4-04 前置度量(R525) →A173
+L175:  散文结论↔账本证据闸门(F18) →A174
+L176: - herdr-agents 可视化②③ attestation 准入真调用(R527)(R510)(R517) →A175
+L177: - herdr-agents 夜批 token 闸门与残余探针(R528) →A176
+L178: - herdr-agents「无 GA 依赖」机械闸门(R529/第26批L219,阶段五第2项「自托管」前置) →A177
+L179: - 调度注册面④象限处置闸门(R531) →A178
+L180: - R530 夜批零额度连续性与看门狗 →A179
+L181: - R532 herdr-agents 夜批「仓库环境态」归因(repo_rev/repo_dirty) →A180
+L182: - R533 T0 备份 RPO 与漂移判定器(R444 D2 收口) →A181
+L183: - sche_tasks prompt 锚定落地(R536,2026-10-01)(R490) →A182
+L184: - AgentRouter 额度投放监控(2026-10-02;2026-10-03 复测订正传输层) →A183
+L185:  anyrouter.top 抢坑(slot)监控(2026-10-03)) →A184
+L186:  linux.do any 状态集中贴深读(R540) →A185
+L187:  Pi compact 400 定案(2026-10-04 E2E)) →A186
+L188:  anyrouter 探针事故复盘(2026-10-05)) →A187
+L189:  L站五动作统一防检测(2026-10-05 用户定义)) →A188
+L190:  L站全节点真人化补口(2026-10-06) →A189
+L191: - L站真人化第二批(R544,2026-10-06) →A190
+L193: - L站防检测架构评审(R545,2026-10-06 只读)(R542)(R544) →A192 [R545_L站防检测架构评审.md]
+L194: - L站防检测五项修复(R546,2026-10-06)(R545) →A193
+L195: - L站审计视图(R547,2026-10-06,用户批准的 R546 建议 #5/#7=纯只读可观测性;报告+三索引已归档,提交 f948c04+本批) →A194
+L196: - 海搜(haisou.cc)「搜不出东西却烧光额度」根因与修复(R549,2026-10-06) →A195
+L197: - L站防检测第三批(R550,2026-10-06,用户提「等级检测触发时间/执行数规则/晚间风险」) →A196
+L199: - L站看门狗桥探活与告警合并(R555,2026-10-06,用户问「今天重启四五次/到底误检还是真掉」) →A198
+L200: - L站守护去 Galley 依赖(R556,2026-10-06,用户「日常 Chrome/非无头/关了能自动重开」) →A199
+L201: - L站守护假重启告警根治(R558,2026-10-07) →A200
+L202: - L站等级检查窗口优先(R565,2026-10-09 用户批准方案B) →A201
+L203: - L站发帖post未执行根因(R569,2026-10-10,用户问「L站流量帖子怎么没执行」) →A202 [R569_L站发帖post未执行根因.md]
+L206: - 网盘搜索优先级分层(R575,2026-10-12,用户诉求「核心 AI Agent/AI Coding/AI 应用开发 优先;变现/自媒体低优先」) →A205
+L207: - 报告编号门禁重复交付裁决(R503,TODO L204↔L195)(R486) →A206

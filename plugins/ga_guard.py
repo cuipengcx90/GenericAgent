@@ -21,11 +21,13 @@ import plugins.hooks as hooks
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 L1 = os.path.join(ROOT, 'memory', 'global_mem_insight.txt')
-MAX_CHARS = 24000        # L1 总字符预算（瘦身后约 1.6 万，留 50% 余量；官方 L0 期望 <1k token，当前未达）
+MAX_CHARS = 16000        # L1 总字符预算（2026-10-13 瘦身后 1.33 万；原 24000 过松，R577–R583 一天内涨 36% 仍不告警）
 LINE_MAX = 500           # 单行预算；超过且无归档锚点的行视为未瘦身
-ANCHORED_MAX = 1500      # 带锚点的行也设上限，防止「锚点 + 大段细节」绕过检查
+ANCHORED_MAX = 800       # 带锚点的行也设上限，防止「锚点 + 大段细节」绕过检查（原 1500，被压到 1495 字刷线）
+RULE_MAX = 300           # 编号规则行上限：规则只留 1 句压缩准则，细节进归档/L3（原先整行豁免，RULES 21 曾涨到 1292 字）
 ANCHOR = re.compile(r'→[AN]\d{3,4}')
-_EXEMPT = re.compile(r'^(#|\[[A-Z_]+\]|\d+\.\s)')   # 标题、分节、编号规则行不计入（规则不压缩），与 tools/l1_compact.py 口径一致
+_EXEMPT = re.compile(r'^(#|\[[A-Z_]+\])')            # 仅标题、分节行不计入
+_RULE = re.compile(r'^\d+\.\s')
 WARN_EVERY = 3600        # 同一进程内同类警告的最小间隔（秒）
 RECORD_MIN = 200         # 带轮次编号 + 日期、且无锚点的长行视为「任务记录」，L0 明文禁止写入 L1
 _RECORD = re.compile(r'R\d{3}.*20\d\d-\d\d-\d\d|20\d\d-\d\d-\d\d.*R\d{3}')
@@ -42,7 +44,8 @@ def check_l1(path=None, max_chars=MAX_CHARS, line_max=LINE_MAX):
     except OSError:
         return 0, 0, None
     fat = sum(1 for s in text.split('\n')
-              if not _EXEMPT.match(s) and (len(s) > ANCHORED_MAX or (len(s) > line_max and not ANCHOR.search(s))))
+              if not _EXEMPT.match(s) and (len(s) > (RULE_MAX if _RULE.match(s) else ANCHORED_MAX)
+                                           or (len(s) > line_max and not ANCHOR.search(s) and not _RULE.match(s))))
     if len(text) <= max_chars and not fat: return len(text), 0, None
     return len(text), fat, (f'[ga_guard] L1 超预算：{len(text)} 字符（上限 {max_chars}），{fat} 行超长未瘦身；'
                            f'每次调用都会多发这些内容。预演：python3 tools/l1_compact.py；官方整理流程见 memory/memory_cleanup_sop.md')
@@ -59,7 +62,9 @@ def violations(path=None, max_chars=MAX_CHARS, line_max=LINE_MAX):
     for n, s in enumerate(text.split('\n'), 1):
         if _EXEMPT.match(s): continue
         head = s[:36].replace('\n', ' ')
-        if len(s) > ANCHORED_MAX: out.append(f'第 {n} 行 {len(s)} 字（上限 {ANCHORED_MAX}）「{head}…」')
+        if _RULE.match(s):
+            if len(s) > RULE_MAX: out.append(f'第 {n} 行规则 {len(s)} 字（规则行上限 {RULE_MAX}，只留 1 句准则，细节迁归档块）「{head}…」')
+        elif len(s) > ANCHORED_MAX: out.append(f'第 {n} 行 {len(s)} 字（上限 {ANCHORED_MAX}）「{head}…」')
         elif not ANCHOR.search(s) and len(s) > RECORD_MIN and _RECORD.search(s):
             out.append(f'第 {n} 行是任务记录（含轮次编号+日期，{len(s)} 字）「{head}…」')
         elif not ANCHOR.search(s) and len(s) > line_max: out.append(f'第 {n} 行 {len(s)} 字未瘦身（上限 {line_max}）「{head}…」')
@@ -129,8 +134,12 @@ def _selftest():
     ok(check_l1(p)[2] is None, '标题/分节行不触发（与 l1_compact 口径一致）')
     open(p, 'w', encoding='utf-8').write('# L1\n' + 'x' * 5000 + ' →A002\n')
     ok(check_l1(p)[2] is not None, '带锚点的超大行也告警（防绕过）')
-    open(p, 'w', encoding='utf-8').write('# L1\n[RULES]\n4. ' + '规' * 900 + '\n')
-    ok(check_l1(p)[2] is None, '编号规则行不触发（规则不压缩）')
+    open(p, 'w', encoding='utf-8').write('# L1\n[RULES]\n4. ' + '规' * 200 + '\n')
+    ok(check_l1(p)[2] is None, '规则行 ≤ RULE_MAX 不触发')
+    open(p, 'w', encoding='utf-8').write('# L1\n[RULES]\n4. ' + '规' * 900 + ' →A003\n')
+    ok(check_l1(p)[2] is not None and violations(p)[0], '规则行超 RULE_MAX 触发，带锚点也不豁免')
+    open(p, 'w', encoding='utf-8').write('# L1\n' + 'x' * 1000 + ' →A002\n')
+    ok(check_l1(p)[2] is not None, '带锚点行超 ANCHORED_MAX(800) 触发')
     before = open(p, 'rb').read(); check_l1(p); ok(open(p, 'rb').read() == before, '只读：文件内容未变')
     ok(_on_agent_before({}) is None, 'hook 返回 None，不改 ctx')
     # —— tool_after 反馈：走 GA 官方 BaseHandler.dispatch，验证真实调用链 ——

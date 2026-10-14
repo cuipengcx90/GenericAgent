@@ -6,12 +6,6 @@
 MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub) →A005
 进程内存/扫描: procmem_scanner.py | procmem_scanner_sop | macOS 自带免root冷门件(R395冲浪): taskpolicy(Qo…) | 本机数据源目录只读地图: tools/personal_source_map.py(12源实测) | 时间衰减源每日快照(R415)) →A006
 定时/自主/反射: scheduled_task_sop | autonomous_operation_sop(活跃TODO) | agentmain --reflect | price_alert已转反射器plist(2min本地查价0成本) | reflect_scripts/01-06=官方示例场景(sys/email/daily/github…) | reflect 接线覆盖率核查(R488)(注册面=LaunchAgents 29+sche_tasks 25=54) | folder_watcher定时任务已归档disabled(30天500跑仅7命中且只给建议不动手) | bridge_autonomous(死任务已归档disabled) | 日志压缩 tools/log_compress.py(copytruncate:归档gzip+尾部…) | 活跃日志治理(2026-09-25 R393) | ROI日报 roi_monitor.py(口径task_volume_v1) | ROI 双口径重标定(R497) | run_tech_trends(定时github_trending)CoT泄…) | 任务产物新鲜度审计=scheduled_task_freshness_audit_sop(静默失败/僵尸任务/归档覆盖率) | temp耐久耦合(R375/C65:定时prompt 吃 cw…) | efficiency_monitor_daily=temp/efficiency_monitor.py(health只算真issue) | 待批台账=pending_decisions(看积压用view_pending.py --…) →A007
-- 规划质量闸门两 ghost 复活(R417) →A008
-- 规划落地率回测(R422) →A009
-- Chrome 历史快照首份消费(R423) →A010
-- Spotlight 检索选路(R424,只读实测) →A011
-- 克隆可得性真演练(R418)(R410) →A012
-- 待批台账注意力压缩(R428) →A013
 - 磁盘可再生候选×T0保护面对账(R429;保护面 temp/t0_baseline.sha256 6299条) →A014
 GA语言/座舱环境: L2[GA 语言环境与 Galley 座舱启动](GA_LANG 决定 sys_prompt{) →A015
 通知推送通道: notify_channels_sop(飞书私信/飞书群/钉钉群) →A016
@@ -64,8 +58,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
  eia_weekly_sop(EIA免密钥) →A063
  smyze_stock_watch_sop(bar-smyze供应链库存口径日检) →A064
 L4: L4_raw_sessions/(原文检索) →A065
-- 待批台账批准前证据器(R433) →A066
-- kc 未消费流首份消费(R434) →A067
+任务/批次记录(R###): ../memory/autonomous_reports/INDEX.md | 已迁出的 L1 记录条目原文: l1_detail_archive.md 末节 L1_REMOVED_20261014
 
 [RULES]
 1. 搜索先行: 优先cwd；搜文件名先es；网页搜索只用google；本机rg未装(搜索静默返回空!)→用grep
@@ -82,126 +75,24 @@ L4: L4_raw_sessions/(原文检索) →A065
 12. 拼接URL/ID禁凭直觉套模板，须用真实返回值实测打开；出错要批量回刷历史数据非只改模板
 13. 禁空报完成: GUI/发布类任务须OCR或等价证据核验后才可报成功；未打通步骤须明示，禁把中间态当完成；口头「已沉淀SOP」须grep memory确认文件真实存在
 14. 网络诊断: Clash TUN 开启时本机"直连"同样被接管，--noproxy/裸socket 结果不可作真实直连证据 →A083
-15. 后台任务禁用 `sleep N` 阻塞等待(实测 code_run 超时强杀 172 次成"卡-杀-重试"循环);GA 无后台工具,一律 `tools/bg_task.py`(start/status/tail/stop,ps 探针锁 LC_ALL=C) →A084
+15. 后台任务禁用 `sleep N` 阻塞等待(实测 code_run 超时强杀 172 次成"卡-杀-重试"循环);GA 无后台工具且本机 `which setsid`=NOT FOUND,一律 `tools/bg_task.py`(start/status/tail/stop,ps 探针锁 LC_ALL=C) →A084
 16. 审「测试全绿」先验测试真执行:mock/桩执行器会无条件写 PASS,须真执行替身复跑并校验接口形状;判「已进 CI」以套件清单+运行日志为证,判 CLI rc 禁管道后取 $? →A085
 17. 拷本机数据库做只读快照必须连 -wal/-shm 一起拷(缺 -wal 会"假空":实测 Notes 2→8 对象),查询走 `file:...?mode=ro`;macOS 容器目录(~/Library/Containers)递归 `find -type f` 会被 TCC **挂起**(>25s 不返回≠返回 0)→只能 `ls` 限深+显式超时,判"空库"要用第二来源交叉证
 18. 引文即契约: 情报/对照/研读类产出里引号内文字会被读作原话, 压缩改写混入=误读源文; 写完须脚本抽取全部引号文本(含「」)回源逐字 grep 校验, 并在文首声明哪些小节才是逐字引用(金句须连标点/引号字形一致);同源风险:搬运 stdout/命令输出入报告须**字节级**原样(实测全角「：（）」易被模型写成半角,逐字比对才暴露)⇒ 用脚本从文件搬运并断言 `line in report`,禁手打转写 →A087
 19. 部分提交(「只提交本行」)三坑: ①`git diff -U3` 会把相距 ≤2×context 的多处改动并成**一个 hunk**⇒按内容过滤 hunk 会把他人未提交行一起带上 →A088
- ★R447 实测三坑(memory 侧三索引 blob 法补行):…) →A089
 20. 自动改写类工具(改名/重命名/重建索引/口径重写)首跑必先 dry-run，并**逐项核对将变动的文件清单**再落盘；对他人/其它会话已定稿的文件慎改（实测 2026-09-23 `autonomous_reports_archive.py inventory --apply` 按会话日志里的草稿名把 8 个已定稿报告改名，随后须逐对 sha1 证明「纯改名、内容零变化」才能安全提交）。
 21. 报告/文档里的实测数值(mtime/行数/字节/条数/file:line)一律当场粘贴命令原始输出并回读,禁凭印象;SOP/定时 prompt 里的数值须回源代码常量(tools/report_number_audit.py、const_number_audit.py) →A091
 
 22. `file_patch`/`file_write --append` 写整行时 new_content 必须自带前导换行(前块末尾无换行时会粘连),否则粘连上一行尾;插入后断言「新行独占一行」;路径写绝对路径,code_run 只提交纯 python →A093
-- herdr-agents 架构剩余工作量总账(R435) →A094 [R435_架构剩余工作量总账.md]
-- 数据源消费者对账(R436)(R421) →A095
-- Chrome 多profile 身份分流证据表(R437)(R430) →A096
-- 高频访问零提及域名清单(R438) →A097
-- macOS shortcuts CLI 单项实测(R439) →A098
-- 第17批规划三路评审(R440,只规划不执行) →A099
-- haisou 判据修复+A/B 复算(R441) →A100 [R441_haisou判据修复与A_B复算.md]
-- 失效网盘链路裁决(R442) →A101 [R442_birdie链路裁决.md]
-- 双 workspace 并发真跑(R443) →A102 [R443_双workspace并发真跑.md]
-- T0 备份→恢复首次真演练(R444) →A103 [R444_T0关键资产备份恢复首次真演练.md]
-- 异议链最小实现(R446) →A104 [R446_异议链最小实现.md]
-- 第18批规划三路评审(R447,只规划不执行) →A105
-- P6 产物查无逐条归因(R448) →A106 [R448_P6产物查无38条逐条归因.md]
-- 零消费者流收口(R449) →A107
-- herdr-agents 规格必填段门禁(R451) →A108
-- herdr-agents revision 一致性快照契约(R452) →A109 [R452_revision快照契约层.md]
-- 待批项代价一页对比(R453) →A110
-- TODO L163 关项(R454) →A111
-- herdr-agents 阶段三验收 4(R455) →A112
-- 规划模式第19批(R456,只规划不执行) →A113
-- 定时任务内容级产出变化检测器(R457,第19批C2)(R411) →A114 [R457_定时任务内容级产出变化检测器.md]
-- herdr-agents monitor 生产端(R458,第19批C1) →A115 [R458_herdr阶段三前置monitor生产端.md]
-- 推送送达凭据单一源(R459,第19批C3) →A116
-- 双会话产出真合并(R460)(R456)(R455) →A117 [R460_R456xR455真合并.md]
-- 台账 C19–C47 前提复测(R463,第19批C6) →A118
-- 规划模式第20批三路评审与下一批 TODO(R465,只规划不执行) →A119
-- efficiency_monitor 错误信号结构化替换(R466,第20批C6) →A120 [R466_efficiency_monitor错误信号结构化替换.md]
-- 三层产物判据回测(R467,第20批C1) →A121 [R467_三层产物判据回测.md]
-- SOP 断言复核器与记忆事实订正(R468,第20批C4) →A122
-- sche_tasks prompt 静态体检器(R469,第20批C3) →A123
-- 家族标定扩面与 done 族键修复(R470,第20批C2) →A124
 - 凭证面体检(R471;25条entries) →A125
 
-- 规划模式第21批三路评审(R472,只规划不执行) →A127
-- 夜批无人值守记录器(R473,第21批C2,三路评审 8/9/7=8.00) →A128
-- R474(第21批 C6「把人叫回来」/TODO 行184,三路评审 9/8.5/6=7.83) →A129
-- 真机面 4 项演练+28 套件复跑(R476,2026-09-28) →A130
-- 记忆计数类断言扩面(R477,第21批 C5 / TODO L186) →A131
-- 状态陈述生成源(R478,第21批 C3/TODO L187) →A132
-- 巡检告警生命周期台账(R479,第21批 C4/TODO L188) →A133 [R479_巡检告警生命周期台账.md]
-- 巡检告警面收口(R480,第21批替换项/TODO L189) →A134 [R480_巡检告警面收口.md]
-- 规划模式第22批(R481,只规划不执行/TODO L190–L196) →A135
-- 时间衰减源留存断档探测(R483,第22批C4/TODO L190) →A136
 
-- x.com 情报链路裁决(R484,第22批C7/TODO L191) →A138
-- herdr-agents 三支并行成果合并入 main + 仓级验收(R485,2026-09-28) →A139 [R485_三支并行成果合并入main与验收.md]
-- 阶段三收口+阶段四契约层(R489,2026-09-28) →A140
-- tools/sche_tasks_cwd_fix.py(计划器/写入器)与 sche_tasks prompt 锚定修复(R490,2026-09-28) →A141
-- N3 长任务无人值守演练(R491,2026-09-28) →A142
-- herdr-agents 阶段四工作项3目标驱动循环生产端接线(R492,2026-09-28) →A143 [R492_阶段四工作项3目标驱动循环生产端接线.md]
-- 规划模式第23批(R493,2026-09-29,只规划不执行) →A144
-- 阶段四两支并入 main 双层验收(R496,第23批C1/TODO L198)(R492) →A145 [R496_阶段四两支并入main双层验收.md]
-- herdr-agents 阶段四两支+阶段五立项(R494) →A146
-- 入口面收口(R499,第23批 C4) →A147
-- LaunchAgents plist 体检(R500,第23批 C3/TODO L202) →A148
-- LaunchAgents 三真缺陷收口(R506,第24批C1/TODO L206) →A149
-- 真实消费者回放验收(R501,第23批替换项/TODO L203) →A150
-- 规划模式第24批(R502,只规划不执行) →A151
-- goal_v0 approve 放行通道真机端到端(R508) →A152
 23. 向**无尾换行**的跟踪文件（L1 global_mem_insight.txt 即如此：`git show HEAD:` 末行带 `\ No newline at end of file`）追加整行时，直接 append 会连带给旧末行补 `\n` ⇒ `git diff -- →A153
 24. herdr-agents 全仓套件(`bash run_tests.sh`)复跑**前置**：`control-plane/l1_map_v0/index.json` 是 gitignored 的构建产物⇒干净 clone / 新 worktree 首跑必红 4 例(`contr →A154
 25. 自测/金丝雀断言**禁绑现场内容**(日志尾部行、当前计数、既有编号):现场一变就假红假绿;须按**结构**(全档扫描/从当前真文动态推导)判定,并保生产判据 A/B 逐字不变。
 26. 内容归属可回源(周报/汇报类):只写本人推动或承接的事;每条 bullet 必带 provenance,tools/weekly_report_provenance_gate.py 须 ALL PASS 才生成 HTML →A156
 27. 定时任务路径口径:launchd WorkingDirectory=GA 仓库根,prompt/SOP 里脚本与产物路径一律写仓库根相对(temp/x.py),禁 ../x 与裸名,禁用交互 cwd 当基准;校验 tools/sche_tasks_lint.py →A157
-- 阶段四判据1夜批连续达标计数(R509,第24批C4/TODO L207) →A158
-阶段五章程最小能力落地： 对外背书包度量背书+准入探针(R510) →A159
-- 污染信号端到端回放(R511,第24批替换项/TODO L210) →A160
-- 规划模式第25批(R512,只规划不执行) →A161
-- 四源单日活动时间线(R514,TODO L213) →A162
-- 阶段门前置台账与判据探针(R513/R515) →A163
-- L4 会话归档覆盖度审计(R516,第25批C2/TODO L216) →A164
-- attestation 消费者面收口(R517,第25批 L215) →A165
-- 仓外证据根可复算裁决器(R518,第25批 L212/TODO L212) →A166
-- 调度注册面四源对账器(R520,第25批 L214) →A167 [R520_调度注册面四源对账器.md]
-- herdr-agents 延后项台账与门禁自测接线(R519,2026-09-29) →A168
-- R521 阶段门判据真实决策回放器(R519 同批第25批L217) →A169
-- herdr-agents 可视化(R522) →A170
-- 规划模式第26批(R523,只规划不执行) →A171
-- herdr-agents 可视化两批+写侧最小实现(R524) →A172
-- 阶段四 W4-04 前置度量(R525) →A173
- 散文结论↔账本证据闸门(F18) →A174
-- herdr-agents 可视化②③ attestation 准入真调用(R527)(R510)(R517) →A175
-- herdr-agents 夜批 token 闸门与残余探针(R528) →A176
-- herdr-agents「无 GA 依赖」机械闸门(R529/第26批L219,阶段五第2项「自托管」前置) →A177
-- 调度注册面④象限处置闸门(R531) →A178
-- R530 夜批零额度连续性与看门狗 →A179
-- R532 herdr-agents 夜批「仓库环境态」归因(repo_rev/repo_dirty) →A180
-- R533 T0 备份 RPO 与漂移判定器(R444 D2 收口) →A181
-- sche_tasks prompt 锚定落地(R536,2026-10-01)(R490) →A182
-- AgentRouter 额度投放监控(2026-10-02;2026-10-03 复测订正传输层) →A183
- anyrouter.top 抢坑(slot)监控(2026-10-03)) →A184
- linux.do any 状态集中贴深读(R540) →A185
- Pi compact 400 定案(2026-10-04 E2E)) →A186
- anyrouter 探针事故复盘(2026-10-05)) →A187
- L站五动作统一防检测(2026-10-05 用户定义)) →A188
- L站全节点真人化补口(2026-10-06) →A189
-- L站真人化第二批(R544,2026-10-06) →A190
 28. 长正文落盘必分块: 单次工具调用回写**超过约千字符**的内容会被平台截断,并把字面量 `...[Truncated]...` 直接写进文件(实测 file_write 一次写 ~2.4KB 报告正文⇒文件里正文中段变成「## 1. 执行输出（原」+`...[Truncated] →A191
-- L站防检测架构评审(R545,2026-10-06 只读)(R542)(R544) →A192 [R545_L站防检测架构评审.md]
-- L站防检测五项修复(R546,2026-10-06)(R545) →A193
-- L站审计视图(R547,2026-10-06,用户批准的 R546 建议 #5/#7=纯只读可观测性;报告+三索引已归档,提交 f948c04+本批) →A194
-- 海搜(haisou.cc)「搜不出东西却烧光额度」根因与修复(R549,2026-10-06) →A195
-- L站防检测第三批(R550,2026-10-06,用户提「等级检测触发时间/执行数规则/晚间风险」) →A196
  AI 课程资源台=tools/course_pool.py(位置子命令) →A197
-- L站看门狗桥探活与告警合并(R555,2026-10-06,用户问「今天重启四五次/到底误检还是真掉」) →A198
-- L站守护去 Galley 依赖(R556,2026-10-06,用户「日常 Chrome/非无头/关了能自动重开」) →A199
-- L站守护假重启告警根治(R558,2026-10-07) →A200
-- L站等级检查窗口优先(R565,2026-10-09 用户批准方案B) →A201
-- L站发帖post未执行根因(R569,2026-10-10,用户问「L站流量帖子怎么没执行」) →A202 [R569_L站发帖post未执行根因.md]
 - 早间浏览栈稳定性汇报器(R573,2026-10-11;判据表 targets 45→46) →A203
 29. minified JS 逆向名字解析: export 名正则必须含 `$`(`(\w+) as X` 会把 `$D as X` 误读成 `D`,实测栽2轮才定位到 FPJS useFingerprint);`_` 这类单字符名须按调用点上下文判,常是解构重命名(`{getData →A204
-- 网盘搜索优先级分层(R575,2026-10-12,用户诉求「核心 AI Agent/AI Coding/AI 应用开发 优先;变现/自媒体低优先」) →A205
-- 报告编号门禁重复交付裁决(R503,TODO L204↔L195)(R486) →A206
