@@ -3369,7 +3369,7 @@ def _selftest_impl():
         if _sa["current_index"] != 1 or not _sa["current_window"]:
             fails.append("T18d now 落段内须给 current_index=1+窗口: %s" % _sa)
         elif _sa["current_window"][2] != _segs[0]["minutes"]:
-            fails.append("T18e 窗口段长须与内核逐字一致: %s" % (_sa["current_window"], _segs[0]["minutes"]))
+            fails.append("T18e 窗口段长须与内核逐字一致: %s / %s" % (_sa["current_window"], _segs[0]["minutes"]))
         if len(_segs) >= 2:
             _gap = _t1 - _t0
             if _sa["rests_n"] != 1 or _sa["rests_long_n"] != (1 if _gap >= SESSION_REST[0] else 0):
@@ -3835,15 +3835,49 @@ def _selftest_impl():
             #   (0/"0"/""⇒等于关掉续载仍全绿),检索面=整模块源码(允许抽到 helper,不再误伤重构)。
             import ast as _ast
 
-            def _ph_replace_ok(_src, _ph):
+            def _ph_replace_ok(_src, _ph, _func=None):
+                # ★R583f R2:_func 给定时检索面缩到该函数体,防「未被调用的死 helper 留活性 .replace」假绿。
+                # ★R583f R1:字面量经 AST 常量折叠后仍恒定的表达式(str(4)/"1"*1/f"{1}"/0+1/True)同样判否。
                 # ★R583e N1:第二实参**禁任何字面常量**(0/"0"/""/"1"/4/None…)——常量=续载批数被写死,
                 #   半途关掉/钉死续载仍会全绿;活性替换必须是运行时表达式(如 str(maxmore))。
-                for _n in _ast.walk(_ast.parse(_src)):
+                def _is_const_expr(_node):
+                    # R583f R1:值不随运行时数据变的表达式(常量折叠)一律判否。
+                    try:
+                        _ast.literal_eval(_node)
+                        return True                        # 纯字面量/容器/常量表达式
+                    except Exception:
+                        pass
+                    if isinstance(_node, _ast.IfExp):
+                        # 两分支恒定时,结果与测试条件无关 ⇒ 仍是钉死值
+                        return _is_const_expr(_node.body) and _is_const_expr(_node.orelse)
+                    if isinstance(_node, _ast.JoinedStr):
+                        return all(_is_const_expr(_v) for _v in _node.values)
+                    if isinstance(_node, _ast.FormattedValue):
+                        return _is_const_expr(_node.value)
+                    if isinstance(_node, (_ast.Tuple, _ast.List, _ast.Set)):
+                        return all(_is_const_expr(_e) for _e in _node.elts)
+                    if isinstance(_node, _ast.BinOp):
+                        return _is_const_expr(_node.left) and _is_const_expr(_node.right)
+                    if isinstance(_node, _ast.UnaryOp):
+                        return _is_const_expr(_node.operand)
+                    if isinstance(_node, _ast.Call):
+                        _f = _node.func
+                        return (isinstance(_f, _ast.Name) and _f.id in ("str", "int", "float", "bool", "repr")
+                                and all(_is_const_expr(_a) for _a in _node.args))
+                    return False
+                _tree = _ast.parse(_src)
+                if _func is not None:
+                    _hit = [n for n in _ast.walk(_tree)
+                            if isinstance(n, _ast.FunctionDef) and n.name == _func]
+                    if not _hit:
+                        return False
+                    _tree = _hit[0]
+                for _n in _ast.walk(_tree):
                     if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
                             and _n.func.attr == "replace" and len(_n.args) >= 2
                             and isinstance(_n.args[0], _ast.Constant) and _n.args[0].value == _ph):
-                        if isinstance(_n.args[1], _ast.Constant):
-                            return False        # 硬编码字面量 ⇒ 等于关掉/钉死续载,不算活性替换
+                        if _is_const_expr(_n.args[1]):
+                            return False        # 字面量/常量折叠表达式 ⇒ 等于关掉/钉死续载,不算活性替换
                         return True
                 return False
 
@@ -3853,8 +3887,8 @@ def _selftest_impl():
                 _src_all = _insp.getsource(browse_one)
             if "__MAXMORE__" not in ROUTE_JS:
                 fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 占位符")
-            elif not _ph_replace_ok(_src_all, "__MAXMORE__"):
-                fails.append('T25c 须真调 .replace("__MAXMORE__", <活性实参>)(整模块内;硬编码常量/仅出现字符串不算)')
+            elif not _ph_replace_ok(_src_all, "__MAXMORE__", _func="browse_one"):
+                fails.append('T25c 须在 browse_one 内真调 .replace("__MAXMORE__", <活性实参>)(限定生产函数;硬编码/常量折叠表达式/死 helper 不算)')
             if _ph_replace_ok('x.replace("__MAXMORE__", "0")', "__MAXMORE__"):
                 fails.append("T25c 正控失败:硬编码常量 0 被误判为活性替换")
             # ★R583e N1:任何字面常量实参("1"/4/None…)都等于钉死续载,须判否(活性=运行时表达式)
@@ -3866,6 +3900,19 @@ def _selftest_impl():
                 fails.append("T25c 正控失败:硬编码常量 None 被误判为活性替换")
             if not _ph_replace_ok('x.replace("__MAXMORE__", str(maxmore))', "__MAXMORE__"):
                 fails.append("T25c 正控失败:运行时表达式 str(maxmore) 未被判为活性替换")
+            # ★R583f R1:常量折叠表达式(值恒定)也须判否 —— str(4)/"1"*1/0+1/f"{1}"/"1" if y else "2"
+            for _expr in ('str(4)', '"1"*1', '0+1', 'f"{1}"', '"1" if y else "2"', 'str(1+1)'):
+                if _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
+                    fails.append("T25c 正控失败:常量折叠表达式 %s 被误判为活性替换" % _expr)
+            # ★R583f R2:_func 限定 ⇒ 死 helper(未被调用)不算
+            _dead = ('def browse_one():\n    pass\n'
+                     'def dead_helper():\n    x.replace("__MAXMORE__", str(maxmore))\n')
+            if _ph_replace_ok(_dead, "__MAXMORE__", _func="browse_one"):
+                fails.append("T25c 正控失败:死 helper 内的活性替换被误判(须限定 browse_one)")
+            _live = ('def browse_one():\n    x.replace("__MAXMORE__", str(maxmore))\n'
+                     'def dead_helper():\n    pass\n')
+            if not _ph_replace_ok(_live, "__MAXMORE__", _func="browse_one"):
+                fails.append("T25c 正控失败:browse_one 内活性替换未判真")
             if _ph_replace_ok('x = "__MAXMORE__"', "__MAXMORE__"):
                 fails.append("T25c 正控失败:死字符串被误判为 .replace 调用")
             # T25d(★R583c/R583d):续载 try 块**禁静默吞异常**。R583d 结构级判据:注释剥离后须真存在
