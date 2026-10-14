@@ -23,4 +23,5 @@
 
 - **钉钉群 text 消息有体积上限**：超限时服务端返回 `errmsg`「body 大小不合法;请保持在 20000bytes 以内」。本机口径 = 请求体 `json.dumps({"msgtype":"text","text":{"content":text}}).encode()`（`ensure_ascii` 默认 True ⇒ CJK 转 `\uXXXX`，报告类文本实测膨胀约 1.4×）。2026-10-01 `github_trending` 首次命中（请求体 34012 B；报告 23965 B / 17681 字符）。★阈值与体积**非单调**：09-23 以 30154 B 成功、10-01 以 34012 B 失败 ⇒ 判定一律以返回体 `errmsg` 为准，勿据单一数字反推规则，也勿用文件字节数替代请求体口径。
 - **推送行的前缀 emoji 不是送达凭据**：`run_tech_trends.py:308` 只 print `ding_result['errmsg']`，前缀恒为 ✅ ⇒ 失败同样打 ✅（2026-10-01 日志「钉钉群: ✅ body 大小不合法…」）。判送达须看 errmsg/errcode 语义（同族纪律：代码路径 > 自述/装饰符）。
+- **直调通道函数前须把 GA 仓库根补进 `sys.path`**：`reflect_scripts/reflect_common.py` 不是可直接导入的顶层包，若 code_run/脚本的工作目录不在 GA 仓库根（如定时任务常用的 `temp/`），`from reflect_scripts.reflect_common import notify_feishu` 会抛 `ModuleNotFoundError: No module named 'reflect_scripts'`。稳妥写法：脚本首行 `sys.path.insert(0, "<GA 仓库根>")` 再 import（2026-10-14 实测，补路径后 `notify_feishu` 返回 `code=0` 并拿到 `message_id`）。
 - **CoT 泄漏与推送体积耦合**：同日报告在标题锚点前的泄漏 9341 字符（占 52.8%），按待批修法裁掉后请求体仍 20586 B > 20000 ⇒ **单靠裁剪不足以解超限**，须并配分片或压缩正文（见 `temp/pending_decisions/DECISIONS_github_trending_cot_leak.md` D4–D6）。
