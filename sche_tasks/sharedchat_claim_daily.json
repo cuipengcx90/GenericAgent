@@ -1,0 +1,7 @@
+{
+  "schedule": "09:30",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 1,
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n\nsharedchat 每日领额（订阅 24h 期，每天可领一次；北京时间 09:30 触发，纯本地脚本零 LLM token）：\n\n1. 【记录报告路径】先用 update_working_checkpoint 记下 scheduler 注入的 [报告路径] 行，防长任务遗忘。\n\n2. 【起后台领额】执行（命令立即返回，进程已脱离会话）：\n   python3 tools/bg_task.py start --name sharedchat_claim -- /opt/anaconda3/bin/python3 tools/sharedchat_claim_daily.py claim --auto\n\n3. 【取启动回执】紧接着执行，把输出（含 pid 与日志路径）原样贴进报告：\n   python3 tools/bg_task.py status --name sharedchat_claim --json\n   ★禁止 sleep/轮询等待：后台进程会对 accounts.json 里每个账号依次 login→claim→复核，写台账 temp/sharedchat_sop/claim_ledger.jsonl 后自行退出（约 2-4 分钟）。本会话不需要等它跑完。\n\n4. 【收尾】报告内容只需：本任务启动时间、bg_task status 的 pid/日志路径、「后台领额已挂起，结果以 temp/sharedchat_sop/claim_ledger.jsonl 为准」一句。不要伪造领额结果（本轮并未同步拿到领额输出）。\n\n5. 【异常】若步骤 2 返回非 0（未启动成功）：在报告里贴原样 stderr，并额外发一条飞书私信说明「sharedchat 领额未能启动：<原因>」（参考 memory/notify_channels_sop.md 的 notify_feishu()）。禁止静默失败。\n"
+}
