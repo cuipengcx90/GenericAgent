@@ -171,6 +171,8 @@ BIG_DEEP_LIGHT_P = 0.08    # (★R581 0.12→0.08:高楼帖更少被划走,须�
 #   故显式调用 postStream.appendMore();真人也不会一口气读完高楼 ⇒ 深读随机 2..FLOOR_MAX_MORE 批,
 #   浅读 0 批(刷到划走)。仅影响阅读深度,不增访问次数。
 FLOOR_MAX_MORE = 4
+TOPIC_WAIT_BUDGET_S = 5     # ★R583i ROUTE_JS 续载前等话题 id 对上目标的上限,计入 js_budget
+MORE_BATCH_BUDGET_S = 9      # ★R583i 单批续载预算(JS 内每批停留 2.5–6s + 两次滚动 + appendMore 网络耗时留 ≥3s 余量),计入 js_budget
 # ★R579 每日楼层上限闸门（防跑飞；turbo 可用 daily_floor_cap 覆盖）。
 #   2026-10-13 口径更新：候选池改混池（top×2 + latest×2）后每帖实际读到约 20 楼（旧池中位仅 4）
 #   ⇒ 原 1200 会在约 60 帖时提前熔断（此时帖配额 daily_cap=600 才用掉 10%）⇒ 默认 1200→2400（≈120 帖）。
@@ -1785,26 +1787,47 @@ ROUTE_JS = r"""
       //   appendMore 拉取——后台标签页里 rAF 被节流,scrollBy 拉不出下一批(实测 DOM 恒 20、
       //   canAppendMore=true、滚到底 26s 不变)。这里在滚到底后显式调用 postStream.appendMore()
       //   逐批加载,直到 canAppendMore=false 或达 __MAXMORE__ 上限(真人也不会一口气读完高楼)。
-      let _more = 0, _canMore = null, _psN = null, _mbErr = "";
+      let _more = 0, _canMore = null, _psN = null, _mbErr = "", _allLoaded = null;
+      // ★R583i:续载进度同步写页面变量 __mbObs(返回值经桥接常丢/超时,daemon 脚本结束后另发 MB_PROBE_JS 读它);
+      //   tid 用于 daemon 校验不是上一帖残留。
+      const _obs = window.__mbObs = {tid: tid, mid: null, more: 0, psn: null, canMore: null, allLoaded: null, err: "", done: false};
       try {
         const _ctrl = window.Discourse.__container__.lookup('controller:topic');
+        // ★R583i:路由刚切换时 .fancy-title 可能仍是上一话题的。等 controller 的话题 id 对上目标 tid(≤5s),
+        //   对不上就不续载(否则会对上一话题的 postStream 续载),并以 topic_mismatch 留证。
+        for (let w=0; w<10 && String(_ctrl.model && _ctrl.model.id) !== String(tid); w++) await new Promise(r=>setTimeout(r, 500));
+        _obs.mid = _ctrl.model ? _ctrl.model.id : null;
+        if (String(_obs.mid) !== String(tid)) throw new Error("topic_mismatch:" + _obs.mid);
         const _ps = _ctrl.model.postStream;
-        // ★R583d D4:先取「续载前」快照,并在每批成功后刷新——中途抛错不再把 psn/canmore 清成 null
-        _canMore = _ps.canAppendMore;
-        try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
-        while (_more < __MAXMORE__ && _ps.canAppendMore) {
-          window.scrollBy(0, 400);                                  // 停在底部附近
-          await Promise.resolve(_ps.appendMore());                  // 拉下一批(20 楼)
-          _more++;
-          await new Promise(r=>setTimeout(r, 700 + Math.random()*500));
+        // 快照:续载前取一次,每批成功后刷新——中途抛错不把 psn/canmore 清成 null(R583d D4)。
+        //   allLoaded 取 loadedAllPosts(不含「正在加载」条件);canAppendMore 含该条件,为 false 不一定读完(R583i)
+        const _snap = () => {
           _canMore = _ps.canAppendMore;
+          _allLoaded = (_ps.loadedAllPosts === undefined) ? null : _ps.loadedAllPosts;
           try { _psN = _ps.posts ? _ps.posts.length : null; } catch(e){ _psN = null; }
+          _obs.more = _more; _obs.psn = _psN; _obs.canMore = _canMore; _obs.allLoaded = _allLoaded;
+        };
+        _snap();
+        while (_more < __MAXMORE__ && _ps.canAppendMore) {
+          window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight - Math.random()*300));
+          const _before = _ps.posts ? _ps.posts.length : 0;
+          await Promise.resolve(_ps.appendMore());                  // 拉下一批(20 楼)
+          // ★R583i:appendMore 空操作(Discourse 自己正在加载/无下一窗口)时楼层数不增长,不计批、直接收手
+          if ((_ps.posts ? _ps.posts.length : 0) <= _before) break;
+          _more++;
+          // ★R583i:新楼层进入后滚到其位置并停留 2.5–6s(≥2 个 tick),不再 0.7–1.2s 连发请求
+          window.scrollTo(0, Math.max(0, document.documentElement.scrollHeight - window.innerHeight - Math.random()*600));
+          await new Promise(r=>setTimeout(r, 2500 + Math.random()*3500));
+          _snap();
         }
-      } catch(e){ _mbErr = String(e).slice(0,120); }   // ★R583c:静默改为可观测(丢桥接/无 appendMore 时留证);★R583d D6:正常=""
+      } catch(e){ _mbErr = String(e).slice(0,120); _obs.err = _mbErr; }   // 异常可观测(R583c),正常=""
+      _obs.done = true;
       for(let s=0;s<__RB__;s++){ await new Promise(r=>setTimeout(r, 900 + Math.random()*500));
         window.scrollBy(0, -380); }
-      return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),posts:document.querySelectorAll('.topic-post').length,
-        psposts:_psN, moreBatches:_more, canMore:_canMore, mbErr:_mbErr}); } }
+      // ★R583i:话题不符时 DOM 里是上一话题的楼层,posts 必须置 null,不得被当作本帖实测
+      return JSON.stringify({how,title:h1.innerText.trim().slice(0,60),
+        posts:(_mbErr.indexOf("topic_mismatch")>=0 ? null : document.querySelectorAll('.topic-post').length),
+        psposts:_psN, moreBatches:_more, canMore:_canMore, allLoaded:_allLoaded, mbErr:_mbErr}); } }
   return JSON.stringify({fail:true,now:location.pathname});
   })(); } finally { window.__tmBusy = 0; }
 })()
@@ -1961,13 +1984,70 @@ def _floor_probe(session, timeout=12):
     try:
         r = run_js(session["id"], FLOOR_PROBE_JS, timeout=timeout)
         raw = r
-        if isinstance(r, dict):
+        if isinstance(r, dict) and "posts" not in r:
+            # ★R583i:run_js 已把 JSON 字符串解析成 dict({"posts":N}),旧码只认 data/raw 键 ⇒ 探针恒返回 None
             raw = r.get("data") if r.get("data") is not None else r.get("raw")
         d = json.loads(raw) if isinstance(raw, str) else (raw or {})
         n = int(d.get("posts")) if isinstance(d, dict) and d.get("posts") is not None else -1
         return n if n >= 0 else None
     except Exception:
         return None
+
+
+# ★R583i 后置探针:长读帖脚本的返回值经桥接常丢/超时,续载进度与楼层数改由脚本结束后另发一次只读 JS 读取。
+#   obs=ROUTE_JS 写的 window.__mbObs(续载批数/已加载数/异常);dom=已渲染 .topic-post 数;
+#   tt=screen-track._totalTimings.size(本话题**已进入上报队列**的楼层数:flush 时累加,早于 POST 成功,失败重排队期间也已计入,
+#   flush 被 _inProgress 推迟时又会偏低——比 DOM 数更接近入账但不是服务端确认数;私有字段,读不到为 null)。
+MB_PROBE_JS = ("(()=>{try{var tt=null;try{var t=window.Discourse.__container__.lookup('service:screen-track');"
+               "tt=t&&t._totalTimings?t._totalTimings.size:null}catch(e){}"
+               "return JSON.stringify({path:location.pathname,busy:(window.__tmBusy?window.__tmBusy:0),"
+               "dom:document.querySelectorAll('.topic-post').length,tt:tt,obs:window.__mbObs||null})}"
+               "catch(e){return JSON.stringify({err:String(e)})}})()")
+MB_FLUSH_WAIT_S = 3.0          # tt<dom 时再等一次(最后一批楼层要等下个 1.5s tick 才 flush)
+_PROBE_KEYS = ("posts", "posts_src", "tt", "psposts", "moreBatches", "canMore", "allLoaded", "mbErr")
+
+
+def _post_probe(session, tid):
+    """读 MB_PROBE_JS;话题路径不含 tid(页面已跳走/整页重载)⇒ 返回 None。失败返回 None。"""
+    def once():
+        r = run_js(session["id"], MB_PROBE_JS, timeout=15)
+        if not (isinstance(r, dict) and "dom" in r):
+            return None                      # 探针本身失败(可回退旧探针)
+        if not re.search(r"/%s(?:[/?#]|$)" % re.escape(str(tid)), str(r.get("path") or "")):
+            return {"mismatch": True, "path": r.get("path")}   # ★R583i 页面已不在目标话题:放弃,不得回退旧探针(会读到别的页面)
+        return r                             # 按路径段精确匹配(子串会把 123456 当成 /t/x/1234567)
+    try:
+        r = once()
+        if r is not None and not r.get("mismatch") and r.get("tt") is not None and r["tt"] < r["dom"]:
+            time.sleep(MB_FLUSH_WAIT_S)
+            r2 = once()
+            if r2 is not None:
+                r = r2
+        return r
+    except Exception:
+        return None
+
+
+def _merge_probe(res, p, tid):
+    """把后置探针并入 res(只补缺,不覆盖读帖返回值已带的键)。返回是否并入。"""
+    if not (isinstance(res, dict) and isinstance(p, dict)) or p.get("mismatch"):
+        return False
+    res.setdefault("tt", None)
+    if res.get("tt") is None:
+        res["tt"] = p.get("tt")
+    if res.get("posts") is None and p.get("dom") is not None:
+        res["posts"] = p["dom"]
+        res["posts_src"] = "probe"
+    o = p.get("obs")
+    if isinstance(o, dict) and str(o.get("tid")) == str(tid):
+        for k_res, k_obs in (("psposts", "psn"), ("moreBatches", "more"), ("canMore", "canMore"),
+                             ("allLoaded", "allLoaded"), ("mbErr", "err")):
+            if res.get(k_res) is None:
+                res[k_res] = o.get(k_obs)
+    return True
+
+
+ROUTE_PLACEHOLDERS = ("__TID__", "__PLAN__", "__STAYMS__", "__RB__", "__MAXMORE__")   # ROUTE_JS 的占位符登记表(★R583i)
 
 
 def browse_one(session, tid, state, cand=None):
@@ -1986,11 +2066,18 @@ def browse_one(session, tid, state, cand=None):
     # ★R583:续载批数——浅读 0 批(刷到划走),深读随机 2..FLOOR_MAX_MORE 批(真人不会一口气读完高楼)
     maxmore = 0 if light else random.randint(2, FLOOR_MAX_MORE)
     code = ROUTE_JS.replace("__TID__", str(tid)).replace("__PLAN__", plan_js).replace("__STAYMS__", str(stay)).replace("__RB__", str(rb)).replace("__MAXMORE__", str(maxmore))
-    js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2 + maxmore * 2.5)
+    # ★R583i 占位符守卫:任何 __X__ 残留(漏替换)都会让脚本静默走错路(如 __MAXMORE__ 是合法标识符,
+    #   node --check 照样过),故替换后统一扫描,残留即失败(通用,覆盖全部占位符)。
+    #   只检查 ROUTE_PLACEHOLDERS 登记表(而非任意全大写 __X__),将来脚本里出现 __NEXT_DATA__ 之类合法字样不误报;
+    #   新增占位符漏登记由自测 T25e 抓(ROUTE_JS 里的全大写占位符集合须 == 登记表)。
+    _left = [_ph for _ph in ROUTE_PLACEHOLDERS if _ph in code]
+    if _left:
+        return False, {"fail": "placeholder_unfilled:" + ",".join(_left)[:80]}
+    js_budget = int(sum(float(p["pause"]) for p in plan) + stay / 1000.0 + rb * 2 + maxmore * MORE_BATCH_BUDGET_S + (0 if maxmore == 0 else TOPIC_WAIT_BUDGET_S))
     # ★R576：深读 JS 的返回值经桥接常丢失（历史 DONE 里深读约 95% 的 title 为空），丢失时守护要白等到
     #   桥接超时。正常模式沿用 max(150, 预算+45) 不动；turbo 下单帖只有几十秒，150 秒下限会把提速吃掉
     #   （实测 T3 每帖 175–180s 而非 ~80s），故收紧为 预算+30（JS 最坏额外耗时约 23s：路由等待≤12.5s、
-    #   每步抖动≤0.4s、底驻抖动≤2.5s）。超时返回的非 need_loc/fail 结果本就按成功处理，语义不变。
+    #   每步抖动≤0.4s、底驻抖动≤2.5s;★R583i 续载另按批/话题等待计入 js_budget）。超时返回的非 need_loc/fail 结果本就按成功处理，语义不变。
     _js_to = max(40, js_budget + 30) if tc else max(150, js_budget + 45)
     if tc:
         _wait_tab_idle(session)        # R576c：上一帖脚本未跑完就不叠加下一帖（仅 turbo）
@@ -2008,12 +2095,32 @@ def browse_one(session, tid, state, cand=None):
         res2 = run_js(session["id"], code, timeout=_js_to)
         ok = isinstance(res2, dict) and not res2.get("fail")
         res = res2
-    # ★R579b 楼层探针：长脚本返回值常丢（68% 行 posts 缺失）⇒ 补「实际读到的楼层」真值
-    if isinstance(res, dict) and res.get("posts") is None:
-        _fp = _floor_probe(session)
-        if _fp is not None:
-            res["posts"] = _fp
-            res["posts_src"] = "probe"
+    # ★R583i 后置探针:长脚本返回值常丢/超时(turbo 期 77% 行 posts 缺失)⇒ 先等脚本跑完(fail-open,
+    #   忙标记已清零则一次探测即返回),再读页面变量补 posts/tt/续载进度;顺序不可倒(脚本中途读到的是偏小值)。
+    #   探针不可用时回退旧的 .topic-post 计数探针。
+    #   正常模式遵守 T21q2 既有契约「不等待标签空闲」:不 wait;turbo 先等空闲再读。
+    #   两种模式统一:探针读到脚本仍在跑(busy 或 __mbObs.done 为假)⇒ 值偏小,**整体丢弃且不回退旧探针**
+    #   (回退探针读的是同一个偏小 DOM),记账回落 estimate。
+    #   ★R583i:ROUTE_JS 报 topic_mismatch(等满 5s 话题 id 仍不是目标)=没读到本帖 ⇒ 判失败,不进 cap/seen_ids/记账。
+    if isinstance(res, dict) and "topic_mismatch" in str(res.get("mbErr") or ""):
+        ok = False
+        res = {"fail": "topic_mismatch", "detail": str(res.get("mbErr"))[:80]}
+    _soft_ok = isinstance(res, dict) and not res.get("need_loc") and not res.get("fail")
+    if _soft_ok and (res.get("posts") is None or res.get("psposts") is None or res.get("tt") is None):
+        if tc:
+            _wait_tab_idle(session)
+        _pp = _post_probe(session, tid)
+        _gone = bool(_pp and _pp.get("mismatch"))        # 页面已跳走:放弃探针,也不回退旧探针
+        _po = (_pp or {}).get("obs")
+        _partial = _pp is not None and bool(
+            _pp.get("busy") or (isinstance(_po, dict) and str(_po.get("tid")) == str(tid) and _po.get("done") is False))
+        if _partial or _gone:
+            pass
+        elif not _merge_probe(res, _pp, tid) and res.get("posts") is None:
+            _fp = _floor_probe(session)
+            if _fp is not None:
+                res["posts"] = _fp
+                res["posts_src"] = "probe"
     if isinstance(res, dict) and res.get("posts") is not None and not res.get("posts_src"):
         res["posts_src"] = "res"
     _tm_pre = None
@@ -2021,26 +2128,15 @@ def browse_one(session, tid, state, cand=None):
         # R576c：仅 turbo。超时≠没读（实测正常模式 4/4 超时但每帖仍有 5–10 次上报）。先等脚本跑完，
         #   再用「上报增量」判定：d==0 才按失败记账（bridge_timeout，不进 cap/seen_ids）；
         #   d>=1 或未知（重启后首探 None）沿用旧语义算成功。正常模式保持旧语义，不动。
-        _wait_tab_idle(session)
+        #   (★R583i:空闲等待已在上面的后置探针块里做过——超时 dict 必缺 posts/tt,必走该块——此处不再重复等待)
         _tm_pre = _tm_probe(session)
+        # ★R583i:替换 res 时保留后置探针并入的键(旧版写死 posts=None 且保留的是超时 dict 里本就不存在的键)
+        _keep = {k: res.get(k) for k in _PROBE_KEYS}
         if _tm_pre is not None and _tm_pre.get("d") == 0:
             ok = False
-            # ★R583d D3:桥接超时时**保留续载观测**(最需诊断的场景别整块丢证)
-            _mbErr_keep = res.get("mbErr") if isinstance(res, dict) else None
-            _psN_keep = res.get("psposts") if isinstance(res, dict) else None
-            _mb_keep = res.get("moreBatches") if isinstance(res, dict) else None
-            _cm_keep = res.get("canMore") if isinstance(res, dict) else None
-            res = {"fail": "bridge_timeout", "detail": str(res)[:120],
-                   "mbErr": _mbErr_keep, "psposts": _psN_keep,
-                   "moreBatches": _mb_keep, "canMore": _cm_keep}
+            res = dict({"fail": "bridge_timeout", "detail": str(res)[:120]}, **_keep)
         else:
-            _mbErr_keep = res.get("mbErr") if isinstance(res, dict) else None
-            _psN_keep = res.get("psposts") if isinstance(res, dict) else None
-            _mb_keep = res.get("moreBatches") if isinstance(res, dict) else None
-            _cm_keep = res.get("canMore") if isinstance(res, dict) else None
-            res = {"title": "", "posts": None, "timeout": True,
-                   "mbErr": _mbErr_keep, "psposts": _psN_keep,
-                   "moreBatches": _mb_keep, "canMore": _cm_keep}
+            res = dict({"title": "", "timeout": True}, **_keep)
     if isinstance(res, dict):
         res["mode"] = "LIGHT" if light else "DEEP"
         res["pose"] = pose
@@ -2298,22 +2394,21 @@ def floors_credit(cand):
 
 
 def floors_credit_of(res, cand):
-    """★R579 楼层记账(新口径=**实际读到的楼层**)。
+    """★R579 楼层记账(新口径=**实际读到的楼层**)。返回 (值, 来源)。
 
-    优先取读帖返回值 res["posts"](ROUTE_JS 里 = 页面上 `.topic-post` 的实测数量,
-    即本次真正渲染/读到的那部分楼层)。
-    ★R583:实测档走 FLOOR_READ_CAP(大),**不再**经 floors_credit(其上限 20 会把真正读到的
-    多批楼层又截回首屏批);桥接丢返回值/超时时该键为 None,才回退 floors_credit(cand)
-    (候选列表楼层数,上限 FLOOR_CREDIT_CAP=20)作保守估计——回退值恒 <=20,不会高估。
-    返回 (值, 来源):'measured'=读帖脚本/探针实测,'estimate'=回退估计。
+    优先级(★R583i):
+      1. res["tt"]  → 'tracked':screen-track 已进入 /topics/timings 上报队列的楼层数(非服务端确认数),比 DOM 数更接近入账;
+      2. res["posts"] → 'measured':页面 `.topic-post` 渲染数(不受首屏 20 截,受 FLOOR_READ_CAP 大封顶);
+      3. 回退 floors_credit(cand) → 'estimate':候选列表楼层数,上限 FLOOR_CREDIT_CAP=20,恒不高估。
     """
     if isinstance(res, dict):
-        got = res.get("posts")
-        try:
-            if got and int(got) > 0:
-                return max(0, min(int(got), FLOOR_READ_CAP)), "measured"
-        except Exception:
-            pass
+        for key, src in (("tt", "tracked"), ("posts", "measured")):
+            try:
+                got = res.get(key)
+                if got and int(got) > 0:
+                    return max(0, min(int(got), FLOOR_READ_CAP)), src
+            except Exception:
+                pass
     return floors_credit(cand), "estimate"
 
 
@@ -2434,6 +2529,8 @@ def browse_batch(session, st, batch=25):
                                        "mb": res.get("moreBatches") if isinstance(res, dict) else None,
                                        "psn": res.get("psposts") if isinstance(res, dict) else None,
                                        "canmore": res.get("canMore") if isinstance(res, dict) else None,
+                                       "allloaded": res.get("allLoaded") if isinstance(res, dict) else None,   # ★R583i loadedAllPosts
+                                       "tt": res.get("tt") if isinstance(res, dict) else None,                 # ★R583i 已上报楼层数
                                        # ★R583c:续载异常可观测(原为静默 catch(e){},桥接/无 appendMore 时丢证)
                                        "mberr": res.get("mbErr") if isinstance(res, dict) else None,
                                        "src": c.get("src"),   # ★R579 候选来源（top/latest），纯观测
@@ -3774,6 +3871,13 @@ def _selftest_impl():
             fails.append("T23h 实测楼层 >20 须按实测计(不得被 FLOOR_CREDIT_CAP 截)")
         if floors_credit_of({"posts": FLOOR_READ_CAP + 500}, {}) != (FLOOR_READ_CAP, "measured"):
             fails.append("T23i 实测楼层须受 FLOOR_READ_CAP 大封顶")
+        # ★R583i:已上报楼层 tt 优先于 DOM 数;tt 缺失/为 0 回落 posts
+        if floors_credit_of({"tt": 38, "posts": 40}, {"posts": 5}) != (38, "tracked"):
+            fails.append("T23j 记账须优先取 screen-track 已上报楼层 tt")
+        if floors_credit_of({"tt": 0, "posts": 40}, {}) != (40, "measured") or floors_credit_of({"tt": None, "posts": 9}, {}) != (9, "measured"):
+            fails.append("T23k tt 缺失/为 0 须回落 posts")
+        if floors_credit_of({"tt": FLOOR_READ_CAP + 1}, {}) != (FLOOR_READ_CAP, "tracked"):
+            fails.append("T23l tt 须受 FLOOR_READ_CAP 封顶")
         if DAILY_FLOOR_CAP_DEFAULT != 2400 or not (1 <= DAILY_FLOOR_CAP_DEFAULT <= 6000):
             fails.append("T23e 默认楼层闸门须=2400 且在 turbo 硬边界(1,6000)内: %s" % DAILY_FLOOR_CAP_DEFAULT)
         if not (0 <= DAILY_FLOOR_CAP_JITTER <= 6000) or DAILY_FLOOR_CAP_DEFAULT + DAILY_FLOOR_CAP_JITTER > 6000:
@@ -3829,179 +3933,284 @@ def _selftest_impl():
             if subprocess.run([shutil.which("node"), "--check", "-"],
                               input="(()=>{)()", capture_output=True, text=True, timeout=10).returncode == 0:
                 fails.append("T25b2 node 未判坏 JS")
-            # T25c(★R583b/R583c/R583d):续载占位符须存在且被**真正 .replace()**——漏替换时 __MAXMORE__ 是
-            #   合法标识符,node --check 照样过,运行时静默零续载。仅 grep 子串太弱(留个死字符串也能过)⇒
-            #   AST 断言存在 `.replace("__MAXMORE__", <活性实参>)`;R583d 强化:第二实参**不得是硬编码常量**
-            #   (0/"0"/""⇒等于关掉续载仍全绿),检索面=整模块源码(允许抽到 helper,不再误伤重构)。
-            import ast as _ast
+            # T25c~f(★R583i):行为级自测——node **真实执行** ROUTE_JS 续载逻辑 + 桩 run_js 跑 browse_one。
+            #   取代 R583b~h 的 AST/正则「形状」判据:形状只能证明源码长得对,证明不了续载真发生,
+            #   且常量折叠判据的完备性不可证;占位符漏替换改由生产代码里的通用守卫兜底(T25e 验证)。
+            def _route_js_run(_maxmore, _throw_at=-1, _total=100, _model_id=123, _id_lag=0, _noop=False, _stuck=False):
+                _code = (ROUTE_JS.replace("__TID__", "123").replace("__PLAN__", "[]").replace("__STAYMS__", "0")
+                         .replace("__RB__", "0").replace("__MAXMORE__", str(_maxmore)))
+                _h = """
+globalThis.window = globalThis;
+const _st = setTimeout; const DELAYS = []; let SCROLLS = 0;
+globalThis.setTimeout = (f, ms) => { DELAYS.push(ms || 0); return _st(f, 0); }; globalThis.setInterval = () => 1;
+window.scrollBy = () => {}; window.scrollTo = () => { SCROLLS++; }; window.innerHeight = 800; window.dispatchEvent = () => {};
+window.require = () => ({default: {routeTo: () => {}}});
+window.PerformanceObserver = class { observe() {} };
+const THROW_AT = @@THROW@@, TOTAL = @@TOTAL@@, MODEL_ID = @@MID@@, ID_LAG = @@LAG@@, NOOP = @@NOOP@@, STUCK = @@STUCK@@;
+let idReads = 0;
+const ps = { posts: new Array(20).fill(0), calls: 0,
+  get canAppendMore() { return !STUCK && this.posts.length < TOTAL; },
+  get loadedAllPosts() { return this.posts.length >= TOTAL; },
+  async appendMore() { this.calls++; if (this.calls === THROW_AT) throw new Error("boom"); if (NOOP) return;
+                       this.posts = this.posts.concat(new Array(20).fill(0)); } };
+window.Discourse = { __container__: { lookup: (n) => n === 'controller:topic' ? {get model() { idReads++; return {id: (idReads <= ID_LAG ? 0 : MODEL_ID), postStream: ps}; }}
+  : n === 'session:main' ? {hasFocus: true, set() {}} : {_topicId: 1, set() {}, tick() {}} } };
+globalThis.document = { querySelector: (s) => s === '.fancy-title' ? {innerText: 't'} : null,
+  querySelectorAll: () => new Array(5).fill(0), documentElement: {scrollHeight: 5000} };
+globalThis.location = {pathname: '/t/topic/123'};
+(async () => { const r = JSON.parse(await eval(@@CODE@@));
+  console.log(JSON.stringify({r: r, obs: window.__mbObs, delays: DELAYS, scrolls: SCROLLS})); })();
+""".replace("@@THROW@@", str(_throw_at)).replace("@@TOTAL@@", str(_total)).replace("@@MID@@", str(_model_id)).replace("@@LAG@@", str(_id_lag)).replace("@@NOOP@@", "true" if _noop else "false").replace("@@STUCK@@", "true" if _stuck else "false").replace("@@CODE@@", json.dumps(_code))
+                _p = subprocess.run([shutil.which("node"), "-"], input=_h, capture_output=True, text=True, timeout=30)
+                try:
+                    return json.loads(_p.stdout.strip().splitlines()[-1])
+                except Exception:
+                    return {"err": (_p.stderr or _p.stdout)[:200]}
 
-            def _ph_replace_ok(_src, _ph, _func=None):
-                # ★R583f R2:_func 给定时检索面缩到该函数体,防「未被调用的死 helper 留活性 .replace」假绿。
-                # ★R583f R1:字面量经 AST 常量折叠后仍恒定的表达式(str(4)/"1"*1/f"{1}"/0+1/True)同样判否。
-                # ★R583e N1:第二实参**禁任何字面常量**(0/"0"/""/"1"/4/None…)——常量=续载批数被写死,
-                #   半途关掉/钉死续载仍会全绿;活性替换必须是运行时表达式(如 str(maxmore))。
-                # R583f R1 / R583g:值不随运行时数据变的表达式(常量折叠)一律判否。
-                #   判据=「结构白名单 + 递归全常量」:任一叶子是变量/调用即判活。
-                _CONST_FUNCS = ("str", "int", "float", "bool", "repr", "bytes",
-                                "list", "tuple", "set", "dict", "len", "sum",
-                                "min", "max", "abs", "round", "sorted", "format",
-                                "ord", "chr", "hex", "oct", "bin")
-                _CONST_METHODS = ("join", "format", "upper", "lower", "strip",
-                                  "replace", "zfill", "ljust", "rjust", "center",
-                                  "title", "capitalize", "casefold", "swapcase",
-                                  "split", "splitlines", "partition", "rpartition",
-                                  "encode")
+            _r3 = _route_js_run(3)
+            _o3 = _r3.get("obs") or {}
+            _x3 = _r3.get("r") or {}
+            if (_x3.get("moreBatches"), _x3.get("psposts"), _x3.get("canMore"), _x3.get("allLoaded"), _x3.get("mbErr")) != (3, 80, True, False, ""):
+                fails.append("T25c 续载 3 批须拉到 80 楼且未读完: %s" % _r3)
+            if (_o3.get("more"), _o3.get("psn"), _o3.get("done"), str(_o3.get("tid"))) != (3, 80, True, "123"):
+                fails.append("T25c 进度须同步写 __mbObs(桥接丢返回值时靠它): %s" % _o3)
+            # 拟人化:每批续载后停留 ≥2.5s(不得回到 0.7–1.2s 连发)且每批至少两次滚动
+            if sum(1 for _d in (_r3.get("delays") or []) if _d >= 2500) != 3 or (_r3.get("scrolls") or 0) < 6:
+                fails.append("T25c 每批续载须停留 ≥2.5s 并滚动: delays>=2500=%s scrolls=%s" % (
+                    sum(1 for _d in (_r3.get("delays") or []) if _d >= 2500), _r3.get("scrolls")))
+            if MORE_BATCH_BUDGET_S < 9 or TOPIC_WAIT_BUDGET_S < 5:
+                fails.append("T25c 预算须覆盖每批停留上限 6s+≥3s 余量、话题 id 等待 5s: %s/%s" % (MORE_BATCH_BUDGET_S, TOPIC_WAIT_BUDGET_S))
+            # 话题不符(controller 仍是上一话题):不得续载,留 topic_mismatch 证据
+            _xm = (_route_js_run(3, _model_id=999).get("r") or {})
+            if _xm.get("moreBatches") != 0 or "topic_mismatch" not in str(_xm.get("mbErr")):
+                fails.append("T25c 话题 id 不符须不续载并记 topic_mismatch: %s" % _xm)
+            # id 滞后:前几次读到的话题 id 不对,等待后对上 ⇒ 正常续载(不得误判 mismatch)
+            _xl = (_route_js_run(2, _id_lag=3).get("r") or {})
+            if _xl.get("moreBatches") != 2 or _xl.get("mbErr"):
+                fails.append("T25c 话题 id 短暂滞后后须恢复续载: %s" % _xl)
+            # mismatch 时 DOM 是上一话题的楼层:posts 必须为 null
+            if _xm.get("posts") is not None:
+                fails.append("T25c topic_mismatch 时 posts 须为 null(DOM 是上一话题的): %s" % _xm)
+            # appendMore 空操作(楼层数不增长):不计批、收手
+            _xn = (_route_js_run(4, _noop=True).get("r") or {})
+            if _xn.get("moreBatches") != 0 or _xn.get("psposts") != 20:
+                fails.append("T25c appendMore 空操作不得计批: %s" % _xn)
+            # allLoaded=loadedAllPosts,不含「正在加载」:canAppendMore=false 但没读完时 allLoaded 必须是 false
+            _xs = (_route_js_run(3, _stuck=True).get("r") or {})
+            if (_xs.get("canMore"), _xs.get("allLoaded"), _xs.get("moreBatches")) != (False, False, 0):
+                fails.append("T25c allLoaded 须取 loadedAllPosts(正在加载时 canMore=false 但 allLoaded=false): %s" % _xs)
+            _x0 = (_route_js_run(0).get("r") or {})
+            if (_x0.get("moreBatches"), _x0.get("psposts")) != (0, 20):
+                fails.append("T25c maxmore=0(浅读)不得续载: %s" % _x0)
+            _xe = (_route_js_run(4, _total=30).get("r") or {})
+            if (_xe.get("moreBatches"), _xe.get("canMore"), _xe.get("allLoaded")) != (1, False, True):
+                fails.append("T25c 读完即停且 allLoaded=true: %s" % _xe)
+            # T25d 续载中途抛错:已成功批次的快照与异常都须可见,不得清成 null/吞掉
+            _rt = _route_js_run(4, _throw_at=2)
+            _xt, _ot = (_rt.get("r") or {}), (_rt.get("obs") or {})
+            if (_xt.get("moreBatches"), _xt.get("psposts")) != (1, 40) or "boom" not in str(_xt.get("mbErr")) \
+                    or "boom" not in str(_ot.get("err")) or _ot.get("done") is not True or _xt.get("canMore") is None:
+                fails.append("T25d 中途抛错须保留已成功批次快照并暴露异常: %s" % _rt)
+            _src_bb = _insp.getsource(browse_batch)
+            if not all(_k in _src_bb for _k in ('"mberr": res.get("mbErr")', '"allloaded"', '"tt": res.get("tt")')):
+                fails.append("T25d browse_batch 须落 mberr/allloaded/tt 日志键")
 
-                def _is_const_expr(_node):
-                    try:
-                        _ast.literal_eval(_node)
-                        return True                        # 纯字面量/容器/常量表达式
-                    except Exception:
-                        pass
-                    if isinstance(_node, _ast.IfExp):
-                        # 两分支恒定时,结果与测试条件无关 ⇒ 仍是钉死值
-                        return _is_const_expr(_node.body) and _is_const_expr(_node.orelse)
-                    if isinstance(_node, _ast.JoinedStr):
-                        return all(_is_const_expr(_v) for _v in _node.values)
-                    if isinstance(_node, _ast.FormattedValue):
-                        return _is_const_expr(_node.value)
-                    if isinstance(_node, (_ast.Tuple, _ast.List, _ast.Set)):
-                        return all(_is_const_expr(_e) for _e in _node.elts)
-                    if isinstance(_node, _ast.Dict):
-                        return (all(_is_const_expr(_k) for _k in _node.keys if _k is not None)
-                                and all(_is_const_expr(_v) for _v in _node.values))
-                    if isinstance(_node, _ast.BinOp):
-                        return _is_const_expr(_node.left) and _is_const_expr(_node.right)
-                    if isinstance(_node, _ast.BoolOp):
-                        # 保守判定:仅当**所有**操作数恒定才判否(如 `True or 4`)。
-                        # 少了任一操作数(如 `x or 4`)⇒ 结果随变量变 ⇒ 须判活。
-                        return all(_is_const_expr(_v) for _v in _node.values)
-                    if isinstance(_node, _ast.UnaryOp):
-                        return _is_const_expr(_node.operand)
-                    if isinstance(_node, _ast.Compare):
-                        return (_is_const_expr(_node.left)
-                                and all(_is_const_expr(_c) for _c in _node.comparators))
-                    if isinstance(_node, _ast.Subscript):
-                        return (_is_const_expr(_node.value) and _is_const_expr(_node.slice))
-                    if isinstance(_node, _ast.Slice):
-                        return all(_p is None or _is_const_expr(_p)
-                                   for _p in (_node.lower, _node.upper, _node.step))
-                    if isinstance(_node, _ast.Starred):
-                        return _is_const_expr(_node.value)
-                    if isinstance(_node, _ast.Call):
-                        _f = _node.func
-                        if not all(_is_const_expr(_a) for _a in _node.args):
-                            return False                   # 实参含变量 ⇒ 活性
-                        if isinstance(_f, _ast.Name):
-                            return _f.id in _CONST_FUNCS
-                        if isinstance(_f, _ast.Attribute):
-                            # 常量上的同值方法,如 "".join([]) / "ab".upper()
-                            return (_f.attr in _CONST_METHODS
-                                    and _is_const_expr(_f.value))
-                        return False
-                    return False
-                _tree = _ast.parse(_src)
-                if _func is not None:
-                    _hit = [n for n in _ast.walk(_tree)
-                            if isinstance(n, _ast.FunctionDef) and n.name == _func]
-                    if not _hit:
-                        return False
-                    _tree = _hit[0]
-                for _n in _ast.walk(_tree):
-                    if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
-                            and _n.func.attr == "replace" and len(_n.args) >= 2
-                            and isinstance(_n.args[0], _ast.Constant) and _n.args[0].value == _ph):
-                        if _is_const_expr(_n.args[1]):
-                            return False        # 字面量/常量折叠表达式 ⇒ 等于关掉/钉死续载,不算活性替换
-                        return True
-                return False
-
+            # T25e/f:桩 run_js 跑 browse_one(占位符真替换 / 占位符守卫 / 后置探针并入 / turbo 超时保留探针)
+            _calls, _route, _mbp, _tmn = [], [None], [None], [3]
+            def _stub(_sid, _code, timeout=60):
+                _calls.append(_code)
+                if _code == TAB_BUSY_JS:
+                    return {"b": 0, "now": 1}
+                if _code == TM_PROBE_JS:
+                    return {"n": _tmn[0], "st": [200]}
+                if _code == MB_PROBE_JS:
+                    return _mbp[0]
+                if _code == FLOOR_PROBE_JS:
+                    return {"posts": 7}
+                return _route[0]
+            _o_run, _o_tc, _o_wait = globals()["run_js"], globals()["turbo_cfg"], globals()["MB_FLUSH_WAIT_S"]
+            _o_prev, _o_route, _o_ph = _TM_PREV["n"], ROUTE_JS, ROUTE_PLACEHOLDERS
+            if set(re.findall(r"__[A-Z0-9]+(?:_[A-Z0-9]+)*__", ROUTE_JS)) != set(ROUTE_PLACEHOLDERS):
+                fails.append("T25e ROUTE_JS 里的全大写占位符集合须 == ROUTE_PLACEHOLDERS(新增占位符须登记): %s vs %s" % (
+                    sorted(set(re.findall(r"__[A-Z0-9]+(?:_[A-Z0-9]+)*__", ROUTE_JS))), sorted(ROUTE_PLACEHOLDERS)))
+            _timeout = {"result": "No response data in 150s (x)"}
+            _mb_ok = {"path": "/t/topic/123", "busy": 0, "dom": 40, "tt": 38,
+                      "obs": {"tid": "123", "more": 2, "psn": 60, "canMore": True, "allLoaded": False, "err": "", "done": True}}
+            _tcfg = {"light_p": 0.0, "deep_cap_s": 60, "stay_s": [2, 2], "rollback": 0, "pause_scale": 0.6}
             try:
-                _src_all = open(__file__, encoding="utf-8").read()
-            except Exception:
-                _src_all = _insp.getsource(browse_one)
-            if "__MAXMORE__" not in ROUTE_JS:
-                fails.append("T25c ROUTE_JS 须含 __MAXMORE__ 占位符")
-            elif not _ph_replace_ok(_src_all, "__MAXMORE__", _func="browse_one"):
-                fails.append('T25c 须在 browse_one 内真调 .replace("__MAXMORE__", <活性实参>)(限定生产函数;硬编码/常量折叠表达式/死 helper 不算)')
-            if _ph_replace_ok('x.replace("__MAXMORE__", "0")', "__MAXMORE__"):
-                fails.append("T25c 正控失败:硬编码常量 0 被误判为活性替换")
-            # ★R583e N1:任何字面常量实参("1"/4/None…)都等于钉死续载,须判否(活性=运行时表达式)
-            if _ph_replace_ok('x.replace("__MAXMORE__", "1")', "__MAXMORE__"):
-                fails.append('T25c 正控失败:硬编码常量 "1" 被误判为活性替换')
-            if _ph_replace_ok('x.replace("__MAXMORE__", 4)', "__MAXMORE__"):
-                fails.append("T25c 正控失败:硬编码常量 4 被误判为活性替换")
-            if _ph_replace_ok('x.replace("__MAXMORE__", None)', "__MAXMORE__"):
-                fails.append("T25c 正控失败:硬编码常量 None 被误判为活性替换")
-            if not _ph_replace_ok('x.replace("__MAXMORE__", str(maxmore))', "__MAXMORE__"):
-                fails.append("T25c 正控失败:运行时表达式 str(maxmore) 未被判为活性替换")
-            # ★R583f R1:常量折叠表达式(值恒定)也须判否 —— str(4)/"1"*1/0+1/f"{1}"/"1" if y else "2"
-            for _expr in ('str(4)', '"1"*1', '0+1', 'f"{1}"', '"1" if y else "2"', 'str(1+1)'):
-                if _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
-                    fails.append("T25c 正控失败:常量折叠表达式 %s 被误判为活性替换" % _expr)
-            # ★R583g:结构级恒值式(非字面量但值恒定)也须判否
-            for _expr in ('True or 4', 'False and 4', '[1][0]', '{"k": 1}["k"]',
-                          '"".join([])', 'len("ab")', '(1 < 2)', '1 < 2',
-                          'str(*[4])', '"a" "b"', '{"a": 1, "b": 2}["a"]',
-                          '"ab".upper()', '"a,b".split(",")[0]'):
-                if _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
-                    fails.append("T25c 正控失败:R583g 结构恒值式 %s 被误判为活性替换" % _expr)
-            # ★R583g 反向:变量基上的同名方法仍须判活(禁过度拦截)
-            for _expr in ('str(_cfg.get("maxmore"))', 'str(maxmore)',
-                          '_v.upper()', 'str(maxmore + 1)'):
-                if not _ph_replace_ok('x.replace("__MAXMORE__", %s)' % _expr, "__MAXMORE__"):
-                    fails.append("T25c 正控失败:R583g 反向活性式 %s 未被判活" % _expr)
-            # ★R583f R2:_func 限定 ⇒ 死 helper(未被调用)不算
-            _dead = ('def browse_one():\n    pass\n'
-                     'def dead_helper():\n    x.replace("__MAXMORE__", str(maxmore))\n')
-            if _ph_replace_ok(_dead, "__MAXMORE__", _func="browse_one"):
-                fails.append("T25c 正控失败:死 helper 内的活性替换被误判(须限定 browse_one)")
-            _live = ('def browse_one():\n    x.replace("__MAXMORE__", str(maxmore))\n'
-                     'def dead_helper():\n    pass\n')
-            if not _ph_replace_ok(_live, "__MAXMORE__", _func="browse_one"):
-                fails.append("T25c 正控失败:browse_one 内活性替换未判真")
-            if _ph_replace_ok('x = "__MAXMORE__"', "__MAXMORE__"):
-                fails.append("T25c 正控失败:死字符串被误判为 .replace 调用")
-            # T25d(★R583c/R583d):续载 try 块**禁静默吞异常**。R583d 结构级判据:注释剥离后须真存在
-            #   `catch(...){ ... _mbErr = <非空> }` 赋值(注释里写一句不算);browse_batch 的 log_jsonl 须含
-            #   AST 级 "mberr" 字典键(注释天然不入 AST,无法绕过)。
-            def _strip_js_comments(_js):
-                _js = re.sub(r"/\*.*?\*/", "", _js, flags=re.S)
-                return re.sub(r"//[^\n]*", "", _js)
-
-            def _js_catch_assigns(_js, _var):
-                _s = _strip_js_comments(_js)
-                for _m in re.finditer(r"catch\s*\(\s*\w+\s*\)\s*\{([^}]*)\}", _s):
-                    if re.search(r"\b%s\s*=\s*[^;\s]" % re.escape(_var), _m.group(1)):
-                        return True
-                return False
-
-            def _py_log_has_key(_src, _key):
-                for _n in _ast.walk(_ast.parse(_src)):
-                    if not (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name) and _n.func.id == "log_jsonl"):
-                        continue
-                    for _a in _n.args:
-                        if isinstance(_a, _ast.Dict):
-                            for _k in _a.keys:
-                                if isinstance(_k, _ast.Constant) and _k.value == _key:
-                                    return True
-                return False
-
-            if not _js_catch_assigns(ROUTE_JS, "_mbErr"):
-                fails.append("T25d ROUTE_JS 续载 catch 须真赋值 _mbErr(注释里写不算),禁静默空 catch")
-            if not _py_log_has_key(_insp.getsource(browse_batch), "mberr"):
-                fails.append("T25d browse_batch log_jsonl 须落 mberr 字典键(AST 级,注释不算)")
-            if _js_catch_assigns("try{} catch(e){}", "_mbErr"):
-                fails.append("T25d 正控失败:裸空 catch 被误判为可观测")
-            if _js_catch_assigns("try{} catch(e){ /* _mbErr = String(e) */ }", "_mbErr"):
-                fails.append("T25d 正控失败:注释里的 _mbErr 赋值被误判为可观测")
-            if _py_log_has_key("# log_jsonl(x, {'mberr': 1})", "mberr"):
-                fails.append("T25d 正控失败:死注释里的 mberr 被误判为真键")
-            # T25e(★R583d D4):续载每批成功后须刷新 _canMore/_psN,否则中途抛错把它们清成 null,
-            #   日志出现「mb>0 但 psn/canmore=null」自相矛盾读数(不影响记账,但误导归因)。
-            _s_route = _strip_js_comments(ROUTE_JS)
-            if not re.search(r"_more\s*\+\+[^}]*?_canMore\s*=\s*_ps\.canAppendMore", _s_route, flags=re.S):
-                fails.append("T25e ROUTE_JS 每批续载后须刷新 _canMore(防中途抛错清空快照)")
+                globals()["run_js"] = _stub
+                globals()["turbo_cfg"] = lambda: None
+                globals()["MB_FLUSH_WAIT_S"] = 0.0
+                _ns = set()
+                for _ in range(60):
+                    _calls.clear(); _route[0] = {"title": "t", "posts": 20, "psposts": 20, "tt": 20, "moreBatches": 1}
+                    browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                    _rcs = [c for c in _calls if c.lstrip().startswith("(async")]
+                    if not _rcs:
+                        fails.append("T25e 读帖脚本未下发(占位符守卫误拦或 browse_one 异常),疑似某占位符漏替换")
+                        break
+                    _rc = _rcs[0]
+                    if re.search(r"__[A-Z0-9]+(?:_[A-Z0-9]+)*__", _rc):
+                        fails.append("T25e 发给浏览器的 ROUTE_JS 仍有占位符残留")
+                        break
+                    _ns.add(int(re.search(r"_more < (\d+) &&", _rc).group(1)))
+                if not ({2, 3, 4} & _ns) or not (_ns <= {0, 2, 3, 4}):
+                    fails.append("T25e 深读须按 2..FLOOR_MAX_MORE 批现场替换 __MAXMORE__、浅读 0 批: %s" % sorted(_ns))
+                # 守卫:占位符漏替换 ⇒ 失败且一次都不发给浏览器
+                globals()["ROUTE_JS"] = _o_route.replace("const tid=", "const _z='__ZZZ_UNFILLED__'; const tid=", 1)
+                globals()["ROUTE_PLACEHOLDERS"] = ROUTE_PLACEHOLDERS + ("__ZZZ_UNFILLED__",)   # 模拟「新增占位符已登记但 browse_one 没替换」
+                _calls.clear()
+                _gok, _gres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if _gok or "placeholder_unfilled" not in str((_gres or {}).get("fail")) or _calls:
+                    fails.append("T25e 占位符残留须失败且不下发: %s calls=%d" % (_gres, len(_calls)))
+                # 守卫不得误报:脚本里将来出现的合法全大写 __X__ 字样(非占位符)不应被当成「未替换」
+                globals()["ROUTE_PLACEHOLDERS"] = _o_ph
+                globals()["ROUTE_JS"] = _o_route.replace("const tid=", "const _z='__NEXT_DATA__'; const tid=", 1)
+                _route[0] = {"title": "t", "posts": 20, "psposts": 20, "tt": 20, "moreBatches": 1}
+                _calls.clear()
+                _gok2, _gres2 = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if not _gok2 or not any(c.lstrip().startswith("(async") for c in _calls):
+                    fails.append("T25e 占位符守卫误报:合法全大写字样 __NEXT_DATA__ 被当成未替换: %s" % _gres2)
+                globals()["ROUTE_JS"] = _o_route
+                globals()["ROUTE_PLACEHOLDERS"] = _o_ph
+                # T25f-1 正常模式 + 桥接超时(返回值丢):脚本结束后探针须补出 posts/tt/续载进度,记账走 tracked
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok)
+                _calls.clear()
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if _calls.count(MB_PROBE_JS) != 2:
+                    fails.append("T25f tt<dom 时须复读一次探针(最后一批要等下个 tick 才 flush): %d 次" % _calls.count(MB_PROBE_JS))
+                if not (_fok and (_fres.get("posts"), _fres.get("tt"), _fres.get("moreBatches"), _fres.get("psposts")) == (40, 38, 2, 60)):
+                    fails.append("T25f 超时后探针须补全 posts/tt/续载进度: %s" % _fres)
+                elif floors_credit_of(_fres, {"posts": 5}) != (38, "tracked"):
+                    fails.append("T25f 记账须优先取已上报楼层 tt: %s" % (floors_credit_of(_fres, {"posts": 5}),))
+                # T25f-2 turbo 超时且上报增量>0:替换 res 时须保留探针键(旧版写死 posts=None)
+                globals()["turbo_cfg"] = lambda: dict(_tcfg)
+                _TM_PREV["n"], _tmn[0] = 3, 5
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok)
+                _calls.clear()
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if not (_fok and _fres.get("timeout") and (_fres.get("posts"), _fres.get("tt"), _fres.get("moreBatches"),
+                        _fres.get("psposts"), _fres.get("canMore"), _fres.get("allLoaded"), _fres.get("mbErr")) == (40, 38, 2, 60, True, False, "")):
+                    fails.append("T25f turbo 超时(d>0)须保留全部探针键: %s" % _fres)
+                # turbo 超时分支不得重复等待空闲:发脚本前 1 次 + 后置探针前 1 次(旧版超时分支还会再等 1 次)
+                if _calls.count(TAB_BUSY_JS) > 2:
+                    fails.append("T25f turbo 超时分支不得重复 _wait_tab_idle: busy 探测 %d 次" % _calls.count(TAB_BUSY_JS))
+                # turbo 下脚本未完成(obs.done=false):值偏小,整体丢弃
+                _TM_PREV["n"], _tmn[0] = 3, 5
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok, obs=dict(_mb_ok["obs"], done=False))
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("tt"), _fres.get("posts"), _fres.get("moreBatches")) != (None, None, None):
+                    fails.append("T25f turbo 下 obs.done=false 的偏小探针值须丢弃: %s" % _fres)
+                # T25f-3 turbo 超时且增量==0:按 bridge_timeout 失败,仍保留续载观测
+                _TM_PREV["n"], _tmn[0] = 5, 5
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok)
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if _fok or _fres.get("fail") != "bridge_timeout" or _fres.get("moreBatches") != 2:
+                    fails.append("T25f turbo 超时(d==0)须判失败并保留续载观测: %s" % _fres)
+                # T25f-3b 正常模式(不等待空闲)探针读到脚本仍在跑(busy>0):值偏小,不得并入、记账回退估计
+                globals()["turbo_cfg"] = lambda: None
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok, busy=1700000000000, dom=3, tt=2)
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("tt"), _fres.get("moreBatches"), _fres.get("posts")) != (None, None, None) \
+                        or floors_credit_of(_fres, {"posts": 5})[1] != "estimate":
+                    fails.append("T25f 正常模式脚本仍在跑(busy)时探针值须整体丢弃且不回退旧探针: %s" % _fres)
+                # 同理 obs.done=false(busy 已清零但脚本未收尾)
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok, obs=dict(_mb_ok["obs"], done=False))
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("tt"), _fres.get("posts")) != (None, None):
+                    fails.append("T25f obs.done=false 时探针值须整体丢弃: %s" % _fres)
+                # 返回值完整(posts/psposts 都在)但没有 tt:仍须发探针补 tt(不得只在 posts 缺失时才探)
+                _route[0], _mbp[0] = {"title": "t", "posts": 20, "psposts": 20, "moreBatches": 1, "canMore": True,
+                                      "allLoaded": False, "mbErr": ""}, dict(_mb_ok)
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("tt"), _fres.get("posts"), _fres.get("psposts")) != (38, 20, 20):
+                    fails.append("T25f 返回值完整但缺 tt 时仍须探针补 tt(且不覆盖已有 posts/psposts): %s" % _fres)
+                # T25f-4 探针返回别的话题(页面已跳走):不得并入,posts 回退旧计数探针
+                globals()["turbo_cfg"] = lambda: None
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok, path="/t/topic/999")
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("tt"), _fres.get("posts"), _fres.get("posts_src"), _fres.get("moreBatches")) != (None, None, None, None) \
+                        or floors_credit_of(_fres, {"posts": 5})[1] != "estimate":
+                    fails.append("T25f 页面已跳走(路径不符)须放弃探针且不回退旧探针(会读到别的页面): %s" % _fres)
+                # 探针本身失败(返回 err)才允许回退旧 .topic-post 计数探针
+                _mbp[0] = {"err": "x"}
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("posts"), _fres.get("posts_src")) != (7, "probe"):
+                    fails.append("T25f 探针本身失败时须回退旧探针: %s" % _fres)
+                # tt 缺失(私有字段读不到)时探针仍须并入 posts/续载进度,不得因 tt<dom 比较抛错而整体丢失
+                _mbp[0] = dict(_mb_ok, tt=None)
+                _route[0] = dict(_timeout)
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if (_fres.get("posts"), _fres.get("tt"), _fres.get("moreBatches")) != (40, None, 2):
+                    fails.append("T25f tt 缺失时探针仍须并入 posts/续载进度: %s" % _fres)
+                # topic_mismatch:判失败,不并入、不记账、不进 cap
+                _route[0] = {"title": "t", "posts": None, "mbErr": "topic_mismatch:999", "moreBatches": 0}
+                _mbp[0] = dict(_mb_ok)
+                _fok, _fres = browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                if _fok or _fres.get("fail") != "topic_mismatch":
+                    fails.append("T25f 续载报 topic_mismatch 须判失败: ok=%s %s" % (_fok, _fres))
+                # turbo:探针前必须先等空闲——桩让忙标记先 1 次忙再空闲,等待须真发生(旧判据只数次数不看是否等)
+                _busy_seq = [0, 1, 0]
+                _o_stub = globals()["run_js"]
+                def _stub_busy(_sid, _code, timeout=60):
+                    if _code == TAB_BUSY_JS:
+                        _calls.append(_code)
+                        return {"b": _busy_seq.pop(0) if _busy_seq else 0, "now": 2}
+                    return _o_stub(_sid, _code, timeout)
+                globals()["run_js"] = _stub_busy
+                globals()["turbo_cfg"] = lambda: dict(_tcfg)
+                _TM_PREV["n"], _tmn[0] = 3, 5
+                _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok)
+                _calls.clear()
+                _o_sleep = time.sleep
+                time.sleep = lambda x: None
+                try:
+                    browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                finally:
+                    time.sleep = _o_sleep
+                    globals()["run_js"] = _o_stub
+                _ix = [i for i, c in enumerate(_calls) if c == MB_PROBE_JS]
+                _ib = [i for i, c in enumerate(_calls) if c == TAB_BUSY_JS]
+                if not _ix or len([b for b in _ib if b < _ix[0]]) < 3:
+                    fails.append("T25f turbo 探针前须真等到忙标记清零(脚本前 1 次 + 探针前 busy→空闲 2 次): busy@%s probe@%s" % (_ib, _ix))
+                # js_budget 必须真被用作下发超时:用空计划隔离,超时 == max(40, N*每批预算+话题等待+30)
+                _o_bp, _to_seen = globals()["_browse_plan"], []
+                globals()["_browse_plan"] = lambda *a, **k: ([], 0, 0, {})
+                _o_stub2 = globals()["run_js"]
+                def _stub_to(_sid, _code, timeout=60):
+                    if _code.lstrip().startswith("(async"):
+                        _to_seen.append((timeout, int(re.search(r"_more < (\d+) &&", _code).group(1))))
+                    return _o_stub2(_sid, _code, timeout)
+                globals()["run_js"] = _stub_to
+                try:
+                    for _ in range(8):
+                        _TM_PREV["n"], _tmn[0] = 3, 5
+                        _route[0], _mbp[0] = dict(_timeout), dict(_mb_ok)
+                        browse_one({"id": "s"}, "123", {}, cand={"posts": 5})
+                finally:
+                    globals()["run_js"], globals()["_browse_plan"] = _o_stub2, _o_bp
+                _bad = [(t, n) for t, n in _to_seen if n and t != max(40, n * MORE_BATCH_BUDGET_S + TOPIC_WAIT_BUDGET_S + 30)]
+                if not any(n for _t, n in _to_seen) or _bad:
+                    fails.append("T25f js_budget 须按续载批数计入下发超时(turbo): 异常=%s 样本=%s" % (_bad[:2], _to_seen[:3]))
+                globals()["turbo_cfg"] = lambda: None
+                # T25f-5 话题 id 按路径段精确匹配:tid=123456 不得接受 /t/x/1234567
+                _mbp[0] = dict(_mb_ok, path="/t/x/1234567")
+                if not (_post_probe({"id": "s"}, "123456") or {}).get("mismatch"):
+                    fails.append("T25f 话题路径须按路径段精确匹配(子串会误收 1234567)")
+                _mbp[0] = dict(_mb_ok, path="/t/x/123456/7")
+                _pq = _post_probe({"id": "s"}, "123456")
+                if not _pq or _pq.get("mismatch"):
+                    fails.append("T25f 路径 /t/x/123456/7 须被接受")
+                # T25f-6 合并层:obs.tid 不符不并入续载进度;res 已有的键不被覆盖
+                _m = {"posts": 20, "psposts": 25}
+                _merge_probe(_m, dict(_mb_ok, obs=dict(_mb_ok["obs"], tid="999")), "123")
+                if _m.get("moreBatches") is not None or _m.get("psposts") != 25 or _m.get("tt") != 38:
+                    fails.append("T25f 合并层须校验 obs.tid 且不覆盖已有键: %s" % _m)
+            finally:
+                globals()["run_js"], globals()["turbo_cfg"], globals()["MB_FLUSH_WAIT_S"] = _o_run, _o_tc, _o_wait
+                globals()["ROUTE_JS"] = _o_route
+                globals()["ROUTE_PLACEHOLDERS"] = _o_ph
+                _TM_PREV["n"] = _o_prev
         else:
             globals()["_JS_GATE_SKIPPED"] = True   # ★R583d D2:node 缺席须显式可见,禁静默假绿
     finally:
