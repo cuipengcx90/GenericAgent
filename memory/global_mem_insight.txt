@@ -57,6 +57,7 @@ L3: memory_cleanup_sop | plan_sop | verify_sop | error_recovery_sop | web_setup_
  l2_snapshot.py(L2快照/回滚) →A062
  eia_weekly_sop(EIA免密钥) →A063
  smyze_stock_watch_sop(bar-smyze供应链库存口径日检) →A064
+ ga_context_audit_sop(GA上下文/token占用自查,只读脚本)
 L4: L4_raw_sessions/(原文检索) →A065
 任务/批次记录(R###): ../memory/autonomous_reports/INDEX.md | 已迁出的 L1 记录条目原文: l1_detail_archive.md 末节 L1_REMOVED_20261014
 
