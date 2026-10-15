@@ -50,6 +50,9 @@
 | 10-09 17:52 | 加入 `wzw` 槽 | – |
 | 10-10 17:53 | 首槽改指本机 magpie 网关 `group/sharedchat-pool`；17:55 起三个会话同时卡 70–95 分钟 | 时间相邻，**因果未证实** |
 | 10-12 | 本次整改 | – |
+| 10-14 | 加入 `muyuan` 槽（muyuan.do / deepseek-v4.1-flash）并置于 `llm_nos` 首位（用户指定） | – |
+| 10-15 18:45 | 加入本机 opencode2api 免费槽 `deepseek-oc2a`，置 `llm_nos` 首位 | – |
+| **10-15 22:04** | **用户指定：`llm_nos` 移出 `deepseek-wududu`、`deepseek-metapi`、`glm-metapi`（11→9 槽，其余上顺延），并整块删除 `agnes-2.5-flash` 槽** | 本表 §2.4 随之重出 |
 
 关于 10-07 审计引入的 `reasoning_effort=high` 与 `max_tokens=384000`：官方 `deepseek-flash` 在同样参数下单轮中位只有 3–4 秒，所以它们**解释不了**中转站的 26–50 秒；是否对中转站有额外影响没有对照数据（10-07 之前没有逐轮时间戳），可用运行时 `/session.reasoning_effort=medium` 对单个槽试一下。10-07 的审计文档本身有价值（`connect_timeout` 是死键等发现仍成立），**只有“`context_win=1000000` 兑现 1M”这一条是错的**，已在该文档加更正说明。
 
@@ -85,7 +88,7 @@
 | `model` | 模型名；`[1m]` 后缀触发 1M beta（仅 Claude 槽） | `''` | 同 | 带 `[1m]` 才有 1M | 仅 2 个 Claude 槽带 `[1m]` |
 | `name` | 展示名，同时是 mixin 的引用名 | 取 `model` | 同 | 无 | 已配 |
 | `proxy` | 单槽代理；不填则不走 | 无 | 同 | 无 | 未配（走系统代理 `127.0.0.1:7897`） |
-| `context_win` | **裁剪触发点**（§2.5） | 38000；deepseek 80000 | 30000（deepseek 70000）/ 28000 | GA 开发者建议 80k | **12 槽 80000**；`agnes` 未配 |
+| `context_win` | **裁剪触发点**（§2.5） | 38000；deepseek 80000 | 30000（deepseek 70000）/ 28000 | GA 开发者建议 80k | **18 个实体槽全 80000**（`mixin_config` 无此项；`agnes` 槽 2026-10-15 已删） |
 | `trim_keep_prefix` | 硬删时保留最前 K 条 | 0 | 0 | 无 | 未配 |
 | `max_retries` | 单槽重试次数（429/5xx） | 4 | 默认 1（示例写 3） | 无 | 槽内 3，**在 mixin 下被强制置 0，无效** |
 | `max_retry_after` | 服务端 `retry-after` 超过它就放弃该次重试 | 60 秒 | – | 无 | 未配 |
@@ -117,35 +120,45 @@
 
 | 参数 | 实际含义 | 代码默认 | 模板 | 本机 |
 |---|---|---|---|---|
-| `llm_nos` | 槽顺序，按 `name` 或序号引用 | 空 | 空 | 10 个槽（§2.4） |
+| `llm_nos` | 槽顺序，按 `name` 或序号引用 | 空 | 空 | 9 个槽（§2.4；2026-10-15 移出 wududu/metapi/glm-metapi 后） |
 | `max_retries` | **最多尝试 `max_retries + 1` 个槽**（`candidates[:retries+1]`），不是同槽重试 | 3 | 10 | 10 |
 | `base_delay` | 模板称“退避起始延迟”；代码只在 `llmcore.py` 保存了该值，**我没找到使用处，疑似无效** | 3.0 | 0.5 | 0.5 |
 | `spring_back` | 切到备用槽后多久回到首槽 | 300 秒 | 300 | 120 |
 
 补充行为：认证类错误（含 401、403、unauthorized、forbidden 等字样）会让该槽在**本进程内永久禁用**，直到会话重建；日志累计 `sharedchat`、`wududu` 各被禁用 7 次，`all backends are disabled` 14 次（无逐行时间戳，不确定发生在哪些天）。
 
-### 2.4 本机 13 个渠道实配表
+### 2.4 本机 18 个渠道实配表
+
+> 本节于 **2026-10-15 按 `mykey.py` 重出**（`llm_nos` 移出 wududu/metapi/glm-metapi 三槽、`agnes-2.5-flash` 槽实体删除之后）。口径 = `mykey.py` 里 18 个 `*_config*` 字典 + 链内顺序；机读复算用 `python3 tools/llm_slot_probe.py --list`。
 
 | mixin 顺序 | name | model | 主机 | 类型 | `context_win` | `max_tokens` | `timeout` | `read_timeout` |
 |---|---|---|---|---|---|---|---|---|
-| 1 | sharedchat-gpt-5.6-sol | group/sharedchat-pool | 127.0.0.1:3425（本机 magpie 网关路由组） | OAI | 80000 | 128000 | 10 | 300 |
-| 2 | deepseek-wududu | deepseek-v4.1-flash | wududu.edu.kg（第三方中转） | OAI | 80000 | 384000 | 15 | 300 |
-| 3 | deepseek-metapi | DeepSeek-V4.1-Flash | metapi.lilililwan.xyz | OAI | 80000 | 384000 | 15 | 300 |
-| 4 | glm-metapi | GLM-5.3-Flash | metapi.lilililwan.xyz | OAI | 80000 | 131072 | 15 | 300 |
-| 5 | deepseek-wzw | deepseek-v4.1-flash | wzw.pp.ua（第三方 new-api 网关） | OAI | 80000 | 384000 | 15 | 300 |
-| 6 | deepseek-flash | deepseek-flash | api.deepseek.com（官方，公司 key） | OAI | 80000 | 384000 | 15 | 300 |
-| 7 | sol-4router | gpt-6.1-sol | 4router.net | OAI | 80000 | 128000 | 10 | 300 |
-| 8 | gpt-4router | gpt-5.6-terra | 4router.net | OAI | 80000 | 128000 | 10 | 300 |
-| 9 | sonnet55-4router | claude-sonnet-5-5[1m] | 4router.net | Claude 原生 | 80000 | 128000 | 默认 | 300 |
-| 10 | opus55-4router | claude-opus-5-5[1m] | 4router.net | Claude 原生 | 80000 | 128000 | 默认 | 300 |
+| 1 | deepseek-oc2a | deepseek-v4.1-flash-free | 127.0.0.1:18080（本机 opencode2api 网关） | OAI | 80000 | 32000 | 15 | 300 |
+| 2 | deepseek-muyuan | deepseek-v4.1-flash | muyuan.do（第三方中转） | OAI | 80000 | 384000 | 15 | 300 |
+| 3 | sharedchat-gpt-5.6-sol | group/sharedchat-pool | 127.0.0.1:3425（本机 magpie 网关路由组） | OAI | 80000 | 128000 | 10 | 300 |
+| 4 | deepseek-wzw | deepseek-v4.1-flash | wzw.pp.ua（第三方 new-api 网关） | OAI | 80000 | 384000 | 15 | 300 |
+| 5 | deepseek-flash | deepseek-flash | api.deepseek.com（官方，公司 key） | OAI | 80000 | 384000 | 15 | 300 |
+| 6 | sol-4router | gpt-6.1-sol | 4router.net | OAI | 80000 | 128000 | 10 | 300 |
+| 7 | gpt-4router | gpt-5.6-terra | 4router.net | OAI | 80000 | 128000 | 10 | 300 |
+| 8 | sonnet55-4router | claude-sonnet-5-5[1m] | 4router.net | Claude 原生 | 80000 | 128000 | 默认 | 300 |
+| 9 | opus55-4router | claude-opus-5-5[1m] | 4router.net | Claude 原生 | 80000 | 128000 | 默认 | 300 |
 | 不在 mixin | luna-4router | gpt-6-luna | 4router.net | OAI | 80000 | 128000 | 10 | 300 |
 | 不在 mixin | gpt-6-astra-hxi | gpt-6-astra | runanytime.hxi.me（10-04 起持续 403，已移出） | OAI | 80000 | 128000 | 15 | 300 |
-| 不在 mixin | agnes-2.5-flash | agnes-2.5-flash | api.agnes-ai.cn | OAI | 默认 38000 | 默认 | 15 | 300 |
+| 不在 mixin（10-15 移出） | deepseek-wududu | deepseek-v4.1-flash | wududu.edu.kg（第三方中转） | OAI | 80000 | 384000 | 15 | 300 |
+| 不在 mixin（10-15 移出） | deepseek-metapi | DeepSeek-V4.1-Flash | metapi.lilililwan.xyz | OAI | 80000 | 384000 | 15 | 300 |
+| 不在 mixin（10-15 移出） | glm-metapi | GLM-5.3-Flash | metapi.lilililwan.xyz | OAI | 80000 | 131072 | 15 | 300 |
+| 不在 mixin | step5-oc2a | step-5-preview-free | 127.0.0.1:18080（本机 opencode2api 网关，免费层） | OAI | 80000 | 65536 | 15 | 300 |
+| 不在 mixin | longcat-oc2a | longcat-2.5-preview-free | 同上（127.0.0.1:18080） | OAI | 80000 | 131072 | 15 | 300 |
+| 不在 mixin | spacebunny-oc2a | space-bunny-free | 同上（127.0.0.1:18080） | OAI | 80000 | 131072 | 15 | 300 |
+| 不在 mixin | musespark-oc2a | muse-spark-1.3-contributor-free | 同上（127.0.0.1:18080） | OAI | 80000 | 131072 | 15 | 300 |
+
+（原 `agnes-2.5-flash` 槽实体已于 2026-10-15 按用户要求整块删除；它此前也不在 mixin 链内。）
 
 要点：
-- `deepseek-v4.1-flash` 这个模型名同时对应 wududu 和 wzw 两个中转站，**响应日志里无法区分**。
+- `deepseek-v4.1-flash` 这个模型名同时对应 muyuan、wzw 两个在链中转站（`wududu` 槽仍在文件里，但 2026-10-15 已移出链），**响应日志里无法区分**。
 - 槽顺序、`read_timeout`、重试均未动；只统一了 `context_win`。
-- 2026-10-04 起官方 `deepseek-flash` 被放到第 6 位以减少公司 key 消耗，这是已知的取舍：中转站慢，官方快。
+- 官方 `deepseek-flash` 现居第 5 位（2026-10-15 移出三槽后上顺延；10-14 时它在第 7 位，10-04 起此前第 6 位）以减少公司 key 消耗，这是已知的取舍：中转站慢，官方快。
+- 链首为 `deepseek-oc2a`（本机 opencode2api 网关免费层，2026-10-15 18:45 加入并置首位）；此前（10-14 起）首位是 `deepseek-muyuan`。该站 Cloudflare 按 UA 拦截，Python 默认 UA 会被拒（`error code 1010`）；GA 的 `NativeOAISession` 默认 UA（`codex_exec/…`）实测可通过，**不要给它单独配 `user_agent`**。
 
 ### 2.5 `context_win` 的换算与取值
 
@@ -231,7 +244,7 @@ L1 第 18、19 条规则（“引文即契约”“部分提交三坑”）的�
 
 | 项 | 口径 |
 |---|---|
-| 行为 | 10 个槽顺序各试一次；全部失败返回 `!!!Error` 文本；`agent_loop` 把无工具调用的响应当成结束；`do_no_tool` 只对“空响应”重试，不处理非空错误文本 |
+| 行为 | 9 个槽顺序各试一次（2026-10-15 移出三槽前为 11）；全部失败返回 `!!!Error` 文本；`agent_loop` 把无工具调用的响应当成结束；`do_no_tool` 只对“空响应”重试，不处理非空错误文本 |
 | 数据 | 3 个会话 21 段，13 段以错误结尾（`489708` 7/11、`813791` 5/8、`292582` 1/2）；10-10 起 23 次整轮错误，终止前累计等待 114 分钟 |
 | 恢复 | 错误后到下一次成功响应中位 22.4 分钟，p25 9.9、p75 51.6、最短 146 秒（含人工输入“继续”的时间，是上界） |
 | 决定 | 不做自动重试；不动槽顺序；不加单轮总时限；不改 `read_timeout` |
@@ -281,6 +294,7 @@ L1 第 18、19 条规则（“引文即契约”“部分提交三坑”）的�
 | 项 | 改动 | 回退 |
 |---|---|---|
 | `mykey.py` | 12 个槽 `context_win` 统一为 80000；其余未动 | 备份 `mykey.py.bak-20261012-before-ctxwin`（原 8 个 1M + 4 个 80000）、`mykey.py.bak-20261012-before-80000`（曾短暂用过的 450000 版） |
+| `mykey.py`（2026-10-14） | 新增 `native_oai_config_muyuan`（muyuan.do / deepseek-v4.1-flash），并置于 `llm_nos` 首位；其余未动 | 备份 `mykey.py.bak-20261014-150806-before-muyuan`；或删掉 `llm_nos` 首项 `deepseek-muyuan` 并移除该 config 块 |
 | `memory/global_mem_insight.txt`（L1） | 瘦身 + 补丁 10 行（5 处断言字句 + 5 条规则全文） | `temp/l1_backup/global_mem_insight.20261012.d9598830391b.txt`（原始 25.3 万字节）、`…after-slim.txt`（瘦身后、补丁前） |
 | `memory/l1_detail_archive.md` | 新增；200 行原文无损 | 删除后 L1 锚点会悬空，需先回退 L1 |
 | `memory/memory_management_sop.md`（L0） | 新增一行“任务记录不进 L1”，在“同步红线”示例下 | 删除该行 |
