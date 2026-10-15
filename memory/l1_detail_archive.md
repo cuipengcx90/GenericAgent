@@ -7,7 +7,7 @@
 键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py | ocr_vision.swift(macOS原生Vision本地OCR,中英混合,离线免费~2s/图,`swiftc -O -o ocr_vision ocr_vision.swift`;实测291图3分钟,API逐张需4.6小时)
 
 ## A004
-密钥/配置: keychain.py | keychain_sop | 泄漏体检=temp/secret_scan/scanner.py(掩码+金丝雀,R391:GA 库基线干净,真面在会话日志/代理配置) | codex CLI(~/.codex/config.toml: [tui] resume_cwd="current|session" 免resume选目录菜单;真机A/B已证;另codex会自写projects信任项;★隔离必401(走config自定义provider)⇒只能吃用户配置) | LLM槽位探活=tools/llm_slot_probe.py(--list/--dry-run/--probe/--selftest/--ledger[--diff];分类9类且EMPTY须排NETERR前[llmcore把HTTP200无内容包成ConnectionError];★真跑走NativeClaudeSession/NativeOAISession,其ask(msg:dict)≠BaseSession.ask(prompt:str)⇒须按会话类型派发;2026-09-25 16:07实测8槽=4 OK(0 deepseek-flash 728ms/1 gpt-4router抖动0.7-20.8s/3 gpt-6-astra/4 sonnet5)4 AUTH(2/5/6/7=HTTP 403「该令牌无权访问模型…」=服务端模型白名单非限流,重试无用)⇒评审选路优先0/3/4;结论仅代表当次环境,用前复跑)
+密钥/配置: keychain.py | keychain_sop | 泄漏体检=temp/secret_scan/scanner.py(掩码+金丝雀,R391:GA 库基线干净,真面在会话日志/代理配置) | codex CLI(~/.codex/config.toml: [tui] resume_cwd="current|session" 免resume选目录菜单;真机A/B已证;另codex会自写projects信任项;★隔离必401(走config自定义provider)⇒只能吃用户配置) | LLM槽位探活=tools/llm_slot_probe.py(--list/--dry-run/--probe/--selftest/--ledger[--diff];分类9类且EMPTY须排NETERR前[llmcore把HTTP200无内容包成ConnectionError];★真跑走NativeClaudeSession/NativeOAISession,其ask(msg:dict)≠BaseSession.ask(prompt:str)⇒须按会话类型派发;2026-09-25 16:07实测8槽=4 OK(0 deepseek-flash 728ms/1 gpt-4router抖动0.7-20.8s/3 gpt-6-astra/4 sonnet5)4 AUTH(2/5/6/7=HTTP 403「该令牌无权访问模型…」=服务端模型白名单非限流,重试无用)⇒评审选路优先0/3/4;结论仅代表当次环境,用前复跑) | oc2a免费模型IP限流429=出口轮换(第二mihomo多socks出口)=oc2a_egress_rotation_sop.md
 
 ## A005
 MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub)
