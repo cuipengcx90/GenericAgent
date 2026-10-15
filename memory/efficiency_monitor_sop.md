@@ -19,3 +19,8 @@ m.save_report('./temp/efficiency_report_latest.json')
 - `health` 只算真 issue；已知良性噪音（LLMLingua/numpy ABI warmup）与已归档任务缺失**降为 notes 不降级**（2026-09-23 修）。
 - 采集前先看日志 mtime 是否早于本次运行时刻：是则所有命中均为历史回显，本轮无新故障。
 - 产物 `temp/efficiency_report_latest.json` 覆盖写；`temp/`+`sche_tasks/done/` 均 gitignored ⇒ 无跟踪产物、无需提交。
+
+## 输入源已冻结（2026-10-15 复核实证）
+- 采集输入 `logs/autonomous_reflect.log` **无写入方**：mtime 停在 2026-10-04 10:47:46（896628 B），`grep -c '2026-10-15'`=0、档内最大日期 token=2026-09-29；`log_lines=11362`/`log_size_mb=0.86` 已连续多批逐字相同。`launchctl list` 无 `com.cuip.genericagent-autonomous`，`~/Library/LaunchAgents/` 亦无该 plist（在册仅 pet/price-alert/scheduler/desktop-bridge-repair/launch/l2-gate）⇒ 孤儿遗留日志；在写的是 `logs/scheduler_reflect.log`。
+- ⇒ 判读铁律：`health='OK'` 只证明**采集器可用**，不等于当日系统健康；`log_*`/`structured_*` 描述的是那个冻结时点。判趋势前须先换输入源。
+- 换源属配置变更（改 `sche_tasks/efficiency_monitor_daily.json` 的输入路径），**未获批不得擅改**；可行性只读实测：`python3 tools/error_signal.py --log logs/scheduler_reflect.log` → `distinct_strong=8`、`verdict=OK (metric=strong, threshold=20)`、rc=0 ⇒ 换源当天不会假红。
