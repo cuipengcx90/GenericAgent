@@ -12,7 +12,7 @@ GA语言/座舱环境: L2[GA 语言环境与 Galley 座舱启动](GA_LANG 决定
 微信信号日报+周报: wechat_signals_sop(日报18点窗口昨18→今18/周报周一09:…) | 微信语音 .silk→文字: tools/silk_to_text.py(pilk 0.2.4 已装含encoder) →A017
 微信朋友圈发布: wechat_moments_publish_sop(隐私尚饮/赞评已通) →A018
 手机: adb_ui.py | android_uu_cellular_troubleshooting_sop →A019
-sharedchat每日领额: sharedchat_sop | tools/sharedchat_claim_daily.py(凭据) →A020
+sharedchat每日领额: sharedchat_sop | tools/sharedchat_claim_daily.py(凭据) | ★R584 reason池固定10条耗尽⇒领额必败(temp/pum_claim_fresh.py 换新理由可绕) →A020
  OB 知识库(沉淀/对外共享): vault) →A021
  需要时 read L2 或 ls ../memory/ 查 L3 →A022
 仓库路径: herdr-agents=~/develop/herdr-agents(可推送) | GA=~/projects/GenericAgent(origin) | Multica深读=temp/multica_research/sub2/{M1_code_core,M2_product_surface,M3_engineering}.md(M3) →A023

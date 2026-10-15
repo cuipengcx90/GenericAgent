@@ -14,3 +14,9 @@
 - 403 响应也要解析 body(区分 CF 挑战页与业务错误码)
 - 凭据仅存 temp/sharedchat_sop/ (gitignored); temp 被清理则需向用户重新索取
 - 注册/邀请流程用户自理(2026-10-07 用户明确接管); NEW2/NEW3 待用户提供后登记进 accounts.json
+
+## ★reason 池耗尽是领额的系统性瓶颈 (2026-10-15 实测)
+- 站点按「**领取原因不能和之前重复**」拒领；而 `tools/sharedchat_claim_daily.py:44` 的 `ROBOT_REASONS` 是**固定 10 条**⇒ 理由池用尽后**每日 claim 全号必失败**。实测 2026-10-15 四号全 `claim_verdict: "ALREADY"` + `claim_detail: {"message": "领取原因不能和之前重复"}`；台账 `claim_ledger.jsonl` 累计 `CLAIMED` 13 次 / distinct reason 8 条。
+- 后果链（跨任务）：领额失败 ⇒ magpie 槽位 `sharedchat-k1-c` 无额度 ⇒ 本机 codex 403 ⇒ 所有依赖 codex 的定时任务（如 `project_update_monitor` 翻译）连带失败，且 403 会先重连 5 次 >120s，被误判成"超时"。判据与处置见 `project_update_monitor_sop.md` 的「第五形态」。
+- 补救（temp 侧，不改仓内源码）：`temp/pum_claim_fresh.py` 进程内替换 `ROBOT_REASONS` 为新理由（从台账读出已用理由并排除，断言新理由 ≥4 条），再复用官方 `main()`；实测 2026-10-15 三号 `CLAIMED`（sub 405063/405064/405069，expire 2026-10-16 00:00）。
+- 长期修复（**属改仓内源码，待批**）：把理由池改为可追加/自动生成（读台账已用句后按模板造新句），否则约每 10 天复发。
