@@ -53,7 +53,8 @@ docker run -d --name easy_proxies_trial --restart unless-stopped --user $(id -u)
 - 刷新脚本：`python3 temp/oc2a_egress/pool_refresh.py [--write] [--restart]`（`--backend auto|easy_proxies|mihomo`；
   auto = 有 easy_proxies 端口表就用它，否则回落到 mihomo 18091-18111）。逻辑：并发探活 → **按出口 IP 去重**（同 IP 只留一个端口）
   → 集合有变化才重写 `/Users/cuip/opencode2api/proxies.txt`（首行 `direct`）→ `--restart` 时 `launchctl kickstart -k gui/501/com.cuip.opencode2api`。
-- 定时面：`sche_tasks/oc2a_pool_refresh.json`（每日 09:30，`tools/sche_tasks_lint.py` 应 PASS）。**别直接注册 launchd 跑 python**（红线）。
+- **保底**：脚本在可用出口 `<3` 时**拒绝写池**（保留旧池）并返回码 `2`，定时任务据此发飞书告警——防止订阅失效当天把池子写成只剩 direct。
+- 实况（2026-10-16 08:45 写入版）：`[28101,28102,28103,28104,28108,28109,28110,28112,28113,28114,28116]`（11 个），dead=`[28100,28105,28106,28107,28115,28117]`。
 - 验收（必须拿到证据）：① `curl` 发一次真实请求应 200；② `lsof -nP -a -p <网关pid> -iTCP | grep 2810` 应见网关**实际连着池内端口**
   （macOS 的 lsof **必须加 `-a`**，否则 `-p` 与 `-iTCP` 是并集、结果全是别的进程）。
 
@@ -67,6 +68,13 @@ docker run -d --name easy_proxies_trial --restart unless-stopped --user $(id -u)
 ## 5. 回滚
 1) `cp /Users/cuip/opencode2api/config.json.bak-<ts>-before-proxies <config.json>` → `launchctl kickstart -k gui/501/com.cuip.opencode2api`；
 2) 停出口实例：`launchctl bootout gui/501 ~/Library/LaunchAgents/com.cuip.mihomo.oc2a.egress.plist`。
+
+## 5.5 网关本身升级/回滚（2026-10-16 做过一次）
+- 源码在 `~/opencode2api`（上游 `jasonxu114514/opencode2api`）。升级：`git fetch origin && git merge --ff-only origin/main`。
+- 编译：**根目录没有 Go 文件**，必须 `go build -trimpath -o opencode2api.new ./cmd/opencode2api`（`go build .` 会 `no Go files`）。
+- 换版：`cp -p opencode2api opencode2api.bak-<日期>` → `mv opencode2api.new opencode2api` → `launchctl kickstart -k gui/501/com.cuip.opencode2api`。
+- 验收：`GET /v1/models` 取**本机实际暴露的免费模型名**再打请求（用错名字会回 `not free` / `protocol not exposed`，别误判为升级坏了）；
+  日志出现 `"legs":"anon:200:..."` 即成功。回滚即把 `opencode2api.bak-<日期>` 换回再 kickstart。
 
 ## 6. 边界（不要当成已解决）
 - 机场节点是**共享 IP**，只是把"1 次机会"变成"多次换 IP 机会"，非独立 IP、非新配额。
