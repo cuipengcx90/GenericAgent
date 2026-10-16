@@ -194,7 +194,12 @@ def endpoint_of(session) -> str:
 
 
 def target_info(row, session) -> dict:
-    d = {'slot': row.get('slot'), 'name': row.get('name')}
+    # slot 只在 slot 域有值；llmno 域传的是 None。此时**不写该键**，好让下游的
+    # r.get('slot', r.get('llm_no')) 能回退到 llm_no —— 若写成 'slot': None，
+    # 键存在但值为 None，.get 的默认值不生效，打印时 None:<3 会抛 TypeError。
+    d = {'name': row.get('name')}
+    if row.get('slot') is not None:
+        d['slot'] = row['slot']
     if session is None:
         d.update(model=None, cls=None, endpoint=None, missing=True)
         return d

@@ -205,6 +205,8 @@ function getLikeCount(post) {
   `osascript -e 'tell application "Google Chrome" to get (URL of every tab of every window)'`（本轮实测：真实只剩 1 个 tab = 用户 linux.do 主页，临时 search.json tab 已消失 ⇒ 未关错）。主 tab 若被误关，用同一 AppleScript `make new tab ... with properties {URL:"https://linux.do/"}` 复原。
 - 归档后要提交 vault git 仓（历史惯例 `chore(vault): 归档 linux.do AI 技术日报 ...`）：`git add` Raw+Wiki+INDEX 三件；**提交前先 `git diff -- "60 Wiki/INDEX.md"` 确认本次只有自己新增的一行**（该文件用户可能同时在改）。若发现上轮遗留未提交的 Raw（如 09-21），顺手单独补一次提交。
 - ★2026-10-12 实测（**共享 vault 的 INDEX 常混有他会话未提交改动**，直接 `git add` 会连他们的行一起提交）：当 `git diff -- "60 Wiki/INDEX.md"` 里出现非本次的新增行/统计行时，改用「blob 法」只提交自己的四处——① 从 `git show HEAD:"60 Wiki/INDEX.md"` 取基线；② 在基线上程序化插入本次「主表行 + 顶部『上次更新』行 + 文末 dated 小节 + 统计块（按自己 delta 自增，如 726→727 / topics 456→457 / mature 389→390）」写成临时文件；③ `git hash-object -w <tmp>` 拿 sha，`git update-index --add --cacheinfo 100644,<sha>,"60 Wiki/INDEX.md"`（**不** `git add` 该文件）；④ `git add` Raw+Wiki 后 commit。提交后须断言 `git show HEAD:"60 Wiki/INDEX.md"` 与临时文件逐字相等，且工作区仍保留他会话改动。⚠️ INDEX 统计行用**全角冒号**（`总条目数：`/`mature：`），按 ASCII `:` 做 `startswith` 匹配恒落空。
+- ★2026-10-15 实测（Raw 段头模板串期）：组装 Raw 时若从上一期 Raw 复制「PDF 全文」段头部，会把上一期的附件名/短链/CDN 实链整段抄进来（本轮一度混入 10-14 的 mtSMNfYZ…/9d909bf…）⇒ 段头（附件名/短链/CDN/大小/sha1）必须用**当期** post+下载结果重建，落盘后 `grep` 断言不含上一期的短链 token。
+- 行数统计口径：pdftotext 文本含换页符 `\f`，Python `splitlines()` 把 `\f` 当行分隔多计行（实测同一文件 splitlines=1382 vs `wc -l`=1354）⇒ 报告/INDEX 里的行数一律用 `wc -l` 或 `count('\n')`。
 
 ### 幂等与并发（2026-09-23 实测，务必先做）
 - ⚠️ 本任务会**双发**：2026-09-23 的 10:02 定时任务同时被两个会话拉起（一个走反射/调度通道、一个走用户 IM 会话），两边各把同一期日报（topic 2938213）从头做了一遍；先跑完的那个已 commit（`ce40abd3`）并发了私信，后跑的**直接覆盖了已提交的 Raw/Wiki**（且后写版本更差：Wiki 7.5KB vs HEAD 15KB）。
