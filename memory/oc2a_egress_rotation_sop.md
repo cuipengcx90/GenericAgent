@@ -54,7 +54,13 @@ docker run -d --name easy_proxies_trial --restart unless-stopped --user $(id -u)
   auto = 有 easy_proxies 端口表就用它，否则回落到 mihomo 18091-18111）。逻辑：并发探活 → **按出口 IP 去重**（同 IP 只留一个端口）
   → 集合有变化才重写 `/Users/cuip/opencode2api/proxies.txt`（首行 `direct`）→ `--restart` 时 `launchctl kickstart -k gui/501/com.cuip.opencode2api`。
 - **保底**：脚本在可用出口 `<3` 时**拒绝写池**（保留旧池）并返回码 `2`，定时任务据此发飞书告警——防止订阅失效当天把池子写成只剩 direct。
-- 实况（2026-10-16 08:45 写入版）：`[28101,28102,28103,28104,28108,28109,28110,28112,28113,28114,28116]`（11 个），dead=`[28100,28105,28106,28107,28115,28117]`。
+- **多订阅（2026-10-16 已接入）**：easy_proxies 的 `subscriptions:` 是**列表**，可放多条订阅链接；
+  一键收编本机 Clash Verge 全部远程订阅：`~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml`
+  里每个 `type: remote` 项的 `url:`（**不是** `profiles/*.yaml`，那里只有节点没有订阅链接）。当前已放 **9 条**（宝可梦星云 + Verge 里另外 8 条）。
+  效果：635 个候选节点 → 探活可用 41 → 去重出口 40 入池（比单订阅 11 个强得多）。
+- **上限与排序**：`pool_refresh.py` 并发 32 线程探测、按 `time_total` 从快到慢排序、`--max-keep`（默认 60）截断；
+  635 个入口全扫约 2 分钟（放后台跑：`tools/bg_task.py start --name poolrefresh --cwd <GA根> -- python3 temp/oc2a_egress/pool_refresh.py --write --restart`）。
+- 实况（2026-10-16 08:45 写入版）：`[28101,28102,28103,28104,28108,28109,28110,28112,28113,28114,28116]`（11 个，单订阅时代）；09:2x 多订阅版重刷后为 40 个端口，最快 `28101:0.5s`。
 - 验收（必须拿到证据）：① `curl` 发一次真实请求应 200；② `lsof -nP -a -p <网关pid> -iTCP | grep 2810` 应见网关**实际连着池内端口**
   （macOS 的 lsof **必须加 `-a`**，否则 `-p` 与 `-iTCP` 是并集、结果全是别的进程）。
 
