@@ -1,0 +1,7 @@
+{
+  "schedule": "09:30",
+  "repeat": "daily",
+  "enabled": true,
+  "max_delay_hours": 4,
+  "prompt": ": \"${GA_ROOT:=/Users/cuip/projects/GenericAgent}\"; export GA_ROOT; cd \"$GA_ROOT\" || exit 3\n【oc2a 出口池巡检/刷新】背景：opencode2api 的匿名通道按**出口 IP**限流（429），池子由 easy_proxies 容器（multi-port 模式，socks 端口见 temp/oc2a_egress/easy_proxies/data/node_ports.json，通常 28100+）提供，第二 mihomo（18091-18111）为备用后端；脚本 --backend auto 会自动识别，勿手改端口。\n本任务：探活全部入口 → 按出口 IP 去重 → **仅当集合变化时**重写 /Users/cuip/opencode2api/proxies.txt 并重启网关（用 `launchctl kickstart -k gui/$UID/com.cuip.opencode2api`；不要用 POST /api/config/reload —— 它需要 WebUI 登录口令+CSRF）。\n\n1. 【记录报告路径】先 update_working_checkpoint 记下 scheduler 注入的 [报告路径]。\n\n2. 【执行】\n```bash\ncd /Users/cuip/projects/GenericAgent\npython3 temp/oc2a_egress/pool_refresh.py --write --restart 2>&1 | tee temp/oc2a_egress/pool_refresh_$(date +%F).log\necho rc=$?\n```\n3. 【收尾】报告里原样贴脚本输出（探活总数 / keep 列表 / dead 列表 / 是否重写 / 是否重启）与日志路径。\n   ⚠️ 若 rc!=0，或 keep 数 < 3（池子太小撑不住轮换），额外发飞书私信告警（reflect_scripts/reflect_common.py 的 notify_feishu()），禁止静默失败。\n   ⚠️ 不要伪造探活结果：本轮只能贴脚本真实输出。\n"
+}

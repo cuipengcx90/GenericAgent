@@ -2,7 +2,7 @@
 细节归档: ../memory/l1_detail_archive.md (每条 →A<行号> 对应其中 "## A<行号>" 原文整行; 需要细节时 grep 锚点)
 浏览器特殊操作: tmwebdriver_sop(HttpOnly Cookie/PDF bl…) →A002
 键鼠/视觉: ljqCtrl_sop | vision_sop | ocr_utils.py | vision_api.template.py | ocr_vision.swift(macOS原生Vision本地OCR) →A003
-密钥/配置: keychain.py | keychain_sop | 泄漏体检=temp/secret_scan/scanner.py(掩码+金丝雀) | codex CLI(~/.codex/config.toml: …) | LLM槽位探活=tools/llm_slot_probe.py(--list/--dry-run/--pro…) | oc2a免费模型IP限流429=出口轮换(第二mihomo多socks出口)=oc2a_egress_rotation_sop.md →A004
+密钥/配置: keychain.py | keychain_sop | 泄漏体检=temp/secret_scan/scanner.py(掩码+金丝雀) | codex CLI(~/.codex/config.toml: …) | LLM槽位探活=tools/llm_slot_probe.py(--list/--dry-run/--pro…) | oc2a免费模型IP限流429=出口轮换(终版: easy_proxies容器多端口2810x+proxyfile自动刷新; 第二mihomo1809x备用)=oc2a_egress_rotation_sop.md →A004
 MCP统一调用: ga_mcp_client.py(trendradar/sls/dbhub) →A005
 进程内存/扫描: procmem_scanner.py | procmem_scanner_sop | macOS 自带免root冷门件(R395冲浪): taskpolicy(Qo…) | 本机数据源目录只读地图: tools/personal_source_map.py(12源实测) | 时间衰减源每日快照(R415)) →A006
 定时/自主/反射: scheduled_task_sop | autonomous_operation_sop(活跃TODO) | agentmain --reflect | price_alert已转反射器plist(2min本地查价0成本) | reflect_scripts/01-06=官方示例场景(sys/email/daily/github…) | reflect 接线覆盖率核查(R488)(注册面=LaunchAgents 29+sche_tasks 25=54) | folder_watcher定时任务已归档disabled(30天500跑仅7命中且只给建议不动手) | bridge_autonomous(死任务已归档disabled) | 日志压缩 tools/log_compress.py(copytruncate:归档gzip+尾部…) | 活跃日志治理(2026-09-25 R393) | ROI日报 roi_monitor.py(口径task_volume_v1) | ROI 双口径重标定(R497) | run_tech_trends(定时github_trending)CoT泄…) | 任务产物新鲜度审计=scheduled_task_freshness_audit_sop(静默失败/僵尸任务/归档覆盖率) | temp耐久耦合(R375/C65:定时prompt 吃 cw…) | efficiency_monitor_daily=temp/efficiency_monitor.py(health只算真issue) | 待批台账=pending_decisions(看积压用view_pending.py --…) →A007
